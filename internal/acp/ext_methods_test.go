@@ -411,7 +411,9 @@ func TestMCPListWithoutSession(t *testing.T) {
 		fn   func() (map[string]any, error)
 	}{
 		{"mcp/toggle", func() (map[string]any, error) { return b.MCPToggle(ctx, "fs", true) }},
-		{"mcp/upsert", func() (map[string]any, error) { return b.MCPUpsert(ctx, map[string]any{"name": "fs", "command": "npx"}) }},
+		{"mcp/upsert", func() (map[string]any, error) {
+			return b.MCPUpsert(ctx, map[string]any{"name": "fs", "command": "npx"})
+		}},
 		{"mcp/delete", func() (map[string]any, error) { return b.MCPDelete(ctx, "fs") }},
 		{"mcp/auth_trigger", func() (map[string]any, error) { return b.MCPAuthTrigger(ctx, "github") }},
 	} {
