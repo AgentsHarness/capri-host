@@ -23,7 +23,9 @@ type Server struct {
 	cfg    config.Config
 	bridge *acp.Bridge
 	http   *http.Server
-	// promptFn runs a turn. Defaults to bridge.Prompt; injectable in tests.
+	// promptFn runs a turn when injected (tests only; signature unchanged).
+	// When nil, handlePrompt uses bridge.PromptWithOpts — the default path —
+	// so the optional messageId/meta fields ride the session/prompt params.
 	// The handler runs it detached from the client connection so a browser
 	// crash mid-turn does not cancel the turn (the grok agent keeps running).
 	promptFn func(ctx context.Context, sessionID string, blocks []acp.ContentBlock) (string, error)
@@ -31,7 +33,6 @@ type Server struct {
 
 func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	s := &Server{cfg: cfg, bridge: bridge}
-	s.promptFn = s.bridge.Prompt
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /events", s.handleSSE)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
@@ -75,6 +76,75 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/mcp-auth-trigger", s.handleMCPAuthTrigger)
 	mux.HandleFunc("GET /api/extensions", s.handleExtensions)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
+	// ── x.ai 扩展直通（完整对齐；实现见 http_ext.go）──
+	mux.HandleFunc("POST /api/xai-call", s.handleXaiCall)
+	mux.HandleFunc("POST /api/session-resume", s.handleSessionResume)
+	mux.HandleFunc("POST /api/session-close", s.handleSessionClose)
+	mux.HandleFunc("POST /api/git/status", s.handleGitStatus)
+	mux.HandleFunc("POST /api/git/diffs", s.handleGitDiffs)
+	mux.HandleFunc("POST /api/git/stage", s.handleGitStage)
+	mux.HandleFunc("POST /api/git/unstage", s.handleGitUnstage)
+	mux.HandleFunc("POST /api/git/discard", s.handleGitDiscard)
+	mux.HandleFunc("POST /api/git/commit", s.handleGitCommit)
+	mux.HandleFunc("POST /api/git/checkout", s.handleGitCheckout)
+	mux.HandleFunc("POST /api/git/checkout-commit", s.handleGitCheckoutCommit)
+	mux.HandleFunc("POST /api/git/stash", s.handleGitStash)
+	mux.HandleFunc("POST /api/git/branches", s.handleGitBranches)
+	mux.HandleFunc("POST /api/git/current-commit", s.handleGitCurrentCommit)
+	mux.HandleFunc("POST /api/git/repo-root", s.handleGitRepoRoot)
+	mux.HandleFunc("POST /api/queue/remove", s.handleQueueRemove)
+	mux.HandleFunc("POST /api/queue/clear", s.handleQueueClear)
+	mux.HandleFunc("POST /api/queue/reorder", s.handleQueueReorder)
+	mux.HandleFunc("POST /api/queue/edit", s.handleQueueEdit)
+	mux.HandleFunc("POST /api/queue/interject", s.handleQueueInterject)
+	mux.HandleFunc("POST /api/skills/list", s.handleSkillsList)
+	mux.HandleFunc("POST /api/skills/toggle", s.handleSkillsToggle)
+	mux.HandleFunc("POST /api/skills/add", s.handleSkillsAdd)
+	mux.HandleFunc("POST /api/skills/remove", s.handleSkillsRemove)
+	mux.HandleFunc("POST /api/skills/refresh-baseline", s.handleSkillsRefreshBaseline)
+	mux.HandleFunc("POST /api/plugins/list", s.handlePluginsList)
+	mux.HandleFunc("POST /api/plugins/action", s.handlePluginsAction)
+	mux.HandleFunc("POST /api/plugins/reload", s.handlePluginsReload)
+	mux.HandleFunc("POST /api/hooks/list", s.handleHooksList)
+	mux.HandleFunc("POST /api/hooks/action", s.handleHooksAction)
+	mux.HandleFunc("POST /api/marketplace/list", s.handleMarketplaceList)
+	mux.HandleFunc("POST /api/marketplace/action", s.handleMarketplaceAction)
+	mux.HandleFunc("POST /api/workflows/list", s.handleWorkflowsList)
+	mux.HandleFunc("POST /api/session/info", s.handleSessionInfoExt)
+	mux.HandleFunc("POST /api/session/usage", s.handleSessionUsage)
+	mux.HandleFunc("POST /api/session/search", s.handleSessionSearch)
+	mux.HandleFunc("POST /api/sessions/list", s.handleSessionsList)
+	mux.HandleFunc("POST /api/prompt-history", s.handlePromptHistory)
+	mux.HandleFunc("POST /api/btw", s.handleBtw)
+	mux.HandleFunc("POST /api/interject", s.handleInterject)
+	mux.HandleFunc("POST /api/commands-list", s.handleCommandsList)
+	mux.HandleFunc("POST /api/workspaces/list", s.handleWorkspacesList)
+	mux.HandleFunc("POST /api/subagent/list-running", s.handleSubagentListRunning)
+	mux.HandleFunc("POST /api/session/share", s.handleSessionShare)
+	mux.HandleFunc("POST /api/mcp/read-resource", s.handleMCPReadResource)
+	mux.HandleFunc("POST /api/mcp/auth-status", s.handleMCPAuthStatus)
+	mux.HandleFunc("POST /api/mcp/setup", s.handleMCPSetup)
+	mux.HandleFunc("POST /api/mcp/toggle-tool", s.handleMCPToggleTool)
+	mux.HandleFunc("POST /api/mcp/call", s.handleMCPCall)
+	mux.HandleFunc("POST /api/auth/info", s.handleAuthInfo)
+	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("POST /api/auth/get-url", s.handleAuthGetURL)
+	mux.HandleFunc("POST /api/auth/submit-code", s.handleAuthSubmitCode)
+	mux.HandleFunc("POST /api/fs/list", s.handleFSList)
+	mux.HandleFunc("POST /api/fs/read-file", s.handleFSReadFile)
+	mux.HandleFunc("POST /api/fs/exists", s.handleFSExists)
+	mux.HandleFunc("POST /api/capabilities", s.handleCapabilities)
+	mux.HandleFunc("POST /api/folder-trust-request", s.handleFolderTrustRequest)
+	mux.HandleFunc("POST /api/suggest", s.handleSuggest)
+	mux.HandleFunc("POST /api/suggest-prompt", s.handleSuggestPrompt)
+	mux.HandleFunc("POST /api/pr/status", s.handlePRStatus)
+	mux.HandleFunc("POST /api/hunk-tracker/hunks", s.handleHunkTrackerHunks)
+	mux.HandleFunc("POST /api/bundle/status", s.handleBundleStatus)
+	mux.HandleFunc("POST /api/terminal/list", s.handleTerminalList)
+	mux.HandleFunc("POST /api/search/content", s.handleSearchContent)
+	mux.HandleFunc("POST /api/billing/auto-topup-rule", s.handleAutoTopupRule)
+	mux.HandleFunc("POST /api/feedback", s.handleFeedback)
+	mux.HandleFunc("POST /api/cloud/env/list", s.handleCloudEnvList)
 	// CORS for Vite dev
 	s.http = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -138,24 +208,25 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	snap := s.bridge.Snapshot()
 	hello := map[string]any{
-		"type":            "hello",
-		"ready":           snap.Ready,
-		"busy":            snap.Busy,
-		"sessionId":       snap.SessionID,
-		"cwd":             snap.Cwd,
-		"text":            snap.Text,
-		"error":           snap.BootError,
-		"agentInfo":       snap.AgentInfo,
-		"modes":           snap.Modes,
-		"configOptions":   snap.ConfigOptions,
-		"models":          snap.Models,
-		"pendingRequests": snap.PendingRequests,
-		"hostId":          snap.HostID,
-		"hostName":        snap.HostName,
-		"homeDir":         snap.HomeDir,
-		"capabilities":    snap.Capabilities,
-		"roster":          snap.Roster,
-		"agentStartedAt":  snap.AgentStartedAt,
+		"type":              "hello",
+		"ready":             snap.Ready,
+		"busy":              snap.Busy,
+		"sessionId":         snap.SessionID,
+		"cwd":               snap.Cwd,
+		"text":              snap.Text,
+		"error":             snap.BootError,
+		"agentInfo":         snap.AgentInfo,
+		"modes":             snap.Modes,
+		"configOptions":     snap.ConfigOptions,
+		"models":            snap.Models,
+		"pendingRequests":   snap.PendingRequests,
+		"hostId":            snap.HostID,
+		"hostName":          snap.HostName,
+		"homeDir":           snap.HomeDir,
+		"capabilities":      snap.Capabilities,
+		"agentCapabilities": snap.AgentCapabilities,
+		"roster":            snap.Roster,
+		"agentStartedAt":    snap.AgentStartedAt,
 	}
 	data, _ := json.Marshal(hello)
 	fmt.Fprintf(w, "data: %s\n\n", data)
@@ -213,6 +284,10 @@ type promptBody struct {
 	Blocks []acp.ContentBlock `json:"blocks"`
 	// Optional: target session (defaults to the active session).
 	SessionID string `json:"sessionId,omitempty"`
+	// Optional: messageId (UUID) / _meta, forwarded on the session/prompt
+	// params only when set (absent key ≠ off, matching the TUI).
+	MessageID string         `json:"messageId,omitempty"`
+	Meta      map[string]any `json:"meta,omitempty"`
 }
 
 func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +315,15 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		sr, err := s.promptFn(context.Background(), body.SessionID, body.Blocks)
+		var sr string
+		var err error
+		if s.promptFn != nil {
+			// Test-injected promptFn keeps its exact contract.
+			sr, err = s.promptFn(context.Background(), body.SessionID, body.Blocks)
+		} else {
+			sr, err = s.bridge.PromptWithOpts(context.Background(), body.SessionID, body.Blocks,
+				acp.PromptOpts{MessageID: body.MessageID, Meta: body.Meta})
+		}
 		done <- result{sr, err}
 	}()
 
@@ -418,8 +501,8 @@ func (s *Server) handleSessionState(w http.ResponseWriter, r *http.Request) {
 }
 
 type sessionLoadBody struct {
-	SessionID string         `json:"sessionId"`
-	Cwd       string         `json:"cwd"`
+	SessionID string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
 	// Meta: client-supplied session seeds (permission-mode flags, the
 	// TUI's yoloMode/autoMode analog) forwarded as the session/load
 	// params `_meta`. Omitted = current behavior exactly.
