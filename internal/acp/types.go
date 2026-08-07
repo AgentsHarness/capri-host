@@ -15,6 +15,15 @@ type SessionConfig struct {
 	MCPServers            []map[string]any `json:"mcpServers"`
 }
 
+// PermissionScope is the bash command scope a client attaches to a
+// permission selection (the TUI's BashCommandSelectedTerms analog). The
+// bridge serializes it into the ACP response `_meta` as the wire keys
+// command_parts / is_glob.
+type PermissionScope struct {
+	CommandParts []string `json:"commandParts"`
+	IsGlob       bool     `json:"isGlob"`
+}
+
 // Status is a snapshot for GET /api/status and SSE hello.
 type Status struct {
 	Ready         bool           `json:"ready"`
