@@ -1,0 +1,534 @@
+package acp
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+)
+
+// ── session/update full passthrough ─────────────────────────────────
+
+// Any sessionUpdate kind outside the explicitly modeled cases must be
+// forwarded verbatim as a session_notification event (previously only 16
+// whitelisted kinds passed through; everything else was dropped as
+// unknown_update, which the frontend ignores). Sample across the
+// life-cycle / UI kinds the agent actually ships, including the
+// required diff_review and tool_call_delta_chunk.
+func TestSessionUpdateFullPassthrough(t *testing.T) {
+	kinds := []string{
+		"workflow_updated",
+		"tool_call_delta_chunk",
+		"diff_review",
+		"memory_files",
+		"model_changed",
+		"subagent_spawned",
+		"response_started",
+		"session_recap",
+	}
+	for _, kind := range kinds {
+		t.Run(kind, func(t *testing.T) {
+			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+			ch, unsub := b.Subscribe()
+			defer unsub()
+			update := map[string]any{"sessionUpdate": kind, "some": "payload"}
+			b.handleSessionUpdate(map[string]any{
+				"sessionId": "s1",
+				"update":    update,
+			})
+			select {
+			case ev := <-ch:
+				if ev["type"] != "session_notification" {
+					t.Fatalf("event type = %v, want session_notification", ev["type"])
+				}
+				if ev["method"] != "session/update" {
+					t.Errorf("event method = %v, want session/update", ev["method"])
+				}
+				params, _ := ev["params"].(map[string]any)
+				if !reflect.DeepEqual(params, map[string]any{"update": update}) {
+					t.Errorf("event params = %v, want the update forwarded verbatim", params)
+				}
+				if ev["sessionId"] != "s1" {
+					t.Errorf("event sessionId = %v, want s1", ev["sessionId"])
+				}
+			case <-time.After(time.Second):
+				t.Fatal("no session_notification event broadcast")
+			}
+		})
+	}
+}
+
+// turn_completed / response_completed over the session/update carrier must
+// yield BOTH the forwarded session_notification event and a usage event
+// extracted from _meta.totalTokens + update.usage (handleXaiNotification
+// parity). The merged usage event carries used (int64 from asInt) and the
+// turn's usage object passed through untouched.
+func TestTurnCompletedSessionUpdateUsage(t *testing.T) {
+	for _, kind := range []string{"turn_completed", "response_completed"} {
+		t.Run(kind, func(t *testing.T) {
+			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+			ch, unsub := b.Subscribe()
+			defer unsub()
+			usage := map[string]any{"totalTokens": float64(55)}
+			b.handleSessionUpdate(map[string]any{
+				"sessionId": "s1",
+				"_meta":     map[string]any{"totalTokens": float64(1234)},
+				"update": map[string]any{
+					"sessionUpdate": kind,
+					"usage":         usage,
+				},
+			})
+			var sawNotification, sawUsage bool
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && !(sawNotification && sawUsage) {
+				select {
+				case ev := <-ch:
+					switch ev["type"] {
+					case "session_notification":
+						sawNotification = true
+						if ev["method"] != "session/update" {
+							t.Errorf("notification method = %v, want session/update", ev["method"])
+						}
+					case "usage":
+						// Only the turn-completed extraction carries BOTH
+						// the carrier-level used count and the usage object.
+						if used, ok := asInt(ev["used"]); ok && used == 1234 {
+							if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
+								sawUsage = true
+							}
+						}
+					}
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			if !sawNotification {
+				t.Errorf("no session_notification event for %s", kind)
+			}
+			if !sawUsage {
+				t.Errorf("no merged usage event (used=1234 + usage object) for %s", kind)
+			}
+		})
+	}
+}
+
+// ── chunk meta forwarding ───────────────────────────────────────────
+
+// agent_message_chunk must mirror user_message_chunk's meta forwarding:
+// hideFromScrollback (chunk meta), displayText / displayAsCron
+// (content-block meta) — alongside the existing messageId.
+func TestAgentMessageChunkForwardsMeta(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	b.handleSessionUpdate(map[string]any{
+		"sessionId": "s1",
+		"update": map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"messageId":     "m-9",
+			"_meta":         map[string]any{"hideFromScrollback": true},
+			"content": map[string]any{
+				"type":  "text",
+				"text":  "hello",
+				"_meta": map[string]any{"displayText": "Custom label", "displayAsCron": true},
+			},
+		},
+	})
+	ev := <-ch
+	if ev["type"] != "chunk" || ev["text"] != "hello" {
+		t.Fatalf("event = %v, want chunk hello", ev)
+	}
+	if ev["messageId"] != "m-9" {
+		t.Errorf("messageId = %v, want m-9", ev["messageId"])
+	}
+	if ev["hideFromScrollback"] != true {
+		t.Errorf("hideFromScrollback = %v, want true", ev["hideFromScrollback"])
+	}
+	if ev["displayText"] != "Custom label" || ev["displayAsCron"] != true {
+		t.Errorf("content meta = %v, want displayText/displayAsCron", ev)
+	}
+}
+
+// agent_thought_chunk forwards update._meta verbatim as the event's
+// `meta` key.
+func TestAgentThoughtChunkForwardsMeta(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	meta := map[string]any{"hideFromScrollback": true, "kind": "internal"}
+	b.handleSessionUpdate(map[string]any{
+		"sessionId": "s1",
+		"update": map[string]any{
+			"sessionUpdate": "agent_thought_chunk",
+			"_meta":         meta,
+			"content":       map[string]any{"type": "text", "text": "thinking…"},
+		},
+	})
+	ev := <-ch
+	if ev["type"] != "thought" || ev["text"] != "thinking…" {
+		t.Fatalf("event = %v, want thought event", ev)
+	}
+	if !reflect.DeepEqual(ev["meta"], meta) {
+		t.Errorf("meta = %v, want %v", ev["meta"], meta)
+	}
+}
+
+// ── session/resume ──────────────────────────────────────────────────
+
+// session/resume must mirror LoadSession: same wire params (plus
+// additionalDirectories), roster registration, active-session switch,
+// ready event with the resume response's models/configOptions, and the
+// busy focus-only path that never hits the wire.
+func TestResumeSessionWireAndRoster(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	ctx := context.Background()
+
+	done := make(chan callResult, 1)
+	go func() {
+		res, err := b.ResumeSession(ctx, "hist-1", "/ws")
+		done <- callResult{res, err}
+	}()
+	resolveNext(t, b, w, map[string]any{
+		"sessionId":     "hist-1",
+		"models":        map[string]any{"currentModelId": "grok-4"},
+		"configOptions": map[string]any{"yoloMode": true},
+	})
+	cr := <-done
+	if cr.err != nil {
+		t.Fatalf("ResumeSession: %v", cr.err)
+	}
+
+	msg := w.last()
+	if msg["method"] != "session/resume" {
+		t.Fatalf("wire method = %v, want session/resume", msg["method"])
+	}
+	wantParams := map[string]any{
+		"sessionId":             "hist-1",
+		"cwd":                   "/ws",
+		"mcpServers":            []any{},
+		"additionalDirectories": []any{},
+	}
+	gotParams, _ := msg["params"].(map[string]any)
+	if !reflect.DeepEqual(gotParams, wantParams) {
+		t.Errorf("params = %v, want %v", gotParams, wantParams)
+	}
+
+	// Roster registration + active switch.
+	b.mu.Lock()
+	act := b.sessions["hist-1"]
+	active := b.activeSessionID
+	b.mu.Unlock()
+	if act == nil {
+		t.Fatal("hist-1 not registered in the roster")
+	}
+	if act.Cwd != "/ws" {
+		t.Errorf("session cwd = %q, want /ws", act.Cwd)
+	}
+	if active != "hist-1" {
+		t.Errorf("activeSessionID = %q, want hist-1", active)
+	}
+
+	// ready event broadcast with the resume response's models/configOptions.
+	select {
+	case ev := <-ch:
+		if ev["type"] != "ready" || ev["sessionId"] != "hist-1" || ev["cwd"] != "/ws" {
+			t.Fatalf("ready event = %v", ev)
+		}
+		if !reflect.DeepEqual(ev["models"], map[string]any{"currentModelId": "grok-4"}) {
+			t.Errorf("ready models = %v", ev["models"])
+		}
+		if !reflect.DeepEqual(ev["configOptions"], map[string]any{"yoloMode": true}) {
+			t.Errorf("ready configOptions = %v", ev["configOptions"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no ready event broadcast")
+	}
+}
+
+// The busy focus-only path re-focuses without calling the agent (same as
+// LoadSession): no wire request, ready + busy re-announced, cwd updated.
+func TestResumeSessionBusyFocusOnly(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].Busy = true
+	b.mu.Unlock()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	res, err := b.ResumeSession(context.Background(), "s1", "/new-cwd")
+	if err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+	if len(w.lines) != 0 {
+		t.Errorf("busy focus-only path must not write requests, got %d", len(w.lines))
+	}
+	if busy, _ := res["busy"].(bool); !busy {
+		t.Errorf("result busy = %v, want true", res["busy"])
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case ev := <-ch:
+			if ev["type"] != "ready" && ev["type"] != "busy" {
+				t.Fatalf("event = %v, want ready or busy", ev)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("missing ready/busy event")
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sessions["s1"].Cwd != "/new-cwd" {
+		t.Errorf("session cwd = %q, want /new-cwd", b.sessions["s1"].Cwd)
+	}
+	if b.activeSessionID != "s1" {
+		t.Errorf("activeSessionID = %q, want s1", b.activeSessionID)
+	}
+}
+
+// ── session/close ───────────────────────────────────────────────────
+
+// session/close defaults to the active session, removes it from the
+// roster, clears activeSessionID, and clears a matching last-session
+// pointer (disk file untouched — restoring a closed session would 404).
+func TestCloseSessionWireAndRoster(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	b.mu.Lock()
+	b.lastSessionID = "s1"
+	b.lastSessionCwd = "/ws"
+	b.mu.Unlock()
+	ctx := context.Background()
+
+	done := make(chan callResult, 1)
+	go func() {
+		res, err := b.CloseSession(ctx, "")
+		done <- callResult{res, err}
+	}()
+	resolveNext(t, b, w, map[string]any{"ok": true})
+	cr := <-done
+	if cr.err != nil {
+		t.Fatalf("CloseSession: %v", cr.err)
+	}
+
+	msg := w.last()
+	if msg["method"] != "session/close" {
+		t.Fatalf("wire method = %v, want session/close", msg["method"])
+	}
+	gotParams, _ := msg["params"].(map[string]any)
+	if !reflect.DeepEqual(gotParams, map[string]any{"sessionId": "s1"}) {
+		t.Errorf("params = %v, want {sessionId: s1}", gotParams)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.sessions["s1"]; ok {
+		t.Error("s1 still in the roster after close")
+	}
+	if b.activeSessionID != "" {
+		t.Errorf("activeSessionID = %q, want empty", b.activeSessionID)
+	}
+	if b.lastSessionID != "" || b.lastSessionCwd != "" {
+		t.Errorf("last-session pointer = %q/%q, want cleared", b.lastSessionID, b.lastSessionCwd)
+	}
+}
+
+// Closing an explicit non-active session must not clear the active one.
+func TestCloseSessionExplicitID(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	done := make(chan callResult, 1)
+	go func() {
+		res, err := b.CloseSession(ctx, "other")
+		done <- callResult{res, err}
+	}()
+	resolveNext(t, b, w, map[string]any{"ok": true})
+	if cr := <-done; cr.err != nil {
+		t.Fatalf("CloseSession: %v", cr.err)
+	}
+	msg := w.last()
+	gotParams, _ := msg["params"].(map[string]any)
+	if gotParams["sessionId"] != "other" {
+		t.Errorf("params sessionId = %v, want other", gotParams["sessionId"])
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeSessionID != "s1" {
+		t.Errorf("activeSessionID = %q, want s1 untouched", b.activeSessionID)
+	}
+}
+
+// Without any active session, session/close fails fast with a 404.
+func TestCloseSessionNoActiveSession(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	b.mu.Lock()
+	b.ready = true
+	b.stdin = discardWriteCloser{}
+	b.mu.Unlock()
+	_, err := b.CloseSession(context.Background(), "")
+	var he *HTTPError
+	if !errors.As(err, &he) || he.Code != 404 {
+		t.Fatalf("err = %v, want HTTPError 404", err)
+	}
+}
+
+// ── session/prompt optional fields ──────────────────────────────────
+
+// PromptWithOpts rides the official optional fields on session/prompt:
+// messageId and _meta are emitted only when non-empty.
+func TestPromptWithOptsWire(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	done := make(chan callResult, 1)
+	go func() {
+		sr, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{
+			MessageID: "uuid-1",
+			Meta:      map[string]any{"yoloMode": true},
+		})
+		done <- callResult{map[string]any{"stopReason": sr}, err}
+	}()
+	resolveNext(t, b, w, map[string]any{"stopReason": "end_turn"})
+	cr := <-done
+	if cr.err != nil {
+		t.Fatalf("PromptWithOpts: %v", cr.err)
+	}
+	if cr.res["stopReason"] != "end_turn" {
+		t.Errorf("stopReason = %v, want end_turn", cr.res["stopReason"])
+	}
+
+	msg := w.last()
+	if msg["method"] != "session/prompt" {
+		t.Fatalf("wire method = %v, want session/prompt", msg["method"])
+	}
+	params, _ := msg["params"].(map[string]any)
+	if params["sessionId"] != "s1" {
+		t.Errorf("sessionId = %v, want s1", params["sessionId"])
+	}
+	if params["messageId"] != "uuid-1" {
+		t.Errorf("messageId = %v, want uuid-1", params["messageId"])
+	}
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok || !reflect.DeepEqual(meta, map[string]any{"yoloMode": true}) {
+		t.Errorf("_meta = %v, want {yoloMode: true}", params["_meta"])
+	}
+	if params["prompt"] == nil {
+		t.Error("prompt missing from params")
+	}
+}
+
+// Plain Prompt (thin wrapper) must not emit messageId/_meta — the wire
+// stays byte-identical to the pre-opts shape.
+func TestPromptOmitsOptsWhenEmpty(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	done := make(chan callResult, 1)
+	go func() {
+		sr, err := b.Prompt(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}})
+		done <- callResult{map[string]any{"stopReason": sr}, err}
+	}()
+	resolveNext(t, b, w, map[string]any{"stopReason": "end_turn"})
+	if cr := <-done; cr.err != nil {
+		t.Fatalf("Prompt: %v", cr.err)
+	}
+	msg := w.last()
+	params, _ := msg["params"].(map[string]any)
+	if _, ok := params["messageId"]; ok {
+		t.Errorf("messageId must be absent: %v", params)
+	}
+	if _, ok := params["_meta"]; ok {
+		t.Errorf("_meta must be absent: %v", params)
+	}
+	want := map[string]any{
+		"sessionId": "s1",
+		"prompt":    []any{map[string]any{"type": "text", "text": "hi"}},
+	}
+	if !reflect.DeepEqual(params, want) {
+		t.Errorf("params = %v, want %v", params, want)
+	}
+}
+
+// ── XaiCall ─────────────────────────────────────────────────────────
+
+// XaiCall is the generic "_"-prefixed extension call: an empty
+// sessionId/session_id in params is replaced with the active session
+// (404 when none is active); keys absent from params stay absent; the
+// RAW result envelope is returned untouched.
+func TestXaiCall(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty sessionId fills active", func(t *testing.T) {
+		b, w := readyBridge()
+		done := make(chan callResult, 1)
+		go func() {
+			res, err := b.XaiCall(ctx, "x.ai/foo", map[string]any{"sessionId": ""})
+			done <- callResult{res, err}
+		}()
+		resolveNext(t, b, w, map[string]any{"result": map[string]any{"ok": true}})
+		cr := <-done
+		if cr.err != nil {
+			t.Fatalf("XaiCall: %v", cr.err)
+		}
+		// RAW result: the ExtMethodResult envelope is not unwrapped.
+		if _, ok := cr.res["result"].(map[string]any); !ok {
+			t.Errorf("result = %v, want raw envelope passthrough", cr.res)
+		}
+		msg := w.last()
+		if msg["method"] != "_x.ai/foo" {
+			t.Errorf("wire method = %v, want _x.ai/foo", msg["method"])
+		}
+		params, _ := msg["params"].(map[string]any)
+		if params["sessionId"] != "s1" {
+			t.Errorf("params sessionId = %v, want s1", params["sessionId"])
+		}
+	})
+
+	t.Run("absent sessionId stays absent", func(t *testing.T) {
+		b, w := readyBridge()
+		done := make(chan callResult, 1)
+		go func() {
+			res, err := b.XaiCall(ctx, "x.ai/foo", map[string]any{})
+			done <- callResult{res, err}
+		}()
+		resolveNext(t, b, w, map[string]any{"ok": true})
+		cr := <-done
+		if cr.err != nil {
+			t.Fatalf("XaiCall: %v", cr.err)
+		}
+		params, _ := w.last()["params"].(map[string]any)
+		if len(params) != 0 {
+			t.Errorf("params = %v, want empty (no sessionId key)", params)
+		}
+	})
+
+	t.Run("snake_case session_id fills active", func(t *testing.T) {
+		b, w := readyBridge()
+		done := make(chan callResult, 1)
+		go func() {
+			res, err := b.XaiCall(ctx, "x.ai/foo", map[string]any{"session_id": ""})
+			done <- callResult{res, err}
+		}()
+		resolveNext(t, b, w, map[string]any{"ok": true})
+		cr := <-done
+		if cr.err != nil {
+			t.Fatalf("XaiCall: %v", cr.err)
+		}
+		params, _ := w.last()["params"].(map[string]any)
+		if params["session_id"] != "s1" {
+			t.Errorf("params session_id = %v, want s1", params["session_id"])
+		}
+	})
+
+	t.Run("no active session 404s", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		b.mu.Lock()
+		b.ready = true
+		b.stdin = discardWriteCloser{}
+		b.mu.Unlock()
+		_, err := b.XaiCall(ctx, "x.ai/foo", map[string]any{"sessionId": ""})
+		var he *HTTPError
+		if !errors.As(err, &he) || he.Code != 404 {
+			t.Fatalf("err = %v, want HTTPError 404", err)
+		}
+	})
+}
