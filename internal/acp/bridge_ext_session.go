@@ -2,53 +2,10 @@ package acp
 
 import (
 	"context"
-	"time"
 )
 
-// XaiCall is the shared x.ai extension transport used by every typed
-// wrapper in this package (the align/core contract).
-//
-// It sends a JSON-RPC request for `_x.ai/<method>` (the "_" prefix is what
-// the agent's extension dispatcher accepts — bare "x.ai/..." names get
-// -32601) and returns the RAW result map, without unwrapping the
-// ExtMethodResult envelope (use UnwrapExtResult for that).
-//
-// Session-id filling rule: if `params` contains a "sessionId" or
-// "session_id" key whose value is "" (the "fill me" sentinel), the active
-// session id is substituted; with no active session the call fails fast
-// with an HTTPError 404. Keys that are absent are left absent — optional
-// session ids are simply omitted by the wrappers.
-func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
-	if err := b.Boot(ctx); err != nil {
-		return nil, err
-	}
-	if params == nil {
-		params = map[string]any{}
-	}
-	for _, k := range []string{"sessionId", "session_id"} {
-		if v, ok := params[k]; ok {
-			if s, isStr := v.(string); isStr && s == "" {
-				params[k] = b.resolveSessionID("")
-				if params[k] == "" {
-					return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
-				}
-			}
-			break
-		}
-	}
-	return b.request(ctx, "_"+method, params, 60*time.Second)
-}
-
-// UnwrapExtResult unwraps the common ExtMethodResult envelope
-// {"result": <payload>, "error": ...} → the inner payload map.
-// Non-envelope results (bare payloads such as {"success": true} or
-// {"ok": true}) are returned unchanged. nil-safe.
-func UnwrapExtResult(res map[string]any) map[string]any {
-	if inner, ok := res["result"].(map[string]any); ok {
-		return inner
-	}
-	return res
-}
+// XaiCall / UnwrapExtResult live in bridge.go / bridge_ext.go (align/core
+// and align/ext1 contracts) — do not redefine them here.
 
 // xaiCallUnwrapped is the common shape of every typed wrapper: XaiCall
 // followed by UnwrapExtResult, with the error short-circuited.

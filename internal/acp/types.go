@@ -31,17 +31,20 @@ type PermissionScope struct {
 
 // Status is a snapshot for GET /api/status and SSE hello.
 type Status struct {
-	Ready         bool           `json:"ready"`
-	Busy          bool           `json:"busy"`
-	Booting       bool           `json:"booting"`
-	SessionID     string         `json:"sessionId,omitempty"`
-	Cwd           string         `json:"cwd,omitempty"`
-	HostID        string         `json:"hostId"`
-	HostName      string         `json:"hostName"`
-	HomeDir       string         `json:"homeDir,omitempty"`
-	AgentInfo     map[string]any `json:"agentInfo,omitempty"`
-	Modes         any            `json:"modes,omitempty"`
-	ConfigOptions any            `json:"configOptions,omitempty"`
+	Ready     bool           `json:"ready"`
+	Busy      bool           `json:"busy"`
+	Booting   bool           `json:"booting"`
+	SessionID string         `json:"sessionId,omitempty"`
+	Cwd       string         `json:"cwd,omitempty"`
+	HostID    string         `json:"hostId"`
+	HostName  string         `json:"hostName"`
+	HomeDir   string         `json:"homeDir,omitempty"`
+	AgentInfo map[string]any `json:"agentInfo,omitempty"`
+	// AgentCapabilities from the agent's initialize response (what the
+	// agent declared, e.g. x.ai extension support).
+	AgentCapabilities any `json:"agentCapabilities,omitempty"`
+	Modes             any `json:"modes,omitempty"`
+	ConfigOptions     any `json:"configOptions,omitempty"`
 	// SessionModelState from the latest session/new or session/load.
 	Models          any          `json:"models,omitempty"`
 	BootError       string       `json:"bootError,omitempty"`
