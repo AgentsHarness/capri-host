@@ -1,0 +1,343 @@
+package server
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// ── POST /api/billing ───────────────────────────────────────────────
+
+func TestBillingEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/billing", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	// The agent's ExtMethodResult envelope ({result:{plan, credits}}) is
+	// passed through verbatim under "result".
+	res, _ := m["result"].(map[string]any)
+	inner, _ := res["result"].(map[string]any)
+	if inner["plan"] != "pro" || inner["credits"] != "42.50" {
+		t.Fatalf("result = %v, want {result:{plan:pro credits:42.50}}", m["result"])
+	}
+
+	// No sessionId and no active session → 404 (task/list convention).
+	rec2 := postJSON(t, s, "/api/billing", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+	if m := decodeBody(t, rec2); !strings.Contains(m["error"].(string), "暂无活动会话") {
+		t.Fatalf("resp = %s, want 暂无活动会话", rec2.Body.String())
+	}
+}
+
+// ── POST /api/memory-flush ──────────────────────────────────────────
+
+func TestMemoryFlushEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/memory-flush", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/memory-flush", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/memory-rewrite ────────────────────────────────────────
+
+func TestMemoryRewriteEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/memory-rewrite", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/memory-rewrite", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/toggle-plan-mode ──────────────────────────────────────
+
+func TestTogglePlanModeEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/toggle-plan-mode", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	// The fake agent returns {result:{planMode:true}}; the handler must
+	// extract the bool onto the top level.
+	if m["planMode"] != true {
+		t.Fatalf("resp = %s, want planMode:true", rec.Body.String())
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/toggle-plan-mode", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/permissions-reset ─────────────────────────────────────
+
+func TestPermissionsResetEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/permissions-reset", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/permissions-reset", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── GET /api/mcp/list ───────────────────────────────────────────────
+
+func TestMCPListEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	req := httptest.NewRequest("GET", "/api/mcp/list", nil)
+	rec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	servers, ok := m["servers"].([]any)
+	if !ok || len(servers) != 2 {
+		t.Fatalf("servers = %v, want 2 entries", m["servers"])
+	}
+	// Object entries pass through; the bare-string entry is normalized
+	// to {name: …}.
+	first := servers[0].(map[string]any)
+	if first["name"] != "fs" || first["enabled"] != true {
+		t.Errorf("servers[0] = %v, want {name:fs enabled:true}", first)
+	}
+	second := servers[1].(map[string]any)
+	if second["name"] != "bare-name" || len(second) != 1 {
+		t.Errorf("servers[1] = %v, want {name:bare-name} only", second)
+	}
+}
+
+func TestNormalizeMCPServers(t *testing.T) {
+	cases := []struct {
+		name string
+		res  map[string]any
+		want []any
+	}{
+		{
+			name: "top-level servers key",
+			res:  map[string]any{"servers": []any{map[string]any{"name": "a"}}},
+			want: []any{map[string]any{"name": "a"}},
+		},
+		{
+			name: "ExtMethodResult envelope result.servers",
+			res:  map[string]any{"result": map[string]any{"servers": []any{map[string]any{"name": "b"}}}},
+			want: []any{map[string]any{"name": "b"}},
+		},
+		{
+			name: "result is a bare array",
+			res:  map[string]any{"result": []any{map[string]any{"name": "c"}}},
+			want: []any{map[string]any{"name": "c"}},
+		},
+		{
+			name: "bare string entries become name objects",
+			res:  map[string]any{"servers": []any{"plain", map[string]any{"name": "d"}}},
+			want: []any{map[string]any{"name": "plain"}, map[string]any{"name": "d"}},
+		},
+		{
+			name: "nil entries dropped",
+			res:  map[string]any{"servers": []any{nil, "x"}},
+			want: []any{map[string]any{"name": "x"}},
+		},
+		{
+			name: "nil input",
+			res:  nil,
+			want: nil,
+		},
+		{
+			name: "no servers anywhere",
+			res:  map[string]any{"result": map[string]any{"foo": "bar"}},
+			want: []any{},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := normalizeMCPServers(c.res)
+			if len(got) != len(c.want) {
+				t.Fatalf("got %d servers, want %d: %+v", len(got), len(c.want), got)
+			}
+			for i := range got {
+				gm, gok := got[i].(map[string]any)
+				wm, wok := c.want[i].(map[string]any)
+				if !gok || !wok || gm["name"] != wm["name"] {
+					t.Errorf("servers[%d] = %v, want %v", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ── POST /api/mcp-toggle ────────────────────────────────────────────
+
+func TestMCPToggleEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/mcp-toggle", `{"name":"fs","enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// enabled:false is legitimate — must not 400.
+	recFalse := postJSON(t, s, "/api/mcp-toggle", `{"name":"fs","enabled":false}`)
+	if recFalse.Code != http.StatusOK {
+		t.Fatalf("enabled:false status = %d, body=%s", recFalse.Code, recFalse.Body.String())
+	}
+
+	// Missing name → 400.
+	rec2 := postJSON(t, s, "/api/mcp-toggle", `{"enabled":true}`)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("missing-name status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+
+	// Missing enabled → 400 (pointer distinguishes absent from false).
+	rec3 := postJSON(t, s, "/api/mcp-toggle", `{"name":"fs"}`)
+	if rec3.Code != http.StatusBadRequest {
+		t.Fatalf("missing-enabled status = %d, body=%s", rec3.Code, rec3.Body.String())
+	}
+}
+
+// ── POST /api/mcp-add ───────────────────────────────────────────────
+
+func TestMCPAddEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/mcp-add",
+		`{"server":{"name":"fs","command":"npx","args":["-y","@modelcontextprotocol/server-fs"],"env":{"KEY":"v"}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// Missing server → 400.
+	rec2 := postJSON(t, s, "/api/mcp-add", `{}`)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("missing-server status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+
+	// Missing server.name → 400 (server object without a name is useless).
+	rec3 := postJSON(t, s, "/api/mcp-add", `{"server":{"command":"npx"}}`)
+	if rec3.Code != http.StatusBadRequest {
+		t.Fatalf("missing-name status = %d, body=%s", rec3.Code, rec3.Body.String())
+	}
+}
+
+// ── POST /api/mcp-remove ────────────────────────────────────────────
+
+func TestMCPRemoveEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/mcp-remove", `{"name":"fs"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// Missing name → 400.
+	rec2 := postJSON(t, s, "/api/mcp-remove", `{}`)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("missing-name status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/mcp-auth-trigger ──────────────────────────────────────
+
+func TestMCPAuthTriggerEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/mcp-auth-trigger", `{"name":"github"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	res, _ := m["result"].(map[string]any)
+	if res["authUrl"] != "https://example.com/auth" {
+		t.Fatalf("result = %v, want authUrl passthrough", m["result"])
+	}
+
+	// Missing name → 400.
+	rec2 := postJSON(t, s, "/api/mcp-auth-trigger", `{}`)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("missing-name status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── graceful degradation: agent says the method is unsupported ──────
+
+// When the agent answers with a JSON-RPC error (e.g. -32601 for an
+// unimplemented extension), the endpoint must still return a JSON body —
+// 200 + {ok:false, error:"「<method>」不受支持: …"} — so the frontend can
+// render an error row instead of a hard failure.
+func TestAgentMethodUnsupportedDegradesTo200(t *testing.T) {
+	t.Setenv(ACPHostFakeAgentErrorMethod, "_x.ai/billing")
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/billing", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s — unsupported must degrade to 200", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != false {
+		t.Fatalf("resp = %s, want ok:false", rec.Body.String())
+	}
+	msg, _ := m["error"].(string)
+	if !strings.Contains(msg, "不受支持") || !strings.Contains(msg, "_x.ai/billing") {
+		t.Fatalf("error = %q, want 「_x.ai/billing」不受支持: …", msg)
+	}
+}

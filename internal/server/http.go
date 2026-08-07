@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,6 +63,18 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/scheduler-delete", s.handleSchedulerDelete)
 	mux.HandleFunc("POST /api/shell", s.handleShell)
 	mux.HandleFunc("GET /api/hosts", s.handleHosts)
+	mux.HandleFunc("POST /api/billing", s.handleBilling)
+	mux.HandleFunc("POST /api/memory-flush", s.handleMemoryFlush)
+	mux.HandleFunc("POST /api/memory-rewrite", s.handleMemoryRewrite)
+	mux.HandleFunc("POST /api/toggle-plan-mode", s.handleTogglePlanMode)
+	mux.HandleFunc("POST /api/permissions-reset", s.handlePermissionsReset)
+	mux.HandleFunc("GET /api/mcp/list", s.handleMCPList)
+	mux.HandleFunc("POST /api/mcp-toggle", s.handleMCPToggle)
+	mux.HandleFunc("POST /api/mcp-add", s.handleMCPAdd)
+	mux.HandleFunc("POST /api/mcp-remove", s.handleMCPRemove)
+	mux.HandleFunc("POST /api/mcp-auth-trigger", s.handleMCPAuthTrigger)
+	mux.HandleFunc("GET /api/extensions", s.handleExtensions)
+	mux.HandleFunc("GET /api/settings", s.handleSettings)
 	// CORS for Vite dev
 	s.http = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -1023,4 +1036,314 @@ func extractTaskList(res map[string]any) []map[string]any {
 		}
 	}
 	return out
+}
+
+// ── admin endpoints (billing / memory / plan / permissions / MCP) ────
+
+// writeAgentError maps an agent-backed endpoint failure to a response.
+// Host-side HTTPErrors keep their status code (e.g. 404 暂无活动会话 — the
+// task/list convention); agent-side failures (unsupported method, agent
+// error, timeout) degrade to 200 + {ok:false, error} so the frontend can
+// render an error row for the operation instead of a hard failure.
+func writeAgentError(w http.ResponseWriter, method string, err error) {
+	var he *acp.HTTPError
+	if errors.As(err, &he) {
+		writeJSON(w, he.Code, map[string]any{"ok": false, "error": he.Msg})
+		return
+	}
+	msg := err.Error()
+	if methodUnsupported(msg) {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": fmt.Sprintf("「%s」不受支持: %s", method, msg)})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": false, "error": msg})
+}
+
+// methodUnsupported reports whether an agent error message indicates the
+// wire method is not implemented (-32601 method_not_found and friends).
+func methodUnsupported(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, pat := range []string{
+		"-32601", "method not found", "unknown method", "no such method",
+		"not supported", "unsupported", "not implemented",
+	} {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractPlanMode pulls a planMode bool out of an x.ai/toggle_plan_mode
+// reply, whether it sits at the top level or inside an ExtMethodResult
+// envelope ({result:{planMode:…}}). Returns ok=false when absent so the
+// caller can fall back to a bare ok response.
+func extractPlanMode(res map[string]any) (bool, bool) {
+	if res == nil {
+		return false, false
+	}
+	inner := res
+	if r, ok := res["result"].(map[string]any); ok {
+		inner = r
+	}
+	for _, k := range []string{"planMode", "plan_mode"} {
+		if v, ok := inner[k].(bool); ok {
+			return v, true
+		}
+	}
+	return false, false
+}
+
+// normalizeMCPServers unwraps an x.ai/mcp/list reply into a []any of server
+// entries, accepting three shapes: {servers:[…]} at the top level, an
+// ExtMethodResult envelope {result:{servers:[…]}}, or a bare result array
+// ({result:[…]}). Bare-string entries (server names) become {name: …};
+// object entries pass through untouched.
+func normalizeMCPServers(res map[string]any) []any {
+	if res == nil {
+		return nil
+	}
+	var raw []any
+	if arr, ok := res["servers"].([]any); ok {
+		raw = arr
+	} else if r, ok := res["result"].(map[string]any); ok {
+		if arr, ok := r["servers"].([]any); ok {
+			raw = arr
+		}
+	} else if arr, ok := res["result"].([]any); ok {
+		raw = arr
+	}
+	out := make([]any, 0, len(raw))
+	for _, item := range raw {
+		if item == nil {
+			continue
+		}
+		if name, ok := item.(string); ok {
+			out = append(out, map[string]any{"name": name})
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// handleBilling — POST /api/billing {sessionId?} → _x.ai/billing.
+// sessionId defaults to the active session.
+func (s *Server) handleBilling(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.Billing(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/billing", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMemoryFlush — POST /api/memory-flush {sessionId?} → _x.ai/memory/flush.
+func (s *Server) handleMemoryFlush(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.MemoryFlush(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/memory/flush", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMemoryRewrite — POST /api/memory-rewrite {sessionId?} → _x.ai/memory/rewrite.
+func (s *Server) handleMemoryRewrite(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.MemoryRewrite(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/memory/rewrite", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleTogglePlanMode — POST /api/toggle-plan-mode {sessionId?} →
+// _x.ai/toggle_plan_mode. The resulting planMode bool is extracted from
+// the reply when present; otherwise a bare ok is returned.
+func (s *Server) handleTogglePlanMode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.TogglePlanMode(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/toggle_plan_mode", err)
+		return
+	}
+	out := map[string]any{"ok": true, "result": res}
+	if pm, ok := extractPlanMode(res); ok {
+		out["planMode"] = pm
+	}
+	writeJSON(w, 200, out)
+}
+
+// handlePermissionsReset — POST /api/permissions-reset {sessionId?} →
+// _x.ai/permissions/reset.
+func (s *Server) handlePermissionsReset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.PermissionsReset(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/permissions/reset", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMCPList — GET /api/mcp/list → _x.ai/mcp/list. The agent's server
+// registry is returned defensively normalized under {servers:[…]}.
+func (s *Server) handleMCPList(w http.ResponseWriter, r *http.Request) {
+	res, err := s.bridge.MCPList(r.Context())
+	if err != nil {
+		writeAgentError(w, "_x.ai/mcp/list", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "servers": normalizeMCPServers(res)})
+}
+
+// handleMCPToggle — POST /api/mcp-toggle {name, enabled} → _x.ai/mcp/toggle.
+func (s *Server) handleMCPToggle(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name    string `json:"name"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.Name == "" || body.Enabled == nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 name 和 enabled"})
+		return
+	}
+	res, err := s.bridge.MCPToggle(r.Context(), body.Name, *body.Enabled)
+	if err != nil {
+		writeAgentError(w, "_x.ai/mcp/toggle", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMCPAdd — POST /api/mcp-add {server:{name, command, args?, env?}} →
+// _x.ai/mcp/upsert. The server object is passed through verbatim — the
+// agent is the authority on its schema — only server.name is validated
+// host-side.
+func (s *Server) handleMCPAdd(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Server map[string]any `json:"server"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.Server == nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 server"})
+		return
+	}
+	if name, _ := body.Server["name"].(string); name == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 server.name"})
+		return
+	}
+	res, err := s.bridge.MCPUpsert(r.Context(), body.Server)
+	if err != nil {
+		writeAgentError(w, "_x.ai/mcp/upsert", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMCPRemove — POST /api/mcp-remove {name} → _x.ai/mcp/delete.
+func (s *Server) handleMCPRemove(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &body); err != nil || body.Name == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 name"})
+		return
+	}
+	res, err := s.bridge.MCPDelete(r.Context(), body.Name)
+	if err != nil {
+		writeAgentError(w, "_x.ai/mcp/delete", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMCPAuthTrigger — POST /api/mcp-auth-trigger {name} →
+// _x.ai/mcp/auth_trigger.
+func (s *Server) handleMCPAuthTrigger(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &body); err != nil || body.Name == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 name"})
+		return
+	}
+	res, err := s.bridge.MCPAuthTrigger(r.Context(), body.Name)
+	if err != nil {
+		writeAgentError(w, "_x.ai/mcp/auth_trigger", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleExtensions — GET /api/extensions: the LOCAL extension inventory
+// (~/.grok on disk), never routed through the agent. Missing/unreadable
+// paths are skipped silently; the response is always 200 with
+// {hooks:[], plugins:[], skills:[]}.
+func (s *Server) handleExtensions(w http.ResponseWriter, r *http.Request) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"hooks": []any{}, "plugins": []any{}, "skills": []any{}})
+		return
+	}
+	writeJSON(w, 200, scanExtensions(home))
+}
+
+// handleSettings — GET /api/settings: the SAFE, read-only subset of
+// ~/.grok/config.toml ({ui, session, models, cli} sections, scalar values
+// only). The file is never written; a missing file yields {}.
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{})
+		return
+	}
+	sections := parseConfigTOML(filepath.Join(home, ".grok", "config.toml"))
+	out := map[string]any{}
+	for _, name := range []string{"ui", "session", "models", "cli"} {
+		if kv, ok := sections[name]; ok && len(kv) > 0 {
+			out[name] = kv
+		}
+	}
+	writeJSON(w, 200, out)
 }

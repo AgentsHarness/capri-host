@@ -2375,6 +2375,149 @@ func (b *Bridge) SchedulerDelete(ctx context.Context, sessionID, taskID string) 
 	}, 30*time.Second)
 }
 
+// ── admin extension methods (billing / memory / plan / permissions / MCP) ─
+
+// resolveSessionID returns the given sessionId, or the active session's id
+// when empty ("" when no session is active).
+func (b *Bridge) resolveSessionID(sessionID string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		return act.SessionID
+	}
+	return sessionID
+}
+
+// Billing calls x.ai/billing: {sessionId} → account billing/quota info
+// (sessionId defaults to the active session).
+func (b *Bridge) Billing(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/billing", map[string]any{
+		"sessionId": sessionID,
+	}, 30*time.Second)
+}
+
+// MemoryFlush calls x.ai/memory/flush: {sessionId} — persists the session's
+// memory (sessionId defaults to the active session).
+func (b *Bridge) MemoryFlush(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/memory/flush", map[string]any{
+		"sessionId": sessionID,
+	}, 30*time.Second)
+}
+
+// MemoryRewrite calls x.ai/memory/rewrite: {sessionId} — rewrites the
+// session's memory from the conversation (sessionId defaults to the active
+// session).
+func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/memory/rewrite", map[string]any{
+		"sessionId": sessionID,
+	}, 30*time.Second)
+}
+
+// TogglePlanMode calls x.ai/toggle_plan_mode: {sessionId} — switches the
+// session's plan mode on/off. The HTTP layer tries to extract the resulting
+// planMode bool from the reply.
+func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/toggle_plan_mode", map[string]any{
+		"sessionId": sessionID,
+	}, 30*time.Second)
+}
+
+// PermissionsReset calls x.ai/permissions/reset: {sessionId} — clears the
+// session's remembered permission decisions (sessionId defaults to the
+// active session).
+func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/permissions/reset", map[string]any{
+		"sessionId": sessionID,
+	}, 30*time.Second)
+}
+
+// MCPList calls x.ai/mcp/list → the agent's MCP server registry. MCP
+// servers are host-global (not session-scoped), so no sessionId is sent
+// and the absence of an active session is not an error — the agent is the
+// authority on whether it needs one.
+func (b *Bridge) MCPList(ctx context.Context) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	return b.request(ctx, "_x.ai/mcp/list", map[string]any{}, 30*time.Second)
+}
+
+// MCPToggle calls x.ai/mcp/toggle: {name, enabled} — enables/disables one
+// MCP server.
+func (b *Bridge) MCPToggle(ctx context.Context, name string, enabled bool) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	return b.request(ctx, "_x.ai/mcp/toggle", map[string]any{
+		"name":    name,
+		"enabled": enabled,
+	}, 30*time.Second)
+}
+
+// MCPUpsert calls x.ai/mcp/upsert: {server: {name, command, args?, env?}}
+// — adds or updates one MCP server. The server object is passed through
+// verbatim; the agent is the authority on its schema.
+func (b *Bridge) MCPUpsert(ctx context.Context, server map[string]any) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	return b.request(ctx, "_x.ai/mcp/upsert", map[string]any{
+		"server": server,
+	}, 30*time.Second)
+}
+
+// MCPDelete calls x.ai/mcp/delete: {name} — removes one MCP server.
+func (b *Bridge) MCPDelete(ctx context.Context, name string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	return b.request(ctx, "_x.ai/mcp/delete", map[string]any{
+		"name": name,
+	}, 30*time.Second)
+}
+
+// MCPAuthTrigger calls x.ai/mcp/auth_trigger: {name} — starts the OAuth
+// flow for one MCP server.
+func (b *Bridge) MCPAuthTrigger(ctx context.Context, name string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	return b.request(ctx, "_x.ai/mcp/auth_trigger", map[string]any{
+		"name": name,
+	}, 30*time.Second)
+}
+
 // Shutdown kills grok.
 func (b *Bridge) Shutdown() {
 	b.mu.Lock()

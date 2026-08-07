@@ -21,6 +21,11 @@ import (
 // request/response) without a real grok binary.
 const ACPHostFakeAgentEnv = "ACP_HOST_FAKE_AGENT"
 
+// ACPHostFakeAgentErrorMethod, when set, makes the fake agent answer that
+// exact method with a JSON-RPC error (method_not_found) so tests can
+// exercise the graceful-degradation path.
+const ACPHostFakeAgentErrorMethod = "ACP_HOST_FAKE_AGENT_ERROR_METHOD"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(ACPHostFakeAgentEnv) == "1" {
 		runFakeAgent()
@@ -49,6 +54,17 @@ func runFakeAgent() {
 			continue
 		}
 		method, _ := msg["method"].(string)
+		if em := os.Getenv(ACPHostFakeAgentErrorMethod); em != "" && method == em {
+			resp, _ := json.Marshal(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"error":   map[string]any{"code": -32601, "message": "method not found: " + method},
+			})
+			out.Write(resp)
+			out.WriteByte('\n')
+			out.Flush()
+			continue
+		}
 		var result map[string]any
 		switch method {
 		case "initialize":
@@ -75,6 +91,33 @@ func runFakeAgent() {
 			result = map[string]any{"ok": true}
 		case "_x.ai/scheduler/delete":
 			result = map[string]any{"ok": true}
+		case "_x.ai/billing":
+			// ExtMethodResult envelope with billing/quota payload.
+			result = map[string]any{"result": map[string]any{"plan": "pro", "credits": "42.50"}}
+		case "_x.ai/memory/flush":
+			result = map[string]any{"ok": true}
+		case "_x.ai/memory/rewrite":
+			result = map[string]any{"ok": true}
+		case "_x.ai/toggle_plan_mode":
+			// planMode nested in the result envelope.
+			result = map[string]any{"result": map[string]any{"planMode": true}}
+		case "_x.ai/permissions/reset":
+			result = map[string]any{"ok": true}
+		case "_x.ai/mcp/list":
+			// Top-level {servers:[…]} shape with a bare-string entry to
+			// exercise name normalization.
+			result = map[string]any{"servers": []any{
+				map[string]any{"name": "fs", "command": "npx", "enabled": true},
+				"bare-name",
+			}}
+		case "_x.ai/mcp/toggle":
+			result = map[string]any{"ok": true}
+		case "_x.ai/mcp/upsert":
+			result = map[string]any{"ok": true}
+		case "_x.ai/mcp/delete":
+			result = map[string]any{"ok": true}
+		case "_x.ai/mcp/auth_trigger":
+			result = map[string]any{"ok": true, "authUrl": "https://example.com/auth"}
 		default:
 			result = map[string]any{}
 		}
