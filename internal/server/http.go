@@ -18,10 +18,15 @@ type Server struct {
 	cfg    config.Config
 	bridge *acp.Bridge
 	http   *http.Server
+	// promptFn runs a turn. Defaults to bridge.Prompt; injectable in tests.
+	// The handler runs it detached from the client connection so a browser
+	// crash mid-turn does not cancel the turn (the grok agent keeps running).
+	promptFn func(ctx context.Context, sessionID string, blocks []acp.ContentBlock) (string, error)
 }
 
 func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	s := &Server{cfg: cfg, bridge: bridge}
+	s.promptFn = s.bridge.Prompt
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /events", s.handleSSE)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
@@ -32,13 +37,20 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/session", s.handleSession)
 	mux.HandleFunc("POST /api/session-load", s.handleSessionLoad)
 	mux.HandleFunc("POST /api/set-mode", s.handleSetMode)
+	mux.HandleFunc("POST /api/set-model", s.handleSetModel)
 	mux.HandleFunc("POST /api/sessions", s.handleListSessions)
+	mux.HandleFunc("POST /api/session-state", s.handleSessionState)
 	mux.HandleFunc("POST /api/session-updates", s.handleSessionUpdates)
+	mux.HandleFunc("POST /api/session-running-tasks", s.handleSessionRunningTasks)
+	mux.HandleFunc("POST /api/git-info", s.handleGitInfo)
 	mux.HandleFunc("POST /api/session-fork", s.handleSessionFork)
 	mux.HandleFunc("POST /api/session-rename", s.handleSessionRename)
 	mux.HandleFunc("POST /api/recap", s.handleRecap)
+	mux.HandleFunc("POST /api/session-info", s.handleSessionInfo)
 	mux.HandleFunc("POST /api/subagent-cancel", s.handleSubagentCancel)
 	mux.HandleFunc("POST /api/task-kill", s.handleTaskKill)
+	mux.HandleFunc("POST /api/task-list", s.handleTaskList)
+	mux.HandleFunc("POST /api/task-output", s.handleTaskOutput)
 	mux.HandleFunc("GET /api/hosts", s.handleHosts)
 	// CORS for Vite dev
 	s.http = &http.Server{
@@ -107,15 +119,19 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		"ready":           snap.Ready,
 		"busy":            snap.Busy,
 		"sessionId":       snap.SessionID,
+		"cwd":             snap.Cwd,
 		"text":            snap.Text,
 		"error":           snap.BootError,
 		"agentInfo":       snap.AgentInfo,
 		"modes":           snap.Modes,
 		"configOptions":   snap.ConfigOptions,
+		"models":          snap.Models,
 		"pendingRequests": snap.PendingRequests,
 		"hostId":          snap.HostID,
 		"hostName":        snap.HostName,
+		"homeDir":         snap.HomeDir,
 		"capabilities":    snap.Capabilities,
+		"roster":          snap.Roster,
 	}
 	data, _ := json.Marshal(hello)
 	fmt.Fprintf(w, "data: %s\n\n", data)
@@ -171,6 +187,8 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 
 type promptBody struct {
 	Blocks []acp.ContentBlock `json:"blocks"`
+	// Optional: target session (defaults to the active session).
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
@@ -184,21 +202,51 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	sr, err := s.bridge.Prompt(ctx, body.Blocks)
-	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
-		return
+	// Run the turn on an independent context, not r.Context(). Previously the
+	// turn was driven by the client connection, so a browser crash mid-turn
+	// cancelled the whole turn (Prompt() sent session/cancel) even though the
+	// grok agent process itself was perfectly healthy. Now a client disconnect
+	// just releases the HTTP handler while the turn keeps running — progress
+	// and completion are observable via SSE, and only an explicit /api/cancel
+	// stops it. For a live client, the handler still blocks and returns the
+	// stopReason as before.
+	type result struct {
+		stopReason string
+		err        error
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "stopReason": sr})
+	done := make(chan result, 1)
+	go func() {
+		sr, err := s.promptFn(context.Background(), body.SessionID, body.Blocks)
+		done <- result{sr, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Client went away mid-turn; the turn continues in the background.
+		return
+	case res := <-done:
+		if res.err != nil {
+			code := 500
+			var he *acp.HTTPError
+			if errors.As(res.err, &he) {
+				code = he.Code
+			}
+			writeJSON(w, code, map[string]any{"ok": false, "error": res.err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "stopReason": res.stopReason})
+	}
+}
+
+type cancelBody struct {
+	// Optional: target session (defaults to the active session).
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	s.bridge.Cancel()
+	var body cancelBody
+	_ = readJSON(r, &body)
+	s.bridge.Cancel(body.SessionID)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -279,6 +327,24 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
+type setModelBody struct {
+	ModelID         string `json:"modelId"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
+	var body setModelBody
+	if err := readJSON(r, &body); err != nil || body.ModelID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modelId"})
+		return
+	}
+	if err := s.bridge.SetModel(r.Context(), body.ModelID, body.ReasoningEffort); err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := s.bridge.ListSessions(r.Context())
 	if err != nil {
@@ -286,6 +352,27 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "sessions": sessions})
+}
+
+type sessionStateBody struct {
+	SessionID string `json:"sessionId"`
+}
+
+// handleSessionState — x.ai/session/state analog: host-side live state of
+// one session (dashboard active/idle/awaiting classification).
+func (s *Server) handleSessionState(w http.ResponseWriter, r *http.Request) {
+	var body sessionStateBody
+	_ = readJSON(r, &body)
+	if body.SessionID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId"})
+		return
+	}
+	st := s.bridge.SessionStateOf(body.SessionID)
+	if st == nil {
+		writeJSON(w, 404, map[string]any{"ok": false, "error": "会话不在线（未在本进程创建/加载）"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "session": st})
 }
 
 type sessionLoadBody struct {
@@ -305,7 +392,8 @@ func (s *Server) handleSessionLoad(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
 		return
 	}
-	if err := s.bridge.LoadSession(r.Context(), body.SessionID, body.Cwd); err != nil {
+	sessRes, err := s.bridge.LoadSession(r.Context(), body.SessionID, body.Cwd)
+	if err != nil {
 		code := 500
 		var he *acp.HTTPError
 		if errors.As(err, &he) {
@@ -314,7 +402,24 @@ func (s *Server) handleSessionLoad(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "sessionId": body.SessionID})
+	// Echo models / busy so the FE can update caption + spinner even if the
+	// SSE ready/busy events race with historyLoading.
+	out := map[string]any{"ok": true, "sessionId": body.SessionID}
+	if sessRes != nil {
+		if m, ok := sessRes["models"]; ok && m != nil {
+			out["models"] = m
+		}
+		if modes, ok := sessRes["modes"]; ok && modes != nil {
+			out["modes"] = modes
+		}
+		if co, ok := sessRes["configOptions"]; ok && co != nil {
+			out["configOptions"] = co
+		}
+		if busy, ok := sessRes["busy"].(bool); ok {
+			out["busy"] = busy
+		}
+	}
+	writeJSON(w, 200, out)
 }
 
 type sessionUpdatesBody struct {
@@ -349,6 +454,65 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		"hasMore":    page.HasMore,
 		"updates":    page.Updates,
 	})
+}
+
+// handleSessionRunningTasks returns the session's STILL-RUNNING tasks
+// (task_backgrounded orphans whose output log was written recently) — the
+// web equivalent of the TUI's live tasks pane. The persisted timeline is
+// only used to surface current work, not to replay history.
+func (s *Server) handleSessionRunningTasks(w http.ResponseWriter, r *http.Request) {
+	var body sessionUpdatesBody
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.SessionID == "" || body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
+		return
+	}
+	events, err := s.bridge.SessionRunningTasks(body.SessionID, body.Cwd)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"ok":        true,
+		"sessionId": body.SessionID,
+		"events":    events,
+	})
+}
+
+// handleGitInfo returns the git branch/worktree state for a session cwd
+// (x.ai/git/info + local worktree probe), so the frontend can show the
+// status-bar branch without waiting for a git_head_changed notification.
+type gitInfoBody struct {
+	SessionID string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+}
+
+func (s *Server) handleGitInfo(w http.ResponseWriter, r *http.Request) {
+	var body gitInfoBody
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	info, err := s.bridge.GitInfo(r.Context(), body.Cwd)
+	if err != nil {
+		// Non-repo / agent error → empty state, not a hard failure.
+		writeJSON(w, 200, map[string]any{
+			"ok": true, "branch": "", "isWorktree": false, "mainRepo": "",
+		})
+		return
+	}
+	out := map[string]any{"ok": true, "sessionId": body.SessionID}
+	for k, v := range info {
+		out[k] = v
+	}
+	writeJSON(w, 200, out)
 }
 
 // handleSessionFork forks the current session via x.ai/session/fork.
@@ -414,6 +578,17 @@ func (s *Server) handleRecap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
+// handleSessionInfo serves the active session's details on demand
+// (TUI /session-info analog) — no client-side state reconstruction.
+func (s *Server) handleSessionInfo(w http.ResponseWriter, r *http.Request) {
+	info := s.bridge.SessionInfo()
+	if info == nil {
+		writeJSON(w, 404, map[string]any{"ok": false, "error": "暂无活动会话"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "session": info})
+}
+
 // handleSubagentCancel cancels a subagent via x.ai/subagent/cancel.
 func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -446,4 +621,101 @@ func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleTaskList lists background tasks via x.ai/task/list.
+func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
+	res, err := s.bridge.TaskList(r.Context())
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleTaskOutput returns one task's stdout for the FE block viewer.
+// Body: { taskId } — the ACTIVE session's live registry
+// (x.ai/task/list); or { taskId, sessionId, cwd } — reconstructed from
+// that session's persisted timeline + on-disk log, so history-replay
+// rows and top-strip restored (TUI-held) tasks get their full log
+// regardless of which history page is loaded.
+func (s *Server) handleTaskOutput(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TaskID    string `json:"taskId"`
+		SessionID string `json:"sessionId,omitempty"`
+		Cwd       string `json:"cwd,omitempty"`
+	}
+	if err := readJSON(r, &body); err != nil || body.TaskID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 taskId"})
+		return
+	}
+	if body.SessionID != "" && body.Cwd != "" {
+		tl, err := s.bridge.TaskLog(body.SessionID, body.Cwd, body.TaskID)
+		if err != nil {
+			if errors.Is(err, acp.ErrTaskLogNotFound) {
+				writeJSON(w, 404, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "task": tl})
+		return
+	}
+	res, err := s.bridge.TaskList(r.Context())
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	// ExtMethodResult envelope: { result: { tasks: [...] } } or flat { tasks }.
+	tasks := extractTaskList(res)
+	var found map[string]any
+	for _, t := range tasks {
+		id, _ := t["task_id"].(string)
+		if id == "" {
+			id, _ = t["taskId"].(string)
+		}
+		if id == body.TaskID {
+			found = t
+			break
+		}
+	}
+	if found == nil {
+		writeJSON(w, 404, map[string]any{"ok": false, "error": "任务不存在或已清理"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "task": found})
+}
+
+// extractTaskList unwraps x.ai/task/list response shapes into a []map.
+func extractTaskList(res map[string]any) []map[string]any {
+	if res == nil {
+		return nil
+	}
+	// Nested ExtMethodResult: { result: { tasks: [...] } }
+	inner := res
+	if r, ok := res["result"].(map[string]any); ok {
+		inner = r
+	}
+	raw, ok := inner["tasks"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
 }

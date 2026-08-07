@@ -10,6 +10,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,13 +19,16 @@ import (
 )
 
 const (
-	promptTimeout    = 30 * time.Minute
-	bootTimeout      = 2 * time.Minute
-	approvalTimeout  = 15 * time.Minute
-	protocolVersion  = 1
+	promptTimeout   = 30 * time.Minute
+	bootTimeout     = 2 * time.Minute
+	approvalTimeout = 15 * time.Minute
+	protocolVersion = 1
 )
 
-// Bridge owns one grok agent stdio process and one ACP session.
+// Bridge owns one grok agent stdio process and manages multiple ACP
+// sessions inside it (the agent is multi-session, like the Grok Build TUI:
+// each session runs its own turn; the host tracks their live states for the
+// dashboard active/idle classification).
 // It does NOT implement fs/* or terminal/* — agent runs tools itself.
 type Bridge struct {
 	cfg GrokConfig
@@ -35,14 +40,25 @@ type Bridge struct {
 
 	ready     bool
 	booting   bool
-	busy      bool
+	// bootDone is closed when an in-flight boot attempt finishes (success
+	// or failure). Concurrent ensureBooted callers wait on it instead of
+	// racing the boot and failing with "grok 进程未运行".
+	bootDone  chan struct{}
 	bootError string
-	sessionID string
-	cwd       string
 	agentInfo map[string]any
-	modes     any
-	configOpts any
 	textBuf   string
+	// Roster: every session created in this process (or loaded), keyed by
+	// sessionId, with host-side live state (busy / awaiting input).
+	sessions        map[string]*SessionState
+	activeSessionID string
+
+	// Last focused session survives process death / host restart so we can
+	// session/load it instead of session/new (which would open a blank chat).
+	// Written whenever createSession / LoadSession makes a session active;
+	// also snapshotted into killProcess / waitProcess before the roster is
+	// wiped. Persisted under ~/.acp-host/last-session.json.
+	lastSessionID  string
+	lastSessionCwd string
 
 	nextAgentID atomic.Int64
 	pending     sync.Map // id(float64/int) -> chan rpcResult
@@ -55,12 +71,25 @@ type Bridge struct {
 
 	hostID   string
 	hostName string
+	homeDir  string
 }
 
 type GrokConfig struct {
 	Bin      string
 	HostID   string
 	HostName string
+	// LastSessionFile overrides the default ~/.acp-host/last-session.json
+	// so tests can inject a temp path without touching the real home.
+	LastSessionFile string
+	// GrokHome overrides the grok data dir (~/.grok) used to locate
+	// session updates files (task timeline / [bg] badge scans).
+	GrokHome string
+}
+
+// lastSessionFile is the on-disk form of the most recently active session.
+type lastSessionFile struct {
+	SessionID string `json:"sessionId"`
+	Cwd       string `json:"cwd,omitempty"`
 }
 
 type rpcResult struct {
@@ -69,11 +98,12 @@ type rpcResult struct {
 }
 
 type clientRequest struct {
-	AgentID any
-	Method  string
-	Params  map[string]any
-	done    chan struct{} // closed when resolved/rejected
-	cancel  bool
+	AgentID   any
+	SessionID string // originating session (dashboard awaiting-input state)
+	Method    string
+	Params    map[string]any
+	done      chan struct{} // closed when resolved/rejected
+	cancel    bool
 	// isPermission: session/request_permission replies with the nested
 	// {outcome:{outcome:"selected"|"cancelled"}} shape; x.ai/* requests
 	// reply with the raw result object the browser supplied.
@@ -84,16 +114,110 @@ type clientRequest struct {
 }
 
 func NewBridge(cfg GrokConfig) *Bridge {
+	homeDir, _ := os.UserHomeDir()
 	b := &Bridge{
 		cfg:         cfg,
 		hostID:      cfg.HostID,
 		hostName:    cfg.HostName,
-		cwd:         mustCwd(),
+		homeDir:     homeDir,
+		sessions:    make(map[string]*SessionState),
 		subscribers: make(map[chan Event]struct{}),
+		bootDone:    make(chan struct{}),
 	}
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
+	if id, cwd := b.loadLastSessionFile(); id != "" {
+		b.lastSessionID = id
+		b.lastSessionCwd = cwd
+	}
 	return b
+}
+
+// lastSessionPath returns the file used to remember the last active session.
+func (b *Bridge) lastSessionPath() string {
+	if b.cfg.LastSessionFile != "" {
+		return b.cfg.LastSessionFile
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".acp-host", "last-session.json")
+}
+
+// loadLastSessionFile reads the persisted last-session pointer (best-effort).
+func (b *Bridge) loadLastSessionFile() (id, cwd string) {
+	path := b.lastSessionPath()
+	if path == "" {
+		return "", ""
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	var st lastSessionFile
+	if json.Unmarshal(raw, &st) != nil || st.SessionID == "" {
+		return "", ""
+	}
+	return st.SessionID, st.Cwd
+}
+
+// persistLastSessionLocked writes lastSessionID/Cwd to disk. Caller holds b.mu.
+func (b *Bridge) persistLastSessionLocked() {
+	if b.lastSessionID == "" {
+		return
+	}
+	path := b.lastSessionPath()
+	if path == "" {
+		return
+	}
+	raw, err := json.Marshal(lastSessionFile{
+		SessionID: b.lastSessionID,
+		Cwd:       b.lastSessionCwd,
+	})
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, raw, 0o600)
+}
+
+// rememberSessionLocked records sid/cwd as the last active session and
+// persists it. Caller holds b.mu. Empty sid is a no-op.
+func (b *Bridge) rememberSessionLocked(sid, cwd string) {
+	if sid == "" {
+		return
+	}
+	if b.lastSessionID == sid && b.lastSessionCwd == cwd {
+		return
+	}
+	b.lastSessionID = sid
+	b.lastSessionCwd = cwd
+	b.persistLastSessionLocked()
+}
+
+// restoreLastSession reloads the last known session after process death or
+// turn failure. It never calls session/new — a failed restore stays failed
+// so the UI does not silently open a blank conversation. Callers that need
+// a brand-new chat must use NewSession explicitly (UI "new session").
+func (b *Bridge) restoreLastSession(ctx context.Context) error {
+	b.mu.Lock()
+	sid := b.lastSessionID
+	cwd := b.lastSessionCwd
+	b.mu.Unlock()
+
+	if sid == "" {
+		return errors.New("没有可恢复的会话")
+	}
+	if cwd == "" {
+		cwd = mustCwd()
+	}
+	if _, err := b.LoadSession(ctx, sid, cwd); err != nil {
+		log.Printf("[acp-host] restore session %s failed: %v", sid, err)
+		return fmt.Errorf("恢复会话失败: %w", err)
+	}
+	log.Printf("[acp-host] restored session %s (cwd=%s)", sid, cwd)
+	return nil
 }
 
 func mustCwd() string {
@@ -140,6 +264,70 @@ func (b *Bridge) Broadcast(ev Event) {
 	}
 }
 
+// ── roster helpers ────────────────────────────────────────────────
+
+// activeSession returns the current active session (nil if none).
+// Callers must hold b.mu.
+func (b *Bridge) activeSessionLocked() *SessionState {
+	if id := b.activeSessionID; id != "" {
+		return b.sessions[id]
+	}
+	return nil
+}
+
+// broadcastRosterChange pushes sessions_changed so clients refresh the
+// dashboard list whenever the roster or a session's live state changed.
+func (b *Bridge) broadcastRosterChange() {
+	b.Broadcast(Event{"type": "sessions_changed", "params": map[string]any{}})
+}
+
+// setSessionBusy flips a session's in-flight turn state and notifies
+// clients on transition (busy ↔ idle = dashboard active ↔ idle).
+func (b *Bridge) setSessionBusy(id string, busy bool) {
+	b.mu.Lock()
+	s := b.sessions[id]
+	changed := false
+	if s != nil && s.Busy != busy {
+		s.Busy = busy
+		changed = true
+	}
+	b.mu.Unlock()
+	if changed {
+		b.broadcastRosterChange()
+	}
+}
+
+// setSessionAwaiting flips a session's awaiting-input state (pending
+// permission / x.ai question) and notifies clients on transition.
+func (b *Bridge) setSessionAwaiting(id string, awaiting bool) {
+	b.mu.Lock()
+	s := b.sessions[id]
+	changed := false
+	if s != nil && s.AwaitingInput != awaiting {
+		s.AwaitingInput = awaiting
+		changed = true
+	}
+	b.mu.Unlock()
+	if changed {
+		b.broadcastRosterChange()
+	}
+}
+
+// sessionIdFrom returns the sessionId carried by an agent notification
+// envelope, falling back to the active session (defensive: some wire forms
+// omit it while a turn is in flight).
+func (b *Bridge) sessionIdFrom(params map[string]any) string {
+	if sid, ok := params["sessionId"].(string); ok && sid != "" {
+		return sid
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if act := b.activeSessionLocked(); act != nil {
+		return act.SessionID
+	}
+	return ""
+}
+
 func (b *Bridge) Snapshot() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -153,38 +341,101 @@ func (b *Bridge) Snapshot() Status {
 		})
 		return true
 	})
+	roster := make([]SessionState, 0, len(b.sessions))
+	busy := false
+	for _, s := range b.sessions {
+		roster = append(roster, *s)
+		if s.Busy {
+			busy = true
+		}
+	}
+	// Most recently active first — dashboard ordering.
+	sort.Slice(roster, func(i, j int) bool {
+		if roster[i].LastActiveAt != roster[j].LastActiveAt {
+			return roster[i].LastActiveAt > roster[j].LastActiveAt
+		}
+		return roster[i].CreatedAt > roster[j].CreatedAt
+	})
+	act := b.activeSessionLocked()
+	var sid, cwd string
+	var modes, configOpts, models any
+	if act != nil {
+		sid = act.SessionID
+		cwd = act.Cwd
+		modes = act.modes
+		configOpts = act.configOpts
+		models = act.models
+	}
 	return Status{
 		Ready:           b.ready,
-		Busy:            b.busy,
+		Busy:            busy,
 		Booting:         b.booting,
-		SessionID:       b.sessionID,
-		Cwd:             b.cwd,
+		SessionID:       sid,
+		Cwd:             cwd,
 		HostID:          b.hostID,
 		HostName:        b.hostName,
+		HomeDir:         b.homeDir,
 		AgentInfo:       b.agentInfo,
-		Modes:           b.modes,
-		ConfigOptions:   b.configOpts,
+		Modes:           modes,
+		ConfigOptions:   configOpts,
+		Models:          models,
 		BootError:       b.bootError,
 		Text:            b.textBuf,
 		PendingRequests: pending,
 		Capabilities:    DefaultClientCaps(),
+		Roster:          roster,
 	}
 }
 
-// Boot starts grok if needed and creates a session.
-func (b *Bridge) Boot(ctx context.Context, sc SessionConfig) error {
+// Boot ensures the agent process is up (initialize + authenticate).
+// It deliberately does NOT create a session — opening a client must not
+// auto-create a new conversation. Sessions are created on demand: the
+// first prompt (Prompt), or explicitly via NewSession / session/new.
+func (b *Bridge) Boot(ctx context.Context) error {
+	return b.ensureBooted(ctx)
+}
+
+// ensureBooted starts the grok agent process (if needed) and completes
+// initialize + authenticate. Does not create any session. Concurrent
+// callers wait for an in-flight boot instead of racing it (a racer would
+// hit a nil stdin, misread it as a wedged agent, and kill a healthy
+// process).
+func (b *Bridge) ensureBooted(ctx context.Context) error {
 	b.mu.Lock()
-	if b.ready || b.booting {
+	if b.ready {
 		b.mu.Unlock()
 		return nil
 	}
+	if b.booting {
+		done := b.bootDone
+		b.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		// The in-flight boot finished; re-check its outcome.
+		b.mu.Lock()
+		ready := b.ready
+		errMsg := b.bootError
+		b.mu.Unlock()
+		if ready {
+			return nil
+		}
+		if errMsg != "" {
+			return errors.New(errMsg)
+		}
+		return errors.New("agent 启动失败")
+	}
 	b.booting = true
 	b.bootError = ""
+	b.bootDone = make(chan struct{})
 	b.mu.Unlock()
 
 	defer func() {
 		b.mu.Lock()
 		b.booting = false
+		close(b.bootDone)
 		b.mu.Unlock()
 	}()
 
@@ -222,8 +473,12 @@ func (b *Bridge) Boot(ctx context.Context, sc SessionConfig) error {
 	}, bootTimeout)
 	if err != nil {
 		// A live-but-wedged process can fail initialize repeatedly; kill it so
-		// the next Boot spawns a fresh agent instead of reusing it.
-		b.killProcess()
+		// the next Boot spawns a fresh agent instead of reusing it. A client
+		// that disconnected mid-boot is NOT a wedged agent — leave the
+		// process running so the next boot attempt can retry initialize on it.
+		if !errors.Is(err, context.Canceled) {
+			b.killProcess()
+		}
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
 		return err
@@ -234,12 +489,48 @@ func (b *Bridge) Boot(ctx context.Context, sc SessionConfig) error {
 	b.mu.Unlock()
 
 	if err := b.authenticate(ctx, initRes); err != nil {
-		b.killProcess()
+		if !errors.Is(err, context.Canceled) {
+			b.killProcess()
+		}
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
 		return err
 	}
 
+	// No session is auto-created at boot anymore (opening a client must
+	// not spawn a new conversation), so announce the bare-ready state —
+	// a client that connected while we were booting would otherwise stay
+	// on "启动中…" forever. A session-level ready (with sessionId) follows
+	// from createSession / LoadSession when one becomes active.
+	b.mu.Lock()
+	noSession := len(b.sessions) == 0
+	agentInfo := b.agentInfo
+	hostID := b.hostID
+	hostName := b.hostName
+	b.mu.Unlock()
+	if noSession {
+		b.Broadcast(Event{
+			"type":      "ready",
+			"agentInfo": agentInfo,
+			"hostId":    hostID,
+			"hostName":  hostName,
+		})
+	}
+	return nil
+}
+
+// NewSession creates a brand-new session in the (already booted) agent
+// process and makes it the active session. Other sessions keep running —
+// this is what powers the parallel dashboard.
+func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
+	if err := b.ensureBooted(ctx); err != nil {
+		return err
+	}
+	return b.createSession(ctx, sc)
+}
+
+// createSession calls session/new and registers the session in the roster.
+func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	cwd := sc.Cwd
 	if cwd == "" {
 		cwd = mustCwd()
@@ -259,35 +550,62 @@ func (b *Bridge) Boot(ctx context.Context, sc SessionConfig) error {
 		"mcpServers":            mcp,
 	}, bootTimeout)
 	if err != nil {
-		b.killProcess()
+		// A client that disconnected mid-request is not an agent failure —
+		// keep the process so other sessions / the next attempt survive.
+		if !errors.Is(err, context.Canceled) {
+			b.killProcess()
+		}
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
 		return err
 	}
 
 	sid, _ := sessRes["sessionId"].(string)
+	if sid == "" {
+		b.killProcess()
+		err := errors.New("session/new 未返回 sessionId")
+		b.setBootError(err.Error())
+		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		return err
+	}
+
+	now := time.Now().UnixMilli()
 	b.mu.Lock()
-	b.sessionID = sid
-	b.cwd = cwd
-	b.modes = sessRes["modes"]
-	b.configOpts = sessRes["configOptions"]
+	s := b.sessions[sid]
+	if s == nil {
+		s = &SessionState{SessionID: sid, CreatedAt: now}
+		b.sessions[sid] = s
+	}
+	s.Cwd = cwd
+	s.modes = sessRes["modes"]
+	s.configOpts = sessRes["configOptions"]
+	s.models = sessRes["models"]
+	b.activeSessionID = sid
+	b.rememberSessionLocked(sid, cwd)
 	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
-	modes := b.modes
-	configOpts := b.configOpts
+	modes := s.modes
+	configOpts := s.configOpts
+	models := s.models
 	agentInfo := b.agentInfo
+	hostID := b.hostID
+	hostName := b.hostName
+	sessCwd := s.Cwd
 	b.mu.Unlock()
 
 	b.Broadcast(Event{
 		"type":          "ready",
 		"sessionId":     sid,
+		"cwd":           sessCwd,
 		"agentInfo":     agentInfo,
 		"modes":         modes,
 		"configOptions": configOpts,
-		"hostId":        b.hostID,
-		"hostName":      b.hostName,
+		"models":        models,
+		"hostId":        hostID,
+		"hostName":      hostName,
 	})
+	b.broadcastRosterChange()
 	return nil
 }
 
@@ -373,11 +691,21 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 	}
 	b.mu.Lock()
 	same := b.cmd == cmd
+	lastID, lastCwd := b.lastSessionID, b.lastSessionCwd
 	if same {
+		// Snapshot the active session before wiping the in-memory roster so
+		// the next prompt can session/load it instead of opening a blank chat.
+		if act := b.activeSessionLocked(); act != nil {
+			b.rememberSessionLocked(act.SessionID, act.Cwd)
+			lastID, lastCwd = act.SessionID, act.Cwd
+		}
 		b.cmd = nil
 		b.stdin = nil
 		b.ready = false
-		b.sessionID = ""
+		b.sessions = make(map[string]*SessionState)
+		b.activeSessionID = ""
+		b.textBuf = ""
+		// lastSessionID / lastSessionCwd intentionally survive.
 		if b.cancelRd != nil {
 			b.cancelRd()
 			b.cancelRd = nil
@@ -388,10 +716,14 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 		return
 	}
 	b.failAllPending(fmt.Errorf("grok 进程已退出 (code=%d)", code))
+	_ = lastID
+	_ = lastCwd
+	log.Printf("[acp-host] grok process exited (code=%d), lastSession=%s", code, lastID)
 	b.Broadcast(Event{
 		"type": "status",
-		"text": fmt.Sprintf("grok 进程已退出 (code=%d)，下一条消息时自动重启", code),
+		"text": "连接HOST异常，请检查后重试",
 	})
+	b.broadcastRosterChange()
 }
 
 func (b *Bridge) readStderr(r io.Reader) {
@@ -504,6 +836,22 @@ func idKey(id any) string {
 }
 
 func (b *Bridge) handleSessionUpdate(params map[string]any) {
+	// Multi-session attribution: the agent's session/update envelope carries
+	// {sessionId, update}; every derived event is tagged so clients can
+	// bucket by session (dashboard) or filter to their active session.
+	sid := b.sessionIdFrom(params)
+
+	// Every standard session/update carries the session-accumulated
+	// context token count in `_meta.totalTokens` (the TUI's ⇣ counter
+	// source, "Accumulated token count across the session"). Surface it
+	// as a usage event so clients can render live context usage — this
+	// is the field x.ai extension notifications do NOT carry.
+	if meta, ok := params["_meta"].(map[string]any); ok {
+		if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
+			b.trackUsage(sid, used, 0)
+			b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+		}
+	}
 	update, _ := params["update"].(map[string]any)
 	if update == nil {
 		return
@@ -515,7 +863,7 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 			b.mu.Lock()
 			b.textBuf += text
 			b.mu.Unlock()
-			ev := Event{"type": "chunk", "text": text}
+			ev := Event{"type": "chunk", "text": text, "sessionId": sid}
 			if mid, ok := update["messageId"]; ok {
 				ev["messageId"] = mid
 			}
@@ -523,49 +871,72 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 		}
 	case "user_message_chunk":
 		if text := contentText(update["content"]); text != "" {
-			b.Broadcast(Event{"type": "user_chunk", "text": text})
+			b.Broadcast(Event{"type": "user_chunk", "text": text, "sessionId": sid})
 		}
 	case "agent_thought_chunk":
 		// content is typically { "type":"text", "text":"..." }; accept a few shapes
 		if text := contentText(update["content"]); text != "" {
-			b.Broadcast(Event{"type": "thought", "text": text})
+			b.Broadcast(Event{"type": "thought", "text": text, "sessionId": sid})
 		}
 	case "tool_call":
-		b.Broadcast(Event{"type": "tool_call", "toolCall": update})
+		b.Broadcast(Event{"type": "tool_call", "toolCall": update, "sessionId": sid})
 	case "tool_call_update":
-		b.Broadcast(Event{"type": "tool_call_update", "toolCallUpdate": update})
+		b.Broadcast(Event{"type": "tool_call_update", "toolCallUpdate": update, "sessionId": sid})
 	case "plan":
-		b.Broadcast(Event{"type": "plan", "entries": update["entries"]})
+		b.Broadcast(Event{"type": "plan", "entries": update["entries"], "sessionId": sid})
 	case "usage_update":
+		b.trackUsage(sid, toInt64(update["used"]), toInt64(update["size"]))
 		b.Broadcast(Event{
-			"type": "usage",
-			"used": update["used"],
-			"size": update["size"],
-			"cost": update["cost"],
+			"type":      "usage",
+			"used":      update["used"],
+			"size":      update["size"],
+			"cost":      update["cost"],
+			"sessionId": sid,
 		})
 	case "current_mode_update":
 		b.mu.Lock()
 		if ms := update["modeState"]; ms != nil {
-			b.modes = ms
+			if s := b.sessions[sid]; s != nil {
+				s.modes = ms
+			}
 		}
-		modes := b.modes
+		var modes any
+		if s := b.sessions[sid]; s != nil {
+			modes = s.modes
+		}
 		b.mu.Unlock()
-		b.Broadcast(Event{"type": "modes_update", "modes": modes})
+		b.Broadcast(Event{"type": "modes_update", "modes": modes, "sessionId": sid})
 	case "config_option_update":
 		b.mu.Lock()
 		if co := update["configOptions"]; co != nil {
-			b.configOpts = co
+			if s := b.sessions[sid]; s != nil {
+				s.configOpts = co
+			}
 		}
-		co := b.configOpts
+		var co any
+		if s := b.sessions[sid]; s != nil {
+			co = s.configOpts
+		}
 		b.mu.Unlock()
-		b.Broadcast(Event{"type": "config_options_update", "configOptions": co})
+		b.Broadcast(Event{"type": "config_options_update", "configOptions": co, "sessionId": sid})
 	case "available_commands_update":
-		b.Broadcast(Event{"type": "commands_update", "commands": update["commands"]})
+		b.Broadcast(Event{"type": "commands_update", "commands": update["commands"], "sessionId": sid})
 	case "session_info_update":
+		b.mu.Lock()
+		if s := b.sessions[sid]; s != nil {
+			if t, ok := update["title"].(string); ok && t != "" {
+				s.Title = t
+			}
+			if u, ok := update["updatedAt"].(string); ok && u != "" {
+				s.UpdatedAt = u
+			}
+		}
+		b.mu.Unlock()
 		b.Broadcast(Event{
 			"type":      "session_info",
 			"title":     update["title"],
 			"updatedAt": update["updatedAt"],
+			"sessionId": sid,
 		})
 	default:
 		// Some builds deliver x.ai-style lifecycle updates over the standard
@@ -581,12 +952,13 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 			"auto_continue_completed", "image_compressed",
 			"session_recap", "session_recap_unavailable":
 			b.Broadcast(Event{
-				"type":   "session_notification",
-				"method": "session/update",
-				"params": map[string]any{"update": update},
+				"type":      "session_notification",
+				"method":    "session/update",
+				"params":    map[string]any{"update": update},
+				"sessionId": sid,
 			})
 		default:
-			b.Broadcast(Event{"type": "unknown_update", "update": update})
+			b.Broadcast(Event{"type": "unknown_update", "update": update, "sessionId": sid})
 		}
 	}
 }
@@ -611,39 +983,168 @@ func unwrapExtMethod(method string, params map[string]any) (string, map[string]a
 // as typed SSE events. Unknown methods fall back to a generic
 // ext_notification event so nothing is silently dropped.
 func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
+	// Tag every extension notification with its originating session so the
+	// dashboard can bucket multi-session activity.
+	sid := b.sessionIdFrom(params)
+	withSid := func(ev Event) Event {
+		if sid != "" {
+			ev["sessionId"] = sid
+		}
+		return ev
+	}
 	switch method {
 	case "x.ai/session_notification", "x.ai/session/update":
-		b.Broadcast(Event{"type": "session_notification", "method": method, "params": params})
+		// Track title/updatedAt into the roster from the session_info
+		// carrier updates the agent sends after creating sessions.
+		if up, ok := params["update"].(map[string]any); ok {
+			if kind, _ := up["sessionUpdate"].(string); kind == "session_info" {
+				b.mu.Lock()
+				if s := b.sessions[sid]; s != nil {
+					if t, ok := up["title"].(string); ok && t != "" {
+						s.Title = t
+					}
+					if u, ok := up["updatedAt"].(string); ok && u != "" {
+						s.UpdatedAt = u
+					}
+				}
+				b.mu.Unlock()
+			}
+		}
+		b.Broadcast(withSid(Event{"type": "session_notification", "method": method, "params": params}))
+		// grok ships usage inside response_completed / turn_completed
+		// notifications instead of the standard usage_update carrier —
+		// surface it as a normal usage event so clients can show live
+		// token counts while busy. Two distinct numbers ride the same
+		// event, both from standard fields:
+		//   - used:  context-window usage, `_meta.totalTokens` when the
+		//            agent provides it (the TUI ⇣ counter source).
+		//            x.ai notifications don't carry it, so on turn end
+		//            we simply keep the last known usage (same as the
+		//            TUI, which only refreshes from meta.totalTokens).
+		//   - usage: the standard TurnCompleted/ResponseCompleted usage
+		//            object passed through untouched (totalTokens is the
+		//            TURN-ACCUMULATED count across every model call in
+		//            the turn — NOT a context-window size). The client
+		//            separates the two; no custom field names.
+		if up, ok := params["update"].(map[string]any); ok {
+			if kind, _ := up["sessionUpdate"].(string); kind == "response_completed" || kind == "turn_completed" {
+				ev := Event{"type": "usage"}
+				if meta, ok := params["_meta"].(map[string]any); ok {
+					if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
+						ev["used"] = used
+						b.trackUsage(sid, used, 0)
+					}
+				}
+				if u, ok := up["usage"].(map[string]any); ok {
+					ev["usage"] = u
+				}
+				// Only broadcast when there is something to update —
+				// an empty usage event (no _meta.totalTokens, no usage
+				// object) would otherwise null the client's `used`.
+				if len(ev) > 1 {
+					b.Broadcast(withSid(ev))
+				}
+			}
+		}
 	case "x.ai/task_backgrounded":
-		b.Broadcast(Event{"type": "task_backgrounded", "params": params})
+		b.Broadcast(withSid(Event{"type": "task_backgrounded", "params": params}))
 	case "x.ai/task_completed":
-		b.Broadcast(Event{"type": "task_completed", "params": params})
+		b.Broadcast(withSid(Event{"type": "task_completed", "params": params}))
 	case "x.ai/monitor_event":
-		b.Broadcast(Event{"type": "monitor_event", "params": params})
+		b.Broadcast(withSid(Event{"type": "monitor_event", "params": params}))
 	case "x.ai/git_head_changed":
-		b.Broadcast(Event{"type": "git_head_changed", "params": params})
+		// Stash the head into the roster so /api/session-info can serve it.
+		b.mu.Lock()
+		if s := b.sessions[sid]; s != nil {
+			if v, ok := params["branch"].(string); ok {
+				s.gitBranch = v
+			}
+			if v, ok := params["isWorktree"].(bool); ok {
+				s.gitWorktree = v
+			}
+			if v, ok := params["mainRepo"].(string); ok {
+				s.gitMainRepo = v
+			}
+		}
+		b.mu.Unlock()
+		b.Broadcast(withSid(Event{"type": "git_head_changed", "params": params}))
 	case "x.ai/yolo_mode_changed":
-		b.Broadcast(Event{"type": "yolo_mode_changed", "params": params})
+		b.Broadcast(withSid(Event{"type": "yolo_mode_changed", "params": params}))
 	case "x.ai/mcp/server_status":
-		b.Broadcast(Event{"type": "mcp_server_status", "params": params})
+		b.Broadcast(withSid(Event{"type": "mcp_server_status", "params": params}))
 	case "x.ai/mcp/tools_changed", "x.ai/mcp_initialized":
-		b.Broadcast(Event{"type": "mcp_tools_changed", "params": params})
+		b.Broadcast(withSid(Event{"type": "mcp_tools_changed", "params": params}))
 	case "x.ai/mcp/servers_updated":
-		b.Broadcast(Event{"type": "mcp_servers_updated", "params": params})
+		b.Broadcast(withSid(Event{"type": "mcp_servers_updated", "params": params}))
 	case "x.ai/sessions/changed":
 		b.Broadcast(Event{"type": "sessions_changed", "params": params})
 	case "x.ai/models/update":
-		b.Broadcast(Event{"type": "models_update", "params": params})
+		// Machine-wide catalog refresh (config.toml changed) — update the
+		// active session's catalog while preserving its current selection
+		// when still available (TUI update_catalog semantics). The raw
+		// payload is a SessionModelState; forwarding it verbatim would
+		// clobber the session's model with the machine-wide current.
+		b.mu.Lock()
+		if act := b.activeSessionLocked(); act != nil {
+			b.applyModelsCatalog(act, params)
+			models := act.models
+			b.mu.Unlock()
+			if models != nil {
+				b.Broadcast(withSid(Event{"type": "models_update", "params": models}))
+			}
+		} else {
+			b.mu.Unlock()
+		}
 	case "x.ai/announcements/update":
 		b.Broadcast(Event{"type": "announcements_update", "params": params})
 	case "x.ai/scheduled_task_fired":
-		b.Broadcast(Event{"type": "scheduled_task_fired", "params": params})
+		b.Broadcast(withSid(Event{"type": "scheduled_task_fired", "params": params}))
 	case "x.ai/scheduled_task_inject_prompt":
-		b.Broadcast(Event{"type": "scheduled_task_inject_prompt", "params": params})
+		b.Broadcast(withSid(Event{"type": "scheduled_task_inject_prompt", "params": params}))
 	case "x.ai/session/prompt_complete":
-		b.Broadcast(Event{"type": "prompt_complete", "params": params})
+		b.Broadcast(withSid(Event{"type": "prompt_complete", "params": params}))
 	default:
-		b.Broadcast(Event{"type": "ext_notification", "method": method, "params": params})
+		b.Broadcast(withSid(Event{"type": "ext_notification", "method": method, "params": params}))
+	}
+}
+
+func asInt(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i, true
+		}
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	}
+	return 0, false
+}
+
+// toInt64 is the lenient variant of asInt: 0 for missing/unparsable values.
+func toInt64(v any) int64 {
+	n, _ := asInt(v)
+	return n
+}
+
+// trackUsage stashes the session's latest context usage (used/total tokens)
+// so /api/session-info can serve it on demand.
+func (b *Bridge) trackUsage(sid string, used, size int64) {
+	if sid == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s := b.sessions[sid]; s != nil {
+		if used > 0 {
+			s.usageUsed = used
+		}
+		if size > 0 {
+			s.usageSize = size
+		}
 	}
 }
 
@@ -666,17 +1167,20 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 	reqID := fmt.Sprintf("acp_cr_%d", b.nextClientReqID.Add(1))
 	cr := &clientRequest{
 		AgentID:      id,
+		SessionID:    b.sessionIdFrom(params),
 		Method:       method,
 		Params:       params,
 		done:         make(chan struct{}),
 		isPermission: true,
 	}
 	b.clientReqs.Store(reqID, cr)
+	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
 		"type":      "client_request",
 		"requestId": reqID,
 		"method":    method,
 		"params":    params,
+		"sessionId": cr.SessionID,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -689,17 +1193,20 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any) {
 	reqID := fmt.Sprintf("acp_cr_%d", b.nextClientReqID.Add(1))
 	cr := &clientRequest{
-		AgentID: id,
-		Method:  method,
-		Params:  params,
-		done:    make(chan struct{}),
+		AgentID:   id,
+		SessionID: b.sessionIdFrom(params),
+		Method:    method,
+		Params:    params,
+		done:      make(chan struct{}),
 	}
 	b.clientReqs.Store(reqID, cr)
+	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
 		"type":      "client_request",
 		"requestId": reqID,
 		"method":    method,
 		"params":    params,
+		"sessionId": cr.SessionID,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -709,6 +1216,9 @@ func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any)
 // the approval timeout elapses, or the agent connection dies, then writes
 // the JSON-RPC response back to the agent.
 func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
+	// Whatever happens (resolve / cancel / timeout), the session is no
+	// longer waiting on input.
+	defer b.setSessionAwaiting(cr.SessionID, false)
 	timer := time.NewTimer(approvalTimeout)
 	defer timer.Stop()
 	select {
@@ -843,6 +1353,13 @@ func (b *Bridge) request(ctx context.Context, method string, params map[string]a
 	select {
 	case <-tctx.Done():
 		b.pending.Delete(key)
+		if err := ctx.Err(); err != nil {
+			// The caller's context went away (e.g. the browser disconnected
+			// mid-turn). Surface the cause so callers can tell a dead client
+			// apart from a dead agent instead of treating every failure as
+			// "agent wedged".
+			return nil, fmt.Errorf("%s: %w", method, err)
+		}
 		return nil, fmt.Errorf("%s 超时", method)
 	case res := <-ch:
 		return res.result, res.err
@@ -861,30 +1378,61 @@ func (b *Bridge) failAllPending(err error) {
 	})
 }
 
-// Prompt sends session/prompt and blocks until the turn finishes.
-func (b *Bridge) Prompt(ctx context.Context, blocks []ContentBlock) (stopReason string, err error) {
+// Prompt sends session/prompt to the given session (default: active) and
+// blocks until the turn finishes. When no session exists yet (the host
+// never auto-creates one at boot), the first prompt restores the last
+// known session if one was remembered; only a machine with no last-session
+// pointer starts a brand-new conversation. A failed restore is an error —
+// never silently open a blank chat. Busy is per-session: other sessions
+// can keep running turns in parallel (the agent process is multi-session).
+func (b *Bridge) Prompt(ctx context.Context, sessionID string, blocks []ContentBlock) (stopReason string, err error) {
 	b.mu.Lock()
-	if b.busy {
+	if sessionID == "" {
+		sessionID = b.activeSessionID
+	}
+	s := b.sessions[sessionID]
+	if s == nil && sessionID == "" {
+		// No active conversation yet. Prefer restoring the last one
+		// (survives agent crash / host restart). Only create a fresh
+		// session when nothing was ever remembered. An explicitly
+		// targeted unknown sessionId below stays a 404.
+		hasLast := b.lastSessionID != ""
+		b.mu.Unlock()
+		if hasLast {
+			if err := b.restoreLastSession(ctx); err != nil {
+				return "", err
+			}
+		} else if err := b.NewSession(ctx, SessionConfig{}); err != nil {
+			return "", err
+		}
+		b.mu.Lock()
+		sessionID = b.activeSessionID
+		s = b.sessions[sessionID]
+	}
+	if s == nil {
+		b.mu.Unlock()
+		return "", &HTTPError{Code: 404, Msg: "会话不存在"}
+	}
+	if s.Busy {
 		b.mu.Unlock()
 		return "", &HTTPError{Code: 409, Msg: "上一条消息还在处理中"}
 	}
-	b.busy = true
+	s.Busy = true
+	s.LastActiveAt = time.Now().UnixMilli()
+	// Keep last-session pointer fresh even if the user only talks to this
+	// session without re-loading it (multi-session focus via prompt).
+	b.rememberSessionLocked(sessionID, s.Cwd)
 	b.mu.Unlock()
-	b.Broadcast(Event{"type": "busy"})
+	b.setSessionBusy(sessionID, true)
+	b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
 
 	defer func() {
-		b.mu.Lock()
-		b.busy = false
-		b.mu.Unlock()
+		b.setSessionBusy(sessionID, false)
 	}()
 
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.ensureBooted(ctx); err != nil {
 		return "", err
 	}
-
-	b.mu.Lock()
-	sid := b.sessionID
-	b.mu.Unlock()
 
 	// convert blocks
 	prompt := make([]any, 0, len(blocks))
@@ -893,37 +1441,67 @@ func (b *Bridge) Prompt(ctx context.Context, blocks []ContentBlock) (stopReason 
 	}
 
 	res, err := b.request(ctx, "session/prompt", map[string]any{
-		"sessionId": sid,
+		"sessionId": sessionID,
 		"prompt":    prompt,
 	}, promptTimeout)
 	if err != nil {
-		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		b.Broadcast(Event{"type": "error", "message": err.Error(), "sessionId": sessionID})
+		// The client (browser) went away mid-turn. The agent process may be
+		// perfectly healthy — and other sessions may be running parallel
+		// turns in the same process — so never killProcess here: that would
+		// abort every session's work, not just this one. Cancel the orphaned
+		// turn so the session does not stay busy for the full promptTimeout,
+		// and return; the client can simply resend.
+		if errors.Is(err, context.Canceled) {
+			b.Cancel(sessionID)
+			b.Broadcast(Event{"type": "status", "text": "连接已断开，本次回复已取消，请重新发送", "sessionId": sessionID})
+			return "", err
+		}
 		// Self-heal: a turn-end failure usually means the agent process is
 		// wedged (it streams output but errors when resolving the turn).
-		// Kill it and immediately rebuild the session so the UI recovers to
-		// "ready" without waiting for the next user message. The failed turn
-		// itself is not retried — the user resends it.
+		// Kill it and reload the SAME session — never session/new on this
+		// path (a failed restore leaves the user without an active chat
+		// rather than a silent blank one). The failed turn is not retried.
+		b.mu.Lock()
+		if s := b.sessions[sessionID]; s != nil {
+			b.rememberSessionLocked(s.SessionID, s.Cwd)
+		} else if sessionID != "" {
+			b.rememberSessionLocked(sessionID, b.lastSessionCwd)
+		}
+		b.mu.Unlock()
+
+		b.killProcess()
 		rebootCtx, cancel := context.WithTimeout(context.Background(), bootTimeout)
 		defer cancel()
-		if rebootErr := b.NewSession(rebootCtx, SessionConfig{}); rebootErr != nil {
+		if rebootErr := b.restoreLastSession(rebootCtx); rebootErr != nil {
 			log.Printf("[acp-host] auto-recovery failed: %v", rebootErr)
-		} else {
-			b.Broadcast(Event{"type": "status", "text": "检测到异常，会话已自动重建，请重发消息"})
 		}
+		// Surface a single user-facing line regardless of whether the
+		// background restore succeeded — the turn itself still failed and
+		// the user needs to check the host / resend.
+		b.Broadcast(Event{"type": "status", "text": "连接HOST异常，请检查后重试"})
 		return "", err
 	}
 	sr, _ := res["stopReason"].(string)
 	if sr == "" {
 		sr = "unknown"
 	}
-	b.Broadcast(Event{"type": "done", "stopReason": sr})
+	b.Broadcast(Event{"type": "done", "stopReason": sr, "sessionId": sessionID})
 	return sr, nil
 }
 
-// Cancel sends session/cancel and cancels pending permissions.
-func (b *Bridge) Cancel() {
+// Cancel sends session/cancel for the given session (default: active) and
+// cancels its pending client requests.
+func (b *Bridge) Cancel(sessionID string) {
 	b.mu.Lock()
-	sid := b.sessionID
+	if sessionID == "" {
+		sessionID = b.activeSessionID
+	}
+	s := b.sessions[sessionID]
+	sid := ""
+	if s != nil {
+		sid = s.SessionID
+	}
 	b.mu.Unlock()
 	if sid != "" {
 		_ = b.write(map[string]any{
@@ -933,8 +1511,11 @@ func (b *Bridge) Cancel() {
 		})
 	}
 	b.clientReqs.Range(func(key, value any) bool {
-		b.clientReqs.Delete(key)
 		cr := value.(*clientRequest)
+		if sid != "" && cr.SessionID != sid {
+			return true // not this session's request
+		}
+		b.clientReqs.Delete(key)
 		cr.cancel = true
 		select {
 		case <-cr.done:
@@ -943,72 +1524,205 @@ func (b *Bridge) Cancel() {
 		}
 		return true
 	})
-	b.Broadcast(Event{"type": "cancelled"})
+	b.Broadcast(Event{"type": "cancelled", "sessionId": sid})
 }
 
-// NewSession kills process and boots a new session.
-func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
-	b.failAllPending(errors.New("会话已重建"))
-	b.clientReqs.Range(func(key, value any) bool {
-		b.clientReqs.Delete(key)
-		cr := value.(*clientRequest)
-		cr.cancel = true
-		select {
-		case <-cr.done:
-		default:
-			close(cr.done)
-		}
-		return true
-	})
-
-	b.killProcess()
-
-	// small delay for process cleanup
-	time.Sleep(100 * time.Millisecond)
-	return b.Boot(ctx, sc)
-}
-
-// killProcess kills the grok agent process (if any) and resets all session
-// state, so the next Boot starts from a fresh process. Used when a turn or a
-// boot step fails on a possibly wedged agent (a live-but-broken process that
-// streams output but errors at turn end / never answers RPCs).
+// killProcess kills the grok agent process (if any) and resets the in-memory
+// roster, so the next Boot starts from a fresh process. The last-session
+// pointer is preserved so restoreLastSession can session/load it.
+// Used when a turn or a boot step fails on a possibly wedged agent.
 func (b *Bridge) killProcess() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if act := b.activeSessionLocked(); act != nil {
+		b.rememberSessionLocked(act.SessionID, act.Cwd)
+	}
 	if b.cmd != nil && b.cmd.Process != nil {
 		_ = b.cmd.Process.Kill()
 	}
 	b.cmd = nil
 	b.stdin = nil
 	b.ready = false
-	b.sessionID = ""
-	b.busy = false
+	b.sessions = make(map[string]*SessionState)
+	b.activeSessionID = ""
 	b.textBuf = ""
-	b.modes = nil
-	b.configOpts = nil
+	// lastSessionID / lastSessionCwd intentionally survive.
 	if b.cancelRd != nil {
 		b.cancelRd()
 		b.cancelRd = nil
 	}
 }
 
-// SetMode calls session/set_mode.
+// SetMode calls session/set_mode on the active session.
 func (b *Bridge) SetMode(ctx context.Context, modeID string) (map[string]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	sid := b.sessionID
+	act := b.activeSessionLocked()
+	var sid string
+	if act != nil {
+		sid = act.SessionID
+	}
 	b.mu.Unlock()
+	if sid == "" {
+		return nil, errors.New("没有活跃会话")
+	}
 	return b.request(ctx, "session/set_mode", map[string]any{
 		"sessionId": sid,
 		"modeId":    modeID,
 	}, 30*time.Second)
 }
 
-// ListSessions calls session/list if supported.
+// SetModel calls session/set_model (grok's /model switch; the wire method
+// is snake_case per the ACP method table). An optional reasoningEffort is
+// forwarded in _meta, matching how the TUI applies --effort.
+func (b *Bridge) SetModel(ctx context.Context, modelID, reasoningEffort string) error {
+	if err := b.Boot(ctx); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	var sid string
+	if act != nil {
+		sid = act.SessionID
+	}
+	b.mu.Unlock()
+	if sid == "" {
+		return errors.New("没有活跃会话")
+	}
+	params := map[string]any{
+		"sessionId": sid,
+		"modelId":   modelID,
+	}
+	if reasoningEffort != "" {
+		params["_meta"] = map[string]any{"reasoningEffort": reasoningEffort}
+	}
+	if _, err := b.request(ctx, "session/set_model", params, 30*time.Second); err != nil {
+		return err
+	}
+	// The agent does not push a model_changed notification for set_model,
+	// so the cached SessionModelState (hello / ready / status snapshot)
+	// would stay stale and revert the UI caption on the next reconnect.
+	// Patch the cache and re-broadcast so every client converges.
+	b.mu.Lock()
+	var models any
+	var name string
+	if act := b.sessions[sid]; act != nil {
+		b.patchSessionModels(act, modelID, reasoningEffort)
+		models = act.models
+		name = modelDisplayName(models, modelID)
+	}
+	b.mu.Unlock()
+	if models != nil {
+		b.Broadcast(Event{"type": "models_update", "params": models, "sessionId": sid})
+	}
+	b.Broadcast(Event{
+		"type":            "model",
+		"modelId":         modelID,
+		"modelName":       name,
+		"reasoningEffort": reasoningEffort,
+		"sessionId":       sid,
+	})
+	return nil
+}
+
+// patchSessionModels updates a session's cached SessionModelState after a
+// successful session/set_model: the current model id, the matching catalog
+// entry's default effort, and (host extension) the top-level reasoning
+// effort the client selected.
+func (b *Bridge) patchSessionModels(s *SessionState, modelID, effort string) {
+	models, ok := s.models.(map[string]any)
+	if !ok {
+		return
+	}
+	models["currentModelId"] = modelID
+	if effort != "" {
+		models["reasoningEffort"] = effort
+	}
+	if avail, ok := models["availableModels"].([]any); ok {
+		for _, raw := range avail {
+			mm, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if id, _ := mm["modelId"].(string); id == modelID {
+				if meta, ok := mm["_meta"].(map[string]any); ok && effort != "" {
+					meta["reasoningEffort"] = effort
+				}
+			}
+		}
+	}
+}
+
+// modelDisplayName resolves a model's display name from a SessionModelState
+// catalog ("" when the id is unknown / no catalog).
+func modelDisplayName(models any, modelID string) string {
+	m, ok := models.(map[string]any)
+	if !ok {
+		return ""
+	}
+	avail, _ := m["availableModels"].([]any)
+	for _, raw := range avail {
+		mm, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := mm["modelId"].(string); id == modelID {
+			if n, ok := mm["name"].(string); ok {
+				return n
+			}
+		}
+	}
+	return ""
+}
+
+// applyModelsCatalog refreshes a session's cached catalog from a
+// machine-wide x.ai/models/update broadcast, keeping the session's current
+// model when it is still offered (falling back to the broadcast's current
+// otherwise, like the TUI's update_catalog). Reasoning-effort fields are
+// left untouched — the broadcast carries each model's static default, not
+// this session's choice.
+func (b *Bridge) applyModelsCatalog(s *SessionState, incoming map[string]any) {
+	models, ok := s.models.(map[string]any)
+	if !ok {
+		if len(incoming) == 0 {
+			return
+		}
+		models = map[string]any{}
+		s.models = models
+	}
+	if inAvail, ok := incoming["availableModels"].([]any); ok {
+		cur, _ := models["currentModelId"].(string)
+		if cur != "" {
+			still := false
+			for _, raw := range inAvail {
+				if mm, ok := raw.(map[string]any); ok {
+					if id, _ := mm["modelId"].(string); id == cur {
+						still = true
+						break
+					}
+				}
+			}
+			if !still {
+				cur = ""
+			}
+		}
+		if cur == "" {
+			cur, _ = incoming["currentModelId"].(string)
+		}
+		models["availableModels"] = inAvail
+		models["currentModelId"] = cur
+	} else if c, ok := incoming["currentModelId"].(string); ok {
+		// Catalog-less payload: only the current id changed.
+		models["currentModelId"] = c
+	}
+}
+
+// ListSessions calls session/list if supported and enriches every session
+// item with the host-side live status (dashboard active/idle/awaiting).
 func (b *Bridge) ListSessions(ctx context.Context) ([]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	res, err := b.request(ctx, "session/list", map[string]any{}, 30*time.Second)
@@ -1016,51 +1730,269 @@ func (b *Bridge) ListSessions(ctx context.Context) ([]any, error) {
 		return nil, err
 	}
 	sessions, _ := res["sessions"].([]any)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// [bg] badge census: scan each session's persisted updates for task
+	// events (best-effort; missing files stay unbadged). Orphan log paths
+	// are collected per session and probed in ONE lsof call afterwards.
+	census := make(map[censusKey]TaskSummary, len(sessions))
+	orphans := make(map[censusKey][]string, len(sessions))
+	for _, it := range sessions {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		sid, _ := m["sessionId"].(string)
+		cwd, _ := m["cwd"].(string)
+		if sid == "" || cwd == "" {
+			continue
+		}
+		sum, ps := sessionTaskCensus(b.grokHome(), cwd, sid)
+		census[censusKey{sid, cwd}] = sum
+		orphans[censusKey{sid, cwd}] = ps
+	}
+	open := probeOrphanPaths(orphans)
+
+	for _, it := range sessions {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		sid, _ := m["sessionId"].(string)
+		if s := b.sessions[sid]; s != nil {
+			m["status"] = map[string]any{
+				"state":         s.State(),
+				"busy":          s.Busy,
+				"awaitingInput": s.AwaitingInput,
+				"lastActiveAt":  s.LastActiveAt,
+			}
+			// Host-side title/updatedAt win over the agent list when the
+			// session is live (agent may not persist them yet).
+			if s.Title != "" {
+				m["title"] = s.Title
+			}
+			if s.UpdatedAt != "" {
+				m["updatedAt"] = s.UpdatedAt
+			}
+		} else {
+			m["status"] = map[string]any{"state": "idle", "busy": false, "awaitingInput": false}
+		}
+		cwd, _ := m["cwd"].(string)
+		if sum, ok := census[censusKey{sid, cwd}]; ok {
+			sum = applyProbe(sum, orphans[censusKey{sid, cwd}], open)
+			m["hasTasks"] = sum.HasTasks
+			m["bgCount"] = sum.BgCount
+			m["bgRunning"] = sum.BgRunning
+		}
+	}
 	return sessions, nil
+}
+
+// SessionStateOf returns the host-side live state of one session (nil if
+// the session is not in the roster). For sessions only known to the agent
+// (never created/loaded in this process), the caller falls back to
+// session/list-derived data.
+func (b *Bridge) SessionStateOf(sessionID string) *SessionState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.sessions[sessionID]
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	return &cp
+}
+
+// SessionInfo returns authoritative live details of the active session
+// (TUI /session-info analog), served on demand via POST /api/session-info:
+// roster fields, tracked context usage / git head, and the model from the
+// session's SessionModelState catalog. Nil when no session is active.
+func (b *Bridge) SessionInfo() *SessionInfoDetail {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	act := b.activeSessionLocked()
+	if act == nil {
+		return nil
+	}
+	d := &SessionInfoDetail{
+		SessionID:   act.SessionID,
+		Title:       act.Title,
+		Cwd:         act.Cwd,
+		UpdatedAt:   act.UpdatedAt,
+		State:       act.State(),
+		Busy:        act.Busy,
+		ContextUsed: act.usageUsed,
+		ContextSize: act.usageSize,
+		GitBranch:   act.gitBranch,
+		GitWorktree: act.gitWorktree,
+		GitMainRepo: act.gitMainRepo,
+		HostID:      b.hostID,
+		HostName:    b.hostName,
+		HomeDir:     b.homeDir,
+	}
+	// Model from SessionModelState: {currentModelId, availableModels:[…]}.
+	m, ok := act.models.(map[string]any)
+	if !ok {
+		return d
+	}
+	cur, _ := m["currentModelId"].(string)
+	if cur == "" {
+		cur, _ = m["current"].(string)
+	}
+	if cur == "" {
+		return d
+	}
+	mi := &ModelInfo{ModelID: cur, Name: modelDisplayName(act.models, cur)}
+	if eff, ok := m["reasoningEffort"].(string); ok && eff != "" {
+		mi.ReasoningEffort = eff
+	}
+	if avail, ok := m["availableModels"].([]any); ok {
+		for _, raw := range avail {
+			mm, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if id, _ := mm["modelId"].(string); id != cur {
+				continue
+			}
+			if meta, ok := mm["_meta"].(map[string]any); ok {
+				if eff, ok := meta["reasoningEffort"].(string); ok && eff != "" && mi.ReasoningEffort == "" {
+					mi.ReasoningEffort = eff
+				}
+				if cw := toInt64(meta["totalContextTokens"]); cw > 0 {
+					mi.ContextWindow = cw
+				}
+			}
+		}
+	}
+	d.Model = mi
+	return d
 }
 
 // LoadSession switches the active session to a historical one (session/load),
 // so subsequent prompts and live updates belong to that session.
-func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string) error {
+//
+// The load response carries the restored session's SessionModelState (the
+// model that was active when the session was saved, after availability
+// fallbacks). We surface it on the ready event so the UI caption matches
+// the restored session instead of the process-global boot model.
+//
+// If the target session is already live in this host and has a turn in
+// flight (Busy), we only re-focus the UI onto it — calling agent
+// session/load would conflict with the running turn (previously 409).
+func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string) (map[string]any, error) {
 	b.mu.Lock()
-	if b.busy {
+	if s := b.sessions[sessionID]; s != nil && s.Busy {
+		// Focus-only path for an in-flight session.
+		if cwd != "" {
+			s.Cwd = cwd
+		}
+		b.activeSessionID = sessionID
+		b.rememberSessionLocked(sessionID, s.Cwd)
+		b.textBuf = ""
+		b.ready = true
+		b.bootError = ""
+		sessRes := map[string]any{"busy": true}
+		if s.models != nil {
+			sessRes["models"] = s.models
+		}
+		if s.modes != nil {
+			sessRes["modes"] = s.modes
+		}
+		if s.configOpts != nil {
+			sessRes["configOptions"] = s.configOpts
+		}
+		agentInfo := b.agentInfo
+		modes := s.modes
+		configOpts := s.configOpts
+		models := s.models
+		hostID := b.hostID
+		hostName := b.hostName
+		sessCwd := s.Cwd
 		b.mu.Unlock()
-		return &HTTPError{Code: 409, Msg: "上一条消息还在处理中"}
+
+		b.Broadcast(Event{
+			"type":          "ready",
+			"sessionId":     sessionID,
+			"cwd":           sessCwd,
+			"agentInfo":     agentInfo,
+			"modes":         modes,
+			"configOptions": configOpts,
+			"models":        models,
+			"hostId":        hostID,
+			"hostName":      hostName,
+		})
+		// Re-announce busy so the client can attach the spinner after history load.
+		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
+		b.broadcastRosterChange()
+		return sessRes, nil
 	}
 	b.mu.Unlock()
 
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
-		return err
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
 	}
-	if _, err := b.request(ctx, "session/load", map[string]any{
+	sessRes, err := b.request(ctx, "session/load", map[string]any{
 		"sessionId":  sessionID,
 		"cwd":        cwd,
 		"mcpServers": []any{},
-	}, bootTimeout); err != nil {
-		return err
+	}, bootTimeout)
+	if err != nil {
+		return nil, err
 	}
 
 	b.mu.Lock()
-	b.sessionID = sessionID
-	b.cwd = cwd
+	act := b.sessions[sessionID]
+	if act == nil {
+		act = &SessionState{SessionID: sessionID, CreatedAt: time.Now().UnixMilli()}
+		b.sessions[sessionID] = act
+	}
+	act.Cwd = cwd
 	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
+	// Prefer fields from the load response — they reflect the restored session.
+	if m, ok := sessRes["models"]; ok && m != nil {
+		act.models = m
+	}
+	if modes, ok := sessRes["modes"]; ok && modes != nil {
+		act.modes = modes
+	}
+	if co, ok := sessRes["configOptions"]; ok && co != nil {
+		act.configOpts = co
+	}
+	b.activeSessionID = sessionID
+	b.rememberSessionLocked(sessionID, cwd)
 	agentInfo := b.agentInfo
-	modes := b.modes
-	configOpts := b.configOpts
+	modes := act.modes
+	configOpts := act.configOpts
+	models := act.models
+	hostID := b.hostID
+	hostName := b.hostName
+	sessCwd := act.Cwd
 	b.mu.Unlock()
+
+	if sessRes == nil {
+		sessRes = map[string]any{}
+	}
+	// Cold load is never mid-turn.
+	sessRes["busy"] = false
 
 	b.Broadcast(Event{
 		"type":          "ready",
 		"sessionId":     sessionID,
+		"cwd":           sessCwd,
 		"agentInfo":     agentInfo,
 		"modes":         modes,
 		"configOptions": configOpts,
-		"hostId":        b.hostID,
-		"hostName":      b.hostName,
+		"models":        models,
+		"hostId":        hostID,
+		"hostName":      hostName,
 	})
-	return nil
+	b.broadcastRosterChange()
+	return sessRes, nil
 }
 
 // ── session history (x.ai/session/updates) ───────────────────────
@@ -1079,7 +2011,7 @@ type UpdatesPage struct {
 // the ACP extension method x.ai/session/updates. Each element of the result
 // is the full storage envelope {timestamp, method, params}.
 func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, offset *int64, limit *int) (UpdatesPage, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return UpdatesPage{}, err
 	}
 	params := map[string]any{"sessionId": sessionID, "cwd": cwd}
@@ -1105,6 +2037,73 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, offs
 	return page, nil
 }
 
+// GitInfo returns the git branch/worktree state for a cwd. The branch comes
+// from the protocol method `_x.ai/git/info` (GitInfoData.currentBranch);
+// worktree state is not part of that payload (the TUI probes it locally
+// with git2), so it is probed here with the standard git plumbing commands
+// `rev-parse --git-dir` vs `--git-common-dir`.
+func (b *Bridge) GitInfo(ctx context.Context, cwd string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	out := map[string]any{"branch": "", "isWorktree": false, "mainRepo": ""}
+	// GitInfoRequest is camelCase on the wire: {sessionId?, gitRoot?}.
+	// The response is an ExtMethodResult envelope {"result": GitInfoData,
+	// "error": …} — the git extensions return to_ext_response, unlike
+	// session/updates which uses the bare payload.
+	res, err := b.request(ctx, "_x.ai/git/info", map[string]any{"gitRoot": cwd}, 15*time.Second)
+	if err == nil {
+		payload := res
+		if inner, ok := res["result"].(map[string]any); ok {
+			payload = inner
+		}
+		if br, ok := payload["currentBranch"].(string); ok {
+			out["branch"] = br
+		}
+	}
+	// Not a git repo (or the agent errored) → empty branch, no worktree.
+	isWorktree, mainRepo := probeWorktree(cwd)
+	out["isWorktree"] = isWorktree
+	out["mainRepo"] = mainRepo
+	return out, nil
+}
+
+// probeWorktree reports whether cwd lives in a linked worktree and, if so,
+// the main repo path (shortened to ~/… under $HOME). Mirrors the TUI's
+// get_worktree_info (git-dir != common-dir ⇒ worktree).
+func probeWorktree(cwd string) (bool, string) {
+	gitDir := runGit(cwd, "rev-parse", "--git-dir")
+	commonDir := runGit(cwd, "rev-parse", "--git-common-dir")
+	if gitDir == "" || commonDir == "" || gitDir == commonDir {
+		return false, ""
+	}
+	abs := commonDir
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(cwd, commonDir)
+	}
+	abs = filepath.Clean(abs)
+	mainRoot := filepath.Dir(abs)
+	if home, err := os.UserHomeDir(); err == nil {
+		if rel, err := filepath.Rel(home, mainRoot); err == nil &&
+			rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			mainRoot = "~/" + rel
+		}
+	}
+	return true, mainRoot
+}
+
+// runGit executes git plumbing in cwd and returns trimmed stdout ("" on
+// failure — non-repo, detached plumbing errors, etc.).
+func runGit(cwd string, args ...string) string {
+	cmd := exec.Command("git", append([]string{"-C", cwd}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // ── x.ai client → agent extension methods ──────────────────────────
 //
 // Extension requests use the "_" prefix wire convention (same as
@@ -1115,12 +2114,16 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, offs
 // one (optionally a git worktree). Params follow the TUI's fork payload:
 // {sourceSessionId, sourceCwd, newCwd, sessionKind:"fork", newSessionId?}.
 func (b *Bridge) ForkSession(ctx context.Context, params map[string]any) (map[string]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	sid := b.sessionID
-	cwd := b.cwd
+	act := b.activeSessionLocked()
+	var sid, cwd string
+	if act != nil {
+		sid = act.SessionID
+		cwd = act.Cwd
+	}
 	b.mu.Unlock()
 	p := map[string]any{
 		"sourceSessionId": sid,
@@ -1136,11 +2139,15 @@ func (b *Bridge) ForkSession(ctx context.Context, params map[string]any) (map[st
 
 // RenameSession calls x.ai/session/rename: {sessionId, title}.
 func (b *Bridge) RenameSession(ctx context.Context, title string) (map[string]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	sid := b.sessionID
+	act := b.activeSessionLocked()
+	var sid string
+	if act != nil {
+		sid = act.SessionID
+	}
 	b.mu.Unlock()
 	return b.request(ctx, "_x.ai/session/rename", map[string]any{
 		"sessionId": sid,
@@ -1151,11 +2158,15 @@ func (b *Bridge) RenameSession(ctx context.Context, title string) (map[string]an
 // Recap fires x.ai/recap (fire-and-forget "where was I" summary; the recap
 // arrives later as a SessionRecap session/update). Returns the ack.
 func (b *Bridge) Recap(ctx context.Context, auto bool) (map[string]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	sid := b.sessionID
+	act := b.activeSessionLocked()
+	var sid string
+	if act != nil {
+		sid = act.SessionID
+	}
 	b.mu.Unlock()
 	return b.request(ctx, "_x.ai/recap", map[string]any{
 		"sessionId": sid,
@@ -1165,7 +2176,7 @@ func (b *Bridge) Recap(ctx context.Context, auto bool) (map[string]any, error) {
 
 // SubagentCancel calls x.ai/subagent/cancel: {subagentId}.
 func (b *Bridge) SubagentCancel(ctx context.Context, subagentID string) (map[string]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	return b.request(ctx, "_x.ai/subagent/cancel", map[string]any{
@@ -1175,15 +2186,41 @@ func (b *Bridge) SubagentCancel(ctx context.Context, subagentID string) (map[str
 
 // TaskKill calls x.ai/task/kill: {sessionId, taskId}.
 func (b *Bridge) TaskKill(ctx context.Context, taskID string) (map[string]any, error) {
-	if err := b.Boot(ctx, SessionConfig{}); err != nil {
+	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
-	sid := b.sessionID
+	act := b.activeSessionLocked()
+	var sid string
+	if act != nil {
+		sid = act.SessionID
+	}
 	b.mu.Unlock()
 	return b.request(ctx, "_x.ai/task/kill", map[string]any{
 		"sessionId": sid,
 		"taskId":    taskID,
+	}, 30*time.Second)
+}
+
+// TaskList calls x.ai/task/list: {sessionId} → {tasks: [TaskSnapshot…]}.
+// Each snapshot includes output/command so the FE block viewer can show
+// live stdout (TUI OpenBlockViewer for BgTask).
+func (b *Bridge) TaskList(ctx context.Context) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	var sid string
+	if act != nil {
+		sid = act.SessionID
+	}
+	b.mu.Unlock()
+	if sid == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/task/list", map[string]any{
+		"sessionId": sid,
 	}, 30*time.Second)
 }
 

@@ -1,3 +1,6 @@
+# Playwright CLI artifacts
+.playwright-cli/
+
 # Binaries
 /acp-host
 *.exe
