@@ -26,6 +26,20 @@ const ACPHostFakeAgentEnv = "ACP_HOST_FAKE_AGENT"
 // exercise the graceful-degradation path.
 const ACPHostFakeAgentErrorMethod = "ACP_HOST_FAKE_AGENT_ERROR_METHOD"
 
+// ACPHostFakeAgentEmitPermission, when set, makes the fake agent emit a
+// session/request_permission request right after answering session/new, so
+// permission-response endpoints round-trip fully.
+const ACPHostFakeAgentEmitPermission = "ACP_HOST_FAKE_AGENT_EMIT_PERMISSION"
+
+// ACPHostFakeAgentRecord, when set, makes the fake agent append every
+// host→agent response that answers its emitted permission request to this
+// file, so tests can assert the response meta the host forwarded.
+const ACPHostFakeAgentRecord = "ACP_HOST_FAKE_AGENT_RECORD"
+
+// fakeAgentPermissionID is the JSON-RPC id the fake agent stamps on its
+// emitted permission request.
+const fakeAgentPermissionID float64 = 99
+
 func TestMain(m *testing.M) {
 	if os.Getenv(ACPHostFakeAgentEnv) == "1" {
 		runFakeAgent()
@@ -53,6 +67,15 @@ func runFakeAgent() {
 		if id == nil {
 			continue
 		}
+		// Capture the host's permission response: a line without a method
+		// that answers our emitted permission request. Record it and skip
+		// the request switch (it is not a request to answer).
+		if record := os.Getenv(ACPHostFakeAgentRecord); record != "" {
+			if rid, ok := id.(float64); ok && rid == fakeAgentPermissionID && msg["method"] == nil {
+				appendPermissionRecord(record, line)
+				continue
+			}
+		}
 		method, _ := msg["method"].(string)
 		if em := os.Getenv(ACPHostFakeAgentErrorMethod); em != "" && method == em {
 			resp, _ := json.Marshal(map[string]any{
@@ -76,6 +99,9 @@ func runFakeAgent() {
 			result = map[string]any{}
 		case "session/new":
 			result = map[string]any{"sessionId": "sess-new"}
+			if os.Getenv(ACPHostFakeAgentEmitPermission) == "1" {
+				emitPermissionRequest(out)
+			}
 		case "_x.ai/session/delete":
 			result = map[string]any{"ok": true}
 		case "_x.ai/compact_conversation":
@@ -154,4 +180,39 @@ func postJSON(t *testing.T, s *Server, path, body string) *httptest.ResponseReco
 	rec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec, req)
 	return rec
+}
+
+// emitPermissionRequest writes a session/request_permission request (id
+// fakeAgentPermissionID) so tests can exercise the host's permission-response
+// path end-to-end. Options include the reject-once row the TUI's followup
+// dispatch resolves against.
+func emitPermissionRequest(out *bufio.Writer) {
+	req, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      fakeAgentPermissionID,
+		"method":  "session/request_permission",
+		"params": map[string]any{
+			"sessionId": "sess-new",
+			"toolCall":  map[string]any{"id": "tc-1", "fields": map[string]any{}},
+			"options": []any{
+				map[string]any{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+				map[string]any{"optionId": "reject-once", "name": "Reject once", "kind": "reject_once"},
+			},
+		},
+	})
+	out.Write(req)
+	out.WriteByte('\n')
+	out.Flush()
+}
+
+// appendPermissionRecord appends one host→agent response line to the record
+// file (created on first write).
+func appendPermissionRecord(path string, line []byte) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(line)
+	_, _ = f.Write([]byte("\n"))
 }
