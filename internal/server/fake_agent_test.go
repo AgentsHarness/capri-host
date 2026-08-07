@@ -42,6 +42,12 @@ const ACPHostFakeAgentRecord = "ACP_HOST_FAKE_AGENT_RECORD"
 // assert fire-and-forget notifications like _x.ai/yolo_mode_changed.
 const ACPHostFakeAgentRecordNotifs = "ACP_HOST_FAKE_AGENT_RECORD_NOTIFS"
 
+// ACPHostFakeAgentRecordRequests, when set, makes the fake agent append
+// every host→agent REQUEST line (has a method) to this file, so tests can
+// assert the exact params the host forwarded — e.g. the session/new and
+// session/load `_meta` permission-mode seeds.
+const ACPHostFakeAgentRecordRequests = "ACP_HOST_FAKE_AGENT_RECORD_REQUESTS"
+
 // fakeAgentPermissionID is the JSON-RPC id the fake agent stamps on its
 // emitted permission request.
 const fakeAgentPermissionID float64 = 99
@@ -86,6 +92,10 @@ func runFakeAgent() {
 				appendPermissionRecord(record, line)
 				continue
 			}
+		}
+		// Record every host→agent request (has a method) verbatim.
+		if record := os.Getenv(ACPHostFakeAgentRecordRequests); record != "" && msg["method"] != nil {
+			appendRecordLine(record, line)
 		}
 		method, _ := msg["method"].(string)
 		if em := os.Getenv(ACPHostFakeAgentErrorMethod); em != "" && method == em {

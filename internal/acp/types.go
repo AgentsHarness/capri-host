@@ -13,6 +13,11 @@ type SessionConfig struct {
 	Cwd                   string           `json:"cwd"`
 	AdditionalDirectories []string         `json:"additionalDirectories"`
 	MCPServers            []map[string]any `json:"mcpServers"`
+	// Meta carries client-supplied session seeds (e.g. the TUI's
+	// yoloMode/autoMode permission flags) forwarded verbatim as the
+	// session/new params `_meta`. Absent = current behavior exactly
+	// (no `_meta` key on the wire).
+	Meta map[string]any `json:"meta,omitempty"`
 }
 
 // PermissionScope is the bash command scope a client attaches to a
@@ -45,6 +50,9 @@ type Status struct {
 	Capabilities    ClientCaps   `json:"capabilities"`
 	// Live per-session states (dashboard active/idle/awaiting classification).
 	Roster []SessionState `json:"roster,omitempty"`
+	// AgentStartedAt (unix ms) stamps the current agent process spawn —
+	// clients detect agent restarts by comparing it across hello events.
+	AgentStartedAt int64 `json:"agentStartedAt,omitempty"`
 }
 
 // SessionState is the host-side live state of one session in the roster.

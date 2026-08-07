@@ -155,6 +155,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		"homeDir":         snap.HomeDir,
 		"capabilities":    snap.Capabilities,
 		"roster":          snap.Roster,
+		"agentStartedAt":  snap.AgentStartedAt,
 	}
 	data, _ := json.Marshal(hello)
 	fmt.Fprintf(w, "data: %s\n\n", data)
@@ -417,8 +418,12 @@ func (s *Server) handleSessionState(w http.ResponseWriter, r *http.Request) {
 }
 
 type sessionLoadBody struct {
-	SessionID string `json:"sessionId"`
-	Cwd       string `json:"cwd"`
+	SessionID string         `json:"sessionId"`
+	Cwd       string         `json:"cwd"`
+	// Meta: client-supplied session seeds (permission-mode flags, the
+	// TUI's yoloMode/autoMode analog) forwarded as the session/load
+	// params `_meta`. Omitted = current behavior exactly.
+	Meta map[string]any `json:"meta,omitempty"`
 }
 
 // handleSessionLoad switches the active session to a historical one
@@ -433,7 +438,7 @@ func (s *Server) handleSessionLoad(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
 		return
 	}
-	sessRes, err := s.bridge.LoadSession(r.Context(), body.SessionID, body.Cwd)
+	sessRes, err := s.bridge.LoadSession(r.Context(), body.SessionID, body.Cwd, body.Meta)
 	if err != nil {
 		code := 500
 		var he *acp.HTTPError
