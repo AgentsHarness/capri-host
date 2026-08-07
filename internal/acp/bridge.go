@@ -38,8 +38,8 @@ type Bridge struct {
 	stdin    io.WriteCloser
 	cancelRd context.CancelFunc
 
-	ready     bool
-	booting   bool
+	ready   bool
+	booting bool
 	// bootDone is closed when an in-flight boot attempt finishes (success
 	// or failure). Concurrent ensureBooted callers wait on it instead of
 	// racing the boot and failing with "grok 进程未运行".
@@ -883,7 +883,27 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 		}
 	case "user_message_chunk":
 		if text := contentText(update["content"]); text != "" {
-			b.Broadcast(Event{"type": "user_chunk", "text": text, "sessionId": sid})
+			ev := Event{"type": "user_chunk", "text": text, "sessionId": sid}
+			// Forward the chunk + content-block meta (wire shape:
+			// update._meta = ContentChunk.meta → hideFromScrollback;
+			// update.content._meta = TextContent.meta → displayText /
+			// displayAsCron) so live rendering classifies system-injected
+			// prompts exactly like the replay path does.
+			if meta, ok := update["_meta"].(map[string]any); ok {
+				if v, ok := meta["hideFromScrollback"]; ok {
+					ev["hideFromScrollback"] = v
+				}
+			}
+			if content, ok := update["content"].(map[string]any); ok {
+				if meta, ok := content["_meta"].(map[string]any); ok {
+					for _, k := range []string{"displayText", "displayAsCron"} {
+						if v, ok := meta[k]; ok {
+							ev[k] = v
+						}
+					}
+				}
+			}
+			b.Broadcast(ev)
 		}
 		for _, img := range contentImages(update["content"]) {
 			if ev, ok := imageEvent(sid, img); ok {
@@ -2273,6 +2293,8 @@ func (b *Bridge) RenameSession(ctx context.Context, title string) (map[string]an
 
 // Recap fires x.ai/recap (fire-and-forget "where was I" summary; the recap
 // arrives later as a SessionRecap session/update). Returns the ack.
+// Recap calls x.ai/recap: {sessionId, auto} — triggers a session recap.
+// The sessionId defaults to the active session (404 when none is active).
 func (b *Bridge) Recap(ctx context.Context, auto bool) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -2284,6 +2306,9 @@ func (b *Bridge) Recap(ctx context.Context, auto bool) (map[string]any, error) {
 		sid = act.SessionID
 	}
 	b.mu.Unlock()
+	if sid == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
 	return b.request(ctx, "_x.ai/recap", map[string]any{
 		"sessionId": sid,
 		"auto":      auto,
@@ -2361,8 +2386,10 @@ func (b *Bridge) SessionDelete(ctx context.Context, sessionID string) (map[strin
 	}, 60*time.Second)
 }
 
-// CompactConversation calls x.ai/compact_conversation: {sessionId, note?}
-// (manual context compaction; the sessionId defaults to the active one).
+// CompactConversation calls x.ai/compact_conversation: {sessionId, userContext?}
+// (manual context compaction; the sessionId defaults to the active one). The
+// agent's request struct only accepts `userContext` for the compaction note —
+// a `note` key would be silently ignored by serde, so the host translates.
 func (b *Bridge) CompactConversation(ctx context.Context, sessionID, note string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -2378,7 +2405,7 @@ func (b *Bridge) CompactConversation(ctx context.Context, sessionID, note string
 	}
 	params := map[string]any{"sessionId": sessionID}
 	if note != "" {
-		params["note"] = note
+		params["userContext"] = note
 	}
 	return b.request(ctx, "_x.ai/compact_conversation", params, 60*time.Second)
 }
@@ -2404,8 +2431,10 @@ func (b *Bridge) RewindPoints(ctx context.Context, sessionID string) (map[string
 	}, 60*time.Second)
 }
 
-// RewindExecute calls x.ai/rewind/execute: {sessionId, targetIndex} —
-// rolls the conversation back to the given rewind point.
+// RewindExecute calls x.ai/rewind/execute: {sessionId, targetPromptIndex} —
+// rolls the conversation back to the given rewind point. The agent's handler
+// only accepts `target_prompt_index`/`targetPromptIndex` (a raw `targetIndex`
+// key would be rejected as invalid params), so the host translates.
 func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetIndex int) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -2420,8 +2449,8 @@ func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetInde
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/rewind/execute", map[string]any{
-		"sessionId":   sessionID,
-		"targetIndex": targetIndex,
+		"sessionId":         sessionID,
+		"targetPromptIndex": targetIndex,
 	}, 60*time.Second)
 }
 
@@ -2474,8 +2503,10 @@ func (b *Bridge) Billing(ctx context.Context, sessionID string) (map[string]any,
 	}, 30*time.Second)
 }
 
-// MemoryFlush calls x.ai/memory/flush: {sessionId} — persists the session's
-// memory (sessionId defaults to the active session).
+// MemoryFlush calls x.ai/memory/flush: {session_id} — persists the session's
+// memory (sessionId defaults to the active session). The agent's request
+// struct is plain snake_case (`session_id`), so the host must NOT send the
+// camelCase `sessionId` key it accepts elsewhere.
 func (b *Bridge) MemoryFlush(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -2484,14 +2515,15 @@ func (b *Bridge) MemoryFlush(ctx context.Context, sessionID string) (map[string]
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/memory/flush", map[string]any{
-		"sessionId": sessionID,
+		"session_id": sessionID,
 	}, 30*time.Second)
 }
 
-// MemoryRewrite calls x.ai/memory/rewrite: {sessionId} — rewrites the
-// session's memory from the conversation (sessionId defaults to the active
-// session).
-func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID string) (map[string]any, error) {
+// MemoryRewrite calls x.ai/memory/rewrite: {sessionId, rawText, contextSummary}
+// — rewrites the session's memory from the given text. The agent's request
+// struct is camelCase with all three fields required; the host must forward
+// rawText/contextSummary or the call fails with invalid params.
+func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextSummary string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -2499,13 +2531,18 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID string) (map[strin
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/memory/rewrite", map[string]any{
-		"sessionId": sessionID,
+		"sessionId":      sessionID,
+		"rawText":        rawText,
+		"contextSummary": contextSummary,
 	}, 30*time.Second)
 }
 
-// TogglePlanMode calls x.ai/toggle_plan_mode: {sessionId} — switches the
-// session's plan mode on/off. The HTTP layer tries to extract the resulting
-// planMode bool from the reply.
+// TogglePlanMode sends x.ai/toggle_plan_mode: {sessionId} — switches the
+// session's plan mode on/off. The agent only handles this method as a
+// fire-and-forget NOTIFICATION (no request branch; a request-style call
+// would get -32601 method_not_found), so the host writes it without a
+// JSON-RPC id and returns a bare ok — the frontend applies its local
+// desired state.
 func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -2513,14 +2550,20 @@ func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[stri
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
-	return b.request(ctx, "_x.ai/toggle_plan_mode", map[string]any{
-		"sessionId": sessionID,
-	}, 30*time.Second)
+	if err := b.write(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "_x.ai/toggle_plan_mode",
+		"params":  map[string]any{"sessionId": sessionID},
+	}); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
 }
 
-// PermissionsReset calls x.ai/permissions/reset: {sessionId} — clears the
-// session's remembered permission decisions (sessionId defaults to the
-// active session).
+// PermissionsReset sends x.ai/permissions/reset: {sessionId} — clears the
+// remembered permission decisions. Like toggle_plan_mode the agent only
+// handles it as a notification (it resets ALL resident sessions, ignoring
+// the sessionId), so the host writes it without a JSON-RPC id.
 func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -2528,64 +2571,139 @@ func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[st
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
-	return b.request(ctx, "_x.ai/permissions/reset", map[string]any{
-		"sessionId": sessionID,
-	}, 30*time.Second)
+	if err := b.write(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "_x.ai/permissions/reset",
+		"params":  map[string]any{"sessionId": sessionID},
+	}); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
 }
 
-// MCPList calls x.ai/mcp/list → the agent's MCP server registry. MCP
-// servers are host-global (not session-scoped), so no sessionId is sent
-// and the absence of an active session is not an error — the agent is the
-// authority on whether it needs one.
+// SetPermissionMode sends x.ai/yolo_mode_changed as a fire-and-forget
+// notification — the agent's permission-mode switch channel (ask / auto /
+// always-approve). session/set_mode only understands the session-mode ids
+// (plan / default / ask), so permission modes MUST go through this
+// notification instead (TUI parity: the pager persists + fires the same
+// payload). The agent applies it to every resident session of this client,
+// no sessionId needed. 'normal' maps to the agent's 'ask' canonical; the
+// unknown-id fallback is 'ask' too, so a stale frontend never dead-ends.
+func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	params := map[string]any{"yolo_mode": false, "auto_mode": false}
+	switch mode {
+	case "auto":
+		params["auto_mode"] = true
+		params["permission_mode"] = "auto"
+	case "always-approve", "always_approve", "yolo":
+		params["yolo_mode"] = true
+		params["permission_mode"] = "always-approve"
+	default: // normal / ask / anything unknown → 普通（ask）模式
+		params["permission_mode"] = "ask"
+	}
+	if err := b.write(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "_x.ai/yolo_mode_changed",
+		"params":  params,
+	}); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
+}
+
+// MCPList calls x.ai/mcp/list: {sessionId?} → the agent's MCP server
+// registry. The active session's id is injected when one exists so the
+// agent can attach per-session state (enabled/status) to each entry; the
+// absence of an active session is not an error (the agent returns the
+// bare catalog).
 func (b *Bridge) MCPList(ctx context.Context) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	return b.request(ctx, "_x.ai/mcp/list", map[string]any{}, 30*time.Second)
+	params := map[string]any{}
+	if sid := b.resolveSessionID(""); sid != "" {
+		params["sessionId"] = sid
+	}
+	return b.request(ctx, "_x.ai/mcp/list", params, 30*time.Second)
 }
 
-// MCPToggle calls x.ai/mcp/toggle: {name, enabled} — enables/disables one
-// MCP server.
+// MCPToggle calls x.ai/mcp/toggle: {session_id, server_name, enabled} —
+// enables/disables one MCP server. The agent's request struct is plain
+// snake_case with `session_id`/`server_name` required, so the host resolves
+// the active session and translates the frontend's `{name, enabled}` body.
 func (b *Bridge) MCPToggle(ctx context.Context, name string, enabled bool) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
+	sid := b.resolveSessionID("")
+	if sid == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
 	return b.request(ctx, "_x.ai/mcp/toggle", map[string]any{
-		"name":    name,
-		"enabled": enabled,
+		"session_id":  sid,
+		"server_name": name,
+		"enabled":     enabled,
 	}, 30*time.Second)
 }
 
-// MCPUpsert calls x.ai/mcp/upsert: {server: {name, command, args?, env?}}
-// — adds or updates one MCP server. The server object is passed through
-// verbatim; the agent is the authority on its schema.
+// MCPUpsert calls x.ai/mcp/upsert: {session_id, server_name, ...config} —
+// adds or updates one MCP server. The agent expects the config flattened at
+// the top level (command/args/env/cwd/url/…), NOT wrapped in a `server`
+// object; `name` becomes `server_name`. Config keys are passed through
+// verbatim.
 func (b *Bridge) MCPUpsert(ctx context.Context, server map[string]any) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	return b.request(ctx, "_x.ai/mcp/upsert", map[string]any{
-		"server": server,
-	}, 30*time.Second)
+	sid := b.resolveSessionID("")
+	if sid == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	serverName, _ := server["name"].(string)
+	params := make(map[string]any, len(server)+1)
+	params["session_id"] = sid
+	params["server_name"] = serverName
+	for k, v := range server {
+		if k == "name" {
+			continue
+		}
+		params[k] = v
+	}
+	return b.request(ctx, "_x.ai/mcp/upsert", params, 30*time.Second)
 }
 
-// MCPDelete calls x.ai/mcp/delete: {name} — removes one MCP server.
+// MCPDelete calls x.ai/mcp/delete: {session_id, server_name} — removes one
+// MCP server. Same snake_case contract as MCPToggle.
 func (b *Bridge) MCPDelete(ctx context.Context, name string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
+	sid := b.resolveSessionID("")
+	if sid == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
 	return b.request(ctx, "_x.ai/mcp/delete", map[string]any{
-		"name": name,
+		"session_id":  sid,
+		"server_name": name,
 	}, 30*time.Second)
 }
 
-// MCPAuthTrigger calls x.ai/mcp/auth_trigger: {name} — starts the OAuth
-// flow for one MCP server.
+// MCPAuthTrigger calls x.ai/mcp/auth_trigger: {session_id, server_name} —
+// starts the OAuth flow for one MCP server. Same snake_case contract.
 func (b *Bridge) MCPAuthTrigger(ctx context.Context, name string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
+	sid := b.resolveSessionID("")
+	if sid == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
 	return b.request(ctx, "_x.ai/mcp/auth_trigger", map[string]any{
-		"name": name,
+		"session_id":  sid,
+		"server_name": name,
 	}, 30*time.Second)
 }
 

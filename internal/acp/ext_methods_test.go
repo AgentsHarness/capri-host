@@ -99,7 +99,7 @@ func TestExtensionMethodsWirePayloads(t *testing.T) {
 			name:   "compact_conversation with note",
 			call:   func(b *Bridge) (map[string]any, error) { return b.CompactConversation(ctx, "", "cleanup") },
 			method: "_x.ai/compact_conversation",
-			params: map[string]any{"sessionId": "s1", "note": "cleanup"},
+			params: map[string]any{"sessionId": "s1", "userContext": "cleanup"},
 		},
 		{
 			name:   "compact_conversation without note",
@@ -117,7 +117,7 @@ func TestExtensionMethodsWirePayloads(t *testing.T) {
 			name:   "rewind/execute",
 			call:   func(b *Bridge) (map[string]any, error) { return b.RewindExecute(ctx, "", 3) },
 			method: "_x.ai/rewind/execute",
-			params: map[string]any{"sessionId": "s1", "targetIndex": float64(3)},
+			params: map[string]any{"sessionId": "s1", "targetPromptIndex": float64(3)},
 		},
 		{
 			name:   "scheduler/delete",
@@ -203,9 +203,13 @@ func TestExtensionMethodsNoActiveSession(t *testing.T) {
 		{"scheduler/delete", func() error { _, err := b.SchedulerDelete(ctx, "", "t-1"); return err }},
 		{"billing", func() error { _, err := b.Billing(ctx, ""); return err }},
 		{"memory/flush", func() error { _, err := b.MemoryFlush(ctx, ""); return err }},
-		{"memory/rewrite", func() error { _, err := b.MemoryRewrite(ctx, ""); return err }},
+		{"memory/rewrite", func() error { _, err := b.MemoryRewrite(ctx, "", "t", "s"); return err }},
 		{"toggle_plan_mode", func() error { _, err := b.TogglePlanMode(ctx, ""); return err }},
 		{"permissions/reset", func() error { _, err := b.PermissionsReset(ctx, ""); return err }},
+		{"mcp/toggle", func() error { _, err := b.MCPToggle(ctx, "fs", true); return err }},
+		{"mcp/upsert", func() error { _, err := b.MCPUpsert(ctx, map[string]any{"name": "fs", "command": "npx"}); return err }},
+		{"mcp/delete", func() error { _, err := b.MCPDelete(ctx, "fs"); return err }},
+		{"mcp/auth_trigger", func() error { _, err := b.MCPAuthTrigger(ctx, "github"); return err }},
 	} {
 		t.Run(call.name, func(t *testing.T) {
 			err := call.fn()
@@ -218,10 +222,10 @@ func TestExtensionMethodsNoActiveSession(t *testing.T) {
 }
 
 // The admin extension methods must hit the wire with the "_" prefix and
-// the expected params (DeepEqual because mcp/upsert carries a nested
-// server object). sessionId defaults to the active session for the
-// session-scoped methods; the MCP methods are host-global and send no
-// sessionId.
+// the expected params (DeepEqual because mcp/upsert carries flattened
+// config keys). sessionId defaults to the active session; the MCP
+// mutations use the agent's snake_case contract (session_id/server_name)
+// with the active session injected.
 func TestAdminExtensionMethodsWirePayloads(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
@@ -246,57 +250,45 @@ func TestAdminExtensionMethodsWirePayloads(t *testing.T) {
 			name:   "memory/flush",
 			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryFlush(ctx, "") },
 			method: "_x.ai/memory/flush",
-			params: map[string]any{"sessionId": "s1"},
+			params: map[string]any{"session_id": "s1"},
 		},
 		{
 			name:   "memory/rewrite",
-			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryRewrite(ctx, "") },
+			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryRewrite(ctx, "", "new memory", "ctx summary") },
 			method: "_x.ai/memory/rewrite",
-			params: map[string]any{"sessionId": "s1"},
+			params: map[string]any{"sessionId": "s1", "rawText": "new memory", "contextSummary": "ctx summary"},
 		},
 		{
-			name:   "toggle_plan_mode",
-			call:   func(b *Bridge) (map[string]any, error) { return b.TogglePlanMode(ctx, "") },
-			method: "_x.ai/toggle_plan_mode",
-			params: map[string]any{"sessionId": "s1"},
-		},
-		{
-			name:   "permissions/reset",
-			call:   func(b *Bridge) (map[string]any, error) { return b.PermissionsReset(ctx, "") },
-			method: "_x.ai/permissions/reset",
-			params: map[string]any{"sessionId": "s1"},
-		},
-		{
-			name:   "mcp/list sends no sessionId",
+			name:   "mcp/list injects active sessionId",
 			call:   func(b *Bridge) (map[string]any, error) { return b.MCPList(ctx) },
 			method: "_x.ai/mcp/list",
-			params: map[string]any{},
+			params: map[string]any{"sessionId": "s1"},
 		},
 		{
 			name:   "mcp/toggle",
 			call:   func(b *Bridge) (map[string]any, error) { return b.MCPToggle(ctx, "fs", true) },
 			method: "_x.ai/mcp/toggle",
-			params: map[string]any{"name": "fs", "enabled": true},
+			params: map[string]any{"session_id": "s1", "server_name": "fs", "enabled": true},
 		},
 		{
-			name: "mcp/upsert forwards server verbatim",
+			name: "mcp/upsert flattens server into agent contract",
 			call: func(b *Bridge) (map[string]any, error) {
 				return b.MCPUpsert(ctx, map[string]any{"name": "fs", "command": "npx", "args": []any{"-y"}})
 			},
 			method: "_x.ai/mcp/upsert",
-			params: map[string]any{"server": map[string]any{"name": "fs", "command": "npx", "args": []any{"-y"}}},
+			params: map[string]any{"session_id": "s1", "server_name": "fs", "command": "npx", "args": []any{"-y"}},
 		},
 		{
 			name:   "mcp/delete",
 			call:   func(b *Bridge) (map[string]any, error) { return b.MCPDelete(ctx, "fs") },
 			method: "_x.ai/mcp/delete",
-			params: map[string]any{"name": "fs"},
+			params: map[string]any{"session_id": "s1", "server_name": "fs"},
 		},
 		{
 			name:   "mcp/auth_trigger",
 			call:   func(b *Bridge) (map[string]any, error) { return b.MCPAuthTrigger(ctx, "github") },
 			method: "_x.ai/mcp/auth_trigger",
-			params: map[string]any{"name": "github"},
+			params: map[string]any{"session_id": "s1", "server_name": "github"},
 		},
 	}
 	for _, c := range cases {
@@ -330,9 +322,68 @@ func TestAdminExtensionMethodsWirePayloads(t *testing.T) {
 	}
 }
 
-// MCP methods are host-global: they succeed without any session instead
-// of failing with 404.
-func TestMCPMethodsWithoutSession(t *testing.T) {
+// toggle_plan_mode and permissions/reset are fire-and-forget notifications
+// (the agent handles them only in its ext_notification path — a
+// request-style call would get -32601): the bridge writes them WITHOUT a
+// JSON-RPC id, returns a bare ok immediately, and never waits for a reply.
+func TestNotificationExtensionMethodsWirePayloads(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		call   func(b *Bridge) (map[string]any, error)
+		method string
+		params map[string]any
+	}{
+		{
+			name:   "toggle_plan_mode",
+			call:   func(b *Bridge) (map[string]any, error) { return b.TogglePlanMode(ctx, "") },
+			method: "_x.ai/toggle_plan_mode",
+			params: map[string]any{"sessionId": "s1"},
+		},
+		{
+			name:   "permissions/reset",
+			call:   func(b *Bridge) (map[string]any, error) { return b.PermissionsReset(ctx, "") },
+			method: "_x.ai/permissions/reset",
+			params: map[string]any{"sessionId": "s1"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b, w := readyBridge()
+			res, err := c.call(b)
+			if err != nil {
+				t.Fatalf("call error: %v", err)
+			}
+			if res["ok"] != true {
+				t.Errorf("result = %v, want ok:true", res)
+			}
+			msg := w.last()
+			if msg == nil {
+				t.Fatal("no message captured")
+			}
+			if msg["id"] != nil {
+				t.Errorf("wire message has id %v, want notification (no id)", msg["id"])
+			}
+			if got := msg["method"]; got != c.method {
+				t.Errorf("wire method = %v, want %s", got, c.method)
+			}
+			gotParams, _ := msg["params"].(map[string]any)
+			if len(gotParams) != len(c.params) {
+				t.Errorf("params = %v, want %v", gotParams, c.params)
+			}
+			for k, want := range c.params {
+				if gotParams[k] != want {
+					t.Errorf("params[%s] = %v, want %v", k, gotParams[k], want)
+				}
+			}
+		})
+	}
+}
+
+// The session-scoped admin methods require an active session; mcp/list is
+// the only MCP method that still works without one (it returns the bare
+// catalog), while the MCP mutations 404 fast like the rest.
+func TestMCPListWithoutSession(t *testing.T) {
 	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 	w := &recordingStdin{}
 	b.mu.Lock()
@@ -340,25 +391,35 @@ func TestMCPMethodsWithoutSession(t *testing.T) {
 	b.stdin = w
 	b.mu.Unlock()
 	ctx := context.Background()
+	done := make(chan callResult, 1)
+	go func() {
+		res, err := b.MCPList(ctx)
+		done <- callResult{res, err}
+	}()
+	resolveNext(t, b, w, map[string]any{"ok": true})
+	cr := <-done
+	if cr.err != nil {
+		t.Fatalf("mcp/list without session: %v", cr.err)
+	}
+	msg := w.last()
+	gotParams, _ := msg["params"].(map[string]any)
+	if len(gotParams) != 0 {
+		t.Errorf("mcp/list params = %v, want empty", gotParams)
+	}
 	for _, call := range []struct {
 		name string
 		fn   func() (map[string]any, error)
 	}{
-		{"mcp/list", func() (map[string]any, error) { return b.MCPList(ctx) }},
 		{"mcp/toggle", func() (map[string]any, error) { return b.MCPToggle(ctx, "fs", true) }},
+		{"mcp/upsert", func() (map[string]any, error) { return b.MCPUpsert(ctx, map[string]any{"name": "fs", "command": "npx"}) }},
 		{"mcp/delete", func() (map[string]any, error) { return b.MCPDelete(ctx, "fs") }},
 		{"mcp/auth_trigger", func() (map[string]any, error) { return b.MCPAuthTrigger(ctx, "github") }},
 	} {
 		t.Run(call.name, func(t *testing.T) {
-			done := make(chan callResult, 1)
-			go func() {
-				res, err := call.fn()
-				done <- callResult{res, err}
-			}()
-			resolveNext(t, b, w, map[string]any{"ok": true})
-			cr := <-done
-			if cr.err != nil {
-				t.Fatalf("call error: %v", cr.err)
+			_, err := call.fn()
+			var he *HTTPError
+			if !errors.As(err, &he) || he.Code != 404 {
+				t.Errorf("err = %v, want HTTPError 404", err)
 			}
 		})
 	}
