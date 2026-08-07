@@ -97,6 +97,91 @@ Host 与 Hub 断开会自动重连（指数退避）；Hub 端 token 失效且�
 | POST | `/api/rewind-points` | 列出可回退点 `{ sessionId?, cwd? }`（统一归一化为 `{ index, timestamp, summary? }`） |
 | POST | `/api/rewind-execute` | 回退到指定回退点 `{ sessionId?, targetIndex }` |
 
+### x.ai 扩展直通（完整对齐）
+
+以下端点全部 **POST + JSON**，与 grok agent 的 `x.ai/*` 扩展方法一一对应
+（经 `bridge.XaiCall` 直通；`sessionId` / `session_id` 为 `""` 时自动填入活动
+会话，无会话则 404；agent 侧失败统一降级为 `200 {ok:false, error}`）。
+成功应答统一为 `{ "ok": true, "result": <agent 原始结果> }`。
+SSE hello 事件新增 `agentCapabilities` 字段（agent initialize 声明的能力）；
+`/api/prompt` 新增可选字段 `messageId`（UUID）与 `meta`（透传为
+session/prompt 的 `_meta`）。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/xai-call` | 通用直通 `{ method, params? }`（method 形如 `"x.ai/foo"`） |
+| POST | `/api/session-resume` | 恢复会话 `{ sessionId, cwd }`（两字段必填） |
+| POST | `/api/session-close` | 关闭会话 `{ sessionId? }`（缺省活动会话） |
+| POST | `/api/git/status` | git 状态 `{ cwd? }`（cwd 空则不带 gitRoot） |
+| POST | `/api/git/diffs` | 差异 `{ cwd?, from, to, paths? }`（from/to 必填） |
+| POST | `/api/git/stage` | 暂存 `{ cwd?, paths? }` |
+| POST | `/api/git/unstage` | 取消暂存 `{ cwd?, paths? }` |
+| POST | `/api/git/discard` | 丢弃改动 `{ cwd?, paths?, includeUntracked? }` |
+| POST | `/api/git/commit` | 提交 `{ cwd?, message, amend?, signoff?, push? }`（message 必填） |
+| POST | `/api/git/checkout` | 切换分支 `{ cwd?, branch, create? }`（branch 必填） |
+| POST | `/api/git/checkout-commit` | 检出提交 `{ cwd?, commit, stashIfDirty? }`（commit 必填） |
+| POST | `/api/git/stash` | 暂存全部改动 `{ cwd?, includeUntracked? }` |
+| POST | `/api/git/branches` | 分支列表 `{ cwd? }` |
+| POST | `/api/git/current-commit` | 当前提交 `{ cwd? }` |
+| POST | `/api/git/repo-root` | git 仓库根目录 `{ cwd? }` |
+| POST | `/api/queue/remove` | 移除队列条目 `{ id }`（需活动会话） |
+| POST | `/api/queue/clear` | 清空队列（需活动会话） |
+| POST | `/api/queue/reorder` | 重排队列 `{ ids: []string }`（wire 键为 `orderedIds`） |
+| POST | `/api/queue/edit` | 编辑队列条目 `{ id, newText }`（需活动会话） |
+| POST | `/api/queue/interject` | 队列插入 `{ id, newText? }`（需活动会话） |
+| POST | `/api/skills/list` | 技能列表 `{ cwd? }` |
+| POST | `/api/skills/toggle` | 启用/禁用技能 `{ name, enabled }` |
+| POST | `/api/skills/add` | 添加技能路径 `{ path?, cwd? }`（原样透传） |
+| POST | `/api/skills/remove` | 移除技能 `{ name }`（wire 键为 `path`） |
+| POST | `/api/skills/refresh-baseline` | 刷新技能基线 |
+| POST | `/api/plugins/list` | 插件列表 `{ sessionId? }` |
+| POST | `/api/plugins/action` | 插件操作 `{ sessionId?, action }`（action 为 tagged 对象） |
+| POST | `/api/plugins/reload` | 重载插件 |
+| POST | `/api/hooks/list` | hooks 列表 `{ sessionId? }` |
+| POST | `/api/hooks/action` | hook 操作 `{ sessionId?, action }`（action 为 tagged 对象） |
+| POST | `/api/marketplace/list` | 插件市场源列表 |
+| POST | `/api/marketplace/action` | 市场操作 `{ action }`（tagged 对象；需活动会话） |
+| POST | `/api/workflows/list` | 工作流列表 `{ sessionId? }` |
+| POST | `/api/session/info` | 会话信息 `{ sessionId? }` |
+| POST | `/api/session/usage` | 会话用量 `{ sessionId? }` |
+| POST | `/api/session/search` | 会话全文搜索 `{ query, cwd?, limit?, offset?, includeContent? }`（query 必填） |
+| POST | `/api/sessions/list` | 全部会话（FleetView 名册，无参） |
+| POST | `/api/prompt-history` | 提示历史 `{ cwd?, sessionId? }`（wire snake_case：cwd / session_id） |
+| POST | `/api/btw` | 旁路提问 `{ question }`（需活动会话） |
+| POST | `/api/interject` | 回合中插入 `{ text }`（需活动会话） |
+| POST | `/api/commands-list` | 可用斜杠命令 `{ sessionId? }` |
+| POST | `/api/workspaces/list` | 远端工作区列表（无参） |
+| POST | `/api/subagent/list-running` | 运行中的子代理 `{ sessionId? }` |
+| POST | `/api/session/share` | 分享会话 `{ sessionId? }`（wire snake_case：session_id） |
+| POST | `/api/mcp/read-resource` | 读 MCP 资源 `{ server, uri }`（camelCase wire） |
+| POST | `/api/mcp/auth-status` | MCP 认证状态 `{ sessionId? }`（wire snake_case：session_id） |
+| POST | `/api/mcp/setup` | MCP 设置提交 `{ serverName, values }`（camelCase wire） |
+| POST | `/api/mcp/toggle-tool` | 启停 MCP 工具 `{ serverName, toolName, enabled }`（wire snake_case） |
+| POST | `/api/mcp/call` | 调用 MCP 工具 `{ server, tool, arguments?, serverUrl?, sessionId? }`（camelCase wire） |
+| POST | `/api/auth/info` | 当前登录信息（无参） |
+| POST | `/api/auth/logout` | 登出（无参） |
+| POST | `/api/auth/get-url` | 获取登录 URL（无参） |
+| POST | `/api/auth/submit-code` | 提交登录码 `{ code }`（必填） |
+| POST | `/api/fs/list` | 列目录 `{ path, depth?, includeHidden?, limit?, ... }`（path 必填） |
+| POST | `/api/fs/read-file` | 读文件 `{ path, maxBytes?, ... }`（path 必填） |
+| POST | `/api/fs/exists` | 路径存在性 `{ path }`（必填） |
+| POST | `/api/capabilities` | 能力查询（grok 无对应请求分支，agent 侧降级 200 ok:false） |
+| POST | `/api/folder-trust-request` | 目录信任请求（grok 侧为反向请求，agent 侧降级 200 ok:false） |
+| POST | `/api/suggest` | 补全建议 `{ text, cwd? }`（text 必填） |
+| POST | `/api/suggest-prompt` | 下一提示预测 `{ generation? }` |
+| POST | `/api/pr/status` | PR 状态 `{ cwd, branch }`（均必填） |
+| POST | `/api/hunk-tracker/hunks` | hunk 列表 `{ path?, source? }`（get-hunks） |
+| POST | `/api/bundle/status` | bundle 状态（无参） |
+| POST | `/api/terminal/list` | 终端列表（无参） |
+| POST | `/api/search/content` | 内容搜索（扁平键原样透传） |
+| POST | `/api/billing/auto-topup-rule` | 自动充值规则（无参） |
+| POST | `/api/feedback` | 反馈 `{ text }`（wire snake_case：session_id / feedback_text） |
+| POST | `/api/cloud/env/list` | 云端环境列表（无参） |
+
+> 注：grok 侧的队列方法（`x.ai/queue/*`）是 ext_notification 型，本层经
+> `XaiCall` 以 request 型发送，结果原样返回；真实 agent 会对这类方法回
+> `-32601 method_not_found`（宿主降级为 `200 {ok:false}`，不会崩）。
+
 ### 管理 / Agent 控制
 
 | 方法 | 路径 | 说明 |

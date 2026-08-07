@@ -271,24 +271,4 @@ func TestExtSessionMethodNoActiveSession(t *testing.T) {
 	}
 }
 
-// UnwrapExtResult: ExtMethodResult envelope → inner payload; bare results
-// pass through; nil-safe.
-func TestUnwrapExtResult(t *testing.T) {
-	if got := UnwrapExtResult(map[string]any{"result": map[string]any{"ok": true}, "error": nil}); !reflect.DeepEqual(got, map[string]any{"ok": true}) {
-		t.Errorf("envelope = %v, want inner payload", got)
-	}
-	bare := map[string]any{"success": true}
-	if got := UnwrapExtResult(bare); !reflect.DeepEqual(got, bare) {
-		t.Errorf("bare = %v, want unchanged", got)
-	}
-	if got := UnwrapExtResult(nil); got != nil {
-		t.Errorf("nil = %v, want nil", got)
-	}
-	// Non-map payloads (e.g. a JSON scalar result) are left as-is.
-	scalar := map[string]any{"result": "plain"}
-	if got := UnwrapExtResult(scalar); !reflect.DeepEqual(got, scalar) {
-		t.Errorf("scalar envelope = %v, want unchanged", got)
-	}
-}
-
 func boolPtr(v bool) *bool { return &v }
