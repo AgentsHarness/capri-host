@@ -47,6 +47,11 @@ type Bridge struct {
 	bootError string
 	agentInfo map[string]any
 	textBuf   string
+	// agentStartedAt (unix ms) stamps the CURRENT agent process spawn.
+	// Clients compare it across hello events to detect an agent restart —
+	// the agent's permission mode is in-memory only and resets on restart,
+	// so the browser re-seeds its known flags to keep behavior in sync.
+	agentStartedAt int64
 	// Roster: every session created in this process (or loaded), keyed by
 	// sessionId, with host-side live state (busy / awaiting input).
 	sessions        map[string]*SessionState
@@ -389,6 +394,7 @@ func (b *Bridge) Snapshot() Status {
 		PendingRequests: pending,
 		Capabilities:    DefaultClientCaps(),
 		Roster:          roster,
+		AgentStartedAt:  b.agentStartedAt,
 	}
 }
 
@@ -548,12 +554,19 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	if mcp == nil {
 		mcp = []map[string]any{}
 	}
-
-	sessRes, err := b.request(ctx, "session/new", map[string]any{
+	params := map[string]any{
 		"cwd":                   cwd,
 		"additionalDirectories": addDirs,
 		"mcpServers":            mcp,
-	}, bootTimeout)
+	}
+	// Client-supplied session seeds (permission mode flags etc.) ride the
+	// params `_meta`, exactly like the TUI's SessionFlags.to_meta() —
+	// absent key ≠ off, so only send when the client provided seeds.
+	if len(sc.Meta) > 0 {
+		params["_meta"] = sc.Meta
+	}
+
+	sessRes, err := b.request(ctx, "session/new", params, bootTimeout)
 	if err != nil {
 		// A client that disconnected mid-request is not an agent failure —
 		// keep the process so other sessions / the next attempt survive.
@@ -676,6 +689,7 @@ func (b *Bridge) ensureProcess() error {
 	b.cmd = cmd
 	b.stdin = stdin
 	b.cancelRd = cancelRd
+	b.agentStartedAt = time.Now().UnixMilli()
 	b.mu.Unlock()
 
 	go b.readStdout(rdCtx, stdout)
@@ -2018,7 +2032,12 @@ func (b *Bridge) SessionInfo() *SessionInfoDetail {
 // If the target session is already live in this host and has a turn in
 // flight (Busy), we only re-focus the UI onto it — calling agent
 // session/load would conflict with the running turn (previously 409).
-func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string) (map[string]any, error) {
+//
+// An optional meta map (client-supplied permission-mode seeds, e.g.
+// yoloMode/autoMode) is forwarded as the session/load params `_meta` —
+// the TUI's SessionFlags.to_meta() analog. Omitted = current behavior
+// exactly (no `_meta` key on the wire).
+func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ...map[string]any) (map[string]any, error) {
 	b.mu.Lock()
 	if s := b.sessions[sessionID]; s != nil && s.Busy {
 		// Focus-only path for an in-flight session.
@@ -2070,11 +2089,15 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string) (map[st
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	sessRes, err := b.request(ctx, "session/load", map[string]any{
+	params := map[string]any{
 		"sessionId":  sessionID,
 		"cwd":        cwd,
 		"mcpServers": []any{},
-	}, bootTimeout)
+	}
+	if len(meta) > 0 && len(meta[0]) > 0 {
+		params["_meta"] = meta[0]
+	}
+	sessRes, err := b.request(ctx, "session/load", params, bootTimeout)
 	if err != nil {
 		return nil, err
 	}
