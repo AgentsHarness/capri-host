@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/benin/acp-host/internal/acp"
@@ -51,6 +55,12 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/task-kill", s.handleTaskKill)
 	mux.HandleFunc("POST /api/task-list", s.handleTaskList)
 	mux.HandleFunc("POST /api/task-output", s.handleTaskOutput)
+	mux.HandleFunc("POST /api/session-delete", s.handleSessionDelete)
+	mux.HandleFunc("POST /api/compact", s.handleCompact)
+	mux.HandleFunc("POST /api/rewind-points", s.handleRewindPoints)
+	mux.HandleFunc("POST /api/rewind-execute", s.handleRewindExecute)
+	mux.HandleFunc("POST /api/scheduler-delete", s.handleSchedulerDelete)
+	mux.HandleFunc("POST /api/shell", s.handleShell)
 	mux.HandleFunc("GET /api/hosts", s.handleHosts)
 	// CORS for Vite dev
 	s.http = &http.Server{
@@ -695,6 +705,301 @@ func (s *Server) handleTaskOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "task": found})
+}
+
+// handleSessionDelete deletes a session via x.ai/session/delete.
+// Body: {sessionId, cwd} — sessionId defaults to the active session; cwd
+// is accepted for symmetry with the other session endpoints but the wire
+// method only carries {sessionId}.
+func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.SessionDelete(r.Context(), body.SessionID)
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleCompact compacts a session's context via x.ai/compact_conversation.
+// Body: {sessionId, note?} — sessionId defaults to the active session.
+func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Note      string `json:"note"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.CompactConversation(r.Context(), body.SessionID, body.Note)
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleRewindPoints lists a session's rewindable points via
+// x.ai/rewind/points. Body: {sessionId, cwd} — sessionId defaults to the
+// active session. Points are normalized to {index, timestamp, summary?}
+// regardless of the agent's snake_case/camelCase field names.
+func (s *Server) handleRewindPoints(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.RewindPoints(r.Context(), body.SessionID)
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "points": normalizeRewindPoints(res)})
+}
+
+// handleRewindExecute rolls a session back to a rewind point via
+// x.ai/rewind/execute. Body: {sessionId, targetIndex}.
+func (s *Server) handleRewindExecute(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID   string `json:"sessionId"`
+		TargetIndex *int   `json:"targetIndex"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.TargetIndex == nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 targetIndex"})
+		return
+	}
+	res, err := s.bridge.RewindExecute(r.Context(), body.SessionID, *body.TargetIndex)
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleSchedulerDelete deletes a scheduled task via x.ai/scheduler/delete.
+// Body: {sessionId, taskId} — sessionId defaults to the active session.
+func (s *Server) handleSchedulerDelete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		TaskID    string `json:"taskId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.TaskID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 taskId"})
+		return
+	}
+	res, err := s.bridge.SchedulerDelete(r.Context(), body.SessionID, body.TaskID)
+	if err != nil {
+		code := 500
+		var he *acp.HTTPError
+		if errors.As(err, &he) {
+			code = he.Code
+		}
+		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// shellBody is POST /api/shell — local command execution, NOT routed
+// through the agent.
+type shellBody struct {
+	Command   string `json:"command"`
+	Cwd       string `json:"cwd"`
+	TimeoutMs int    `json:"timeoutMs"`
+}
+
+const (
+	shellDefaultTimeout = 10 * time.Second
+	shellMaxTimeout     = 60 * time.Second
+)
+
+// handleShell runs a command locally via os/exec (sh -c) — a pure host
+// facility that never touches the agent. Body: {command, cwd?, timeoutMs?}
+// (cwd defaults to the active session's cwd, timeout defaults to 10s and
+// is capped at 60s). Like handlePrompt, the command runs on an independent
+// context, so a browser disconnect just releases the handler while the
+// command keeps running; only the timeout stops it. No stdin is attached.
+func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
+	var body shellBody
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Command) == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "command 不能为空"})
+		return
+	}
+	cwd := body.Cwd
+	if cwd == "" {
+		cwd = s.bridge.Snapshot().Cwd // active session cwd
+	}
+	if cwd == "" {
+		wd, err := os.Getwd()
+		if err == nil {
+			cwd = wd
+		}
+	}
+	timeout := shellDefaultTimeout
+	if body.TimeoutMs > 0 {
+		t := time.Duration(body.TimeoutMs) * time.Millisecond
+		if t > shellMaxTimeout {
+			t = shellMaxTimeout
+		}
+		timeout = t
+	}
+
+	type shellResult struct {
+		exitCode int
+		stdout   string
+		stderr   string
+		timedOut bool
+	}
+	done := make(chan shellResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", body.Command)
+		cmd.Dir = cwd
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		// No stdin by design.
+		res := shellResult{}
+		if err := cmd.Run(); err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				res.exitCode = ee.ExitCode()
+			} else {
+				res.exitCode = -1
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				res.timedOut = true
+			}
+		}
+		res.stdout = stdout.String()
+		res.stderr = stderr.String()
+		done <- res
+	}()
+
+	select {
+	case <-r.Context().Done():
+		// Client went away mid-run; the command continues in the background.
+		return
+	case res := <-done:
+		writeJSON(w, 200, map[string]any{
+			"ok":       true,
+			"exitCode": res.exitCode,
+			"stdout":   res.stdout,
+			"stderr":   res.stderr,
+			"timedOut": res.timedOut,
+		})
+	}
+}
+
+// firstAny returns the first present value under any of the given keys.
+func firstAny(m map[string]any, keys ...string) any {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+// asInt64 is the lenient int reader for JSON-decoded numbers.
+func asInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i, true
+		}
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
+}
+
+// normalizeRewindPoints unwraps the x.ai/rewind/points response — flat
+// {points:[…]} or ExtMethodResult {result:{points:[…]}} — and normalizes
+// each point's field names (snake_case or camelCase on the wire) into
+// {index, timestamp, summary?}. Points without a usable index are dropped.
+func normalizeRewindPoints(res map[string]any) []map[string]any {
+	if res == nil {
+		return nil
+	}
+	inner := res
+	if r, ok := res["result"].(map[string]any); ok {
+		inner = r
+	}
+	var raw []any
+	if p, ok := inner["points"].([]any); ok {
+		raw = p
+	} else if p, ok := inner["rewindPoints"].([]any); ok {
+		raw = p
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		idx, hasIdx := asInt64(firstAny(m, "index", "prompt_index", "target_prompt_index", "targetIndex"))
+		if !hasIdx {
+			continue
+		}
+		pt := map[string]any{"index": idx}
+		if ts := firstAny(m, "timestamp", "ts"); ts != nil {
+			pt["timestamp"] = ts
+		}
+		if sum := firstAny(m, "summary", "description"); sum != nil {
+			pt["summary"] = sum
+		}
+		out = append(out, pt)
+	}
+	return out
 }
 
 // extractTaskList unwraps x.ai/task/list response shapes into a []map.
