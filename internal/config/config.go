@@ -8,12 +8,13 @@ import (
 type Config struct {
 	Port    int
 	GrokBin string
-	// Hub mode (optional, Phase later)
-	HubEnabled bool
-	HubURL     string
-	HostToken  string
-	HostID     string
-	HostName   string
+	// Hub relay mode: set HUB_URL to pair with acp-hub and serve
+	// requests through it (hub is the browser-facing endpoint).
+	HubURL      string
+	HubPairCode string
+	HostToken   string
+	HostID      string
+	HostName    string
 }
 
 func Load() Config {
@@ -28,13 +29,13 @@ func Load() Config {
 		bin = "grok"
 	}
 	return Config{
-		Port:       port,
-		GrokBin:    bin,
-		HubEnabled: os.Getenv("HUB_ENABLED") == "1" || os.Getenv("HUB_ENABLED") == "true",
-		HubURL:     os.Getenv("HUB_URL"),
-		HostToken:  os.Getenv("HOST_TOKEN"),
-		HostID:     envOr("HOST_ID", "local"),
-		HostName:   envOr("HOST_NAME", "Local Host"),
+		Port:        port,
+		GrokBin:     bin,
+		HubURL:      os.Getenv("HUB_URL"),
+		HubPairCode: os.Getenv("HUB_PAIR_CODE"),
+		HostToken:   os.Getenv("HOST_TOKEN"),
+		HostID:      envOr("HOST_ID", "local"),
+		HostName:    envOr("HOST_NAME", "Local Host"),
 	}
 }
 

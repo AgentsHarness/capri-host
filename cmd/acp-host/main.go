@@ -2,14 +2,15 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/benin/acp-host/internal/acp"
 	"github.com/benin/acp-host/internal/config"
+	"github.com/benin/acp-host/internal/hub"
 	"github.com/benin/acp-host/internal/server"
 )
 
@@ -22,11 +23,32 @@ func main() {
 	})
 	srv := server.New(cfg, bridge)
 
-	// Eager boot in background (non-fatal if grok missing until first prompt)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Hub relay mode: pair with acp-hub and serve requests through it.
+	// The browser talks to the hub; this host keeps working locally too.
+	if cfg.HubURL != "" {
+		hc := hub.NewClient(hub.Config{
+			URL:       cfg.HubURL,
+			HostID:    cfg.HostID,
+			HostName:  cfg.HostName,
+			PairCode:  cfg.HubPairCode,
+			Token:     cfg.HostToken,
+			LocalBase: fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+		})
+		go hc.Run(ctx, bridge)
+	}
+
+	// Eager boot in background (non-fatal if grok missing until first prompt).
+	// Boot only warms the agent process — it does NOT create a session, so
+	// acp-fe opening does not auto-start a new conversation. The first
+	// prompt restores the last known session when one exists; only a machine
+	// with no last-session pointer creates a new chat on demand.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		bootCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		if err := bridge.Boot(ctx, acp.SessionConfig{}); err != nil {
+		if err := bridge.Boot(bootCtx); err != nil {
 			log.Printf("[acp-host] initial boot: %v", err)
 		}
 	}()
@@ -37,12 +59,10 @@ func main() {
 		}
 	}()
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	<-ctx.Done()
 	log.Printf("[acp-host] shutting down…")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = srv.Shutdown(shutdownCtx)
 	bridge.Shutdown()
 }
