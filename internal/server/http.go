@@ -277,6 +277,11 @@ type permBody struct {
 	RequestID string `json:"requestId"`
 	OptionID  string `json:"optionId"`
 	Cancelled bool   `json:"cancelled"`
+	// Scope and FollowupMessage are optional and forwarded to the agent
+	// via the ACP response `_meta` (bash command scope / reject followup),
+	// aligned with the TUI's permission dispatch.
+	Scope           *acp.PermissionScope `json:"scope,omitempty"`
+	FollowupMessage string               `json:"followupMessage,omitempty"`
 }
 
 func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
@@ -289,7 +294,7 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 requestId"})
 		return
 	}
-	if err := s.bridge.RespondPermission(body.RequestID, body.OptionID, body.Cancelled); err != nil {
+	if err := s.bridge.RespondPermissionWithMeta(body.RequestID, body.OptionID, body.Cancelled, body.Scope, body.FollowupMessage); err != nil {
 		writeJSON(w, 404, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
