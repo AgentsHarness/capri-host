@@ -111,6 +111,11 @@ type clientRequest struct {
 	outcome      map[string]any // session/request_permission result
 	result       map[string]any // generic x.ai/* request result
 	errMsg       string
+	// meta: ACP response `_meta` for session/request_permission replies —
+	// the bash scope (BashCommandSelectedTerms: command_parts/is_glob) or
+	// the followup_message the client attached, serialized exactly like the
+	// TUI sends them.
+	meta map[string]any
 }
 
 func NewBridge(cfg GrokConfig) *Bridge {
@@ -1272,9 +1277,7 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 		id := cr.AgentID
 		if cr.cancel {
 			if cr.isPermission {
-				b.respond(id, map[string]any{
-					"outcome": map[string]any{"outcome": "cancelled"},
-				})
+				b.respond(id, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
 			} else {
 				b.respondError(id, "已取消", -32800)
 			}
@@ -1285,41 +1288,109 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 			return
 		}
 		if cr.isPermission {
-			b.respond(id, cr.outcome)
+			b.respond(id, permissionResult(cr.outcome, cr.meta))
 			return
 		}
 		b.respond(id, cr.result)
 	case <-timer.C:
 		b.clientReqs.Delete(reqID)
 		if cr.isPermission {
-			b.respond(cr.AgentID, map[string]any{
-				"outcome": map[string]any{"outcome": "cancelled"},
-			})
+			b.respond(cr.AgentID, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
 		} else {
 			b.respondError(cr.AgentID, "审批超时", -32002)
 		}
 	}
 }
 
-// RespondPermission resolves a pending session/request_permission.
+// permissionResult wraps an ACP permission outcome with the optional
+// response `_meta` — the ACP wire shape is result = {outcome, _meta?}
+// (RequestPermissionResponse; `_meta` reserved for client/agent extension
+// metadata). The meta object carries exactly the keys the TUI puts there:
+// BashCommandSelectedTerms {command_parts, is_glob} or {followup_message}.
+func permissionResult(outcome map[string]any, meta map[string]any) map[string]any {
+	if len(meta) == 0 {
+		return map[string]any{"outcome": outcome}
+	}
+	return map[string]any{
+		"outcome": outcome,
+		"_meta":   meta,
+	}
+}
+
+// RespondPermission resolves a pending session/request_permission without
+// response meta (legacy signature — no scope / followup to attach).
 func (b *Bridge) RespondPermission(requestID, optionID string, cancelled bool) error {
+	return b.RespondPermissionWithMeta(requestID, optionID, cancelled, nil, "")
+}
+
+// RespondPermissionWithMeta resolves a pending session/request_permission,
+// forwarding the client's bash scope and/or followup message to the agent
+// via the ACP response `_meta` — the same wire shape the TUI sends:
+//
+//   - scope (Selected replies): {command_parts: [...], is_glob: bool}
+//     (BashCommandSelectedTerms, word-scope or authored glob).
+//   - followupMessage on a cancelled reply: resolved with the request's
+//     RejectOnce option + {followup_message: text} — the TUI
+//     dispatch_permission_followup semantics, because the agent only reads
+//     followup text off the RejectOnce branch. Without a RejectOnce option
+//     it falls back to a plain Cancelled outcome (TUI does the same).
+//
+// Both fields are optional; with none set the wire response is byte-identical
+// to the legacy RespondPermission.
+func (b *Bridge) RespondPermissionWithMeta(requestID, optionID string, cancelled bool, scope *PermissionScope, followupMessage string) error {
 	v, ok := b.clientReqs.LoadAndDelete(requestID)
 	if !ok {
 		return errors.New("审批请求不存在或已过期")
 	}
 	cr := v.(*clientRequest)
 	if cancelled {
+		if msg := strings.TrimSpace(followupMessage); msg != "" {
+			if rejectOnce := rejectOnceOptionID(cr.Params); rejectOnce != "" {
+				cr.outcome = map[string]any{
+					"outcome":  "selected",
+					"optionId": rejectOnce,
+				}
+				cr.meta = map[string]any{"followup_message": msg}
+				close(cr.done)
+				return nil
+			}
+		}
 		cr.cancel = true
-	} else {
-		cr.outcome = map[string]any{
-			"outcome": map[string]any{
-				"outcome":  "selected",
-				"optionId": optionID,
-			},
+		close(cr.done)
+		return nil
+	}
+	cr.outcome = map[string]any{
+		"outcome":  "selected",
+		"optionId": optionID,
+	}
+	if scope != nil && len(scope.CommandParts) > 0 {
+		cr.meta = map[string]any{
+			"command_parts": scope.CommandParts,
+			"is_glob":       scope.IsGlob,
 		}
 	}
 	close(cr.done)
 	return nil
+}
+
+// rejectOnceOptionID returns the optionId of the request's RejectOnce
+// option ("" when absent). The agent serializes PermissionOptionKind as
+// snake_case ("reject_once"); the camelCase form is tolerated defensively.
+func rejectOnceOptionID(params map[string]any) string {
+	raw, _ := params["options"].([]any)
+	for _, item := range raw {
+		opt, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _ := opt["kind"].(string)
+		if kind != "reject_once" && kind != "rejectOnce" {
+			continue
+		}
+		id, _ := opt["optionId"].(string)
+		return id
+	}
+	return ""
 }
 
 // RespondClientRequest resolves a forwarded x.ai/* request with either a
