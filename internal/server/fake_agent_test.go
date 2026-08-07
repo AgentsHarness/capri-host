@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -36,6 +37,11 @@ const ACPHostFakeAgentEmitPermission = "ACP_HOST_FAKE_AGENT_EMIT_PERMISSION"
 // file, so tests can assert the response meta the host forwarded.
 const ACPHostFakeAgentRecord = "ACP_HOST_FAKE_AGENT_RECORD"
 
+// ACPHostFakeAgentRecordNotifs, when set, makes the fake agent append every
+// host→agent notification line (no JSON-RPC id) to this file, so tests can
+// assert fire-and-forget notifications like _x.ai/yolo_mode_changed.
+const ACPHostFakeAgentRecordNotifs = "ACP_HOST_FAKE_AGENT_RECORD_NOTIFS"
+
 // fakeAgentPermissionID is the JSON-RPC id the fake agent stamps on its
 // emitted permission request.
 const fakeAgentPermissionID float64 = 99
@@ -65,6 +71,11 @@ func runFakeAgent() {
 		}
 		id := msg["id"]
 		if id == nil {
+			// Notification (no id): record it when asked — the fake agent
+			// never answers notifications.
+			if notifs := os.Getenv(ACPHostFakeAgentRecordNotifs); notifs != "" {
+				appendRecordLine(notifs, line)
+			}
 			continue
 		}
 		// Capture the host's permission response: a line without a method
@@ -182,6 +193,23 @@ func postJSON(t *testing.T, s *Server, path, body string) *httptest.ResponseReco
 	return rec
 }
 
+// createActiveSession boots a session through /api/session (the fake agent
+// answers session/new with "sess-new") so session-scoped endpoints like the
+// MCP mutations can resolve an active sessionId.
+func createActiveSession(t *testing.T, s *Server) string {
+	t.Helper()
+	rec := postJSON(t, s, "/api/session", `{"cwd":"/ws"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create session status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	sid, _ := m["sessionId"].(string)
+	if sid == "" {
+		t.Fatalf("create session resp = %s, want sessionId", rec.Body.String())
+	}
+	return sid
+}
+
 // emitPermissionRequest writes a session/request_permission request (id
 // fakeAgentPermissionID) so tests can exercise the host's permission-response
 // path end-to-end. Options include the reject-once row the TUI's followup
@@ -208,6 +236,12 @@ func emitPermissionRequest(out *bufio.Writer) {
 // appendPermissionRecord appends one host→agent response line to the record
 // file (created on first write).
 func appendPermissionRecord(path string, line []byte) {
+	appendRecordLine(path, line)
+}
+
+// appendRecordLine appends one raw line to a record file (created on first
+// write). Shared by the permission-response and notification recorders.
+func appendRecordLine(path string, line []byte) {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
