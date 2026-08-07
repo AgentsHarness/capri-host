@@ -869,9 +869,21 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 			}
 			b.Broadcast(ev)
 		}
+		// Image blocks ride the same chunk carrier: emit one typed image
+		// event per block (text parts still go through the chunk event).
+		for _, img := range contentImages(update["content"]) {
+			if ev, ok := imageEvent(sid, img); ok {
+				b.Broadcast(ev)
+			}
+		}
 	case "user_message_chunk":
 		if text := contentText(update["content"]); text != "" {
 			b.Broadcast(Event{"type": "user_chunk", "text": text, "sessionId": sid})
+		}
+		for _, img := range contentImages(update["content"]) {
+			if ev, ok := imageEvent(sid, img); ok {
+				b.Broadcast(ev)
+			}
 		}
 	case "agent_thought_chunk":
 		// content is typically { "type":"text", "text":"..." }; accept a few shapes
@@ -1101,6 +1113,25 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		b.Broadcast(withSid(Event{"type": "scheduled_task_fired", "params": params}))
 	case "x.ai/scheduled_task_inject_prompt":
 		b.Broadcast(withSid(Event{"type": "scheduled_task_inject_prompt", "params": params}))
+	case "x.ai/scheduled_task_created":
+		// Wire fields may be snake_case (task_id/prompt/interval/
+		// next_fire_at) or camelCase, and taskId may sit at the top level
+		// instead of inside a task object — normalize to one typed event.
+		task, _ := params["task"].(map[string]any)
+		b.Broadcast(withSid(Event{
+			"type": "scheduled_task_created",
+			"task": map[string]any{
+				"taskId":     pick([]map[string]any{task, params}, "taskId", "task_id"),
+				"prompt":     pick([]map[string]any{task, params}, "prompt"),
+				"interval":   pick([]map[string]any{task, params}, "interval"),
+				"nextFireAt": pick([]map[string]any{task, params}, "nextFireAt", "next_fire_at"),
+			},
+		}))
+	case "x.ai/scheduled_task_deleted":
+		b.Broadcast(withSid(Event{
+			"type":   "scheduled_task_deleted",
+			"taskId": pick([]map[string]any{params}, "taskId", "task_id"),
+		}))
 	case "x.ai/session/prompt_complete":
 		b.Broadcast(withSid(Event{"type": "prompt_complete", "params": params}))
 	default:
@@ -1128,6 +1159,20 @@ func asInt(v any) (int64, bool) {
 func toInt64(v any) int64 {
 	n, _ := asInt(v)
 	return n
+}
+
+// pick returns the first present value found under any of the given keys,
+// checking each map in order (snake_case/camelCase wire compatibility).
+// Returns nil when nothing matched.
+func pick(maps []map[string]any, keys ...string) any {
+	for _, m := range maps {
+		for _, k := range keys {
+			if v, ok := m[k]; ok {
+				return v
+			}
+		}
+	}
+	return nil
 }
 
 // trackUsage stashes the session's latest context usage (used/total tokens)
@@ -2224,6 +2269,112 @@ func (b *Bridge) TaskList(ctx context.Context) (map[string]any, error) {
 	}, 30*time.Second)
 }
 
+// SessionDelete calls x.ai/session/delete: {sessionId} (defaults to the
+// active session). Deletion can take a while (worktree cleanup etc.), so
+// it gets a generous 60s timeout.
+func (b *Bridge) SessionDelete(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		sessionID = act.SessionID
+	}
+	b.mu.Unlock()
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/session/delete", map[string]any{
+		"sessionId": sessionID,
+	}, 60*time.Second)
+}
+
+// CompactConversation calls x.ai/compact_conversation: {sessionId, note?}
+// (manual context compaction; the sessionId defaults to the active one).
+func (b *Bridge) CompactConversation(ctx context.Context, sessionID, note string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		sessionID = act.SessionID
+	}
+	b.mu.Unlock()
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	params := map[string]any{"sessionId": sessionID}
+	if note != "" {
+		params["note"] = note
+	}
+	return b.request(ctx, "_x.ai/compact_conversation", params, 60*time.Second)
+}
+
+// RewindPoints calls x.ai/rewind/points: {sessionId} → the agent's list of
+// rewindable conversation points. Raw result is returned; the HTTP layer
+// normalizes the field names (snake_case/camelCase) for the frontend.
+func (b *Bridge) RewindPoints(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		sessionID = act.SessionID
+	}
+	b.mu.Unlock()
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/rewind/points", map[string]any{
+		"sessionId": sessionID,
+	}, 60*time.Second)
+}
+
+// RewindExecute calls x.ai/rewind/execute: {sessionId, targetIndex} —
+// rolls the conversation back to the given rewind point.
+func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetIndex int) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		sessionID = act.SessionID
+	}
+	b.mu.Unlock()
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/rewind/execute", map[string]any{
+		"sessionId":   sessionID,
+		"targetIndex": targetIndex,
+	}, 60*time.Second)
+}
+
+// SchedulerDelete calls x.ai/scheduler/delete: {sessionId, taskId} — stops
+// a scheduled task (sessionId defaults to the active one).
+func (b *Bridge) SchedulerDelete(ctx context.Context, sessionID, taskID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		sessionID = act.SessionID
+	}
+	b.mu.Unlock()
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/scheduler/delete", map[string]any{
+		"sessionId": sessionID,
+		"taskId":    taskID,
+	}, 30*time.Second)
+}
+
 // Shutdown kills grok.
 func (b *Bridge) Shutdown() {
 	b.mu.Lock()
@@ -2265,4 +2416,50 @@ func contentText(v any) string {
 		return b.String()
 	}
 	return ""
+}
+
+// contentImages scans an ACP content value — a plain string, a single
+// block, or a (possibly nested) block array — for image blocks shaped
+// {type:"image", data, mimeType|mime}. It mirrors contentText's traversal
+// so image blocks are found without disturbing the text path.
+func contentImages(v any) []map[string]any {
+	var out []map[string]any
+	var walk func(any)
+	walk = func(v any) {
+		switch c := v.(type) {
+		case map[string]any:
+			if t, _ := c["type"].(string); t == "image" {
+				out = append(out, c)
+				return
+			}
+			if inner, ok := c["content"]; ok {
+				walk(inner)
+			}
+		case []any:
+			for _, item := range c {
+				walk(item)
+			}
+		}
+	}
+	walk(v)
+	return out
+}
+
+// imageEvent builds the SSE image event for one image block:
+// {type:"image", sessionId, data, mimeType}. data is passed through
+// as-is (raw base64 or a data URI); blocks without a string data are
+// skipped (ok=false). mimeType falls back to image/png when absent.
+func imageEvent(sid string, block map[string]any) (Event, bool) {
+	data, ok := block["data"].(string)
+	if !ok {
+		return nil, false
+	}
+	mime, _ := block["mimeType"].(string)
+	if mime == "" {
+		mime, _ = block["mime"].(string)
+	}
+	if mime == "" {
+		mime = "image/png"
+	}
+	return Event{"type": "image", "sessionId": sid, "data": data, "mimeType": mime}, true
 }
