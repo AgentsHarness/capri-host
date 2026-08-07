@@ -80,12 +80,15 @@ func (s *Server) handleXaiCall(w http.ResponseWriter, r *http.Request) {
 
 // ── 官方 ACP 补齐 ─────────────────────────────────────────────────────
 
-// handleSessionResume — POST /api/session-resume {sessionId, cwd} → ResumeSession。
-// 两个字段必填（400）。
+// handleSessionResume — POST /api/session-resume {sessionId, cwd, meta?} →
+// ResumeSession. sessionId/cwd are required (400); the optional meta map
+// (client-supplied seeds) is forwarded as the session/resume params `_meta`
+// (the session-load analog), omitted when absent.
 func (s *Server) handleSessionResume(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SessionID string `json:"sessionId"`
-		Cwd       string `json:"cwd"`
+		SessionID string         `json:"sessionId"`
+		Cwd       string         `json:"cwd"`
+		Meta      map[string]any `json:"meta,omitempty"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -94,7 +97,7 @@ func (s *Server) handleSessionResume(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
 		return
 	}
-	res, err := s.bridge.ResumeSession(r.Context(), body.SessionID, body.Cwd)
+	res, err := s.bridge.ResumeSession(r.Context(), body.SessionID, body.Cwd, body.Meta)
 	if err != nil {
 		writeAgentError(w, "session/resume", err)
 		return
@@ -672,7 +675,32 @@ func (s *Server) handleCommandsList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWorkspacesList(w http.ResponseWriter, r *http.Request) {
-	s.xaiCall(w, r, "x.ai/workspaces/list", map[string]any{})
+	// Optional x.ai/workspaces/list fields (camelCase, workspaces.rs):
+	// pageSize/pageToken/query/kind — forwarded only when present (absent
+	// = the existing no-arg request exactly).
+	var body struct {
+		PageSize  *int   `json:"pageSize,omitempty"`
+		PageToken string `json:"pageToken,omitempty"`
+		Query     string `json:"query,omitempty"`
+		Kind      string `json:"kind,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	params := map[string]any{}
+	if body.PageSize != nil {
+		params["pageSize"] = *body.PageSize
+	}
+	if body.PageToken != "" {
+		params["pageToken"] = body.PageToken
+	}
+	if body.Query != "" {
+		params["query"] = body.Query
+	}
+	if body.Kind != "" {
+		params["kind"] = body.Kind
+	}
+	s.xaiCall(w, r, "x.ai/workspaces/list", params)
 }
 
 func (s *Server) handleSubagentListRunning(w http.ResponseWriter, r *http.Request) {
@@ -888,8 +916,14 @@ func (s *Server) handleFolderTrustRequest(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleSuggest(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Text string `json:"text"`
-		Cwd  string `json:"cwd"`
+		Text       string  `json:"text"`
+		Cwd        string  `json:"cwd"`
+		Cursor     *int    `json:"cursor,omitempty"`
+		Limit      *int    `json:"limit,omitempty"`
+		Generation *uint64 `json:"generation,omitempty"`
+		IncludeAI  *bool   `json:"includeAi,omitempty"`
+		AIModel    string  `json:"aiModel,omitempty"`
+		TokenOnly  *bool   `json:"tokenOnly,omitempty"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -901,6 +935,26 @@ func (s *Server) handleSuggest(w http.ResponseWriter, r *http.Request) {
 	params := map[string]any{"text": body.Text}
 	if body.Cwd != "" {
 		params["cwd"] = body.Cwd
+	}
+	// Optional x.ai/suggest fields (camelCase, suggest/mod.rs): forwarded
+	// only when present (absent = the existing text/cwd request exactly).
+	if body.Cursor != nil {
+		params["cursor"] = *body.Cursor
+	}
+	if body.Limit != nil {
+		params["limit"] = *body.Limit
+	}
+	if body.Generation != nil {
+		params["generation"] = *body.Generation
+	}
+	if body.IncludeAI != nil {
+		params["includeAi"] = *body.IncludeAI
+	}
+	if body.AIModel != "" {
+		params["aiModel"] = body.AIModel
+	}
+	if body.TokenOnly != nil {
+		params["tokenOnly"] = *body.TokenOnly
 	}
 	s.xaiCall(w, r, "x.ai/suggest", params)
 }

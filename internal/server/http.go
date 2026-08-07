@@ -145,6 +145,81 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/billing/auto-topup-rule", s.handleAutoTopupRule)
 	mux.HandleFunc("POST /api/feedback", s.handleFeedback)
 	mux.HandleFunc("POST /api/cloud/env/list", s.handleCloudEnvList)
+	// ── x.ai 扩展直通（完整对齐，第二批；实现见 http_ext2.go）──
+	mux.HandleFunc("POST /api/session/state", s.handleSessionStateExt)
+	mux.HandleFunc("POST /api/session-import", s.handleSessionImport)
+	mux.HandleFunc("POST /api/session-repair", s.handleSessionRepair)
+	mux.HandleFunc("POST /api/session-update-mcp-servers", s.handleSessionUpdateMcpServers)
+	mux.HandleFunc("POST /api/session-add-local-workspace", s.handleSessionAddLocalWorkspace)
+	mux.HandleFunc("POST /api/session-resolve-worktree-resume", s.handleSessionResolveWorktreeResume)
+	mux.HandleFunc("POST /api/session-rehydrate", s.handleSessionRehydrate)
+	mux.HandleFunc("POST /api/session-summaries/session-list", s.handleSessionSummariesSessionList)
+	mux.HandleFunc("POST /api/session-summaries/workspace-list", s.handleSessionSummariesWorkspaceList)
+	mux.HandleFunc("POST /api/session-summaries/workspace-list-recent", s.handleSessionSummariesWorkspaceListRecent)
+	mux.HandleFunc("POST /api/cloud/terminate", s.handleCloudTerminate)
+	mux.HandleFunc("POST /api/cloud/env/create", s.handleCloudEnvCreate)
+	mux.HandleFunc("POST /api/cloud/env/update", s.handleCloudEnvUpdate)
+	mux.HandleFunc("POST /api/cloud/env/delete", s.handleCloudEnvDelete)
+	mux.HandleFunc("POST /api/api-key-get", s.handleApiKeyGet)
+	mux.HandleFunc("POST /api/api-key-set", s.handleApiKeySet)
+	mux.HandleFunc("POST /api/auth/get-bearer-token", s.handleAuthGetBearerToken)
+	mux.HandleFunc("POST /api/auth/cancel", s.handleAuthCancel)
+	mux.HandleFunc("POST /api/auth/check-subscription", s.handleAuthCheckSubscription)
+	mux.HandleFunc("POST /api/privacy/set-coding-data-retention", s.handlePrivacySetCodingDataRetention)
+	mux.HandleFunc("POST /api/rollout/survey", s.handleRolloutSurvey)
+	mux.HandleFunc("POST /api/git/files", s.handleGitFiles)
+	mux.HandleFunc("POST /api/git/stage-content", s.handleGitStageContent)
+	mux.HandleFunc("POST /api/git/checkout-session-head", s.handleGitCheckoutSessionHead)
+	mux.HandleFunc("POST /api/git/worktree/create", s.handleWorktreeCreate)
+	mux.HandleFunc("POST /api/git/worktree/remove", s.handleWorktreeRemove)
+	mux.HandleFunc("POST /api/git/worktree/apply", s.handleWorktreeApply)
+	mux.HandleFunc("POST /api/git/worktree/create-from-worktree", s.handleWorktreeCreateFromWorktree)
+	mux.HandleFunc("POST /api/git/worktree/create-from-worktree-sync", s.handleWorktreeCreateFromWorktreeSync)
+	mux.HandleFunc("POST /api/git/worktree/resume-session", s.handleWorktreeResumeSession)
+	mux.HandleFunc("POST /api/git/worktree/list", s.handleWorktreeList)
+	mux.HandleFunc("POST /api/git/worktree/show", s.handleWorktreeShow)
+	mux.HandleFunc("POST /api/git/worktree/gc", s.handleWorktreeGc)
+	mux.HandleFunc("POST /api/git/worktree/db/stats", s.handleWorktreeDbStats)
+	mux.HandleFunc("POST /api/git/worktree/db/rebuild", s.handleWorktreeDbRebuild)
+	mux.HandleFunc("POST /api/git/worktree/db/path", s.handleWorktreeDbPath)
+	mux.HandleFunc("POST /api/hunk-tracker/files", s.handleHunkTrackerFiles)
+	mux.HandleFunc("POST /api/hunk-tracker/file-contents", s.handleHunkTrackerFileContents)
+	mux.HandleFunc("POST /api/hunk-tracker/summary", s.handleHunkTrackerSummary)
+	mux.HandleFunc("POST /api/hunk-tracker/hunk-action", s.handleHunkTrackerHunkAction)
+	mux.HandleFunc("POST /api/hunk-tracker/file-action", s.handleHunkTrackerFileAction)
+	mux.HandleFunc("POST /api/hunk-tracker/turn-action", s.handleHunkTrackerTurnAction)
+	mux.HandleFunc("POST /api/hunk-tracker/all-action", s.handleHunkTrackerAllAction)
+	mux.HandleFunc("POST /api/skills/reset", s.handleSkillsReset)
+	mux.HandleFunc("POST /api/skills/config", s.handleSkillsConfig)
+	mux.HandleFunc("POST /api/plugins/notify-updates", s.handlePluginsNotifyUpdates)
+	mux.HandleFunc("POST /api/subagent/get", s.handleSubagentGet)
+	mux.HandleFunc("POST /api/terminal/create", s.handleTerminalCreate)
+	mux.HandleFunc("POST /api/terminal/kill", s.handleTerminalKill)
+	mux.HandleFunc("POST /api/terminal/output", s.handleTerminalOutput)
+	mux.HandleFunc("POST /api/terminal/wait-for-exit", s.handleTerminalWaitForExit)
+	mux.HandleFunc("POST /api/terminal/release", s.handleTerminalRelease)
+	mux.HandleFunc("POST /api/terminal/background", s.handleTerminalBackground)
+	mux.HandleFunc("POST /api/terminal/pty/create", s.handleTerminalPtyCreate)
+	mux.HandleFunc("POST /api/terminal/pty/load", s.handleTerminalPtyLoad)
+	mux.HandleFunc("POST /api/terminal/pty/resize", s.handleTerminalPtyResize)
+	mux.HandleFunc("POST /api/terminal/pty/input", s.handleTerminalPtyInput)
+	mux.HandleFunc("POST /api/fs/write-file", s.handleFSWriteFile)
+	mux.HandleFunc("POST /api/fs/delete-file", s.handleFSDeleteFile)
+	mux.HandleFunc("POST /api/search/fuzzy/open", s.handleSearchFuzzyOpen)
+	mux.HandleFunc("POST /api/search/fuzzy/change", s.handleSearchFuzzyChange)
+	mux.HandleFunc("POST /api/search/fuzzy/close", s.handleSearchFuzzyClose)
+	mux.HandleFunc("POST /api/bundle/sync", s.handleBundleSync)
+	mux.HandleFunc("POST /api/bundle/entry-get", s.handleBundleEntryGet)
+	mux.HandleFunc("POST /api/code/goto-definition", s.handleCodeGotoDefinition)
+	mux.HandleFunc("POST /api/code/goto-references", s.handleCodeGotoReferences)
+	mux.HandleFunc("POST /api/code/find-definitions", s.handleCodeFindDefinitions)
+	mux.HandleFunc("POST /api/code/find-references", s.handleCodeFindReferences)
+	mux.HandleFunc("POST /api/code/status", s.handleCodeStatus)
+	mux.HandleFunc("POST /api/review/comment", s.handleReviewComment)
+	mux.HandleFunc("POST /api/review/comment-delete", s.handleReviewCommentDelete)
+	mux.HandleFunc("POST /api/debug/trigger-feedback", s.handleDebugTriggerFeedback)
+	mux.HandleFunc("POST /api/debug/arm-auto-compact", s.handleDebugArmAutoCompact)
+	mux.HandleFunc("POST /api/debug/agent", s.handleDebugAgent)
 	// CORS for Vite dev
 	s.http = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -348,12 +423,33 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 type cancelBody struct {
 	// Optional: target session (defaults to the active session).
 	SessionID string `json:"sessionId,omitempty"`
+	// Optional session/cancel `_meta` seeds (grok reads them at
+	// acp_agent.rs:2079-2108): cancelTrigger ("esc"|"ctrl_c"),
+	// cancelSubagents (default true), rewindIfNoOutput / rewindIfPristine.
+	// Only the keys the client sends are forwarded; absent = agent default.
+	CancelTrigger    string `json:"cancelTrigger,omitempty"`
+	CancelSubagents  *bool  `json:"cancelSubagents,omitempty"`
+	RewindIfNoOutput *bool  `json:"rewindIfNoOutput,omitempty"`
+	RewindIfPristine *bool  `json:"rewindIfPristine,omitempty"`
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var body cancelBody
 	_ = readJSON(r, &body)
-	s.bridge.Cancel(body.SessionID)
+	meta := map[string]any{}
+	if body.CancelTrigger != "" {
+		meta["cancelTrigger"] = body.CancelTrigger
+	}
+	if body.CancelSubagents != nil {
+		meta["cancelSubagents"] = *body.CancelSubagents
+	}
+	if body.RewindIfNoOutput != nil {
+		meta["rewindIfNoOutput"] = *body.RewindIfNoOutput
+	}
+	if body.RewindIfPristine != nil {
+		meta["rewindIfPristine"] = *body.RewindIfPristine
+	}
+	s.bridge.CancelWithMeta(body.SessionID, meta)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -470,8 +566,24 @@ func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// listSessionsBody — POST /api/sessions. cwd/cursor/meta are OPTIONAL
+// official session/list fields forwarded on the wire when present (absent
+// = the existing `{}` request exactly); the response keeps the existing
+// local enrichment (status/badges) untouched.
+type listSessionsBody struct {
+	Cwd    string         `json:"cwd,omitempty"`
+	Cursor string         `json:"cursor,omitempty"`
+	Meta   map[string]any `json:"meta,omitempty"`
+}
+
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	sessions, err := s.bridge.ListSessions(r.Context())
+	var body listSessionsBody
+	_ = readJSON(r, &body)
+	var opts acp.ListSessionsOpts
+	if body.Cwd != "" || body.Cursor != "" || len(body.Meta) > 0 {
+		opts = acp.ListSessionsOpts{Cwd: body.Cwd, Cursor: body.Cursor, Meta: body.Meta}
+	}
+	sessions, err := s.bridge.ListSessions(r.Context(), opts)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -556,6 +668,13 @@ type sessionUpdatesBody struct {
 	Cwd       string `json:"cwd"`
 	Offset    *int64 `json:"offset"`
 	Limit     *int   `json:"limit"`
+	// Optional x.ai/session/updates request fields (camelCase on the wire):
+	// stream delivers updates as chunked notifications, chunkSize sets the
+	// per-chunk size (default 64), turnIndex tails by user-message turn
+	// count. Absent = the existing offset/limit behavior exactly.
+	Stream    bool `json:"stream,omitempty"`
+	ChunkSize *int `json:"chunkSize,omitempty"`
+	TurnIndex *int `json:"turnIndex,omitempty"`
 }
 
 // handleSessionUpdates fetches a session's stored updates (message history)
@@ -571,7 +690,14 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
 		return
 	}
-	page, err := s.bridge.SessionUpdates(r.Context(), body.SessionID, body.Cwd, body.Offset, body.Limit)
+	opts := acp.SessionUpdatesOpts{Offset: body.Offset, Limit: body.Limit, Stream: body.Stream}
+	if body.ChunkSize != nil {
+		opts.ChunkSize = body.ChunkSize
+	}
+	if body.TurnIndex != nil {
+		opts.TurnIndex = body.TurnIndex
+	}
+	page, err := s.bridge.SessionUpdates(r.Context(), body.SessionID, body.Cwd, opts)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
