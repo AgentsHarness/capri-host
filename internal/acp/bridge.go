@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -472,19 +473,21 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 			// x.ai extension capabilities (aligned with the Grok Build TUI):
 			// bash output streams incrementally without ANSI color (we render
 			// it as plain text), git head changes are notified, hunk tracking
-			// stays agent-side.
-			"meta": map[string]any{
-				"x.ai/incrementalBashOutput": true,
-				"x.ai/bashOutputNoColor":     true,
-				"x.ai/gitHeadChanged":        true,
-				"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
-			},
+			// stays agent-side. codeNavigation / folderTrust / fs_notify are
+			// env-opt-in (absent = off, same as the TUI).
+			"meta": initCapabilitiesMeta(),
 		},
 		"clientInfo": map[string]any{
 			"name":    "acp-host",
 			"title":   "ACP Host",
 			"version": "0.1.0",
 		},
+		// `_meta` mirrors the Grok Build TUI's build_initialize_meta
+		// (xai-grok-pager/src/acp/mod.rs): clientType defaults to the
+		// pager's PAGER_CLIENT_TYPE and clientVersion to its build-time
+		// version; the remaining seeds are env-driven and omitted when the
+		// env var is absent (matching the TUI's default omit).
+		"_meta": initMetaSeeds(),
 	}, bootTimeout)
 	if err != nil {
 		// A live-but-wedged process can fail initialize repeatedly; kill it so
@@ -552,6 +555,102 @@ func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
 		return err
 	}
 	return b.createSession(ctx, sc)
+}
+
+// initClientType / initClientVersion mirror the Grok Build TUI's initialize
+// `_meta` (xai-grok-pager/src/client_identity.rs): PAGER_CLIENT_TYPE is the
+// literal "grok-pager"; PAGER_CLIENT_VERSION is the build-time crate version,
+// which the host approximates with its own release constant.
+const (
+	initClientType    = "grok-pager"
+	initClientVersion = "0.1.0"
+)
+
+// initMetaSeeds builds the initialize request `_meta` (the TUI's
+// build_initialize_meta analog): clientType/clientVersion always present,
+// the remaining seeds only when their env var is set (absent env = key
+// omitted, matching the TUI's default). Verified against the agent's reads:
+// clientIdentifier (acp_agent.rs:134), clientSource (mod.rs:2212),
+// systemPromptOverride (mod.rs:1119), rules (mod.rs:1099), mcpApps
+// (acp_agent.rs:167), bufferingSettings (acp_agent.rs:176), startupHints
+// (agent_ops.rs:4108).
+func initMetaSeeds() map[string]any {
+	meta := map[string]any{
+		"clientType":    initClientType,
+		"clientVersion": initClientVersion,
+	}
+	addStringEnv(meta, "clientIdentifier", "ACP_INIT_CLIENT_IDENTIFIER")
+	addStringEnv(meta, "clientSource", "ACP_INIT_CLIENT_SOURCE")
+	addStringEnv(meta, "systemPromptOverride", "ACP_INIT_SYSTEM_PROMPT_OVERRIDE")
+	addStringEnv(meta, "rules", "ACP_INIT_RULES")
+	if boolEnv("ACP_INIT_MCP_APPS") {
+		meta["mcpApps"] = true
+	}
+	if v := jsonEnv("ACP_INIT_BUFFERING_SETTINGS"); v != nil {
+		// BufferingSettings is camelCase on the wire (update_chunk_merge.rs).
+		meta["bufferingSettings"] = v
+	}
+	if v := jsonEnv("ACP_INIT_STARTUP_HINTS"); v != nil {
+		// StartupHints is camelCase (session/acp_types.rs).
+		meta["startupHints"] = v
+	}
+	return meta
+}
+
+// initCapabilitiesMeta builds the clientCapabilities.meta object: the four
+// always-on TUI capabilities plus env-opt-in codeNavigation / folderTrust /
+// fs_notify (absent = off, matching the TUI where those keys are absent).
+func initCapabilitiesMeta() map[string]any {
+	meta := map[string]any{
+		"x.ai/incrementalBashOutput": true,
+		"x.ai/bashOutputNoColor":     true,
+		"x.ai/gitHeadChanged":        true,
+		"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
+	}
+	if boolEnv("ACP_CAP_CODE_NAVIGATION") {
+		// Agent reads meta["x.ai/codeNavigation"]["enabled"] (code_nav.rs:9).
+		meta["x.ai/codeNavigation"] = map[string]any{"enabled": true}
+	}
+	if boolEnv("ACP_CAP_FOLDER_TRUST_INTERACTIVE") {
+		// Agent reads meta["x.ai/folderTrust"]["interactive"]
+		// (folder_trust_prompt.rs:75).
+		meta["x.ai/folderTrust"] = map[string]any{"interactive": true}
+	}
+	if boolEnv("ACP_CAP_FS_NOTIFY") {
+		// Agent reads meta["x.ai/fs_notify"] as a bool (agent_ops.rs:4044).
+		meta["x.ai/fs_notify"] = true
+	}
+	return meta
+}
+
+// addStringEnv adds key → env value to m when the env var is non-empty.
+func addStringEnv(m map[string]any, key, env string) {
+	if v := os.Getenv(env); v != "" {
+		m[key] = v
+	}
+}
+
+// boolEnv reports whether an env var is set to a truthy value
+// (1/true/yes/on; case-insensitive). Unset or anything else = false.
+func boolEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// jsonEnv parses an env var as a JSON object; nil when unset or invalid.
+func jsonEnv(name string) map[string]any {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return nil
+	}
+	var v map[string]any
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return nil
+	}
+	return v
 }
 
 // createSession calls session/new and registers the session in the roster.
@@ -659,11 +758,41 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	if methodID == "" {
 		return errors.New("没有可用的认证方式，请先运行 `grok login`，或设置环境变量 XAI_API_KEY")
 	}
+	// The agent's AuthRequestMeta (mvp_agent/mod.rs:1203) reads
+	// headless/reauth/use_oauth/force_interactive/request_seq from the
+	// authenticate `_meta`. headless stays true; the rest are env-driven
+	// and omitted when absent (absent key = current behavior exactly).
+	meta := map[string]any{"headless": true}
+	if boolEnv("ACP_AUTH_REAUTH") {
+		meta["reauth"] = true
+	}
+	if boolEnv("ACP_AUTH_USE_OAUTH") {
+		meta["use_oauth"] = true
+	}
+	if boolEnv("ACP_AUTH_FORCE_INTERACTIVE") {
+		meta["force_interactive"] = true
+	}
+	if v, ok := intEnv("ACP_AUTH_REQUEST_SEQ"); ok {
+		meta["request_seq"] = v
+	}
 	_, err := b.request(ctx, "authenticate", map[string]any{
 		"methodId": methodID,
-		"_meta":    map[string]any{"headless": true},
+		"_meta":    meta,
 	}, bootTimeout)
 	return err
+}
+
+// intEnv parses an env var as an integer (ok=false when unset/invalid).
+func intEnv(name string) (int64, bool) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 func (b *Bridge) setBootError(msg string) {
@@ -919,6 +1048,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 					}
 				}
 			}
+			// fullUpdate carries the ENTIRE original update map so no
+			// field of the agent_message_chunk payload is ever dropped.
+			ev["fullUpdate"] = update
 			b.Broadcast(ev)
 		}
 		// Image blocks ride the same chunk carrier: emit one typed image
@@ -950,6 +1082,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 					}
 				}
 			}
+			// fullUpdate carries the ENTIRE original update map so no
+			// field of the user_message_chunk payload is ever dropped.
+			ev["fullUpdate"] = update
 			b.Broadcast(ev)
 		}
 		for _, img := range contentImages(update["content"]) {
@@ -1200,7 +1335,11 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 			models := act.models
 			b.mu.Unlock()
 			if models != nil {
-				b.Broadcast(withSid(Event{"type": "models_update", "params": models}))
+				ev := Event{"type": "models_update", "params": models}
+				// raw carries the ORIGINAL notification params so no field
+				// of the machine-wide broadcast is lost to the merge.
+				ev["raw"] = params
+				b.Broadcast(withSid(ev))
 			}
 		} else {
 			b.mu.Unlock()
@@ -1212,24 +1351,48 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 	case "x.ai/scheduled_task_inject_prompt":
 		b.Broadcast(withSid(Event{"type": "scheduled_task_inject_prompt", "params": params}))
 	case "x.ai/scheduled_task_created":
-		// Wire fields may be snake_case (task_id/prompt/interval/
-		// next_fire_at) or camelCase, and taskId may sit at the top level
-		// instead of inside a task object — normalize to one typed event.
+		// Wire fields may be snake_case (task_id/prompt/human_schedule/
+		// next_fire_at, the SessionUpdate::ScheduledTaskCreated carrier) or
+		// camelCase, and taskId may sit at the top level instead of inside
+		// a task object — normalize to one typed event. The normalized
+		// `task` keeps the FE contract (taskId/prompt/interval/nextFireAt),
+		// while `rawTask`/`rawParams`/`meta` preserve every remaining
+		// original field (humanSchedule, status, enabled, createdAt,
+		// lastFiredAt, timezone, _meta.eventId /
+		// x.ai/schedulerGeneration / x.ai/schedulerRevision, …) so nothing
+		// is dropped.
 		task, _ := params["task"].(map[string]any)
-		b.Broadcast(withSid(Event{
+		update, _ := params["update"].(map[string]any)
+		ev := withSid(Event{
 			"type": "scheduled_task_created",
 			"task": map[string]any{
-				"taskId":     pick([]map[string]any{task, params}, "taskId", "task_id"),
-				"prompt":     pick([]map[string]any{task, params}, "prompt"),
-				"interval":   pick([]map[string]any{task, params}, "interval"),
-				"nextFireAt": pick([]map[string]any{task, params}, "nextFireAt", "next_fire_at"),
+				"taskId":     pick([]map[string]any{task, update, params}, "taskId", "task_id"),
+				"prompt":     pick([]map[string]any{task, update, params}, "prompt"),
+				"interval":   pick([]map[string]any{task, update, params}, "interval", "humanSchedule", "human_schedule"),
+				"nextFireAt": pick([]map[string]any{task, update, params}, "nextFireAt", "next_fire_at"),
 			},
-		}))
+		})
+		// Full original payloads ride along — nothing is dropped anymore.
+		ev["rawParams"] = params
+		if len(update) > 0 {
+			ev["rawTask"] = update
+		}
+		if meta, ok := params["_meta"].(map[string]any); ok {
+			ev["meta"] = meta
+		}
+		b.Broadcast(ev)
 	case "x.ai/scheduled_task_deleted":
-		b.Broadcast(withSid(Event{
+		ev := withSid(Event{
 			"type":   "scheduled_task_deleted",
 			"taskId": pick([]map[string]any{params}, "taskId", "task_id"),
-		}))
+		})
+		// rawParams preserves the full original params (e.g. session_id +
+		// _meta.eventId / scheduler generation-revision stamps).
+		ev["rawParams"] = params
+		if meta, ok := params["_meta"].(map[string]any); ok {
+			ev["meta"] = meta
+		}
+		b.Broadcast(ev)
 	case "x.ai/session/prompt_complete":
 		b.Broadcast(withSid(Event{"type": "prompt_complete", "params": params}))
 	default:
@@ -1724,6 +1887,15 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 // Cancel sends session/cancel for the given session (default: active) and
 // cancels its pending client requests.
 func (b *Bridge) Cancel(sessionID string) {
+	b.CancelWithMeta(sessionID, nil)
+}
+
+// CancelWithMeta is Cancel with an optional `_meta` forwarded on the
+// session/cancel params. The agent reads cancelTrigger ("esc"|"ctrl_c"),
+// cancelSubagents (default true), and rewindIfNoOutput / rewindIfPristine
+// from that meta (mvp_agent/acp_agent.rs:2079-2108); an empty meta keeps
+// the wire byte-identical to Cancel.
+func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 	b.mu.Lock()
 	if sessionID == "" {
 		sessionID = b.activeSessionID
@@ -1735,10 +1907,14 @@ func (b *Bridge) Cancel(sessionID string) {
 	}
 	b.mu.Unlock()
 	if sid != "" {
+		params := map[string]any{"sessionId": sid}
+		if len(meta) > 0 {
+			params["_meta"] = meta
+		}
 		_ = b.write(map[string]any{
 			"jsonrpc": "2.0",
 			"method":  "session/cancel",
-			"params":  map[string]any{"sessionId": sid},
+			"params":  params,
 		})
 	}
 	b.clientReqs.Range(func(key, value any) bool {
@@ -1950,13 +2126,38 @@ func (b *Bridge) applyModelsCatalog(s *SessionState, incoming map[string]any) {
 	}
 }
 
+// ListSessionsOpts carries the optional official session/list params the
+// host forwards on the wire: cwd (scope), cursor (pagination), and Meta
+// (→ `_meta`, the ACP list request's meta — read by the agent at
+// handlers/session.rs:310 as `args.meta`). Zero values are omitted, so the
+// default wire shape stays `{}` exactly.
+type ListSessionsOpts struct {
+	Cwd    string
+	Cursor string
+	Meta   map[string]any
+}
+
 // ListSessions calls session/list if supported and enriches every session
 // item with the host-side live status (dashboard active/idle/awaiting).
-func (b *Bridge) ListSessions(ctx context.Context) ([]any, error) {
+// Optional opts forward the official request fields (cwd/cursor/`_meta`);
+// the local enrichment is untouched.
+func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) ([]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	res, err := b.request(ctx, "session/list", map[string]any{}, 30*time.Second)
+	params := map[string]any{}
+	if len(opts) > 0 {
+		if opts[0].Cwd != "" {
+			params["cwd"] = opts[0].Cwd
+		}
+		if opts[0].Cursor != "" {
+			params["cursor"] = opts[0].Cursor
+		}
+		if len(opts[0].Meta) > 0 {
+			params["_meta"] = opts[0].Meta
+		}
+	}
+	res, err := b.request(ctx, "session/list", params, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -2241,7 +2442,12 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 // and a busy in-flight target takes the same focus-only path (re-focus +
 // re-announce busy, no agent call — session/resume would conflict with the
 // running turn).
-func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string) (map[string]any, error) {
+//
+// An optional meta map (client-supplied seeds, e.g. permission-mode flags)
+// is forwarded as the session/resume params `_meta` — the LoadSession
+// analog. Omitted = current behavior exactly (no `_meta` key on the wire;
+// additionalDirectories stays []).
+func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta ...map[string]any) (map[string]any, error) {
 	b.mu.Lock()
 	if s := b.sessions[sessionID]; s != nil && s.Busy {
 		// Focus-only path for an in-flight session (mirror LoadSession).
@@ -2293,12 +2499,16 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string) (map[
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	sessRes, err := b.request(ctx, "session/resume", map[string]any{
+	params := map[string]any{
 		"sessionId":             sessionID,
 		"cwd":                   cwd,
 		"mcpServers":            []any{},
 		"additionalDirectories": []any{},
-	}, bootTimeout)
+	}
+	if len(meta) > 0 && len(meta[0]) > 0 {
+		params["_meta"] = meta[0]
+	}
+	sessRes, err := b.request(ctx, "session/resume", params, bootTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -2407,19 +2617,45 @@ type UpdatesPage struct {
 	HasMore    bool  `json:"hasMore"`
 }
 
+// SessionUpdatesOpts carries the optional x.ai/session/updates request
+// fields (extensions/session_updates.rs Request, camelCase): offset/limit
+// keep the existing pagination, stream delivers the updates as chunked
+// notifications (agent replies {totalCount, chunkCount, …}), chunkSize
+// sets the updates per chunk (default 64), turnIndex tails by user-message
+// turn count. Zero values are omitted — the wire shape for the existing
+// callers is unchanged.
+type SessionUpdatesOpts struct {
+	Offset    *int64
+	Limit     *int
+	Stream    bool
+	ChunkSize *int
+	TurnIndex *int
+}
+
 // SessionUpdates fetches a session's stored updates (message history) via
 // the ACP extension method x.ai/session/updates. Each element of the result
 // is the full storage envelope {timestamp, method, params}.
-func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, offset *int64, limit *int) (UpdatesPage, error) {
+func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...SessionUpdatesOpts) (UpdatesPage, error) {
 	if err := b.Boot(ctx); err != nil {
 		return UpdatesPage{}, err
 	}
 	params := map[string]any{"sessionId": sessionID, "cwd": cwd}
-	if offset != nil {
-		params["offset"] = *offset
-	}
-	if limit != nil {
-		params["limit"] = *limit
+	if len(opts) > 0 {
+		if opts[0].Offset != nil {
+			params["offset"] = *opts[0].Offset
+		}
+		if opts[0].Limit != nil {
+			params["limit"] = *opts[0].Limit
+		}
+		if opts[0].Stream {
+			params["stream"] = true
+		}
+		if opts[0].ChunkSize != nil {
+			params["chunkSize"] = *opts[0].ChunkSize
+		}
+		if opts[0].TurnIndex != nil {
+			params["turnIndex"] = *opts[0].TurnIndex
+		}
 	}
 	// ACP wire convention: extension methods are sent with an underscore
 	// prefix ("_" + method). The agent's decoder strips it and routes the
