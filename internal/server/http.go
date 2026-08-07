@@ -347,6 +347,19 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modeId"})
 		return
 	}
+	// Permission modes ride the x.ai/yolo_mode_changed notification (the
+	// agent's ask/auto/always-approve channel, TUI parity) — session/set_mode
+	// only understands the session-mode ids and would silently no-op on
+	// normal/auto/always-approve. Session-mode ids keep the legacy path.
+	switch body.ModeID {
+	case "normal", "auto", "always-approve", "always_approve", "yolo":
+		if _, err := s.bridge.SetPermissionMode(r.Context(), body.ModeID); err != nil {
+			writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
 	res, err := s.bridge.SetMode(r.Context(), body.ModeID)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
@@ -981,9 +994,10 @@ func asInt64(v any) (int64, bool) {
 }
 
 // normalizeRewindPoints unwraps the x.ai/rewind/points response — flat
-// {points:[…]} or ExtMethodResult {result:{points:[…]}} — and normalizes
-// each point's field names (snake_case or camelCase on the wire) into
-// {index, timestamp, summary?}. Points without a usable index are dropped.
+// {points:[…]}, ExtMethodResult {result:{points:[…]}}, or the agent's raw
+// snake_case {rewind_points:[…]} — and normalizes each point's field names
+// (snake_case or camelCase on the wire) into {index, timestamp, summary?}.
+// Points without a usable index are dropped.
 func normalizeRewindPoints(res map[string]any) []map[string]any {
 	if res == nil {
 		return nil
@@ -997,6 +1011,8 @@ func normalizeRewindPoints(res map[string]any) []map[string]any {
 		raw = p
 	} else if p, ok := inner["rewindPoints"].([]any); ok {
 		raw = p
+	} else if p, ok := inner["rewind_points"].([]any); ok {
+		raw = p
 	}
 	out := make([]map[string]any, 0, len(raw))
 	for _, item := range raw {
@@ -1009,11 +1025,14 @@ func normalizeRewindPoints(res map[string]any) []map[string]any {
 			continue
 		}
 		pt := map[string]any{"index": idx}
-		if ts := firstAny(m, "timestamp", "ts"); ts != nil {
+		if ts := firstAny(m, "timestamp", "ts", "created_at"); ts != nil {
 			pt["timestamp"] = ts
 		}
-		if sum := firstAny(m, "summary", "description"); sum != nil {
+		if sum := firstAny(m, "summary", "description", "prompt_preview"); sum != nil {
 			pt["summary"] = sum
+		}
+		if hfc := firstAny(m, "has_file_changes", "hasFileChanges"); hfc != nil {
+			pt["hasFileChanges"] = hfc
 		}
 		out = append(out, pt)
 	}
@@ -1077,26 +1096,6 @@ func methodUnsupported(msg string) bool {
 		}
 	}
 	return false
-}
-
-// extractPlanMode pulls a planMode bool out of an x.ai/toggle_plan_mode
-// reply, whether it sits at the top level or inside an ExtMethodResult
-// envelope ({result:{planMode:…}}). Returns ok=false when absent so the
-// caller can fall back to a bare ok response.
-func extractPlanMode(res map[string]any) (bool, bool) {
-	if res == nil {
-		return false, false
-	}
-	inner := res
-	if r, ok := res["result"].(map[string]any); ok {
-		inner = r
-	}
-	for _, k := range []string{"planMode", "plan_mode"} {
-		if v, ok := inner[k].(bool); ok {
-			return v, true
-		}
-	}
-	return false, false
 }
 
 // normalizeMCPServers unwraps an x.ai/mcp/list reply into a []any of server
@@ -1167,16 +1166,24 @@ func (s *Server) handleMemoryFlush(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
-// handleMemoryRewrite — POST /api/memory-rewrite {sessionId?} → _x.ai/memory/rewrite.
+// handleMemoryRewrite — POST /api/memory-rewrite {sessionId?, rawText,
+// contextSummary?} → _x.ai/memory/rewrite. rawText is required by the
+// agent's request contract (rawText + contextSummary).
 func (s *Server) handleMemoryRewrite(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SessionID string `json:"sessionId"`
+		SessionID      string `json:"sessionId"`
+		RawText        string `json:"rawText"`
+		ContextSummary string `json:"contextSummary"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	res, err := s.bridge.MemoryRewrite(r.Context(), body.SessionID)
+	if body.RawText == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 rawText"})
+		return
+	}
+	res, err := s.bridge.MemoryRewrite(r.Context(), body.SessionID, body.RawText, body.ContextSummary)
 	if err != nil {
 		writeAgentError(w, "_x.ai/memory/rewrite", err)
 		return
@@ -1185,8 +1192,9 @@ func (s *Server) handleMemoryRewrite(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTogglePlanMode — POST /api/toggle-plan-mode {sessionId?} →
-// _x.ai/toggle_plan_mode. The resulting planMode bool is extracted from
-// the reply when present; otherwise a bare ok is returned.
+// _x.ai/toggle_plan_mode (sent as a fire-and-forget notification; the
+// agent has no request branch for it). The frontend applies its local
+// desired planMode, so a bare ok is the contract.
 func (s *Server) handleTogglePlanMode(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID string `json:"sessionId"`
@@ -1195,16 +1203,11 @@ func (s *Server) handleTogglePlanMode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	res, err := s.bridge.TogglePlanMode(r.Context(), body.SessionID)
-	if err != nil {
+	if _, err := s.bridge.TogglePlanMode(r.Context(), body.SessionID); err != nil {
 		writeAgentError(w, "_x.ai/toggle_plan_mode", err)
 		return
 	}
-	out := map[string]any{"ok": true, "result": res}
-	if pm, ok := extractPlanMode(res); ok {
-		out["planMode"] = pm
-	}
-	writeJSON(w, 200, out)
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // handlePermissionsReset — POST /api/permissions-reset {sessionId?} →

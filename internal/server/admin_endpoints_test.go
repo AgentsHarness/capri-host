@@ -1,10 +1,16 @@
 package server
 
 import (
+	"bufio"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ── POST /api/billing ───────────────────────────────────────────────
@@ -63,7 +69,7 @@ func TestMemoryFlushEndpoint(t *testing.T) {
 func TestMemoryRewriteEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
 
-	rec := postJSON(t, s, "/api/memory-rewrite", `{"sessionId":"sess-1"}`)
+	rec := postJSON(t, s, "/api/memory-rewrite", `{"sessionId":"sess-1","rawText":"new memory","contextSummary":"ctx"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
@@ -71,8 +77,14 @@ func TestMemoryRewriteEndpoint(t *testing.T) {
 		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
 	}
 
+	// rawText is required by the agent contract — missing → 400.
+	recMissing := postJSON(t, s, "/api/memory-rewrite", `{"sessionId":"sess-1"}`)
+	if recMissing.Code != http.StatusBadRequest {
+		t.Fatalf("missing-rawText status = %d, body=%s", recMissing.Code, recMissing.Body.String())
+	}
+
 	// No sessionId and no active session → 404.
-	rec2 := postJSON(t, s, "/api/memory-rewrite", `{}`)
+	rec2 := postJSON(t, s, "/api/memory-rewrite", `{"rawText":"x"}`)
 	if rec2.Code != http.StatusNotFound {
 		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
 	}
@@ -91,10 +103,10 @@ func TestTogglePlanModeEndpoint(t *testing.T) {
 	if m["ok"] != true {
 		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
 	}
-	// The fake agent returns {result:{planMode:true}}; the handler must
-	// extract the bool onto the top level.
-	if m["planMode"] != true {
-		t.Fatalf("resp = %s, want planMode:true", rec.Body.String())
+	// The method is sent as a fire-and-forget notification — no planMode
+	// reply exists; the frontend applies its local desired state.
+	if m["planMode"] != nil {
+		t.Fatalf("resp = %s, want no planMode (notification, no reply)", rec.Body.String())
 	}
 
 	// No sessionId and no active session → 404.
@@ -121,6 +133,104 @@ func TestPermissionsResetEndpoint(t *testing.T) {
 	rec2 := postJSON(t, s, "/api/permissions-reset", `{}`)
 	if rec2.Code != http.StatusNotFound {
 		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/set-mode: permission-mode notification dispatch ───────
+
+// readRecordedNotifs polls the fake agent's notification record file until
+// it holds at least n lines, then returns them as parsed maps.
+func readRecordedNotifs(t *testing.T, path string, n int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f, err := os.Open(path)
+		if err == nil {
+			var lines []map[string]any
+			sc := bufio.NewScanner(f)
+			for sc.Scan() {
+				var m map[string]any
+				if json.Unmarshal(sc.Bytes(), &m) == nil {
+					lines = append(lines, m)
+				}
+			}
+			f.Close()
+			if len(lines) >= n {
+				return lines
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("fake agent never recorded %d notifications in %s", n, path)
+	return nil
+}
+
+// Permission modes MUST go to the agent as the _x.ai/yolo_mode_changed
+// notification (the agent's ask/auto/always-approve channel) — session/
+// set_mode would silently no-op on these ids. Pins the wire payload per
+// mode, exactly as the TUI's persist_permission_mode_and_notify sends it.
+func TestSetModePermissionModeNotification(t *testing.T) {
+	notifPath := filepath.Join(t.TempDir(), "notifs.jsonl")
+	t.Setenv(ACPHostFakeAgentRecordNotifs, notifPath)
+	s, _ := newFakeAgentServer(t)
+
+	cases := []struct {
+		modeID     string
+		yolo       bool
+		auto       bool
+		permission string
+	}{
+		{modeID: "normal", yolo: false, auto: false, permission: "ask"},
+		{modeID: "auto", yolo: false, auto: true, permission: "auto"},
+		{modeID: "yolo", yolo: true, auto: false, permission: "always-approve"},
+	}
+	for _, tc := range cases {
+		rec := postJSON(t, s, "/api/set-mode",
+			`{"modeId":`+strconv.Quote(tc.modeID)+`}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("set-mode %s status = %d, body=%s", tc.modeID, rec.Code, rec.Body.String())
+		}
+		if m := decodeBody(t, rec); m["ok"] != true {
+			t.Fatalf("set-mode %s resp = %s, want ok:true", tc.modeID, rec.Body.String())
+		}
+	}
+
+	notifs := readRecordedNotifs(t, notifPath, len(cases))
+	for i, tc := range cases {
+		m := notifs[i]
+		if m["method"] != "_x.ai/yolo_mode_changed" {
+			t.Fatalf("notif %d method = %v, want _x.ai/yolo_mode_changed", i, m["method"])
+		}
+		if m["id"] != nil {
+			t.Fatalf("notif %d has id %v — must be a fire-and-forget notification", i, m["id"])
+		}
+		params, _ := m["params"].(map[string]any)
+		if params["yolo_mode"] != tc.yolo || params["auto_mode"] != tc.auto ||
+			params["permission_mode"] != tc.permission {
+			t.Fatalf("notif %d (%s) params = %v, want {yolo_mode:%v auto_mode:%v permission_mode:%q}",
+				i, tc.modeID, params, tc.yolo, tc.auto, tc.permission)
+		}
+	}
+}
+
+// Session-mode ids (plan) keep the legacy session/set_mode request path —
+// the fake agent answers it, so the endpoint still returns the agent result.
+func TestSetModePlanStillSessionSetMode(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/set-mode", `{"modeId":"plan"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	// The fake agent answers unknown methods with {} — a real agent answers
+	// session/set_mode with its response, and the host passes it through.
+	if _, hasResult := m["result"]; !hasResult {
+		t.Fatalf("resp = %s, want a result passthrough for session/set_mode", rec.Body.String())
 	}
 }
 
@@ -218,6 +328,7 @@ func TestNormalizeMCPServers(t *testing.T) {
 
 func TestMCPToggleEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	createActiveSession(t, s)
 
 	rec := postJSON(t, s, "/api/mcp-toggle", `{"name":"fs","enabled":true}`)
 	if rec.Code != http.StatusOK {
@@ -250,6 +361,7 @@ func TestMCPToggleEndpoint(t *testing.T) {
 
 func TestMCPAddEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	createActiveSession(t, s)
 
 	rec := postJSON(t, s, "/api/mcp-add",
 		`{"server":{"name":"fs","command":"npx","args":["-y","@modelcontextprotocol/server-fs"],"env":{"KEY":"v"}}}`)
@@ -277,6 +389,7 @@ func TestMCPAddEndpoint(t *testing.T) {
 
 func TestMCPRemoveEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	createActiveSession(t, s)
 
 	rec := postJSON(t, s, "/api/mcp-remove", `{"name":"fs"}`)
 	if rec.Code != http.StatusOK {
@@ -297,6 +410,7 @@ func TestMCPRemoveEndpoint(t *testing.T) {
 
 func TestMCPAuthTriggerEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	createActiveSession(t, s)
 
 	rec := postJSON(t, s, "/api/mcp-auth-trigger", `{"name":"github"}`)
 	if rec.Code != http.StatusOK {

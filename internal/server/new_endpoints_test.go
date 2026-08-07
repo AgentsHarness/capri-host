@@ -143,6 +143,27 @@ func TestNormalizeRewindPoints(t *testing.T) {
 			want: []map[string]any{{"index": int64(3), "timestamp": float64(300)}},
 		},
 		{
+			// The real grok agent serializes RewindPointsResponse verbatim:
+			// a top-level snake_case `rewind_points` key with
+			// prompt_index / created_at / prompt_preview fields.
+			name: "agent raw snake_case rewind_points",
+			res: map[string]any{"rewind_points": []any{
+				map[string]any{
+					"prompt_index":       float64(2),
+					"created_at":         "2026-08-07T14:00:26Z",
+					"num_file_snapshots": float64(1),
+					"has_file_changes":   true,
+					"prompt_preview":     "删除history上方的按钮们",
+				},
+			}},
+			want: []map[string]any{{
+				"index":          int64(2),
+				"timestamp":      "2026-08-07T14:00:26Z",
+				"summary":        "删除history上方的按钮们",
+				"hasFileChanges": true,
+			}},
+		},
+		{
 			name: "points without index dropped",
 			res:  map[string]any{"points": []any{map[string]any{"timestamp": float64(1)}, "not-a-map"}},
 			want: nil,
