@@ -36,6 +36,8 @@ func TestExt2SessionEndpoints(t *testing.T) {
 		{"/api/session-summaries/session-list", `{"workspaceDirectory":"/ws"}`},
 		{"/api/session-summaries/workspace-list", `{}`},
 		{"/api/session-summaries/workspace-list-recent", `{"limit":50}`},
+		{"/api/session-load-history", `{"beforeId":"c-1"}`},
+		{"/api/session-load-history", `{}`},
 	}
 	for _, c := range cases {
 		rec := postJSON(t, s, c.path, c.body)
@@ -418,6 +420,29 @@ func TestExt2WireKeys(t *testing.T) {
 	want = map[string]any{"sessionId": "sess-new", "sourceCwd": "/ws", "repoRoot": "/repo", "worktreePath": "/wt"}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("session/rehydrate params = %v, want %v", params, want)
+	}
+
+	// load_history：camelCase beforeId；空则省略（第一页无游标），不传 sessionId。
+	params = recordedParams(t, s, recordPath, "/api/session-load-history", `{"beforeId":"c-9"}`, "_x.ai/session/load_history")
+	want = map[string]any{"beforeId": "c-9"}
+	if !reflect.DeepEqual(params, want) {
+		t.Errorf("session/load_history params = %v, want %v", params, want)
+	}
+	// 第二条（无游标）：findRequest 只取第一条，这里取最后一条录制。
+	params = recordedParams(t, s, recordPath, "/api/session-load-history", `{}`, "_x.ai/session/load_history")
+	var last map[string]any
+	for _, m := range readRecordedRequests(t, recordPath) {
+		if m["method"] == "_x.ai/session/load_history" {
+			last = m
+		}
+	}
+	if last == nil {
+		t.Fatal("no recorded _x.ai/session/load_history request")
+	}
+	params, _ = last["params"].(map[string]any)
+	want = map[string]any{}
+	if !reflect.DeepEqual(params, want) {
+		t.Errorf("session/load_history no-cursor params = %v, want %v", params, want)
 	}
 
 	// 会话摘要：SNAKE_CASE。

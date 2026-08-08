@@ -48,6 +48,33 @@ const ACPHostFakeAgentRecordNotifs = "ACP_HOST_FAKE_AGENT_RECORD_NOTIFS"
 // session/load `_meta` permission-mode seeds.
 const ACPHostFakeAgentRecordRequests = "ACP_HOST_FAKE_AGENT_RECORD_REQUESTS"
 
+// ACPHostFakeAgentPromptMeta / SessionNewMeta / SessionListCursor /
+// SessionListMeta / AuthMeta: JSON strings injected into the fake agent's
+// canned responses (`_meta` / pagination cursor) so tests can assert the
+// host's meta/cursor passthrough to the browser. Unset = the canned
+// response carries no such keys (absent key ≠ off).
+const (
+	ACPHostFakeAgentPromptMeta      = "ACP_HOST_FAKE_AGENT_PROMPT_META"
+	ACPHostFakeAgentSessionNewMeta  = "ACP_HOST_FAKE_AGENT_SESSION_NEW_META"
+	ACPHostFakeAgentSessionListCur  = "ACP_HOST_FAKE_AGENT_SESSION_LIST_CURSOR"
+	ACPHostFakeAgentSessionListMeta = "ACP_HOST_FAKE_AGENT_SESSION_LIST_META"
+	ACPHostFakeAgentAuthMeta        = "ACP_HOST_FAKE_AGENT_AUTH_META"
+)
+
+// fakeAgentMeta parses an env var as a JSON object for the canned `_meta`
+// response; nil when unset or invalid.
+func fakeAgentMeta(env string) map[string]any {
+	v := os.Getenv(env)
+	if v == "" {
+		return nil
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(v), &m) != nil {
+		return nil
+	}
+	return m
+}
+
 // fakeAgentPermissionID is the JSON-RPC id the fake agent stamps on its
 // emitted permission request.
 const fakeAgentPermissionID float64 = 99
@@ -118,10 +145,29 @@ func runFakeAgent() {
 			}
 		case "authenticate":
 			result = map[string]any{}
+			if m := fakeAgentMeta(ACPHostFakeAgentAuthMeta); m != nil {
+				result["_meta"] = m
+			}
 		case "session/new":
 			result = map[string]any{"sessionId": "sess-new"}
+			if m := fakeAgentMeta(ACPHostFakeAgentSessionNewMeta); m != nil {
+				result["_meta"] = m
+			}
 			if os.Getenv(ACPHostFakeAgentEmitPermission) == "1" {
 				emitPermissionRequest(out)
+			}
+		case "session/list":
+			result = map[string]any{"sessions": []any{}}
+			if v := os.Getenv(ACPHostFakeAgentSessionListCur); v != "" {
+				result["nextCursor"] = v
+			}
+			if m := fakeAgentMeta(ACPHostFakeAgentSessionListMeta); m != nil {
+				result["_meta"] = m
+			}
+		case "session/prompt":
+			result = map[string]any{"stopReason": "end_turn"}
+			if m := fakeAgentMeta(ACPHostFakeAgentPromptMeta); m != nil {
+				result["_meta"] = m
 			}
 		case "_x.ai/session/delete":
 			result = map[string]any{"ok": true}
