@@ -80,6 +80,7 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/xai-call", s.handleXaiCall)
 	mux.HandleFunc("POST /api/session-resume", s.handleSessionResume)
 	mux.HandleFunc("POST /api/session-close", s.handleSessionClose)
+	mux.HandleFunc("POST /api/session-load-history", s.handleSessionLoadHistory)
 	mux.HandleFunc("POST /api/git/status", s.handleGitStatus)
 	mux.HandleFunc("POST /api/git/diffs", s.handleGitDiffs)
 	mux.HandleFunc("POST /api/git/stage", s.handleGitStage)
@@ -386,20 +387,22 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	// stopReason as before.
 	type result struct {
 		stopReason string
+		meta       map[string]any // 响应的 `_meta`（仅非空才发）
 		err        error
 	}
 	done := make(chan result, 1)
 	go func() {
 		var sr string
+		var meta map[string]any
 		var err error
 		if s.promptFn != nil {
 			// Test-injected promptFn keeps its exact contract.
 			sr, err = s.promptFn(context.Background(), body.SessionID, body.Blocks)
 		} else {
-			sr, err = s.bridge.PromptWithOpts(context.Background(), body.SessionID, body.Blocks,
+			sr, meta, err = s.bridge.PromptWithOpts(context.Background(), body.SessionID, body.Blocks,
 				acp.PromptOpts{MessageID: body.MessageID, Meta: body.Meta})
 		}
-		done <- result{sr, err}
+		done <- result{sr, meta, err}
 	}()
 
 	select {
@@ -416,7 +419,12 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, code, map[string]any{"ok": false, "error": res.err.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true, "stopReason": res.stopReason})
+		out := map[string]any{"ok": true, "stopReason": res.stopReason}
+		// 响应的 `_meta` 原样透传给浏览器（仅非空才带，absent key ≠ off）。
+		if len(res.meta) > 0 {
+			out["meta"] = res.meta
+		}
+		writeJSON(w, 200, out)
 	}
 }
 
@@ -583,12 +591,20 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	if body.Cwd != "" || body.Cursor != "" || len(body.Meta) > 0 {
 		opts = acp.ListSessionsOpts{Cwd: body.Cwd, Cursor: body.Cursor, Meta: body.Meta}
 	}
-	sessions, err := s.bridge.ListSessions(r.Context(), opts)
+	sessions, nextCursor, meta, err := s.bridge.ListSessions(r.Context(), opts)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "sessions": sessions})
+	out := map[string]any{"ok": true, "sessions": sessions}
+	// 响应游标与 `_meta` 原样透传（仅非空才带；absent key ≠ off）。
+	if nextCursor != "" {
+		out["nextCursor"] = nextCursor
+	}
+	if len(meta) > 0 {
+		out["meta"] = meta
+	}
+	writeJSON(w, 200, out)
 }
 
 type sessionStateBody struct {

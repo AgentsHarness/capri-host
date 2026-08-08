@@ -382,7 +382,7 @@ func TestPromptWithOptsWire(t *testing.T) {
 
 	done := make(chan callResult, 1)
 	go func() {
-		sr, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{
+		sr, _, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{
 			MessageID: "uuid-1",
 			Meta:      map[string]any{"yoloMode": true},
 		})
@@ -445,6 +445,93 @@ func TestPromptOmitsOptsWhenEmpty(t *testing.T) {
 	}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("params = %v, want %v", params, want)
+	}
+}
+
+// The session/prompt response `_meta` must be passed through verbatim:
+// returned by PromptWithOpts AND carried on the done event (`meta`). When
+// the agent returns no `_meta`, the done event stays byte-identical (no
+// `meta` key — absent key ≠ off).
+func TestPromptResponseMetaPassthrough(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	done := make(chan callResult, 1)
+	go func() {
+		sr, meta, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{})
+		done <- callResult{map[string]any{"stopReason": sr, "meta": meta}, err}
+	}()
+	resolveNext(t, b, w, map[string]any{
+		"stopReason": "end_turn",
+		"_meta":      map[string]any{"turn_id": "t-1", "cost": float64(42)},
+	})
+	cr := <-done
+	if cr.err != nil {
+		t.Fatalf("PromptWithOpts: %v", cr.err)
+	}
+	meta, ok := cr.res["meta"].(map[string]any)
+	if !ok || meta["turn_id"] != "t-1" || meta["cost"] != float64(42) {
+		t.Errorf("returned meta = %v, want {turn_id:t-1 cost:42}", cr.res["meta"])
+	}
+
+	// The done event must carry the same meta under `meta`.
+	var ev Event
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case ev = <-sub:
+			if ev["type"] == "done" {
+				break drain
+			}
+		case <-deadline:
+			t.Fatal("no done event broadcast")
+		}
+	}
+	if !reflect.DeepEqual(ev["meta"], map[string]any{"turn_id": "t-1", "cost": float64(42)}) {
+		t.Errorf("done event meta = %v, want {turn_id:t-1 cost:42}", ev["meta"])
+	}
+}
+
+// Without a response `_meta` the done event must not carry a `meta` key.
+func TestPromptDoneEventOmitsMetaWhenAbsent(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	var gotMeta map[string]any
+	done := make(chan callResult, 1)
+	go func() {
+		sr, meta, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{})
+		gotMeta = meta
+		done <- callResult{map[string]any{"stopReason": sr}, err}
+	}()
+	resolveNext(t, b, w, map[string]any{"stopReason": "end_turn"})
+	cr := <-done
+	if cr.err != nil {
+		t.Fatalf("PromptWithOpts: %v", cr.err)
+	}
+	if gotMeta != nil {
+		t.Errorf("returned meta = %v, want nil", gotMeta)
+	}
+	var ev Event
+	deadline := time.After(2 * time.Second)
+drain:
+	for {
+		select {
+		case ev = <-sub:
+			if ev["type"] == "done" {
+				break drain
+			}
+		case <-deadline:
+			t.Fatal("no done event broadcast")
+		}
+	}
+	if _, ok := ev["meta"]; ok {
+		t.Errorf("done event must not carry meta when the agent returned none: %v", ev)
 	}
 }
 
