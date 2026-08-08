@@ -273,7 +273,7 @@ x.ai/schedulerGeneration/Revision）；`scheduled_task_deleted` 新增
 `rawParams`/`meta`；`models_update` 新增 `raw`（机器级原始广播）；
 `chunk`/`user_chunk` 新增 `fullUpdate`（完整原始 update map）。
 
-通知 / sessionUpdate 语义化（增量 typed 事件，generic 载体照发）：
+通知 / sessionUpdate 语义化（单发 typed 事件，generic 仅前向兼容）：
 
 - x.ai 通知 typed 化（取代 ext_notification 兜底，未知方法仍走
   ext_notification）：`session_updates_chunk`（x.ai/session/updates/chunk）、
@@ -282,12 +282,22 @@ x.ai/schedulerGeneration/Revision）；`scheduled_task_deleted` 新增
   `search_content_status`、`git_worktree_status`、`mcp_init_progress`、
   `pty_notification`、`session_interjection`、`leader_reconnected`
   —— 形状 `{type, params, sessionId}`。
-- sessionUpdate kind 语义化：kind 分发抽成 `dispatchSessionUpdateKind`，
-  官方 `session/update` 与 `x.ai/session_notification` / `x.ai/session/update`
-  双载体共享，每个 kind 双发 generic `session_notification` + typed
-  `{type: <kind>, update, sessionId}`（`task_backgrounded` /
-  `task_completed` / `monitor_event` 为 `{type, params, sessionId}`，
-  scheduled_task_created/deleted 复用归一化 task/rawTask/rawParams/meta）。
+- sessionUpdate kind 语义化：kind 分发抽成 `dispatchSessionUpdateKind`
+  （返回该 kind 是否已建模），官方 `session/update` 与
+  `x.ai/session_notification` / `x.ai/session/update` 双载体共享。每个
+  modeled kind **单发** typed 事件 `{type: <kind>, update, sessionId,
+  meta?}`（`params._meta` 非空时带 `meta`，两个载体统一；sessionId 空则
+  省略），**无 generic**；`compaction_checkpoint` / `rewind_marker` /
+  `unknown` 及未来任何未建模 kind 只发 generic `session_notification`
+  （前向兼容载体：官方形状 `{type, method:"session/update",
+  params:{update}, sessionId}`，x.ai 形状 `{type, method:<原方法名>,
+  params:<完整原 params 含 _meta>, sessionId?}`）。
+- `task_backgrounded` / `task_completed` / `monitor_event` 的 kind typed
+  事件同为 `{type, update, sessionId, meta?}`；x.ai standalone 通知通道
+  （`x.ai/task_backgrounded` / `x.ai/task_completed` /
+  `x.ai/monitor_event` 方法）保持 `{type, params, sessionId}` 不变
+  （不同载体，形状跟随 wire）。scheduled_task_created/deleted 复用归一化
+  task/rawTask/rawParams/meta（两个载体共享 helper）。
   新增 typed kind：`diff_review`、`retry_state`、`auto_compact_*`、
   `auto_continue_completed`、`memory_flush_started/completed`、
   `memory_dream_completed`、`memory_session_saved`、`memory_files`、
@@ -299,13 +309,15 @@ x.ai/schedulerGeneration/Revision）；`scheduled_task_deleted` 新增
   `scheduled_task_created/fired/deleted`、`tool_call_delta_chunk`、
   `image_compressed`、`image_dropped`、`workflow_updated`、`goal_updated`、
   `pending_interaction`、`interaction_resolved`、`response_started`、
-  `reasoning_completed`、`model_auto_switched`、`model_changed`。
+  `reasoning_completed`、`turn_completed`、`response_completed`、
+  `model_auto_switched`、`model_changed`。
 - `model_auto_switched` / `model_changed` 额外更新 roster 会话的 models
   缓存（currentModelId + 可选 reasoningEffort）并广播 `models_update`
-  与 `model`（SetModel 形状，modelName 经 catalog 解析）事件。
-- `turn_completed` / `response_completed` 刻意**不**新增 typed 事件
-  （acp-fe 双路径处理，避免双重触发），仅保留 usage 提取；
-  `compaction_checkpoint` / `rewind_marker` 仅持久化不发 UI，不处理。
+  与 `model`（SetModel 形状，modelName 经 catalog 解析）事件（即该 kind
+  的 typed 语义事件）。
+- `turn_completed` / `response_completed` 已 typed（update 原样含
+  stop_reason / prompt_id / usage 等字段），usage 提取保留在两个载体
+  （官方载体带 size:nil、x.ai 载体不带）。
 
 > 注：grok 侧的队列方法（`x.ai/queue/*`）是 ext_notification 型，本层经
 > `XaiCall` 以 request 型发送，结果原样返回；真实 agent 会对这类方法回

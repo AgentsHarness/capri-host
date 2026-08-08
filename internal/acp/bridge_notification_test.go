@@ -9,8 +9,9 @@ import (
 // bridge_notification_test.go — 通知 / sessionUpdate 语义化：
 //   - Part 1: x.ai/* 通知 typed 化（14 个方法取代 ext_notification 兜底）。
 //   - Part 2: sessionUpdate kind 分发（dispatchSessionUpdateKind）在两个
-//     载体（官方 session/update 与 x.ai/session_notification）上双发
-//     generic session_notification + 增量 typed 事件。
+//     载体（官方 session/update 与 x.ai/session_notification）上单发
+//     typed 事件；generic session_notification 仅保留给未建模 kind
+//     （前向兼容载体）。
 
 // ── Part 1: x.ai 通知 typed 化 ──────────────────────────────────────
 
@@ -81,10 +82,11 @@ func TestUnknownXaiNotificationStillExtNotification(t *testing.T) {
 
 // ── Part 2: sessionUpdate kind 语义化（官方载体） ───────────────────
 
-// 官方 session/update 载体：每个新 typed kind 双发 generic
-// session_notification（FE 规范载体，method=session/update，params 原样）
-// 与增量 typed 事件 {type: <kind>, update: <原始 update>, sessionId}。
-func TestSessionUpdateKindTypedPlusGeneric(t *testing.T) {
+// 官方 session/update 载体：每个 modeled kind 单发 typed 事件
+// {type: <kind>, update: <原始 update>, sessionId}，无 generic
+// session_notification（FE 已适配 typed 消费；generic 仅保留给未建模
+// kind 作前向兼容，见 TestUnmodeledKindGenericOnly）。
+func TestSessionUpdateKindTypedOnly(t *testing.T) {
 	kinds := []string{
 		"diff_review", "subagent_spawned", "image_dropped", "retry_state",
 		"memory_files", "hook_execution", "workflow_updated",
@@ -97,74 +99,59 @@ func TestSessionUpdateKindTypedPlusGeneric(t *testing.T) {
 			defer unsub()
 			update := map[string]any{"sessionUpdate": kind, "some": "payload"}
 			b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
-			var sawGeneric, sawTyped bool
-			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) && !(sawGeneric && sawTyped) {
-				select {
-				case ev := <-ch:
-					switch ev["type"] {
-					case "session_notification":
-						sawGeneric = true
-						if ev["method"] != "session/update" {
-							t.Errorf("generic method = %v, want session/update", ev["method"])
-						}
-						params, _ := ev["params"].(map[string]any)
-						if !reflect.DeepEqual(params, map[string]any{"update": update}) {
-							t.Errorf("generic params = %v, want the update forwarded verbatim", params)
-						}
-					case kind:
-						sawTyped = true
-						if !reflect.DeepEqual(ev["update"], update) {
-							t.Errorf("typed update = %v, want the original update map verbatim", ev["update"])
-						}
-						if ev["sessionId"] != "s1" {
-							t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
-						}
-					}
-				case <-time.After(50 * time.Millisecond):
-				}
+			ev := <-ch
+			if ev["type"] != kind {
+				t.Fatalf("event type = %v, want %s", ev["type"], kind)
 			}
-			if !sawGeneric {
-				t.Errorf("no generic session_notification for kind %s", kind)
+			if !reflect.DeepEqual(ev["update"], update) {
+				t.Errorf("typed update = %v, want the original update map verbatim", ev["update"])
 			}
-			if !sawTyped {
-				t.Errorf("no typed %s event", kind)
+			if ev["sessionId"] != "s1" {
+				t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+			}
+			if _, ok := ev["meta"]; ok {
+				t.Errorf("typed event must not carry meta without params._meta: %v", ev)
+			}
+			// 单发：无 generic，不得再有第二个事件。
+			select {
+			case extra := <-ch:
+				t.Fatalf("unexpected extra event: %v", extra)
+			case <-time.After(50 * time.Millisecond):
 			}
 		})
 	}
 }
 
-// task_backgrounded / task_completed / monitor_event 的 typed 事件形状与
-// 现有 x.ai 通道一致（{type, params, sessionId}）—— FE 双通道按 taskId
-// 幂等合并。
-func TestTaskKindsUseParamsShape(t *testing.T) {
+// task_backgrounded / task_completed / monitor_event 的 kind typed 事件
+// 形状与其它 kind 统一：{type, update, sessionId}（update = 原始 update
+// 对象）；x.ai standalone 通知通道（x.ai/task_backgrounded 等方法）才用
+// {type, params, sessionId}（见 TestXaiStandaloneTaskKindsParamsShape）。
+func TestTaskKindsUseUpdateShape(t *testing.T) {
 	for _, kind := range []string{"task_backgrounded", "task_completed", "monitor_event"} {
 		t.Run(kind, func(t *testing.T) {
 			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 			ch, unsub := b.Subscribe()
 			defer unsub()
 			update := map[string]any{"sessionUpdate": kind, "task_id": "t-1"}
-			params := map[string]any{"sessionId": "s1", "update": update}
-			b.handleSessionUpdate(params)
-			var sawTyped bool
-			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) && !sawTyped {
-				select {
-				case ev := <-ch:
-					if ev["type"] == kind {
-						sawTyped = true
-						if !reflect.DeepEqual(ev["params"], params) {
-							t.Errorf("typed params = %v, want the carrier params verbatim", ev["params"])
-						}
-						if ev["sessionId"] != "s1" {
-							t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
-						}
-					}
-				case <-time.After(50 * time.Millisecond):
-				}
+			b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
+			ev := <-ch
+			if ev["type"] != kind {
+				t.Fatalf("event type = %v, want %s", ev["type"], kind)
 			}
-			if !sawTyped {
-				t.Fatalf("no typed %s event", kind)
+			if !reflect.DeepEqual(ev["update"], update) {
+				t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
+			}
+			if ev["sessionId"] != "s1" {
+				t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+			}
+			if _, ok := ev["params"]; ok {
+				t.Errorf("typed event must not carry params: %v", ev)
+			}
+			// 单发：无 generic，不得再有第二个事件。
+			select {
+			case extra := <-ch:
+				t.Fatalf("unexpected extra event: %v", extra)
+			case <-time.After(50 * time.Millisecond):
 			}
 		})
 	}
@@ -255,8 +242,8 @@ func TestScheduledTaskDeletedKindNormalized(t *testing.T) {
 }
 
 // model_changed kind：roster models 缓存更新（currentModelId +
-// reasoningEffort）+ models_update / model 事件广播；generic
-// session_notification 照发。
+// reasoningEffort）+ models_update / model 事件广播（typed 语义事件）；
+// kind modeled → 无 generic session_notification。
 func TestModelChangedKindUpdatesRoster(t *testing.T) {
 	b, _ := metaReadyBridge(t)
 	b.mu.Lock()
@@ -276,14 +263,16 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 		"reasoning_effort": "high",
 	}
 	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
-	var sawGeneric, sawModelsUpdate, sawModel bool
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !(sawGeneric && sawModelsUpdate && sawModel) {
+	var sawModelsUpdate, sawModel bool
+	var events []Event
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
 		select {
 		case ev := <-ch:
+			events = append(events, ev)
 			switch ev["type"] {
 			case "session_notification":
-				sawGeneric = true
+				t.Errorf("unexpected generic session_notification for modeled kind model_changed: %v", ev)
 			case "models_update":
 				sawModelsUpdate = true
 				models, _ := ev["params"].(map[string]any)
@@ -302,11 +291,11 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 					t.Errorf("model sessionId = %v, want s1", ev["sessionId"])
 				}
 			}
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	if !sawGeneric || !sawModelsUpdate || !sawModel {
-		t.Errorf("sawGeneric=%v sawModelsUpdate=%v sawModel=%v", sawGeneric, sawModelsUpdate, sawModel)
+	if !sawModelsUpdate || !sawModel {
+		t.Errorf("sawModelsUpdate=%v sawModel=%v", sawModelsUpdate, sawModel)
 	}
 	b.mu.Lock()
 	models, _ := b.sessions["s1"].models.(map[string]any)
@@ -319,6 +308,7 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 // model_auto_switched kind（previous_model_id/new_model_id/reason）：
 // currentModelId 更新；无 reasoningEffort 时保留原 effort（
 // patchSessionModels 语义）。model 事件不带 reasoningEffort 键。
+// kind modeled → 无 generic session_notification。
 func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 	b, _ := metaReadyBridge(t)
 	b.mu.Lock()
@@ -341,11 +331,15 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 	}
 	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
 	var sawModelsUpdate, sawModel bool
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !(sawModelsUpdate && sawModel) {
+	var events []Event
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
 		select {
 		case ev := <-ch:
+			events = append(events, ev)
 			switch ev["type"] {
+			case "session_notification":
+				t.Errorf("unexpected generic session_notification for modeled kind model_auto_switched: %v", ev)
 			case "models_update":
 				sawModelsUpdate = true
 				models, _ := ev["params"].(map[string]any)
@@ -364,7 +358,7 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 					t.Errorf("model event must not carry reasoningEffort: %v", ev)
 				}
 			}
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
 	if !sawModelsUpdate || !sawModel {
@@ -378,10 +372,11 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 	}
 }
 
-// turn_completed：usage 提取照旧（carrier totalTokens + usage 对象），
-// generic session_notification 照发，但绝不新增 standalone typed
-// 事件（acp-fe 双路径处理，chat.ts:2768 与 3502）。
-func TestTurnCompletedNoTypedEvent(t *testing.T) {
+// turn_completed：typed 事件是 FE 回合封口语义（update 原样含
+// stop_reason / prompt_id / usage 等字段），params._meta 非空时带 meta；
+// kind modeled → 无 generic session_notification。usage 提取照旧
+// （carrier totalTokens + usage 对象）。
+func TestTurnCompletedTypedAndUsage(t *testing.T) {
 	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 	ch, unsub := b.Subscribe()
 	defer unsub()
@@ -395,19 +390,30 @@ func TestTurnCompletedNoTypedEvent(t *testing.T) {
 			"usage":         map[string]any{"totalTokens": float64(55)},
 		},
 	})
-	var sawNotification, sawTurnUsage bool
+	var sawTyped, sawTurnUsage bool
 	var events []Event
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		select {
 		case ev := <-ch:
 			events = append(events, ev)
-			if ev["type"] == "turn_completed" {
-				t.Fatalf("unexpected typed turn_completed event: %v", ev)
-			}
 			switch ev["type"] {
 			case "session_notification":
-				sawNotification = true
+				t.Errorf("unexpected generic session_notification for modeled kind turn_completed: %v", ev)
+			case "turn_completed":
+				sawTyped = true
+				up, _ := ev["update"].(map[string]any)
+				if up["stop_reason"] != "end_turn" || up["prompt_id"] != "p-1" {
+					t.Errorf("typed update = %v, want stop_reason/prompt_id verbatim", ev["update"])
+				}
+				if ev["sessionId"] != "s1" {
+					t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+				}
+				// params._meta 非空 → 保全进 typed 事件 meta 字段。
+				meta, _ := ev["meta"].(map[string]any)
+				if meta["totalTokens"] != float64(1234) {
+					t.Errorf("typed meta = %v, want params._meta preserved", ev["meta"])
+				}
 			case "usage":
 				// turn 提取的 usage 事件带 usage 对象。
 				if _, ok := ev["usage"].(map[string]any); ok {
@@ -417,13 +423,12 @@ func TestTurnCompletedNoTypedEvent(t *testing.T) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	if !sawNotification {
-		t.Error("no session_notification for turn_completed")
+	if !sawTyped {
+		t.Error("no typed turn_completed event")
 	}
 	if !sawTurnUsage {
 		t.Error("no usage extraction for turn_completed")
 	}
-	// 事件集合里不得出现 typed turn_completed（已在循环内断言），且
 	// 双 usage（carrier totalTokens + turn 提取）都到达。
 	var usageCount int
 	for _, ev := range events {
@@ -438,8 +443,8 @@ func TestTurnCompletedNoTypedEvent(t *testing.T) {
 
 // ── Part 2: sessionUpdate kind 语义化（x.ai 载体） ──────────────────
 
-// x.ai/session_notification 载体：generic（method 原样、params 含
-// `_meta` 保全）+ typed 双发。
+// x.ai/session_notification 载体：modeled kind 只发 typed（无 generic）；
+// params._meta 非空时保全进 typed 事件的 meta 字段。
 func TestXaiSessionNotificationKindDispatch(t *testing.T) {
 	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 	ch, unsub := b.Subscribe()
@@ -458,23 +463,16 @@ func TestXaiSessionNotificationKindDispatch(t *testing.T) {
 		"_meta":     map[string]any{"eventId": "evt-42"},
 	}
 	b.handleXaiNotification("x.ai/session_notification", params)
-	var sawGeneric, sawTyped bool
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !(sawGeneric && sawTyped) {
+	var sawTyped bool
+	var events []Event
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
 		select {
 		case ev := <-ch:
+			events = append(events, ev)
 			switch ev["type"] {
 			case "session_notification":
-				sawGeneric = true
-				if ev["method"] != "x.ai/session_notification" {
-					t.Errorf("generic method = %v, want x.ai/session_notification", ev["method"])
-				}
-				// `_meta`（eventId 等）保全方式不变。
-				p, _ := ev["params"].(map[string]any)
-				meta, _ := p["_meta"].(map[string]any)
-				if meta["eventId"] != "evt-42" {
-					t.Errorf("generic _meta = %v, want eventId preserved", p["_meta"])
-				}
+				t.Errorf("unexpected generic session_notification for modeled kind: %v", ev)
 			case "subagent_progress":
 				sawTyped = true
 				if !reflect.DeepEqual(ev["update"], update) {
@@ -483,12 +481,115 @@ func TestXaiSessionNotificationKindDispatch(t *testing.T) {
 				if ev["sessionId"] != "s1" {
 					t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
 				}
+				// `_meta`（eventId 等）保全进 typed 事件 meta 字段。
+				meta, _ := ev["meta"].(map[string]any)
+				if meta["eventId"] != "evt-42" {
+					t.Errorf("typed meta = %v, want eventId preserved", ev["meta"])
+				}
 			}
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	if !sawGeneric || !sawTyped {
-		t.Errorf("sawGeneric=%v sawTyped=%v", sawGeneric, sawTyped)
+	if !sawTyped {
+		t.Errorf("no typed subagent_progress event")
+	}
+}
+
+// x.ai standalone 通知通道（x.ai/task_backgrounded / x.ai/task_completed /
+// x.ai/monitor_event 方法）形状保持 {type, params, sessionId}——与 kind
+// typed 事件的 {type, update, sessionId} 不同载体、不同形状（见
+// TestTaskKindsUseUpdateShape）。
+func TestXaiStandaloneTaskKindsParamsShape(t *testing.T) {
+	for _, c := range []struct{ method, want string }{
+		{"x.ai/task_backgrounded", "task_backgrounded"},
+		{"x.ai/task_completed", "task_completed"},
+		{"x.ai/monitor_event", "monitor_event"},
+	} {
+		t.Run(c.method, func(t *testing.T) {
+			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+			ch, unsub := b.Subscribe()
+			defer unsub()
+			params := map[string]any{"sessionId": "s1", "task_id": "t-1"}
+			b.handleXaiNotification(c.method, params)
+			ev := <-ch
+			if ev["type"] != c.want {
+				t.Fatalf("event type = %v, want %s", ev["type"], c.want)
+			}
+			if !reflect.DeepEqual(ev["params"], params) {
+				t.Errorf("params = %v, want verbatim %v", ev["params"], params)
+			}
+			if ev["sessionId"] != "s1" {
+				t.Errorf("sessionId = %v, want s1", ev["sessionId"])
+			}
+		})
+	}
+}
+
+// 未建模 kind（compaction_checkpoint / rewind_marker / unknown 及未来
+// 任何新 kind）：只发 generic session_notification（前向兼容载体），
+// 不新增 typed 事件。
+func TestUnmodeledKindGenericOnly(t *testing.T) {
+	for _, kind := range []string{
+		"compaction_checkpoint", "rewind_marker", "unknown", "future_kind_alpha",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+			ch, unsub := b.Subscribe()
+			defer unsub()
+			update := map[string]any{"sessionUpdate": kind, "some": "payload"}
+			b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
+			ev := <-ch
+			if ev["type"] != "session_notification" {
+				t.Fatalf("event type = %v, want session_notification", ev["type"])
+			}
+			if ev["method"] != "session/update" {
+				t.Errorf("generic method = %v, want session/update", ev["method"])
+			}
+			params, _ := ev["params"].(map[string]any)
+			if !reflect.DeepEqual(params, map[string]any{"update": update}) {
+				t.Errorf("generic params = %v, want the update forwarded verbatim", params)
+			}
+			if ev["sessionId"] != "s1" {
+				t.Errorf("generic sessionId = %v, want s1", ev["sessionId"])
+			}
+			// 只发 generic：不得再有第二个事件。
+			select {
+			case extra := <-ch:
+				t.Fatalf("unexpected extra event: %v", extra)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// x.ai 载体未建模 kind：只发 generic（method 原样、params 含 `_meta`
+// 保全），无 typed 事件。
+func TestXaiUnmodeledKindGenericOnly(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	update := map[string]any{"sessionUpdate": "future_kind_x", "some": "payload"}
+	params := map[string]any{
+		"sessionId": "s1",
+		"update":    update,
+		"_meta":     map[string]any{"eventId": "evt-7"},
+	}
+	b.handleXaiNotification("x.ai/session_notification", params)
+	ev := <-ch
+	if ev["type"] != "session_notification" || ev["method"] != "x.ai/session_notification" {
+		t.Fatalf("event = %v, want generic x.ai/session_notification", ev)
+	}
+	if !reflect.DeepEqual(ev["params"], params) {
+		t.Errorf("generic params = %v, want full original params (含 _meta)", ev["params"])
+	}
+	if ev["sessionId"] != "s1" {
+		t.Errorf("generic sessionId = %v, want s1", ev["sessionId"])
+	}
+	// 只发 generic：不得再有第二个事件。
+	select {
+	case extra := <-ch:
+		t.Fatalf("unexpected extra event: %v", extra)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
