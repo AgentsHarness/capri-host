@@ -1066,19 +1066,21 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	if update == nil {
 		return
 	}
-	// Kind 分发与 x.ai 通道共享（dispatchSessionUpdateKind）。官方载体的
-	// generic session_notification（notify）由 dispatch 对每个未显式建模
-	// 的 kind 发出（现状保持）；typed 事件是增量。
-	notify := Event{
-		"type":      "session_notification",
-		"method":    "session/update",
-		"params":    map[string]any{"update": update},
-		"sessionId": sid,
-	}
-	b.dispatchSessionUpdateKind(sid, params, notify, func(ev Event) Event {
+	// Kind 分发与 x.ai 通道共享（dispatchSessionUpdateKind）。modeled
+	// kind 只发 typed 事件（FE 已适配）；仅当 dispatch 返回 false
+	// （未建模 kind）时 generic session_notification 作为前向兼容载体
+	// 发出，形状保持现状。
+	if !b.dispatchSessionUpdateKind(sid, params, func(ev Event) Event {
 		ev["sessionId"] = sid
 		return ev
-	})
+	}) {
+		b.Broadcast(Event{
+			"type":      "session_notification",
+			"method":    "session/update",
+			"params":    map[string]any{"update": update},
+			"sessionId": sid,
+		})
+	}
 
 	// grok ships usage inside turn_completed / response_completed
 	// updates instead of the standard usage_update carrier — surface it
@@ -1087,8 +1089,8 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	//            counter source).
 	//   - usage: the standard TurnCompleted/ResponseCompleted usage
 	//            object passed through untouched.
-	// 这两个 kind 刻意不新增 standalone typed 事件：acp-fe 对
-	// turn_completed 有双路径处理（chat.ts:2768 与 3502），新增会双重触发。
+	// typed 事件（dispatch 已发）是 FE 回合封口语义；usage 提取保留在此
+	// （官方载体带 size:nil；x.ai 载体不带 —— 保持原状，不统一）。
 	if kind, _ := update["sessionUpdate"].(string); kind == "turn_completed" || kind == "response_completed" {
 		ev := Event{"type": "usage"}
 		if meta, ok := params["_meta"].(map[string]any); ok {
@@ -1112,25 +1114,33 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 }
 
 // dispatchSessionUpdateKind routes one sessionUpdate `update` to its typed
-// events. Shared by BOTH sessionUpdate carriers — the official
-// session/update envelope (handleSessionUpdate) and the x.ai channel
-// (x.ai/session_notification / x.ai/session/update, handleXaiNotification)
-// — so every kind behaves identically regardless of which rail it rides
-// (acp-fe 对两个通道按标签幂等合并，chat.ts:3648 附近注释)。
+// events. Returns whether the kind is modeled (handled): true → the caller
+// must NOT emit the generic session_notification (FE 消费 typed 事件);
+// false → the kind is unmodeled and the caller emits the generic
+// session_notification as the forward-compat carrier (compaction_checkpoint
+// / rewind_marker / unknown 及未来任何新 kind). Shared by BOTH sessionUpdate
+// carriers — the official session/update envelope (handleSessionUpdate) and
+// the x.ai channel (x.ai/session_notification / x.ai/session/update,
+// handleXaiNotification) — so every kind behaves identically regardless of
+// which rail it rides.
 //
-//   - notify: the generic session_notification event the OFFICIAL carrier
-//     emits for kinds without explicit typed handling (the FE 的规范载体；
-//     typed 事件是增量，绝不取代它). The x.ai carrier passes nil — it
-//     broadcasts the generic event unconditionally before dispatching, so
-//     its `_meta`（eventId 等）保全方式保持现状。
 //   - tag: sessionId 归属约定（官方载体恒打 sessionId；x.ai 载体空则省略，
 //     withSid 约定）。
-func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, notify Event, tag func(Event) Event) {
+//
+// Typed kind 事件（{type: <kind>, update, sessionId, meta?}）在
+// params._meta 非空时携带 `meta`（官方与 x.ai 载体统一，两个载体都可能有
+// _meta——eventId 等）；仅非空才带（absent key ≠ off）。
+func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, tag func(Event) Event) bool {
 	update, _ := params["update"].(map[string]any)
 	if update == nil {
-		return
+		return false
 	}
 	kind, _ := update["sessionUpdate"].(string)
+	// meta 保全：params._meta 非空时随 typed kind 事件携带。
+	var kindMeta any
+	if m, ok := params["_meta"].(map[string]any); ok && len(m) > 0 {
+		kindMeta = m
+	}
 	switch kind {
 	case "agent_message_chunk":
 		if text := contentText(update["content"]); text != "" {
@@ -1172,6 +1182,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 				b.Broadcast(ev)
 			}
 		}
+		return true
 	case "user_message_chunk":
 		if text := contentText(update["content"]); text != "" {
 			ev := Event{"type": "user_chunk", "text": text}
@@ -1204,6 +1215,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 				b.Broadcast(ev)
 			}
 		}
+		return true
 	case "agent_thought_chunk":
 		// content is typically { "type":"text", "text":"..." }; accept a few shapes
 		if text := contentText(update["content"]); text != "" {
@@ -1215,12 +1227,16 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 			}
 			b.Broadcast(tag(ev))
 		}
+		return true
 	case "tool_call":
 		b.Broadcast(tag(Event{"type": "tool_call", "toolCall": update}))
+		return true
 	case "tool_call_update":
 		b.Broadcast(tag(Event{"type": "tool_call_update", "toolCallUpdate": update}))
+		return true
 	case "plan":
 		b.Broadcast(tag(Event{"type": "plan", "entries": update["entries"]}))
+		return true
 	case "usage_update":
 		b.trackUsage(sid, toInt64(update["used"]), toInt64(update["size"]))
 		b.Broadcast(tag(Event{
@@ -1229,6 +1245,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 			"size": update["size"],
 			"cost": update["cost"],
 		}))
+		return true
 	case "current_mode_update":
 		b.mu.Lock()
 		if ms := update["modeState"]; ms != nil {
@@ -1242,6 +1259,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 		}
 		b.mu.Unlock()
 		b.Broadcast(tag(Event{"type": "modes_update", "modes": modes}))
+		return true
 	case "config_option_update":
 		b.mu.Lock()
 		if co := update["configOptions"]; co != nil {
@@ -1255,8 +1273,10 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 		}
 		b.mu.Unlock()
 		b.Broadcast(tag(Event{"type": "config_options_update", "configOptions": co}))
+		return true
 	case "available_commands_update":
 		b.Broadcast(tag(Event{"type": "commands_update", "commands": update["commands"]}))
+		return true
 	case "session_info_update", "session_info":
 		// session_info_update 是官方 ACP SessionUpdate 的 kind（serde tag
 		// "sessionUpdate"，agent-client-protocol-schema client.rs:106）；
@@ -1277,46 +1297,48 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 			"title":     update["title"],
 			"updatedAt": update["updatedAt"],
 		}))
+		return true
 	case "scheduled_task_created":
 		// 复用 x.ai 通道的归一化 helper（task/rawTask/rawParams/meta 保全，
 		// 见 broadcastScheduledTaskCreated）。
-		if notify != nil {
-			b.Broadcast(notify)
-		}
 		b.broadcastScheduledTaskCreated(sid, params, tag)
+		return true
 	case "scheduled_task_deleted":
-		if notify != nil {
-			b.Broadcast(notify)
-		}
 		b.broadcastScheduledTaskDeleted(sid, params, tag)
+		return true
 	case "task_backgrounded", "task_completed", "monitor_event":
-		// 形状与现有 x.ai 通道一致（{type, params, sessionId}）—— FE 对
-		// session_notification 标签与 standalone 事件双通道按 taskId
-		// 幂等合并（chat.ts:3648 附近注释）。
-		if notify != nil {
-			b.Broadcast(notify)
+		// 形状与其它 kind typed 事件统一：{type, update, sessionId}
+		// （update = 原始 update 对象）。x.ai standalone 通知通道
+		// （x.ai/task_backgrounded / x.ai/task_completed /
+		// x.ai/monitor_event 方法）保持 {type, params, sessionId} 不动
+		// —— 不同载体，形状跟随 wire（见 handleXaiNotification）。
+		ev := Event{"type": kind, "update": update}
+		if kindMeta != nil {
+			ev["meta"] = kindMeta
 		}
-		b.Broadcast(tag(Event{"type": kind, "params": params}))
+		b.Broadcast(tag(ev))
+		return true
 	case "model_auto_switched", "model_changed":
-		// 更新 roster models 缓存 + 广播 models_update / model（见
-		// handleModelSwitchKind）；generic session_notification 照发。
-		if notify != nil {
-			b.Broadcast(notify)
-		}
+		// roster models 缓存更新 + models_update / model 广播（typed 语义
+		// 事件，见 handleModelSwitchKind）；kind modeled → 无 generic，
+		// FE 改用 typed 消费。
 		b.handleModelSwitchKind(sid, update, tag)
+		return true
 	case "turn_completed", "response_completed":
-		// 刻意不新增 standalone typed 事件：acp-fe 对 turn_completed 有
-		// 双路径处理（chat.ts:2768 与 3502），新增会双重触发。usage 提取
-		// 保留在两个载体（handleSessionUpdate / handleXaiNotification）。
-		if notify != nil {
-			b.Broadcast(notify)
+		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
+		// prompt_id / usage 等字段）；usage 提取保留在两个载体
+		// （handleSessionUpdate / handleXaiNotification）。
+		ev := Event{"type": kind, "update": update}
+		if kindMeta != nil {
+			ev["meta"] = kindMeta
 		}
+		b.Broadcast(tag(ev))
+		return true
 	case "compaction_checkpoint", "rewind_marker", "unknown":
-		// 仅持久化、不发 UI（grokbuild-acp-protocol.md §13：compaction
-		// checkpoint / rewind marker 不上 live 通道）；unknown 前向兼容忽略。
-		if notify != nil {
-			b.Broadcast(notify)
-		}
+		// 仅持久化、不发 typed UI（grokbuild-acp-protocol.md §13：
+		// compaction checkpoint / rewind marker 不上 live 通道）；unknown
+		// 前向兼容忽略。未建模 → 由调用方发 generic（保持不变）。
+		return false
 	case "diff_review", "retry_state", "auto_compact_started",
 		"auto_compact_completed", "auto_compact_failed", "auto_compact_cancelled",
 		"auto_continue_completed", "memory_flush_started", "memory_flush_completed",
@@ -1330,21 +1352,21 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, no
 		"image_dropped", "workflow_updated", "goal_updated",
 		"pending_interaction", "interaction_resolved", "response_started",
 		"reasoning_completed":
-		// 增量 typed 事件：{type: <kind>, update: <原始 update>, sessionId}
-		// （sessionId 空则省略，withSid 约定），字段原样透传不归一化。载荷
-		// 形状以 grok 源码 extensions/notification.rs 的 SessionUpdate 枚举
-		// （tag = "sessionUpdate"，snake_case）为准。generic
-		// session_notification 照发 —— 该事件是 FE 的规范载体。
-		if notify != nil {
-			b.Broadcast(notify)
+		// 单发 typed 事件：{type: <kind>, update: <原始 update>, sessionId,
+		// meta?}（sessionId 空则省略，withSid 约定；params._meta 非空时带
+		// meta），字段原样透传不归一化。载荷形状以 grok 源码
+		// extensions/notification.rs 的 SessionUpdate 枚举（tag =
+		// "sessionUpdate"，snake_case）为准。modeled → 无 generic。
+		ev := Event{"type": kind, "update": update}
+		if kindMeta != nil {
+			ev["meta"] = kindMeta
 		}
-		b.Broadcast(tag(Event{"type": kind, "update": update}))
+		b.Broadcast(tag(ev))
+		return true
 	default:
-		// 未建模的 kind：generic session_notification 照发（前向兼容，
-		// 不新增 typed 事件）。
-		if notify != nil {
-			b.Broadcast(notify)
-		}
+		// 未建模的 kind（未来任何新 kind）：generic session_notification
+		// 由调用方发出（前向兼容，不新增 typed 事件）。
+		return false
 	}
 }
 
@@ -1415,8 +1437,8 @@ func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any
 // 附近），然后广播 `models_update`（形状与现有一致：{type:"models_update",
 // params: <session 的 models>, sessionId}）与 `model`（形状与 SetModel
 // 一致：{type:"model", modelId, modelName, reasoningEffort, sessionId}；
-// modelName 用 modelDisplayName 解析，空字符串省略）。generic
-// session_notification 由调用方照发。
+// modelName 用 modelDisplayName 解析，空字符串省略）。这两个广播即该
+// kind 的 typed 语义事件（modeled → 无 generic session_notification）。
 func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag func(Event) Event) {
 	// 新模型 id：model_changed 走 model_id/modelId，model_auto_switched
 	// 走 new_model_id/newModelId。
@@ -1435,7 +1457,7 @@ func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag fu
 		}
 	}
 	if id == "" {
-		// 字段缺失/为空：无可应用的状态（generic 已照发）。
+		// 字段缺失/为空：无可应用的状态（kind modeled，无 generic）。
 		return
 	}
 	b.mu.Lock()
@@ -1489,12 +1511,14 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 	}
 	switch method {
 	case "x.ai/session_notification", "x.ai/session/update":
-		// The generic event is the FE 的规范载体；先发，且携带完整 params
-		// 使 `_meta`（eventId 等）保全方式保持现状。Kind 分发（含
-		// session_info 的 title/updatedAt roster 跟踪）在
+		// Kind 分发（含 session_info 的 title/updatedAt roster 跟踪）在
 		// dispatchSessionUpdateKind —— 与官方 session/update 载体一致。
-		b.Broadcast(withSid(Event{"type": "session_notification", "method": method, "params": params}))
-		b.dispatchSessionUpdateKind(sid, params, nil, withSid)
+		// modeled kind 只发 typed；仅当 dispatch 返回 false（未建模）时
+		// generic 照发，携带完整 params 使 `_meta`（eventId 等）保全
+		// 方式保持现状。
+		if !b.dispatchSessionUpdateKind(sid, params, withSid) {
+			b.Broadcast(withSid(Event{"type": "session_notification", "method": method, "params": params}))
+		}
 		// grok ships usage inside response_completed / turn_completed
 		// notifications instead of the standard usage_update carrier —
 		// surface it as a normal usage event so clients can show live
@@ -1510,8 +1534,8 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		//            TURN-ACCUMULATED count across every model call in
 		//            the turn — NOT a context-window size). The client
 		//            separates the two; no custom field names.
-		// 这两个 kind 刻意不新增 standalone typed 事件（acp-fe 双路径处理，
-		// chat.ts:2768 与 3502）。
+		// typed 事件（dispatch 已发）是 FE 回合封口语义；usage 提取保留在
+		// 此（x.ai 载体不带 size:nil，官方载体带 —— 保持原状，不统一）。
 		if up, ok := params["update"].(map[string]any); ok {
 			if kind, _ := up["sessionUpdate"].(string); kind == "response_completed" || kind == "turn_completed" {
 				ev := Event{"type": "usage"}
