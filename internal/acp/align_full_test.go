@@ -162,7 +162,7 @@ func TestListSessionsForwardsOpts(t *testing.T) {
 
 	// 无 opts → wire 保持 {}。
 	runResolved(t, b, w, map[string]any{"sessions": []any{}}, func() error {
-		_, err := b.ListSessions(ctx)
+		_, _, _, err := b.ListSessions(ctx)
 		return err
 	})
 	method, params := lastRequestParams(t, w)
@@ -176,7 +176,7 @@ func TestListSessionsForwardsOpts(t *testing.T) {
 	// opts → cwd/cursor/`_meta`（ACP ListSessionsRequest：cwd? cursor?
 	// meta→`_meta`，handlers/session.rs:308-310）。
 	runResolved(t, b, w, map[string]any{"sessions": []any{}}, func() error {
-		_, err := b.ListSessions(ctx, ListSessionsOpts{
+		_, _, _, err := b.ListSessions(ctx, ListSessionsOpts{
 			Cwd:    "/ws",
 			Cursor: "abc",
 			Meta:   map[string]any{"clientType": "pager"},
@@ -190,6 +190,58 @@ func TestListSessionsForwardsOpts(t *testing.T) {
 	want := map[string]any{"cwd": "/ws", "cursor": "abc", "_meta": map[string]any{"clientType": "pager"}}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("opts params = %v, want %v", params, want)
+	}
+}
+
+// ── A5b: session/list 响应游标与 `_meta` 透传 ───────────────────────
+
+// The session/list response's pagination cursor (camelCase nextCursor or
+// snake_case next_cursor — both accepted) and `_meta` are returned for
+// passthrough; "" / nil when absent.
+func TestListSessionsReturnsCursorAndMeta(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	// camelCase nextCursor + `_meta`。
+	var gotCursor string
+	var gotMeta map[string]any
+	runResolved(t, b, w, map[string]any{
+		"sessions":   []any{},
+		"nextCursor": "c2",
+		"_meta":      map[string]any{"has_more": true},
+	}, func() error {
+		var err error
+		_, gotCursor, gotMeta, err = b.ListSessions(ctx)
+		return err
+	})
+	if gotCursor != "c2" {
+		t.Errorf("nextCursor = %q, want c2", gotCursor)
+	}
+	if !reflect.DeepEqual(gotMeta, map[string]any{"has_more": true}) {
+		t.Errorf("meta = %v, want {has_more:true}", gotMeta)
+	}
+
+	// snake_case next_cursor 兼容。
+	runResolved(t, b, w, map[string]any{
+		"sessions":    []any{},
+		"next_cursor": "c3",
+	}, func() error {
+		var err error
+		_, gotCursor, _, err = b.ListSessions(ctx)
+		return err
+	})
+	if gotCursor != "c3" {
+		t.Errorf("next_cursor = %q, want c3", gotCursor)
+	}
+
+	// 缺省：游标 ""、meta nil。
+	runResolved(t, b, w, map[string]any{"sessions": []any{}}, func() error {
+		var err error
+		_, gotCursor, gotMeta, err = b.ListSessions(ctx)
+		return err
+	})
+	if gotCursor != "" || gotMeta != nil {
+		t.Errorf("absent cursor/meta: cursor = %q, meta = %v, want \"\"/nil", gotCursor, gotMeta)
 	}
 }
 

@@ -94,6 +94,18 @@ func TestExtSessionMethodsWirePayloads(t *testing.T) {
 			method: "_x.ai/session/list",
 			params: map[string]any{},
 		},
+		{
+			name:   "session/load_history sends beforeId cursor",
+			call:   func(b *Bridge) (map[string]any, error) { return b.SessionLoadHistory(ctx, "c-42") },
+			method: "_x.ai/session/load_history",
+			params: map[string]any{"beforeId": "c-42"},
+		},
+		{
+			name:   "session/load_history omits beforeId when empty (first page)",
+			call:   func(b *Bridge) (map[string]any, error) { return b.SessionLoadHistory(ctx, "") },
+			method: "_x.ai/session/load_history",
+			params: map[string]any{},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

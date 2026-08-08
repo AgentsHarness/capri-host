@@ -43,8 +43,18 @@ type Status struct {
 	// AgentCapabilities from the agent's initialize response (what the
 	// agent declared, e.g. x.ai extension support).
 	AgentCapabilities any `json:"agentCapabilities,omitempty"`
-	Modes             any `json:"modes,omitempty"`
-	ConfigOptions     any `json:"configOptions,omitempty"`
+	// AuthMeta: the `_meta` from the authenticate response (AuthMeta:
+	// email/auth_mode/team_id/team_name/is_zdr/team_role/
+	// coding_data_retention_opt_out/show_resolved_model/gate/
+	// subscription_tier), passthrough to clients. Nil when the agent
+	// returned no `_meta` (absent key ≠ off).
+	AuthMeta      any `json:"authMeta,omitempty"`
+	Modes         any `json:"modes,omitempty"`
+	ConfigOptions any `json:"configOptions,omitempty"`
+	// SessionMeta: the `_meta` from the latest session/new | session/load |
+	// session/resume response (agent → host), passthrough to clients. Nil
+	// when the agent returned no `_meta`.
+	SessionMeta any `json:"sessionMeta,omitempty"`
 	// SessionModelState from the latest session/new or session/load.
 	Models          any          `json:"models,omitempty"`
 	BootError       string       `json:"bootError,omitempty"`
@@ -78,6 +88,11 @@ type SessionState struct {
 	modes      any
 	configOpts any
 	models     any
+
+	// sessionMeta: the `_meta` from the latest session/new | session/load |
+	// session/resume response (agent → host), surfaced on the ready event
+	// and in Status.SessionMeta; not serialized on roster rows.
+	sessionMeta any
 
 	// Latest context usage (session/update _meta.totalTokens / usage_update)
 	// and git head (x.ai/git_head_changed) — served via /api/session-info;
