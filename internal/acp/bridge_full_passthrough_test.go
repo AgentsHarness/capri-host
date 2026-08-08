@@ -10,22 +10,18 @@ import (
 
 // ── session/update full passthrough ─────────────────────────────────
 
-// Any sessionUpdate kind outside the explicitly modeled cases must be
-// forwarded verbatim as a session_notification event (previously only 16
-// whitelisted kinds passed through; everything else was dropped as
-// unknown_update, which the frontend ignores). Sample across the
-// life-cycle / UI kinds the agent actually ships, including the
-// required diff_review and tool_call_delta_chunk.
+// Any UNMODELED sessionUpdate kind must be forwarded verbatim as a
+// session_notification event (the forward-compat carrier — modeled kinds
+// now emit only their typed event, see
+// TestSessionUpdateKindTypedOnly). Sample the persist-only kinds and a
+// couple of hypothetical future kinds.
 func TestSessionUpdateFullPassthrough(t *testing.T) {
 	kinds := []string{
-		"workflow_updated",
-		"tool_call_delta_chunk",
-		"diff_review",
-		"memory_files",
-		"model_changed",
-		"subagent_spawned",
-		"response_started",
-		"session_recap",
+		"compaction_checkpoint",
+		"rewind_marker",
+		"unknown",
+		"future_kind_alpha",
+		"future_kind_beta",
 	}
 	for _, kind := range kinds {
 		t.Run(kind, func(t *testing.T) {
@@ -52,6 +48,12 @@ func TestSessionUpdateFullPassthrough(t *testing.T) {
 				if ev["sessionId"] != "s1" {
 					t.Errorf("event sessionId = %v, want s1", ev["sessionId"])
 				}
+				// 只发 generic：不得再有第二个事件。
+				select {
+				case extra := <-ch:
+					t.Fatalf("unexpected extra event: %v", extra)
+				case <-time.After(50 * time.Millisecond):
+				}
 			case <-time.After(time.Second):
 				t.Fatal("no session_notification event broadcast")
 			}
@@ -60,11 +62,12 @@ func TestSessionUpdateFullPassthrough(t *testing.T) {
 }
 
 // turn_completed / response_completed over the session/update carrier must
-// yield BOTH the forwarded session_notification event and a usage event
-// extracted from _meta.totalTokens + update.usage (handleXaiNotification
-// parity). The merged usage event carries used (int64 from asInt) and the
-// turn's usage object passed through untouched.
-func TestTurnCompletedSessionUpdateUsage(t *testing.T) {
+// yield the typed turn_completed/response_completed event (FE 回合封口语义,
+// update verbatim) and a usage event extracted from _meta.totalTokens +
+// update.usage (handleXaiNotification parity). The merged usage event
+// carries used (int64 from asInt) and the turn's usage object passed
+// through untouched. Modeled → no generic session_notification.
+func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
 	for _, kind := range []string{"turn_completed", "response_completed"} {
 		t.Run(kind, func(t *testing.T) {
 			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
@@ -79,16 +82,23 @@ func TestTurnCompletedSessionUpdateUsage(t *testing.T) {
 					"usage":         usage,
 				},
 			})
-			var sawNotification, sawUsage bool
-			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) && !(sawNotification && sawUsage) {
+			var sawTyped, sawUsage bool
+			var events []Event
+			deadline := time.Now().Add(300 * time.Millisecond)
+			for time.Now().Before(deadline) {
 				select {
 				case ev := <-ch:
+					events = append(events, ev)
 					switch ev["type"] {
 					case "session_notification":
-						sawNotification = true
-						if ev["method"] != "session/update" {
-							t.Errorf("notification method = %v, want session/update", ev["method"])
+						t.Errorf("unexpected generic session_notification for modeled kind %s: %v", kind, ev)
+					case kind:
+						sawTyped = true
+						if !reflect.DeepEqual(ev["update"], map[string]any{"sessionUpdate": kind, "usage": usage}) {
+							t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
+						}
+						if ev["sessionId"] != "s1" {
+							t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
 						}
 					case "usage":
 						// Only the turn-completed extraction carries BOTH
@@ -99,11 +109,11 @@ func TestTurnCompletedSessionUpdateUsage(t *testing.T) {
 							}
 						}
 					}
-				case <-time.After(50 * time.Millisecond):
+				case <-time.After(20 * time.Millisecond):
 				}
 			}
-			if !sawNotification {
-				t.Errorf("no session_notification event for %s", kind)
+			if !sawTyped {
+				t.Errorf("no typed %s event", kind)
 			}
 			if !sawUsage {
 				t.Errorf("no merged usage event (used=1234 + usage object) for %s", kind)
