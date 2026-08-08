@@ -162,6 +162,26 @@ func (s *Server) handleSessionRehydrate(w http.ResponseWriter, r *http.Request) 
 	s.xaiCall(w, r, "x.ai/session/rehydrate", params)
 }
 
+// handleSessionLoadHistory — POST /api/session-load-history {beforeId?} →
+// x.ai/session/load_history {beforeId?}（camelCase；beforeId 为客户端持有
+// 的游标，空则省略 = 第一页，grok-build chat_conversation_history.rs：
+// `beforeId` → `nextBeforeId`）。gateway 型会话，不传 sessionId。成功返回
+// {ok:true, result:<agent 原始 result>}，错误经 writeAgentError 降级。
+func (s *Server) handleSessionLoadHistory(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		BeforeID string `json:"beforeId,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	res, err := s.bridge.SessionLoadHistory(r.Context(), body.BeforeID)
+	if err != nil {
+		writeAgentError(w, "x.ai/session/load_history", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
 // ── 会话摘要（x.ai/session_summaries/*）───────────────────────────────
 
 // handleSessionSummariesSessionList — POST /api/session-summaries/session-list

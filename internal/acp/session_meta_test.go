@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // metaReadyBridge is readyBridge with an isolated last-session file (the
@@ -181,5 +182,223 @@ func TestLoadSessionBusyFocusOnlyIgnoresMeta(t *testing.T) {
 			msgs = append(msgs, m)
 		}
 		t.Errorf("busy focus-only path must not write requests, got %d: %v", n, msgs)
+	}
+}
+
+// ── 响应 `_meta` 透传（session/new | session/load | session/resume）────
+
+// nextEvent drains the subscriber channel until an event of the wanted
+// type arrives (broadcasts happen synchronously, but busy/ready may race).
+func nextEvent(t *testing.T, sub chan Event, typ string) Event {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-sub:
+			if ev["type"] == typ {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("no %s event broadcast", typ)
+		}
+	}
+}
+
+// The session/new response `_meta` must be stored and passed through: the
+// ready event carries `sessionMeta` and Status exposes it too; without a
+// response `_meta` neither appears (absent key ≠ off).
+func TestCreateSessionResponseMetaPassthrough(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	runResolved(t, b, w, map[string]any{
+		"sessionId": "s2",
+		"_meta":     map[string]any{"turn_count": float64(3), "kind": "fresh"},
+	}, func() error {
+		return b.NewSession(ctx, SessionConfig{Cwd: "/ws"})
+	})
+
+	ev := nextEvent(t, sub, "ready")
+	if !reflect.DeepEqual(ev["sessionMeta"], map[string]any{"turn_count": float64(3), "kind": "fresh"}) {
+		t.Errorf("ready sessionMeta = %v, want {turn_count:3 kind:fresh}", ev["sessionMeta"])
+	}
+	snap := b.Snapshot()
+	if !reflect.DeepEqual(snap.SessionMeta, map[string]any{"turn_count": float64(3), "kind": "fresh"}) {
+		t.Errorf("Status.SessionMeta = %v, want {turn_count:3 kind:fresh}", snap.SessionMeta)
+	}
+}
+
+func TestCreateSessionReadyOmitsMetaWhenAbsent(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	runResolved(t, b, w, map[string]any{"sessionId": "s2"}, func() error {
+		return b.NewSession(ctx, SessionConfig{Cwd: "/ws"})
+	})
+
+	ev := nextEvent(t, sub, "ready")
+	if _, ok := ev["sessionMeta"]; ok {
+		t.Errorf("ready event must not carry sessionMeta when the agent returned none: %v", ev)
+	}
+	if snap := b.Snapshot(); snap.SessionMeta != nil {
+		t.Errorf("Status.SessionMeta = %v, want nil", snap.SessionMeta)
+	}
+}
+
+// The session/load response `_meta` is stored and passed through on the
+// cold-load ready event.
+func TestLoadSessionResponseMetaPassthrough(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	runResolved(t, b, w, map[string]any{
+		"sessionId": "hist-1",
+		"_meta":     map[string]any{"kind": "restored"},
+	}, func() error {
+		_, err := b.LoadSession(ctx, "hist-1", "/ws")
+		return err
+	})
+
+	ev := nextEvent(t, sub, "ready")
+	if !reflect.DeepEqual(ev["sessionMeta"], map[string]any{"kind": "restored"}) {
+		t.Errorf("ready sessionMeta = %v, want {kind:restored}", ev["sessionMeta"])
+	}
+	if snap := b.Snapshot(); !reflect.DeepEqual(snap.SessionMeta, map[string]any{"kind": "restored"}) {
+		t.Errorf("Status.SessionMeta = %v, want {kind:restored}", snap.SessionMeta)
+	}
+}
+
+// The busy focus-only path re-announces the session's STORED response meta
+// (no agent call happens, so nothing new to fetch).
+func TestLoadSessionFocusOnlyCarriesStoredMeta(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	b.mu.Lock()
+	b.sessions["s1"].Busy = true
+	b.sessions["s1"].sessionMeta = map[string]any{"kind": "restored"}
+	b.mu.Unlock()
+
+	if _, err := b.LoadSession(ctx, "s1", "/ws"); err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	ev := nextEvent(t, sub, "ready")
+	if !reflect.DeepEqual(ev["sessionMeta"], map[string]any{"kind": "restored"}) {
+		t.Errorf("ready sessionMeta = %v, want {kind:restored}", ev["sessionMeta"])
+	}
+}
+
+// The session/resume response `_meta` is stored and passed through on the
+// cold-resume ready event.
+func TestResumeSessionResponseMetaPassthrough(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	runResolved(t, b, w, map[string]any{
+		"sessionId": "paused-1",
+		"_meta":     map[string]any{"kind": "resumed"},
+	}, func() error {
+		_, err := b.ResumeSession(ctx, "paused-1", "/ws")
+		return err
+	})
+
+	ev := nextEvent(t, sub, "ready")
+	if !reflect.DeepEqual(ev["sessionMeta"], map[string]any{"kind": "resumed"}) {
+		t.Errorf("ready sessionMeta = %v, want {kind:resumed}", ev["sessionMeta"])
+	}
+	if snap := b.Snapshot(); !reflect.DeepEqual(snap.SessionMeta, map[string]any{"kind": "resumed"}) {
+		t.Errorf("Status.SessionMeta = %v, want {kind:resumed}", snap.SessionMeta)
+	}
+}
+
+// ── authenticate 响应 `_meta`（AuthMeta）─────────────────────────────
+
+// The authenticate response `_meta` is stored on the bridge and exposed
+// via Status.AuthMeta; ready events carry it next to agentInfo.
+func TestAuthenticateStoresAuthMeta(t *testing.T) {
+	b, w := readyBridge()
+	ctx := context.Background()
+
+	runResolved(t, b, w, map[string]any{
+		"_meta": map[string]any{"email": "a@b.c", "subscription_tier": "pro"},
+	}, func() error {
+		return b.authenticate(ctx, map[string]any{
+			"authMethods": []any{map[string]any{"id": "cached_token"}},
+		})
+	})
+
+	want := map[string]any{"email": "a@b.c", "subscription_tier": "pro"}
+	if !reflect.DeepEqual(b.authMeta, want) {
+		t.Errorf("authMeta = %v, want %v", b.authMeta, want)
+	}
+	if snap := b.Snapshot(); !reflect.DeepEqual(snap.AuthMeta, want) {
+		t.Errorf("Status.AuthMeta = %v, want %v", snap.AuthMeta, want)
+	}
+}
+
+func TestAuthenticateAuthMetaNilWhenAbsent(t *testing.T) {
+	b, w := readyBridge()
+	ctx := context.Background()
+
+	runResolved(t, b, w, map[string]any{}, func() error {
+		return b.authenticate(ctx, map[string]any{
+			"authMethods": []any{map[string]any{"id": "cached_token"}},
+		})
+	})
+
+	if b.authMeta != nil {
+		t.Errorf("authMeta = %v, want nil", b.authMeta)
+	}
+	if snap := b.Snapshot(); snap.AuthMeta != nil {
+		t.Errorf("Status.AuthMeta = %v, want nil", snap.AuthMeta)
+	}
+}
+
+// The session-ready event carries authMeta (next to agentInfo) when the
+// authenticate response had one.
+func TestReadyEventCarriesAuthMeta(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	b.mu.Lock()
+	b.authMeta = map[string]any{"email": "a@b.c"}
+	b.mu.Unlock()
+
+	runResolved(t, b, w, map[string]any{"sessionId": "s2"}, func() error {
+		return b.NewSession(ctx, SessionConfig{Cwd: "/ws"})
+	})
+
+	ev := nextEvent(t, sub, "ready")
+	if !reflect.DeepEqual(ev["authMeta"], map[string]any{"email": "a@b.c"}) {
+		t.Errorf("ready authMeta = %v, want {email:a@b.c}", ev["authMeta"])
+	}
+}
+
+// Without authMeta the ready event must not carry an authMeta key.
+func TestReadyEventOmitsAuthMetaWhenAbsent(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	runResolved(t, b, w, map[string]any{"sessionId": "s2"}, func() error {
+		return b.NewSession(ctx, SessionConfig{Cwd: "/ws"})
+	})
+
+	ev := nextEvent(t, sub, "ready")
+	if _, ok := ev["authMeta"]; ok {
+		t.Errorf("ready event must not carry authMeta when absent: %v", ev)
 	}
 }

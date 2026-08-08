@@ -47,6 +47,12 @@ type Bridge struct {
 	bootDone  chan struct{}
 	bootError string
 	agentInfo map[string]any
+	// authMeta: the `_meta` from the authenticate response (AuthMeta:
+	// email/auth_mode/team_id/team_name/is_zdr/team_role/
+	// coding_data_retention_opt_out/show_resolved_model/gate/
+	// subscription_tier), surfaced in Status and ready events. Nil when
+	// the agent returned no `_meta` (absent key ≠ off).
+	authMeta map[string]any
 	// initAgentCapabilities is the `agentCapabilities` object from the
 	// agent's initialize response, surfaced in Status/Snapshot.
 	initAgentCapabilities any
@@ -372,13 +378,20 @@ func (b *Bridge) Snapshot() Status {
 	})
 	act := b.activeSessionLocked()
 	var sid, cwd string
-	var modes, configOpts, models any
+	var modes, configOpts, models, sessionMeta any
 	if act != nil {
 		sid = act.SessionID
 		cwd = act.Cwd
 		modes = act.modes
 		configOpts = act.configOpts
 		models = act.models
+		sessionMeta = act.sessionMeta
+	}
+	// AuthMeta/SessionMeta 是 any 字段：有类型的 nil map 装进 any 后
+	// omitempty 会失效（输出 null），所以 nil 时不装。
+	var authMeta any
+	if b.authMeta != nil {
+		authMeta = b.authMeta
 	}
 	return Status{
 		Ready:             b.ready,
@@ -391,8 +404,10 @@ func (b *Bridge) Snapshot() Status {
 		HomeDir:           b.homeDir,
 		AgentInfo:         b.agentInfo,
 		AgentCapabilities: b.initAgentCapabilities,
+		AuthMeta:          authMeta,
 		Modes:             modes,
 		ConfigOptions:     configOpts,
+		SessionMeta:       sessionMeta,
 		Models:            models,
 		BootError:         b.bootError,
 		Text:              b.textBuf,
@@ -533,16 +548,23 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	b.mu.Lock()
 	noSession := len(b.sessions) == 0
 	agentInfo := b.agentInfo
+	authMeta := b.authMeta
 	hostID := b.hostID
 	hostName := b.hostName
 	b.mu.Unlock()
 	if noSession {
-		b.Broadcast(Event{
+		ev := Event{
 			"type":      "ready",
 			"agentInfo": agentInfo,
 			"hostId":    hostID,
 			"hostName":  hostName,
-		})
+		}
+		// authenticate 响应 `_meta`（AuthMeta）与 agentInfo 并列透传，
+		// 仅非空才带（absent key ≠ off）。
+		if authMeta != nil {
+			ev["authMeta"] = authMeta
+		}
+		b.Broadcast(ev)
 	}
 	return nil
 }
@@ -711,6 +733,9 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	s.modes = sessRes["modes"]
 	s.configOpts = sessRes["configOptions"]
 	s.models = sessRes["models"]
+	// session/new 响应 `_meta`（agent 下发）原样存下，ready 事件 / Status
+	// 透传；缺省为 nil（absent key ≠ off）。
+	s.sessionMeta = sessRes["_meta"]
 	b.activeSessionID = sid
 	b.rememberSessionLocked(sid, cwd)
 	b.textBuf = ""
@@ -719,13 +744,15 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	modes := s.modes
 	configOpts := s.configOpts
 	models := s.models
+	sessionMeta := s.sessionMeta
 	agentInfo := b.agentInfo
+	authMeta := b.authMeta
 	hostID := b.hostID
 	hostName := b.hostName
 	sessCwd := s.Cwd
 	b.mu.Unlock()
 
-	b.Broadcast(Event{
+	ev := Event{
 		"type":          "ready",
 		"sessionId":     sid,
 		"cwd":           sessCwd,
@@ -735,7 +762,14 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 		"models":        models,
 		"hostId":        hostID,
 		"hostName":      hostName,
-	})
+	}
+	if sessionMeta != nil {
+		ev["sessionMeta"] = sessionMeta
+	}
+	if authMeta != nil {
+		ev["authMeta"] = authMeta
+	}
+	b.Broadcast(ev)
 	b.broadcastRosterChange()
 	return nil
 }
@@ -775,11 +809,25 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	if v, ok := intEnv("ACP_AUTH_REQUEST_SEQ"); ok {
 		meta["request_seq"] = v
 	}
-	_, err := b.request(ctx, "authenticate", map[string]any{
+	res, err := b.request(ctx, "authenticate", map[string]any{
 		"methodId": methodID,
 		"_meta":    meta,
 	}, bootTimeout)
-	return err
+	if err != nil {
+		return err
+	}
+	// AuthMeta: 响应 `_meta`（email/auth_mode/team_id/team_name/is_zdr/
+	// team_role/coding_data_retention_opt_out/show_resolved_model/gate/
+	// subscription_tier）原样存下，Status / ready 事件透传；缺省为 nil
+	// （absent key ≠ off）。显式归 nil：类型断言的失败值是有类型的 nil
+	// map，直接存入 any 字段会让 omitempty 失效。
+	b.mu.Lock()
+	b.authMeta = nil
+	if m, ok := res["_meta"].(map[string]any); ok {
+		b.authMeta = m
+	}
+	b.mu.Unlock()
+	return nil
 }
 
 // intEnv parses an env var as an integer (ok=false when unset/invalid).
@@ -1766,13 +1814,16 @@ type PromptOpts struct {
 // never silently open a blank chat. Busy is per-session: other sessions
 // can keep running turns in parallel (the agent process is multi-session).
 func (b *Bridge) Prompt(ctx context.Context, sessionID string, blocks []ContentBlock) (stopReason string, err error) {
-	return b.PromptWithOpts(ctx, sessionID, blocks, PromptOpts{})
+	sr, _, err := b.PromptWithOpts(ctx, sessionID, blocks, PromptOpts{})
+	return sr, err
 }
 
 // PromptWithOpts is Prompt with the official optional fields (messageId /
 // _meta) forwarded on the session/prompt params when set; empty opts keep
-// the wire byte-identical to Prompt.
-func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []ContentBlock, opts PromptOpts) (stopReason string, err error) {
+// the wire byte-identical to Prompt. Returns the turn's stopReason plus
+// the response `_meta` (the agent's prompt-result meta, nil when absent)
+// so the HTTP layer can pass it through to the browser.
+func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []ContentBlock, opts PromptOpts) (stopReason string, meta map[string]any, err error) {
 	b.mu.Lock()
 	if sessionID == "" {
 		sessionID = b.activeSessionID
@@ -1787,10 +1838,10 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		b.mu.Unlock()
 		if hasLast {
 			if err := b.restoreLastSession(ctx); err != nil {
-				return "", err
+				return "", nil, err
 			}
 		} else if err := b.NewSession(ctx, SessionConfig{}); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		b.mu.Lock()
 		sessionID = b.activeSessionID
@@ -1798,11 +1849,11 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	if s == nil {
 		b.mu.Unlock()
-		return "", &HTTPError{Code: 404, Msg: "会话不存在"}
+		return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
 	}
 	if s.Busy {
 		b.mu.Unlock()
-		return "", &HTTPError{Code: 409, Msg: "上一条消息还在处理中"}
+		return "", nil, &HTTPError{Code: 409, Msg: "上一条消息还在处理中"}
 	}
 	s.Busy = true
 	s.LastActiveAt = time.Now().UnixMilli()
@@ -1818,7 +1869,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}()
 
 	if err := b.ensureBooted(ctx); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// convert blocks
@@ -1849,7 +1900,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		if errors.Is(err, context.Canceled) {
 			b.Cancel(sessionID)
 			b.Broadcast(Event{"type": "status", "text": "连接已断开，本次回复已取消，请重新发送", "sessionId": sessionID})
-			return "", err
+			return "", nil, err
 		}
 		// Self-heal: a turn-end failure usually means the agent process is
 		// wedged (it streams output but errors when resolving the turn).
@@ -1874,14 +1925,21 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// background restore succeeded — the turn itself still failed and
 		// the user needs to check the host / resend.
 		b.Broadcast(Event{"type": "status", "text": "连接HOST异常，请检查后重试"})
-		return "", err
+		return "", nil, err
 	}
 	sr, _ := res["stopReason"].(string)
 	if sr == "" {
 		sr = "unknown"
 	}
-	b.Broadcast(Event{"type": "done", "stopReason": sr, "sessionId": sessionID})
-	return sr, nil
+	// 响应 `_meta`（agent 下发的 prompt-result meta）原样透传：done 事件
+	// 带 `meta`、返回值给 HTTP 层；仅非空才带（absent key ≠ off）。
+	meta, _ = res["_meta"].(map[string]any)
+	ev := Event{"type": "done", "stopReason": sr, "sessionId": sessionID}
+	if len(meta) > 0 {
+		ev["meta"] = meta
+	}
+	b.Broadcast(ev)
+	return sr, meta, nil
 }
 
 // Cancel sends session/cancel for the given session (default: active) and
@@ -2140,10 +2198,12 @@ type ListSessionsOpts struct {
 // ListSessions calls session/list if supported and enriches every session
 // item with the host-side live status (dashboard active/idle/awaiting).
 // Optional opts forward the official request fields (cwd/cursor/`_meta`);
-// the local enrichment is untouched.
-func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) ([]any, error) {
+// the local enrichment is untouched. Returns the sessions plus the
+// response's pagination cursor (nextCursor / next_cursor, "" = no more
+// pages) and `_meta` (nil when absent) for passthrough to the browser.
+func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (sessions []any, nextCursor string, meta map[string]any, err error) {
 	if err := b.Boot(ctx); err != nil {
-		return nil, err
+		return nil, "", nil, err
 	}
 	params := map[string]any{}
 	if len(opts) > 0 {
@@ -2159,9 +2219,17 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) ([]
 	}
 	res, err := b.request(ctx, "session/list", params, 30*time.Second)
 	if err != nil {
-		return nil, err
+		return nil, "", nil, err
 	}
-	sessions, _ := res["sessions"].([]any)
+	sessions, _ = res["sessions"].([]any)
+	// 分页游标：agent 可能回 camelCase `nextCursor` 或 snake_case
+	// `next_cursor`，两个都兼容；空串 = 没有更多页。
+	nextCursor, _ = res["nextCursor"].(string)
+	if nextCursor == "" {
+		nextCursor, _ = res["next_cursor"].(string)
+	}
+	// 响应 `_meta` 原样透传（仅非空才发，absent key ≠ off）。
+	meta, _ = res["_meta"].(map[string]any)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2219,7 +2287,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) ([]
 			m["bgRunning"] = sum.BgRunning
 		}
 	}
-	return sessions, nil
+	return sessions, nextCursor, meta, nil
 }
 
 // SessionStateOf returns the host-side live state of one session (nil if
@@ -2345,12 +2413,14 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		modes := s.modes
 		configOpts := s.configOpts
 		models := s.models
+		sessionMeta := s.sessionMeta
+		authMeta := b.authMeta
 		hostID := b.hostID
 		hostName := b.hostName
 		sessCwd := s.Cwd
 		b.mu.Unlock()
 
-		b.Broadcast(Event{
+		ev := Event{
 			"type":          "ready",
 			"sessionId":     sessionID,
 			"cwd":           sessCwd,
@@ -2360,7 +2430,16 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 			"models":        models,
 			"hostId":        hostID,
 			"hostName":      hostName,
-		})
+		}
+		// 已存 roster 的 sessionMeta / authenticate 的 authMeta 原样透传，
+		// 仅非空才带。
+		if sessionMeta != nil {
+			ev["sessionMeta"] = sessionMeta
+		}
+		if authMeta != nil {
+			ev["authMeta"] = authMeta
+		}
+		b.Broadcast(ev)
 		// Re-announce busy so the client can attach the spinner after history load.
 		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
 		b.broadcastRosterChange()
@@ -2404,12 +2483,19 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	if co, ok := sessRes["configOptions"]; ok && co != nil {
 		act.configOpts = co
 	}
+	// session/load 响应 `_meta` 原样存下（缺省保留 roster 旧值，与
+	// models/modes 的处理一致），ready 事件 / Status 透传。
+	if m, ok := sessRes["_meta"]; ok && m != nil {
+		act.sessionMeta = m
+	}
 	b.activeSessionID = sessionID
 	b.rememberSessionLocked(sessionID, cwd)
 	agentInfo := b.agentInfo
 	modes := act.modes
 	configOpts := act.configOpts
 	models := act.models
+	sessionMeta := act.sessionMeta
+	authMeta := b.authMeta
 	hostID := b.hostID
 	hostName := b.hostName
 	sessCwd := act.Cwd
@@ -2421,7 +2507,7 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	// Cold load is never mid-turn.
 	sessRes["busy"] = false
 
-	b.Broadcast(Event{
+	ev := Event{
 		"type":          "ready",
 		"sessionId":     sessionID,
 		"cwd":           sessCwd,
@@ -2431,7 +2517,14 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		"models":        models,
 		"hostId":        hostID,
 		"hostName":      hostName,
-	})
+	}
+	if sessionMeta != nil {
+		ev["sessionMeta"] = sessionMeta
+	}
+	if authMeta != nil {
+		ev["authMeta"] = authMeta
+	}
+	b.Broadcast(ev)
 	b.broadcastRosterChange()
 	return sessRes, nil
 }
@@ -2473,12 +2566,14 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		modes := s.modes
 		configOpts := s.configOpts
 		models := s.models
+		sessionMeta := s.sessionMeta
+		authMeta := b.authMeta
 		hostID := b.hostID
 		hostName := b.hostName
 		sessCwd := s.Cwd
 		b.mu.Unlock()
 
-		b.Broadcast(Event{
+		ev := Event{
 			"type":          "ready",
 			"sessionId":     sessionID,
 			"cwd":           sessCwd,
@@ -2488,7 +2583,14 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 			"models":        models,
 			"hostId":        hostID,
 			"hostName":      hostName,
-		})
+		}
+		if sessionMeta != nil {
+			ev["sessionMeta"] = sessionMeta
+		}
+		if authMeta != nil {
+			ev["authMeta"] = authMeta
+		}
+		b.Broadcast(ev)
 		// Re-announce busy so the client can attach the spinner after history load.
 		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
 		b.broadcastRosterChange()
@@ -2533,12 +2635,19 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	if co, ok := sessRes["configOptions"]; ok && co != nil {
 		act.configOpts = co
 	}
+	// session/resume 响应 `_meta` 原样存下（缺省保留 roster 旧值），
+	// ready 事件 / Status 透传。
+	if m, ok := sessRes["_meta"]; ok && m != nil {
+		act.sessionMeta = m
+	}
 	b.activeSessionID = sessionID
 	b.rememberSessionLocked(sessionID, cwd)
 	agentInfo := b.agentInfo
 	modes := act.modes
 	configOpts := act.configOpts
 	models := act.models
+	sessionMeta := act.sessionMeta
+	authMeta := b.authMeta
 	hostID := b.hostID
 	hostName := b.hostName
 	sessCwd := act.Cwd
@@ -2550,7 +2659,7 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	// A resumed session is never mid-turn.
 	sessRes["busy"] = false
 
-	b.Broadcast(Event{
+	ev := Event{
 		"type":          "ready",
 		"sessionId":     sessionID,
 		"cwd":           sessCwd,
@@ -2560,7 +2669,14 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		"models":        models,
 		"hostId":        hostID,
 		"hostName":      hostName,
-	})
+	}
+	if sessionMeta != nil {
+		ev["sessionMeta"] = sessionMeta
+	}
+	if authMeta != nil {
+		ev["authMeta"] = authMeta
+	}
+	b.Broadcast(ev)
 	b.broadcastRosterChange()
 	return sessRes, nil
 }
