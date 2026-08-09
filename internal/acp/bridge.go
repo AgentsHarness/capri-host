@@ -57,6 +57,10 @@ type Bridge struct {
 	// agent's initialize response, surfaced in Status/Snapshot.
 	initAgentCapabilities any
 	textBuf               string
+	// genRate 是 per-session 的生成输出速率（tok/s）估算器（见
+	// genrate.go）：chunk 到达时观察、tool_call / 回合终态 seal、
+	// user_message_chunk 复位；节流后广播 gen_rate 事件。
+	genRate *genRateTracker
 	// agentStartedAt (unix ms) stamps the CURRENT agent process spawn.
 	// Clients compare it across hello events to detect an agent restart —
 	// the agent's permission mode is in-memory only and resets on restart,
@@ -80,6 +84,12 @@ type Bridge struct {
 
 	nextClientReqID atomic.Int64
 	clientReqs      sync.Map // requestId string -> *clientRequest
+
+	// ── goal engine (host-side /goal, see goal.go) ────────────────────
+	goalMu     sync.Mutex
+	goal       *GoalState
+	goalStop   chan struct{} // closed to end the goal loop
+	goalLoopOn bool
 
 	subscribersMu sync.Mutex
 	subscribers   map[chan Event]struct{}
@@ -112,6 +122,19 @@ type rpcResult struct {
 	err    error
 }
 
+// RPCError is a JSON-RPC error reply from the agent — the agent process
+// is alive and answered (it parsed the request and rejected it), it just
+// failed the call itself (e.g. the model API's 400 "Internal Error: …").
+// Distinct from transport failures (timeout / write error / boot failure),
+// which mean the agent may be wedged: callers keep the process for
+// RPCError and only self-heal (kill + restore) on real transport failures.
+type RPCError struct {
+	Code int
+	Msg  string
+}
+
+func (e *RPCError) Error() string { return e.Msg }
+
 type clientRequest struct {
 	AgentID   any
 	SessionID string // originating session (dashboard awaiting-input state)
@@ -143,6 +166,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		sessions:    make(map[string]*SessionState),
 		subscribers: make(map[chan Event]struct{}),
 		bootDone:    make(chan struct{}),
+		genRate:     newGenRateTracker(),
 	}
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
@@ -1008,12 +1032,19 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 		c := ch.(chan rpcResult)
 		if errObj, has := msg["error"]; has && errObj != nil {
 			em := "agent error"
+			code := 0
 			if m, ok := errObj.(map[string]any); ok {
 				if s, ok := m["message"].(string); ok {
 					em = s
 				}
+				if c, ok := m["code"].(float64); ok {
+					code = int(c)
+				}
 			}
-			c <- rpcResult{err: errors.New(em)}
+			// Typed wrap: the agent REPLIED with an error, so the process is
+			// healthy — callers distinguish this from transport failures
+			// (timeout etc.) and skip the kill+restore self-heal.
+			c <- rpcResult{err: &RPCError{Code: code, Msg: em}}
 		} else {
 			res, _ := msg["result"].(map[string]any)
 			if res == nil {
@@ -1174,6 +1205,14 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			// field of the agent_message_chunk payload is ever dropped.
 			ev["fullUpdate"] = update
 			b.Broadcast(tag(ev))
+			// 生成输出速率（按流式字符估算 + usage 自校准，见 genrate.go）：
+			// 与 chunk 同轨广播，节流后每个 session 每 ≥250ms 至多一条
+			// active。时间源优先 _meta.agentTimestampMs（agentClock=true，
+			// 取消 800ms 空闲封顶等防攒包启发式）。
+			now, agentClock := metaAgentTs(params)
+			if rate, ok := b.genRate.observe(sid, text, now, agentClock); ok {
+				b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": true}))
+			}
 		}
 		// Image blocks ride the same chunk carrier: emit one typed image
 		// event per block (text parts still go through the chunk event).
@@ -1184,6 +1223,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		}
 		return true
 	case "user_message_chunk":
+		// 用户输入打断生成段：静默复位速率估算器（不发任何事件，
+		// 客户端显示值在下一段 live 更新前保留）。
+		b.genRate.reset(sid)
 		if text := contentText(update["content"]); text != "" {
 			ev := Event{"type": "user_chunk", "text": text}
 			// Forward the chunk + content-block meta (wire shape:
@@ -1226,9 +1268,19 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 				ev["meta"] = meta
 			}
 			b.Broadcast(tag(ev))
+			// 思考文本同样更新生成速率（见 genrate.go）。
+			now, agentClock := metaAgentTs(params)
+			if rate, ok := b.genRate.observe(sid, text, now, agentClock); ok {
+				b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": true}))
+			}
 		}
 		return true
 	case "tool_call":
+		// 工具执行打断生成段：seal 冻结速率（active:false 不受节流
+		// 限制；本段从未发布过速率则静默）。
+		if rate, ok := b.genRate.seal(sid); ok {
+			b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": false}))
+		}
 		b.Broadcast(tag(Event{"type": "tool_call", "toolCall": update}))
 		return true
 	case "tool_call_update":
@@ -1325,6 +1377,19 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		b.handleModelSwitchKind(sid, update, tag)
 		return true
 	case "turn_completed", "response_completed":
+		// 回合终态：seal 生成段并冻结速率（同 tool_call）；update 携带
+		// 真实 usage 时改发精确值（真实 token / 累计生成时长）并自校准
+		// 估算系数（见 genrate.go sealWithUsage）。
+		var rate float64
+		var ok bool
+		if real, has := usageRealTokens(update); has {
+			rate, ok = b.genRate.sealWithUsage(sid, real)
+		} else {
+			rate, ok = b.genRate.seal(sid)
+		}
+		if ok {
+			b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": false}))
+		}
 		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
 		// prompt_id / usage 等字段）；usage 提取保留在两个载体
 		// （handleSessionUpdate / handleXaiNotification）。
@@ -1347,7 +1412,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		"auto_recovery_exhausted", "hook_annotation", "hook_execution",
 		"hooks_changed", "plugins_changed", "plugin_updates_installed",
 		"session_summary_generated", "session_recap", "session_recap_unavailable",
-		"subagent_spawned", "subagent_progress", "subagent_finished",
+		"last_turn_summary", "subagent_spawned", "subagent_progress",
+		"subagent_finished",
 		"scheduled_task_fired", "tool_call_delta_chunk", "image_compressed",
 		"image_dropped", "workflow_updated", "goal_updated",
 		"pending_interaction", "interaction_resolved", "response_started",
@@ -1666,6 +1732,15 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		// 回合中插话（session/acp_session_impl/interjection.rs:171）：
 		// {sessionId, text, interjectionId?}。
 		b.Broadcast(withSid(Event{"type": "session_interjection", "params": params}))
+	case "x.ai/follow_ups":
+		// 回合结束后的建议 chips（TUI app/acp_handler/follow_ups.rs 渲染；
+		// params 含 response_id / follow_ups 列表，原样透传）。
+		b.Broadcast(withSid(Event{"type": "follow_ups", "params": params}))
+	case "x.ai/leader/version_mismatch":
+		// leader 与 client 版本不一致横幅（TUI xai-grok-pager/src/acp/
+		// version_mismatch.rs 渲染；wire params 为 {clientVersion,
+		// leaderVersion, message}——message 被 TUI 忽略，原样透传）。
+		b.Broadcast(withSid(Event{"type": "leader_version_mismatch", "params": params}))
 	case "x.ai/leader_reconnected":
 		// leader 重连信号（xai-grok-pager-bin/src/main.rs:1354 等，
 		// params 可为空）。
@@ -2117,7 +2192,15 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	res, err := b.request(ctx, "session/prompt", params, promptTimeout)
 	if err != nil {
-		b.Broadcast(Event{"type": "error", "message": err.Error(), "sessionId": sessionID})
+		// source 标记（前端据此渲染）：agent 报错（RPCError — 进程活着、
+		// 拒绝了回合）vs 传输失败（超时/写失败 — agent 可能不可达）。
+		// 老版本客户端忽略该字段，仅按带 sessionId 的回合错误处理。
+		source := "transport"
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) {
+			source = "agent"
+		}
+		b.Broadcast(Event{"type": "error", "message": err.Error(), "sessionId": sessionID, "source": source})
 		// The client (browser) went away mid-turn. The agent process may be
 		// perfectly healthy — and other sessions may be running parallel
 		// turns in the same process — so never killProcess here: that would
@@ -2129,29 +2212,35 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 			b.Broadcast(Event{"type": "status", "text": "连接已断开，本次回复已取消，请重新发送", "sessionId": sessionID})
 			return "", nil, err
 		}
-		// Self-heal: a turn-end failure usually means the agent process is
-		// wedged (it streams output but errors when resolving the turn).
-		// Kill it and reload the SAME session — never session/new on this
-		// path (a failed restore leaves the user without an active chat
-		// rather than a silent blank one). The failed turn is not retried.
-		b.mu.Lock()
-		if s := b.sessions[sessionID]; s != nil {
-			b.rememberSessionLocked(s.SessionID, s.Cwd)
-		} else if sessionID != "" {
-			b.rememberSessionLocked(sessionID, b.lastSessionCwd)
-		}
-		b.mu.Unlock()
+		// A plain JSON-RPC error is the AGENT rejecting the turn (e.g. the
+		// model API's 400 "Internal Error: …") — the process answered and is
+		// healthy; the error event above already surfaced the failure, no
+		// self-heal needed. Only transport-level failures (timeout / write
+		// error / boot failure — anything but RPCError) suggest a wedged
+		// process: kill it and reload the SAME session — never session/new
+		// on this path (a failed restore leaves the user without an active
+		// chat rather than a silent blank one). The failed turn is not
+		// retried.
+		if !errors.As(err, &rpcErr) {
+			b.mu.Lock()
+			if s := b.sessions[sessionID]; s != nil {
+				b.rememberSessionLocked(s.SessionID, s.Cwd)
+			} else if sessionID != "" {
+				b.rememberSessionLocked(sessionID, b.lastSessionCwd)
+			}
+			b.mu.Unlock()
 
-		b.killProcess()
-		rebootCtx, cancel := context.WithTimeout(context.Background(), bootTimeout)
-		defer cancel()
-		if rebootErr := b.restoreLastSession(rebootCtx); rebootErr != nil {
-			log.Printf("[acp-host] auto-recovery failed: %v", rebootErr)
+			b.killProcess()
+			rebootCtx, cancel := context.WithTimeout(context.Background(), bootTimeout)
+			defer cancel()
+			if rebootErr := b.restoreLastSession(rebootCtx); rebootErr != nil {
+				log.Printf("[acp-host] auto-recovery failed: %v", rebootErr)
+			}
+			// Surface a single user-facing line regardless of whether the
+			// background restore succeeded — the turn itself still failed and
+			// the user needs to check the host / resend.
+			b.Broadcast(Event{"type": "status", "text": "连接HOST异常，请检查后重试"})
 		}
-		// Surface a single user-facing line regardless of whether the
-		// background restore succeeded — the turn itself still failed and
-		// the user needs to check the host / resend.
-		b.Broadcast(Event{"type": "status", "text": "连接HOST异常，请检查后重试"})
 		return "", nil, err
 	}
 	sr, _ := res["stopReason"].(string)
@@ -3116,6 +3205,47 @@ func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]a
 	return b.request(ctx, "_"+method, params, 60*time.Second)
 }
 
+// XaiNotify sends a client→agent x.ai extension NOTIFICATION (fire-and-forget,
+// no JSON-RPC id) with the official "_" wire prefix. The agent's decoder
+// strips "_" and routes the remainder to its ext_notification handler —
+// the transport for methods that have NO ext_method arm and no response
+// (x.ai/queue/*, x.ai/toggle_plan_mode, x.ai/permissions/reset, …; TUI
+// parity: xai-grok-pager app/effects/mod.rs sends these as ExtNotification).
+// Session defaulting matches XaiCall: an empty "sessionId"/"session_id" in
+// params is replaced with the active session's id; when no session is
+// active this returns HTTPError 404. Note: the agent's ext_notification
+// handlers read only "sessionId" on this rail — "session_id" is a dead key
+// (kept in the loop purely for XaiCall parity). The host resolves the id
+// itself — a notification carries no response, so XaiCall's request-side
+// auto-fill cannot apply. Returns {ok:true} once the line is written; the
+// agent's authoritative state comes back via its re-broadcasts (e.g. queue
+// → x.ai/queue/changed).
+func (b *Bridge) XaiNotify(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if params == nil {
+		params = map[string]any{}
+	}
+	for _, k := range []string{"sessionId", "session_id"} {
+		if v, ok := params[k].(string); ok && v == "" {
+			sid := b.resolveSessionID("")
+			if sid == "" {
+				return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+			}
+			params[k] = sid
+		}
+	}
+	if err := b.write(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "_" + method,
+		"params":  params,
+	}); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
+}
+
 // ForkSession calls x.ai/session/fork: forks the current session into a new
 // one (optionally a git worktree). Params follow the TUI's fork payload:
 // {sourceSessionId, sourceCwd, newCwd, sessionKind:"fork", newSessionId?}.
@@ -3301,11 +3431,16 @@ func (b *Bridge) RewindPoints(ctx context.Context, sessionID string) (map[string
 	}, 60*time.Second)
 }
 
-// RewindExecute calls x.ai/rewind/execute: {sessionId, targetPromptIndex} —
-// rolls the conversation back to the given rewind point. The agent's handler
-// only accepts `target_prompt_index`/`targetPromptIndex` (a raw `targetIndex`
-// key would be rejected as invalid params), so the host translates.
-func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetIndex int) (map[string]any, error) {
+// RewindExecute calls x.ai/rewind/execute: {sessionId, targetPromptIndex,
+// force, mode} — rolls the conversation back to the given rewind point. The
+// agent's handler only accepts `target_prompt_index`/`targetPromptIndex` (a
+// raw `targetIndex` key would be rejected as invalid params), so the host
+// translates. `force: true` mirrors the TUI's /rewind (rewind_execute_params):
+// without it the agent typically declines the rollback (success:false,
+// nothing truncated). `mode` is passed through: "conversation_only" (the
+// default, TUI behavior) rolls back the conversation only; "all" also
+// reverts the point's file snapshots.
+func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetIndex int, mode string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -3318,9 +3453,14 @@ func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetInde
 	if sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
+	if mode == "" {
+		mode = "conversation_only"
+	}
 	return b.request(ctx, "_x.ai/rewind/execute", map[string]any{
 		"sessionId":         sessionID,
 		"targetPromptIndex": targetIndex,
+		"force":             true,
+		"mode":              mode,
 	}, 60*time.Second)
 }
 
@@ -3412,22 +3552,9 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 // fire-and-forget NOTIFICATION (no request branch; a request-style call
 // would get -32601 method_not_found), so the host writes it without a
 // JSON-RPC id and returns a bare ok — the frontend applies its local
-// desired state.
+// desired state. SessionId defaults to the active session.
 func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error) {
-	if err := b.Boot(ctx); err != nil {
-		return nil, err
-	}
-	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
-		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
-	}
-	if err := b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "_x.ai/toggle_plan_mode",
-		"params":  map[string]any{"sessionId": sessionID},
-	}); err != nil {
-		return nil, err
-	}
-	return map[string]any{"ok": true}, nil
+	return b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{"sessionId": sessionID})
 }
 
 // PermissionsReset sends x.ai/permissions/reset: {sessionId} — clears the
@@ -3435,20 +3562,7 @@ func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[stri
 // handles it as a notification (it resets ALL resident sessions, ignoring
 // the sessionId), so the host writes it without a JSON-RPC id.
 func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
-	if err := b.Boot(ctx); err != nil {
-		return nil, err
-	}
-	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
-		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
-	}
-	if err := b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "_x.ai/permissions/reset",
-		"params":  map[string]any{"sessionId": sessionID},
-	}); err != nil {
-		return nil, err
-	}
-	return map[string]any{"ok": true}, nil
+	return b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{"sessionId": sessionID})
 }
 
 // SetPermissionMode sends x.ai/yolo_mode_changed as a fire-and-forget

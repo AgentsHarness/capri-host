@@ -115,9 +115,25 @@ func TestExtensionMethodsWirePayloads(t *testing.T) {
 		},
 		{
 			name:   "rewind/execute",
-			call:   func(b *Bridge) (map[string]any, error) { return b.RewindExecute(ctx, "", 3) },
+			call:   func(b *Bridge) (map[string]any, error) { return b.RewindExecute(ctx, "", 3, "") },
 			method: "_x.ai/rewind/execute",
-			params: map[string]any{"sessionId": "s1", "targetPromptIndex": float64(3)},
+			params: map[string]any{
+				"sessionId":         "s1",
+				"targetPromptIndex": float64(3),
+				"force":             true,
+				"mode":              "conversation_only",
+			},
+		},
+		{
+			name:   "rewind/execute with all mode",
+			call:   func(b *Bridge) (map[string]any, error) { return b.RewindExecute(ctx, "", 2, "all") },
+			method: "_x.ai/rewind/execute",
+			params: map[string]any{
+				"sessionId":         "s1",
+				"targetPromptIndex": float64(2),
+				"force":             true,
+				"mode":              "all",
+			},
 		},
 		{
 			name:   "scheduler/delete",
@@ -199,7 +215,7 @@ func TestExtensionMethodsNoActiveSession(t *testing.T) {
 		{"session/delete", func() error { _, err := b.SessionDelete(ctx, ""); return err }},
 		{"compact_conversation", func() error { _, err := b.CompactConversation(ctx, "", ""); return err }},
 		{"rewind/points", func() error { _, err := b.RewindPoints(ctx, ""); return err }},
-		{"rewind/execute", func() error { _, err := b.RewindExecute(ctx, "", 0); return err }},
+		{"rewind/execute", func() error { _, err := b.RewindExecute(ctx, "", 0, ""); return err }},
 		{"scheduler/delete", func() error { _, err := b.SchedulerDelete(ctx, "", "t-1"); return err }},
 		{"billing", func() error { _, err := b.Billing(ctx, ""); return err }},
 		{"memory/flush", func() error { _, err := b.MemoryFlush(ctx, ""); return err }},

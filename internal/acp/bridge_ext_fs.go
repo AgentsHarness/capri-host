@@ -134,31 +134,6 @@ func (b *Bridge) FsDeleteFile(ctx context.Context, path string) (map[string]any,
 // request struct requires session_id), so it is omitted everywhere except
 // there.
 
-// GitStatus calls x.ai/git/status with the wire keys {gitRoot?,
-// includeUntracked?, includeStats?, ignoreSubmodules?, includePatches?}.
-// sessionId is omitted. Nil *bool → key omitted → grok default
-// (includeUntracked=true, others false). Returns the unwrapped
-// GitStatusData payload.
-func (b *Bridge) GitStatus(ctx context.Context, gitRoot string, includeUntracked, includeStats, ignoreSubmodules, includePatches *bool) (map[string]any, error) {
-	params := map[string]any{}
-	if gitRoot != "" {
-		params["gitRoot"] = gitRoot
-	}
-	if includeUntracked != nil {
-		params["includeUntracked"] = *includeUntracked
-	}
-	if includeStats != nil {
-		params["includeStats"] = *includeStats
-	}
-	if ignoreSubmodules != nil {
-		params["ignoreSubmodules"] = *ignoreSubmodules
-	}
-	if includePatches != nil {
-		params["includePatches"] = *includePatches
-	}
-	return xaiResult(b.XaiCall(ctx, "x.ai/git/status", params))
-}
-
 // GitFiles calls x.ai/git/files with the wire keys {gitRoot?, paths,
 // version?}. sessionId is omitted. paths is required and always sent;
 // version "" → omitted → grok's default "HEAD". Returns the unwrapped
