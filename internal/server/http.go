@@ -62,6 +62,12 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/rewind-points", s.handleRewindPoints)
 	mux.HandleFunc("POST /api/rewind-execute", s.handleRewindExecute)
 	mux.HandleFunc("POST /api/scheduler-delete", s.handleSchedulerDelete)
+	// ── goal engine (TUI /goal parity; host-side, see http_goal.go) ──
+	mux.HandleFunc("POST /api/goal/set", s.handleGoalSet)
+	mux.HandleFunc("POST /api/goal/status", s.handleGoalStatus)
+	mux.HandleFunc("POST /api/goal/pause", s.handleGoalPause)
+	mux.HandleFunc("POST /api/goal/resume", s.handleGoalResume)
+	mux.HandleFunc("POST /api/goal/clear", s.handleGoalClear)
 	mux.HandleFunc("POST /api/shell", s.handleShell)
 	mux.HandleFunc("GET /api/hosts", s.handleHosts)
 	mux.HandleFunc("POST /api/billing", s.handleBilling)
@@ -98,6 +104,8 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/queue/reorder", s.handleQueueReorder)
 	mux.HandleFunc("POST /api/queue/edit", s.handleQueueEdit)
 	mux.HandleFunc("POST /api/queue/interject", s.handleQueueInterject)
+	mux.HandleFunc("POST /api/queue/hold-edit", s.handleQueueHoldEdit)
+	mux.HandleFunc("POST /api/queue/release-edit", s.handleQueueReleaseEdit)
 	mux.HandleFunc("POST /api/skills/list", s.handleSkillsList)
 	mux.HandleFunc("POST /api/skills/toggle", s.handleSkillsToggle)
 	mux.HandleFunc("POST /api/skills/add", s.handleSkillsAdd)
@@ -411,12 +419,11 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	case res := <-done:
 		if res.err != nil {
-			code := 500
-			var he *acp.HTTPError
-			if errors.As(res.err, &he) {
-				code = he.Code
-			}
-			writeJSON(w, code, map[string]any{"ok": false, "error": res.err.Error()})
+			// writeAgentError 约定：agent 侧失败（回合被 agent 拒绝，如
+			// 模型 API 400 "Internal Error"）降级为 200 + {ok:false, error}
+			// ——前端渲染成回合错误行而非连接错误；host 侧 HTTPError
+			// （404 会话不存在 / 409 上一条消息还在处理中）保留状态码。
+			writeAgentError(w, "session/prompt", res.err)
 			return
 		}
 		out := map[string]any{"ok": true, "stopReason": res.stopReason}
@@ -518,7 +525,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	var sc acp.SessionConfig
 	_ = readJSON(r, &sc)
 	if err := s.bridge.NewSession(r.Context(), sc); err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/new", err)
 		return
 	}
 	snap := s.bridge.Snapshot()
@@ -542,7 +549,7 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 	switch body.ModeID {
 	case "normal", "auto", "always-approve", "always_approve", "yolo":
 		if _, err := s.bridge.SetPermissionMode(r.Context(), body.ModeID); err != nil {
-			writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+			writeAgentError(w, "set-permission-mode", err)
 			return
 		}
 		writeJSON(w, 200, map[string]any{"ok": true})
@@ -550,7 +557,7 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.SetMode(r.Context(), body.ModeID)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/set-mode", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -568,7 +575,7 @@ func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.bridge.SetModel(r.Context(), body.ModelID, body.ReasoningEffort); err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/set-model", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -593,7 +600,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	sessions, nextCursor, meta, err := s.bridge.ListSessions(r.Context(), opts)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/list", err)
 		return
 	}
 	out := map[string]any{"ok": true, "sessions": sessions}
@@ -651,12 +658,7 @@ func (s *Server) handleSessionLoad(w http.ResponseWriter, r *http.Request) {
 	}
 	sessRes, err := s.bridge.LoadSession(r.Context(), body.SessionID, body.Cwd, body.Meta)
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/load", err)
 		return
 	}
 	// Echo models / busy so the FE can update caption + spinner even if the
@@ -715,7 +717,7 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := s.bridge.SessionUpdates(r.Context(), body.SessionID, body.Cwd, opts)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/updates", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{
@@ -812,7 +814,7 @@ func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.ForkSession(r.Context(), params)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/fork", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -829,7 +831,7 @@ func (s *Server) handleSessionRename(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.RenameSession(r.Context(), body.Title)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/rename", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -843,7 +845,7 @@ func (s *Server) handleRecap(w http.ResponseWriter, r *http.Request) {
 	_ = readJSON(r, &body)
 	res, err := s.bridge.Recap(r.Context(), body.Auto)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/recap", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -871,7 +873,7 @@ func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.SubagentCancel(r.Context(), body.SubagentID)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "x.ai/subagent/cancel", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -888,7 +890,7 @@ func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.TaskKill(r.Context(), body.TaskID)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "x.ai/task/kill", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -898,12 +900,7 @@ func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
 	res, err := s.bridge.TaskList(r.Context())
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "x.ai/task/list", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -940,12 +937,7 @@ func (s *Server) handleTaskOutput(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.TaskList(r.Context())
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "x.ai/task/list", err)
 		return
 	}
 	// ExtMethodResult envelope: { result: { tasks: [...] } } or flat { tasks }.
@@ -983,12 +975,7 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.SessionDelete(r.Context(), body.SessionID)
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/delete", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -1007,12 +994,7 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.CompactConversation(r.Context(), body.SessionID, body.Note)
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/compact", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -1033,23 +1015,21 @@ func (s *Server) handleRewindPoints(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.RewindPoints(r.Context(), body.SessionID)
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/rewind_points", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "points": normalizeRewindPoints(res)})
 }
 
 // handleRewindExecute rolls a session back to a rewind point via
-// x.ai/rewind/execute. Body: {sessionId, targetIndex}.
+// x.ai/rewind/execute. Body: {sessionId, targetIndex, mode?} — mode is
+// optional ("all" | "conversation_only"); empty defaults to
+// "conversation_only" (TUI /rewind behavior, conversation-only rollback).
 func (s *Server) handleRewindExecute(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID   string `json:"sessionId"`
 		TargetIndex *int   `json:"targetIndex"`
+		Mode        string `json:"mode"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
@@ -1059,14 +1039,13 @@ func (s *Server) handleRewindExecute(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 targetIndex"})
 		return
 	}
-	res, err := s.bridge.RewindExecute(r.Context(), body.SessionID, *body.TargetIndex)
+	if body.Mode != "" && body.Mode != "all" && body.Mode != "conversation_only" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "mode 必须是 all 或 conversation_only"})
+		return
+	}
+	res, err := s.bridge.RewindExecute(r.Context(), body.SessionID, *body.TargetIndex, body.Mode)
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "session/rewind", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -1089,12 +1068,7 @@ func (s *Server) handleSchedulerDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.bridge.SchedulerDelete(r.Context(), body.SessionID, body.TaskID)
 	if err != nil {
-		code := 500
-		var he *acp.HTTPError
-		if errors.As(err, &he) {
-			code = he.Code
-		}
-		writeJSON(w, code, map[string]any{"ok": false, "error": err.Error()})
+		writeAgentError(w, "scheduler/delete", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
@@ -1295,10 +1269,17 @@ func extractTaskList(res map[string]any) []map[string]any {
 // ── admin endpoints (billing / memory / plan / permissions / MCP) ────
 
 // writeAgentError maps an agent-backed endpoint failure to a response.
-// Host-side HTTPErrors keep their status code (e.g. 404 暂无活动会话 — the
-// task/list convention); agent-side failures (unsupported method, agent
-// error, timeout) degrade to 200 + {ok:false, error} so the frontend can
-// render an error row for the operation instead of a hard failure.
+// Three-tier contract (the frontend classifies on exactly this):
+//   - host-side HTTPError          → keep its status code (404 暂无活动会话,
+//     409 上一条消息还在处理中 — task/list convention);
+//   - agent JSON-RPC rejection (RPCError) → 200 + {ok:false, error, code?} —
+//     the agent is alive and answered; the FE renders an operation/turn
+//     error row, never a connection error;
+//   - transport failure (timeout / write error / boot failure) → 502
+//     (bad gateway) — the host is fine, the upstream agent is not; the FE
+//     still renders an operation error row but can tell the two apart.
+//
+// Unsupported-method replies keep their friendly 200 + ok:false form.
 func writeAgentError(w http.ResponseWriter, method string, err error) {
 	var he *acp.HTTPError
 	if errors.As(err, &he) {
@@ -1310,7 +1291,16 @@ func writeAgentError(w http.ResponseWriter, method string, err error) {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": fmt.Sprintf("「%s」不受支持: %s", method, msg)})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": false, "error": msg})
+	var rpcErr *acp.RPCError
+	if errors.As(err, &rpcErr) {
+		body := map[string]any{"ok": false, "error": msg}
+		if rpcErr.Code != 0 {
+			body["code"] = rpcErr.Code
+		}
+		writeJSON(w, 200, body)
+		return
+	}
+	writeJSON(w, 502, map[string]any{"ok": false, "error": msg})
 }
 
 // methodUnsupported reports whether an agent error message indicates the
