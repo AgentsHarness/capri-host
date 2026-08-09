@@ -59,6 +59,11 @@ HUB_URL=http://hub-host:8787 HUB_PAIR_CODE=DDVZRR HOST_ID=macbook HOST_NAME="Mac
 首次配对成功后 token 保存在 `~/.acp-host/hub.json`，之后重启无需配对码。
 Host 与 Hub 断开会自动重连（指数退避）；Hub 端 token 失效且提供了配对码时会自动重新配对。
 
+Hub 会下发浏览器订阅数（`hello.subscribers` / `{type:"subscribers",count}`）。
+**无浏览器打开 FE 时**，本机暂停向 Hub 上报 bridge 事件（chunk/tool 等），只保留
+`host_status` 心跳以更新 ready；有订阅后再恢复。浏览器重新连上后通过
+`/api/status` 与 session-updates 水合，不依赖空闲期事件。
+
 ## API（Local / 经 Hub 中转一致）
 
 ### 核心 / 事件流

@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benin/acp-host/internal/acp"
 	"github.com/benin/acp-host/internal/config"
@@ -47,6 +49,12 @@ const ACPHostFakeAgentRecordNotifs = "ACP_HOST_FAKE_AGENT_RECORD_NOTIFS"
 // assert the exact params the host forwarded — e.g. the session/new and
 // session/load `_meta` permission-mode seeds.
 const ACPHostFakeAgentRecordRequests = "ACP_HOST_FAKE_AGENT_RECORD_REQUESTS"
+
+// ACPHostFakeAgentPromptDelayMs, when set, makes the fake agent sleep that
+// many milliseconds before answering session/prompt — tests use it to hold
+// a turn in flight (Busy=true) long enough to observe host behavior
+// mid-turn (e.g. the SSE hello busy flag).
+const ACPHostFakeAgentPromptDelayMs = "ACP_HOST_FAKE_AGENT_PROMPT_DELAY_MS"
 
 // ACPHostFakeAgentPromptMeta / SessionNewMeta / SessionListCursor /
 // SessionListMeta / AuthMeta: JSON strings injected into the fake agent's
@@ -165,6 +173,11 @@ func runFakeAgent() {
 				result["_meta"] = m
 			}
 		case "session/prompt":
+			if d := os.Getenv(ACPHostFakeAgentPromptDelayMs); d != "" {
+				if ms, err := strconv.Atoi(d); err == nil && ms > 0 {
+					time.Sleep(time.Duration(ms) * time.Millisecond)
+				}
+			}
 			result = map[string]any{"stopReason": "end_turn"}
 			if m := fakeAgentMeta(ACPHostFakeAgentPromptMeta); m != nil {
 				result["_meta"] = m
