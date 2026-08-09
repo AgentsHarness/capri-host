@@ -10,7 +10,7 @@
 
 ```
 浏览器 (acp-fe) ──HTTP/SSE──▶ acp-host ──stdio──▶ grok agent
-浏览器 (acp-fe) ──HTTP/SSE──▶ acp-hub ──SSE+HTTP──▶ acp-host × N ──stdio──▶ grok agent
+浏览器 (acp-fe) ──WS+HTTP──▶ acp-hub ──QUIC/WS──▶ acp-host × N ──stdio──▶ grok agent
 ```
 
 ## 运行
@@ -57,12 +57,20 @@ HUB_URL=http://hub-host:8787 HUB_PAIR_CODE=DDVZRR HOST_ID=macbook HOST_NAME="Mac
 ```
 
 首次配对成功后 token 保存在 `~/.acp-host/hub.json`，之后重启无需配对码。
-Host 与 Hub 断开会自动重连（指数退避）；Hub 端 token 失效且提供了配对码时会自动重新配对。
+Host 与 Hub 通过 **QUIC**（UDP 8788，失败自动回退 WebSocket `/ws/host`）保持一条
+双向连接：事件上行、中转请求下行、`respond` 上行。断开会自动重连（指数退避）；
+Hub 端 token 失效且提供了配对码时会自动重新配对。
 
 Hub 会下发浏览器订阅数（`hello.subscribers` / `{type:"subscribers",count}`）。
 **无浏览器打开 FE 时**，本机暂停向 Hub 上报 bridge 事件（chunk/tool 等），只保留
 `host_status` 心跳以更新 ready；有订阅后再恢复。浏览器重新连上后通过
 `/api/status` 与 session-updates 水合，不依赖空闲期事件。
+
+Live 上报路径：bridge 订阅 → 50ms/32 条合批 → **同 session 连续 chunk/thought 文本合并** → 去掉
+`fullUpdate` → **合并后**分配 **seq** + 入**重放缓冲**（最近 5000 条，seq 连续无空洞）→ QUIC/WS
+`events` 帧（单帧 ≤8MB，超限丢弃并打日志；重放按 ≤1MB/帧分片）。写失败或队列满时丢弃并打日志，
+不阻塞 agent 订阅 loop；重连后按 hub `hello.seq` 精确补发断线期间事件（seq 由 host 分配、hub 原样
+保留，两端计数始终一致）。
 
 ## API（Local / 经 Hub 中转一致）
 
