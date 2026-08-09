@@ -44,6 +44,14 @@ type Client struct {
 	stateMu sync.Mutex
 	token   string
 
+	// forwardEvents is true only while at least one browser is subscribed
+	// to the hub's /events stream. The hub pushes {type:"subscribers",
+	// count:N} (and hello.subscribers) so idle hosts stop uploading
+	// bridge traffic; host_status heartbeats always continue.
+	fwdMu         sync.Mutex
+	forwardEvents bool
+	fwdKnown      bool // false until the hub tells us a count
+
 	inflightMu sync.Mutex
 	inflight   map[string]context.CancelFunc // reqId → cancel of the local HTTP call
 }
@@ -222,12 +230,45 @@ func (c *Client) clearState() {
 
 // ── event forwarding (bridge → hub) ───────────────────────────────────
 
+// setBrowserSubscribers enables/disables bridge→hub event upload based on
+// the hub's live browser /events subscriber count.
+func (c *Client) setBrowserSubscribers(count int) {
+	enable := count > 0
+	c.fwdMu.Lock()
+	prev := c.forwardEvents
+	known := c.fwdKnown
+	c.forwardEvents = enable
+	c.fwdKnown = true
+	c.fwdMu.Unlock()
+	if !known || prev != enable {
+		if enable {
+			log.Printf("[hub-client] 浏览器在线 (subscribers=%d)，开始上报事件", count)
+		} else {
+			log.Printf("[hub-client] 无浏览器订阅，暂停事件上报（保留 host_status 心跳）")
+		}
+	}
+}
+
+func (c *Client) forwardingEnabled() bool {
+	c.fwdMu.Lock()
+	defer c.fwdMu.Unlock()
+	// Until the hub announces a count, stay paused so a quiet hub does
+	// not attract full event traffic by default.
+	return c.fwdKnown && c.forwardEvents
+}
+
 func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 	ch, unsub := bridge.Subscribe()
 	defer unsub()
 	batch := make([]acp.Event, 0, 16)
 	flush := func() {
 		if len(batch) == 0 {
+			return
+		}
+		if !c.forwardingEnabled() {
+			// Drop queued events while nobody is listening; browsers
+			// rehydrate via /api/status and session-updates on connect.
+			batch = batch[:0]
 			return
 		}
 		evs := batch
@@ -245,6 +286,10 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 		case <-ctx.Done():
 			return
 		case ev := <-ch:
+			if !c.forwardingEnabled() {
+				// Discard immediately — do not buffer while paused.
+				continue
+			}
 			batch = append(batch, ev)
 			if len(batch) >= 16 {
 				flush()
@@ -253,6 +298,8 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 			flush()
 		case <-heartbeat.C:
 			flush()
+			// Always heartbeat: keeps hub registry ready flag fresh even
+			// with zero browser subscribers.
 			c.postHostStatus(ctx, bridge)
 		}
 	}
@@ -319,11 +366,13 @@ func (c *Client) streamLoop(ctx context.Context, bridge *acp.Bridge) error {
 			continue
 		}
 		var msg struct {
-			Type   string          `json:"type"`
-			ReqID  string          `json:"reqId"`
-			Method string          `json:"method"`
-			Path   string          `json:"path"`
-			Body   json.RawMessage `json:"body"`
+			Type        string          `json:"type"`
+			ReqID       string          `json:"reqId"`
+			Method      string          `json:"method"`
+			Path        string          `json:"path"`
+			Body        json.RawMessage `json:"body"`
+			Count       *int            `json:"count"`       // type:"subscribers"
+			Subscribers *int            `json:"subscribers"` // type:"hello"
 		}
 		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
 			log.Printf("[hub-client] 忽略无法解析的中转消息: %v", err)
@@ -331,7 +380,22 @@ func (c *Client) streamLoop(ctx context.Context, bridge *acp.Bridge) error {
 		}
 		switch msg.Type {
 		case "hello":
-			// Stream confirmed by the hub.
+			// Stream confirmed; optional subscribers count from newer hubs.
+			if msg.Subscribers != nil {
+				c.setBrowserSubscribers(*msg.Subscribers)
+			}
+		case "subscribers":
+			n := 0
+			if msg.Count != nil {
+				n = *msg.Count
+			}
+			was := c.forwardingEnabled()
+			c.setBrowserSubscribers(n)
+			// Just resumed: push a fresh host_status so the registry and
+			// any newly-opened browser see current ready state promptly.
+			if !was && c.forwardingEnabled() {
+				c.postHostStatus(ctx, bridge)
+			}
 		case "request":
 			go c.handleRelay(ctx, msg.ReqID, msg.Method, msg.Path, msg.Body)
 		}

@@ -174,6 +174,8 @@ func TestForwardLoop(t *testing.T) {
 	if err := c.ensureToken(context.Background()); err != nil {
 		t.Fatalf("ensureToken: %v", err)
 	}
+	// Hub would push subscribers>0 when a browser is listening.
+	c.setBrowserSubscribers(1)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -190,6 +192,90 @@ func TestForwardLoop(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no event forwarded to hub")
+	}
+}
+
+func TestForwardLoopPausedWhenNoBrowsers(t *testing.T) {
+	fh := newFakeHub(t)
+	ts := httptest.NewServer(fh.handler())
+	defer ts.Close()
+
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", StateFile: filepath.Join(t.TempDir(), "hub.json")})
+	if err := c.ensureToken(context.Background()); err != nil {
+		t.Fatalf("ensureToken: %v", err)
+	}
+	// Explicitly idle: no browser subscribers → no event upload.
+	c.setBrowserSubscribers(0)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.forwardLoop(ctx, bridge)
+
+	time.Sleep(100 * time.Millisecond)
+	bridge.Broadcast(acp.Event{"type": "chunk", "text": "should not upload"})
+
+	select {
+	case ev := <-fh.eventsCh:
+		// host_status heartbeats are OK; bridge chunk events must not appear.
+		if ev["type"] == "chunk" {
+			t.Fatalf("paused forwardLoop uploaded chunk: %v", ev)
+		}
+	case <-time.After(500 * time.Millisecond):
+		// expected: nothing (or only future heartbeats, which we didn't wait for)
+	}
+
+	// Resume and confirm traffic starts.
+	c.setBrowserSubscribers(1)
+	bridge.Broadcast(acp.Event{"type": "chunk", "text": "now online"})
+	select {
+	case ev := <-fh.eventsCh:
+		if ev["type"] != "chunk" || ev["text"] != "now online" {
+			// May receive host_status first if a heartbeat races; keep reading.
+			deadline := time.After(3 * time.Second)
+			for ev["type"] != "chunk" {
+				select {
+				case ev = <-fh.eventsCh:
+				case <-deadline:
+					t.Fatalf("no chunk after resume, last=%v", ev)
+				}
+			}
+			if ev["text"] != "now online" {
+				t.Errorf("chunk after resume = %v", ev)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no event after resuming subscribers")
+	}
+}
+
+func TestStreamHelloSubscribersGate(t *testing.T) {
+	fh := newFakeHub(t)
+	fh.streamFrames = []string{
+		`{"type":"hello","service":"hub","subscribers":0}`,
+		`{"type":"subscribers","count":1}`,
+	}
+	ts := httptest.NewServer(fh.handler())
+	defer ts.Close()
+
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", StateFile: filepath.Join(t.TempDir(), "hub.json")})
+	if err := c.ensureToken(context.Background()); err != nil {
+		t.Fatalf("ensureToken: %v", err)
+	}
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.streamLoop(ctx, bridge) }()
+
+	// Wait until the subscribers frame enables forwarding.
+	deadline := time.After(3 * time.Second)
+	for !c.forwardingEnabled() {
+		select {
+		case <-deadline:
+			t.Fatal("forwarding never enabled after subscribers:1")
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 
@@ -248,6 +334,10 @@ func TestStreamRelayRoundTrip(t *testing.T) {
 
 func TestRunForwardsEvents(t *testing.T) {
 	fh := newFakeHub(t)
+	// Stream hello announces a listening browser so forwardLoop is armed.
+	fh.streamFrames = []string{
+		`{"type":"hello","service":"hub","subscribers":1}`,
+	}
 	ts := httptest.NewServer(fh.handler())
 	defer ts.Close()
 
@@ -259,7 +349,14 @@ func TestRunForwardsEvents(t *testing.T) {
 	go c.Run(ctx, bridge)
 
 	deadline := time.After(3 * time.Second)
-	time.Sleep(300 * time.Millisecond) // let the stream connect + forwardLoop subscribe
+	// Wait until stream hello enables forwarding.
+	for !c.forwardingEnabled() {
+		select {
+		case <-deadline:
+			t.Fatal("forwarding never enabled from stream hello")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 	bridge.Broadcast(acp.Event{"type": "chunk", "text": "via Run"})
 	for {
 		select {
