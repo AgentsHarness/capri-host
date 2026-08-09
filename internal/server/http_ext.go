@@ -12,10 +12,10 @@ import "net/http"
 // bridge.XaiCall 填入活动会话；无会话时 XaiCall 返回 404 → writeAgentError
 // 透传。
 //
-// 队列端点（x.ai/queue/*）在 grok 侧是 ext_notification 型，本层经 XaiCall
-// 以 request 型发送，结果原样返回；真实 agent 会对这类方法回 -32601
-// method_not_found（宿主降级为 200 {ok:false}，不会崩）。未来如需通知型
-// 可在 bridge 增加导出包装。
+// 队列端点（x.ai/queue/*）在 grok 侧是 ext_notification 型：经
+// bridge.XaiNotify 以 _x.ai/queue/* 通知（无 JSON-RPC id）发送，端点即写
+// 即回 {ok:true}；权威队列状态经 x.ai/queue/changed 广播回传（见
+// handleQueue* 各端点）。
 
 // xaiCall 是共享直通：调用 bridge.XaiCall 并统一应答 {ok:true, result}。
 func (s *Server) xaiCall(w http.ResponseWriter, r *http.Request, method string, params map[string]any) {
@@ -126,12 +126,22 @@ func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Cwd string `json:"cwd"`
+		Cwd              string `json:"cwd"`
+		IncludeUntracked *bool  `json:"includeUntracked"`
 	}
 	if !readBody(w, r, &body) {
 		return
 	}
-	s.xaiCall(w, r, "x.ai/git/status", gitRootParams(body.Cwd))
+	// Agent 侧 x.ai/git/status 的 include_untracked 缺省自 2026-08-07 起为
+	// false（此前为 true）；host 这里显式解析默认值并总是发送该键，保证
+	// 行为不随 agent 版本漂移。默认 true 维持本端点历史语义（含 untracked）。
+	includeUntracked := true
+	if body.IncludeUntracked != nil {
+		includeUntracked = *body.IncludeUntracked
+	}
+	params := gitRootParams(body.Cwd)
+	params["includeUntracked"] = includeUntracked
+	s.xaiCall(w, r, "x.ai/git/status", params)
 }
 
 func (s *Server) handleGitDiffs(w http.ResponseWriter, r *http.Request) {
@@ -322,12 +332,27 @@ func (s *Server) handleGitRepoRoot(w http.ResponseWriter, r *http.Request) {
 	s.xaiCall(w, r, "x.ai/git/git_repo_root", gitRootParams(body.Cwd))
 }
 
-// ── 队列（grok 侧为 ext_notification 型；此处经 XaiCall 以 request 型发送，
-//    结果原样返回。需活动会话：sessionId 由 XaiCall 填充，否则 404）────
+// ── 队列（grok 侧为 ext_notification 型：只收 fire-and-forget 通知，无
+//    ext_method 分支；以 _x.ai/queue/* 通知发送，sessionId 由宿主解析，
+//    缺活动会话 404。结果经 x.ai/queue/changed 广播回传，端点即写即回
+//    {ok:true}。TUI 同款：xai-grok-pager app/effects/mod.rs 全以
+//    ExtNotification 发送）────
+
+// queueNotify fires one x.ai/queue/* mutation as a fire-and-forget
+// notification and writes the immediate {ok:true} (or error) response.
+func (s *Server) queueNotify(w http.ResponseWriter, r *http.Request, method string, params map[string]any) {
+	res, err := s.bridge.XaiNotify(r.Context(), method, params)
+	if err != nil {
+		writeAgentError(w, "_"+method, err)
+		return
+	}
+	writeJSON(w, 200, res)
+}
 
 func (s *Server) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID string `json:"id"`
+		ID              string `json:"id"`
+		ExpectedVersion int64  `json:"expectedVersion"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -336,11 +361,15 @@ func (s *Server) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 id"})
 		return
 	}
-	s.xaiCall(w, r, "x.ai/queue/remove", map[string]any{"sessionId": "", "id": body.ID})
+	params := map[string]any{"sessionId": "", "id": body.ID}
+	if body.ExpectedVersion != 0 {
+		params["expectedVersion"] = body.ExpectedVersion
+	}
+	s.queueNotify(w, r, "x.ai/queue/remove", params)
 }
 
 func (s *Server) handleQueueClear(w http.ResponseWriter, r *http.Request) {
-	s.xaiCall(w, r, "x.ai/queue/clear", map[string]any{"sessionId": ""})
+	s.queueNotify(w, r, "x.ai/queue/clear", map[string]any{"sessionId": ""})
 }
 
 // handleQueueReorder — {ids: []string}；wire 键为 orderedIds（grok 侧
@@ -356,7 +385,7 @@ func (s *Server) handleQueueReorder(w http.ResponseWriter, r *http.Request) {
 	if len(body.IDs) > 0 {
 		params["orderedIds"] = body.IDs
 	}
-	s.xaiCall(w, r, "x.ai/queue/reorder", params)
+	s.queueNotify(w, r, "x.ai/queue/reorder", params)
 }
 
 func (s *Server) handleQueueEdit(w http.ResponseWriter, r *http.Request) {
@@ -367,32 +396,69 @@ func (s *Server) handleQueueEdit(w http.ResponseWriter, r *http.Request) {
 	if !readBody(w, r, &body) {
 		return
 	}
-	params := map[string]any{"sessionId": ""}
-	if body.ID != "" {
-		params["id"] = body.ID
+	if body.ID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 id"})
+		return
 	}
-	if body.NewText != "" {
-		params["newText"] = body.NewText
+	if body.NewText == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 newText"})
+		return
 	}
-	s.xaiCall(w, r, "x.ai/queue/edit", params)
+	s.queueNotify(w, r, "x.ai/queue/edit", map[string]any{"sessionId": "", "id": body.ID, "newText": body.NewText})
 }
 
 func (s *Server) handleQueueInterject(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID      string `json:"id"`
-		NewText string `json:"newText"`
+		ID              string `json:"id"`
+		NewText         string `json:"newText"`
+		ExpectedVersion int64  `json:"expectedVersion"`
 	}
 	if !readBody(w, r, &body) {
 		return
 	}
-	params := map[string]any{"sessionId": ""}
-	if body.ID != "" {
-		params["id"] = body.ID
+	if body.ID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 id"})
+		return
 	}
+	params := map[string]any{"sessionId": "", "id": body.ID}
 	if body.NewText != "" {
 		params["newText"] = body.NewText
 	}
-	s.xaiCall(w, r, "x.ai/queue/interject", params)
+	if body.ExpectedVersion != 0 {
+		params["expectedVersion"] = body.ExpectedVersion
+	}
+	s.queueNotify(w, r, "x.ai/queue/interject", params)
+}
+
+// handleQueueHoldEdit — 编辑锁（客户端编辑期间组合保持）{id}。wire
+// parse_queue_edit_command 只读 id（combine-hold 语义，TUI 同款）。
+func (s *Server) handleQueueHoldEdit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.ID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 id"})
+		return
+	}
+	s.queueNotify(w, r, "x.ai/queue/hold_edit", map[string]any{"sessionId": "", "id": body.ID})
+}
+
+// handleQueueReleaseEdit — 释放编辑锁 {id}（同 hold_edit，只读 id）。
+func (s *Server) handleQueueReleaseEdit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.ID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 id"})
+		return
+	}
+	s.queueNotify(w, r, "x.ai/queue/release_edit", map[string]any{"sessionId": "", "id": body.ID})
 }
 
 // ── Skills / Plugins / Hooks / Marketplace / Workflows ────────────────

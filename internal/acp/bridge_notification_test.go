@@ -15,7 +15,7 @@ import (
 
 // ── Part 1: x.ai 通知 typed 化 ──────────────────────────────────────
 
-// 14 个 x.ai 通知方法到达 typed SSE 事件（取代 ext_notification 兜底），
+// 16 个 x.ai 通知方法到达 typed SSE 事件（取代 ext_notification 兜底），
 // params 原样透传；无第二个事件（typed 事件即唯一事件）。
 func TestXaiNotificationTypedEvents(t *testing.T) {
 	cases := []struct {
@@ -35,6 +35,8 @@ func TestXaiNotificationTypedEvents(t *testing.T) {
 		{"x.ai/mcp/init_progress", "mcp_init_progress"},
 		{"x.ai/terminal/pty/notification", "pty_notification"},
 		{"x.ai/session/interjection", "session_interjection"},
+		{"x.ai/follow_ups", "follow_ups"},
+		{"x.ai/leader/version_mismatch", "leader_version_mismatch"},
 		{"x.ai/leader_reconnected", "leader_reconnected"},
 	}
 	for _, c := range cases {
@@ -91,6 +93,7 @@ func TestSessionUpdateKindTypedOnly(t *testing.T) {
 		"diff_review", "subagent_spawned", "image_dropped", "retry_state",
 		"memory_files", "hook_execution", "workflow_updated",
 		"session_summary_generated", "auto_compact_completed", "goal_updated",
+		"last_turn_summary",
 	}
 	for _, kind := range kinds {
 		t.Run(kind, func(t *testing.T) {

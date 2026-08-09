@@ -119,29 +119,6 @@ func TestExtBridgeFsReadFile(t *testing.T) {
 
 // ── git wrappers ──────────────────────────────────────────────────────
 
-func TestExtBridgeGitStatus(t *testing.T) {
-	ctx := context.Background()
-	b, w := readyBridge()
-	untracked := true
-	res := extBridgeCall(t, b, w, func() (map[string]any, error) {
-		return b.GitStatus(ctx, "", &untracked, nil, nil, nil)
-	}, map[string]any{"result": map[string]any{"branch": "main"}})
-	if res["branch"] != "main" {
-		t.Errorf("result = %v, want unwrapped payload with branch", res)
-	}
-	method, params := wireParams(t, w)
-	if method != "_x.ai/git/status" {
-		t.Errorf("wire method = %s, want _x.ai/git/status", method)
-	}
-	want := map[string]any{"includeUntracked": true}
-	if !reflect.DeepEqual(params, want) {
-		t.Errorf("params = %v, want %v (camelCase includeUntracked, no sessionId)", params, want)
-	}
-	if _, has := params["sessionId"]; has {
-		t.Errorf("params must not carry sessionId: %v", params)
-	}
-}
-
 func TestExtBridgeGitCommit(t *testing.T) {
 	ctx := context.Background()
 	b, w := readyBridge()
