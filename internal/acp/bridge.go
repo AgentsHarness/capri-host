@@ -3381,9 +3381,29 @@ func (b *Bridge) SessionDelete(ctx context.Context, sessionID string) (map[strin
 	if sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
-	return b.request(ctx, "_x.ai/session/delete", map[string]any{
+	sessRes, err := b.request(ctx, "_x.ai/session/delete", map[string]any{
 		"sessionId": sessionID,
 	}, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	// Deleting the ACTIVE session drops the frontend into the EMPTY state
+	// (no auto-new). Clear the roster entry, the active-session pointer and
+	// any last-session hint pointing at the deleted session, so the next
+	// prompt without a sessionId creates a fresh session instead of trying
+	// to restore the deleted one (same cleanup as CloseSession).
+	b.mu.Lock()
+	delete(b.sessions, sessionID)
+	if b.activeSessionID == sessionID {
+		b.activeSessionID = ""
+	}
+	if b.lastSessionID == sessionID {
+		b.lastSessionID = ""
+		b.lastSessionCwd = ""
+	}
+	b.mu.Unlock()
+	b.broadcastRosterChange()
+	return sessRes, nil
 }
 
 // CompactConversation calls x.ai/compact_conversation: {sessionId, userContext?}
