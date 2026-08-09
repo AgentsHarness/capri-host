@@ -292,10 +292,19 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	snap := s.bridge.Snapshot()
+	// hello 的 busy 只反映被 announce 的会话（snap.SessionID）本身，而非
+	// 所有会话的 OR 聚合（聚合版保留在 Status.Busy，供 /api/status）：
+	// 另一个会话在后台跑回合时页面刷新，前台视图不应被永久置 busy ——
+	// 后台会话的 done 事件会被客户端按 sessionId 过滤掉，永远清不掉。
+	// 与 handleSessionLoad 返回 per-session busy 的语义一致。
+	helloBusy := false
+	if st := s.bridge.SessionStateOf(snap.SessionID); st != nil {
+		helloBusy = st.Busy
+	}
 	hello := map[string]any{
 		"type":              "hello",
 		"ready":             snap.Ready,
-		"busy":              snap.Busy,
+		"busy":              helloBusy,
 		"sessionId":         snap.SessionID,
 		"cwd":               snap.Cwd,
 		"text":              snap.Text,
