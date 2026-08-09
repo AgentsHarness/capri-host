@@ -41,7 +41,7 @@ go run ./cmd/acp-host
 | `ACP_INIT_RULES` | — | initialize `_meta.rules`（附加规则文本；缺省省略） |
 | `ACP_INIT_MCP_APPS` | — | `1/true` 时 initialize `_meta.mcpApps=true`（声明支持 MCP Apps；缺省省略） |
 | `ACP_INIT_BUFFERING_SETTINGS` | — | initialize `_meta.bufferingSettings`（JSON 对象，camelCase：`maxItems`/`maxBytes`/`maxDurationMs`；缺省省略） |
-| `ACP_INIT_STARTUP_HINTS` | — | initialize `_meta.startupHints`（JSON 对象，camelCase，如 `{"skipGitStatus":true}`；缺省省略） |
+| `ACP_INIT_STARTUP_HINTS` | — | initialize `_meta.startupHints`（JSON 对象，camelCase，如 `{"skipGitStatus":true}`；缺省省略）。可用键含 `nonInteractive`、`skipGitStatus`、`deliveryTools`（`["server__tool"]`，声明会话输出只通过指定工具交付；2026-08-07 起支持） |
 | `ACP_CAP_CODE_NAVIGATION` | — | `1/true` 时宣告 `clientCapabilities.meta["x.ai/codeNavigation"].enabled`（缺省关闭） |
 | `ACP_CAP_FOLDER_TRUST_INTERACTIVE` | — | `1/true` 时宣告 `clientCapabilities.meta["x.ai/folderTrust"].interactive`（缺省关闭） |
 | `ACP_CAP_FS_NOTIFY` | — | `1/true` 时宣告 `clientCapabilities.meta["x.ai/fs_notify"]`（缺省关闭） |
@@ -73,6 +73,20 @@ Host 与 Hub 断开会自动重连（指数退避）；Hub 端 token 失效且�
 | POST | `/api/permission-response` | `{ requestId, optionId?, cancelled? }` |
 | POST | `/api/client-response` | 透传 client_request 的响应给 Agent |
 | POST | `/api/shell` | 本地执行 `sh -c {command}`（不经 Agent；`cwd?` 默认活动会话目录，`timeoutMs?` 默认 10s、上限 60s） |
+
+### 自主目标（/goal 引擎，host 侧）
+
+ACP 协议只有 `goal_updated` 通知、没有 goal 控制方法，goal 引擎由 host 实现（`internal/acp/goal.go`，对齐 TUI 的 goal_tracker）：设定后 host 自动驱动延续回合（注入目标指令、回合空闲时自动再发一轮），从回复文本 / `update_goal` 工具调用 / agent 的 `goal_updated` 解析进度，完成声明进入证据验证回合，支持 token 预算（`usage` 事件累计，超限 → `budget_limited`）。状态变化广播 `goal_updated`（`{type:"goal_updated", update:<state>, sessionId}`），字段与 TUI wire 一致（active / user_paused / blocked / complete / cleared / budget_limited）。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/goal/set` | `{ objective, tokenBudget? }` — 设定自主目标（活动会话），host 自动开始执行 |
+| POST | `/api/goal/status` | 当前目标状态快照（不经过 agent，即时；无目标时 `goal: null`） |
+| POST | `/api/goal/pause` | 暂停进行中的目标（user_paused） |
+| POST | `/api/goal/resume` | 恢复暂停的目标 |
+| POST | `/api/goal/clear` | 清除目标（cleared） |
+
+全部返回 `{ ok:true, goal:<state> }`。
 
 ### 会话
 
@@ -126,7 +140,7 @@ session/prompt 的 `_meta`）。
 | POST | `/api/xai-call` | 通用直通 `{ method, params? }`（method 形如 `"x.ai/foo"`） |
 | POST | `/api/session-resume` | 恢复会话 `{ sessionId, cwd, meta? }`（sessionId/cwd 必填；meta 经 session/resume 的 `_meta` 透传） |
 | POST | `/api/session-close` | 关闭会话 `{ sessionId? }`（缺省活动会话） |
-| POST | `/api/git/status` | git 状态 `{ cwd? }`（cwd 空则不带 gitRoot） |
+| POST | `/api/git/status` | git 状态 `{ cwd?, includeUntracked? }`（cwd 空则不带 gitRoot；includeUntracked 缺省 true，总是显式发送——agent 侧 2026-08-07 起缺省已改为 false） |
 | POST | `/api/git/diffs` | 差异 `{ cwd?, from, to, paths? }`（from/to 必填） |
 | POST | `/api/git/stage` | 暂存 `{ cwd?, paths? }` |
 | POST | `/api/git/unstage` | 取消暂存 `{ cwd?, paths? }` |
@@ -138,11 +152,13 @@ session/prompt 的 `_meta`）。
 | POST | `/api/git/branches` | 分支列表 `{ cwd? }` |
 | POST | `/api/git/current-commit` | 当前提交 `{ cwd? }` |
 | POST | `/api/git/repo-root` | git 仓库根目录 `{ cwd? }` |
-| POST | `/api/queue/remove` | 移除队列条目 `{ id }`（需活动会话） |
+| POST | `/api/queue/remove` | 移除队列条目 `{ id, expectedVersion? }`（需活动会话） |
 | POST | `/api/queue/clear` | 清空队列（需活动会话） |
 | POST | `/api/queue/reorder` | 重排队列 `{ ids: []string }`（wire 键为 `orderedIds`） |
-| POST | `/api/queue/edit` | 编辑队列条目 `{ id, newText }`（需活动会话） |
-| POST | `/api/queue/interject` | 队列插入 `{ id, newText? }`（需活动会话） |
+| POST | `/api/queue/edit` | 编辑队列条目 `{ id, newText }`（均必填；需活动会话） |
+| POST | `/api/queue/interject` | 队列插入 `{ id, newText?, expectedVersion? }`（需活动会话） |
+| POST | `/api/queue/hold-edit` | 锁定队列条目编辑 `{ id }`（combine-hold，需活动会话） |
+| POST | `/api/queue/release-edit` | 释放队列条目编辑锁 `{ id }`（需活动会话） |
 | POST | `/api/skills/list` | 技能列表 `{ cwd? }` |
 | POST | `/api/skills/toggle` | 启用/禁用技能 `{ name, enabled }` |
 | POST | `/api/skills/add` | 添加技能路径 `{ path?, cwd? }`（原样透传） |
@@ -280,7 +296,9 @@ x.ai/schedulerGeneration/Revision）；`scheduled_task_deleted` 新增
   `queue_changed`、`config_changed`、`settings_update`、`fs_notify`、
   `fs_index`、`fs_index_delta`、`search_fuzzy_status`、
   `search_content_status`、`git_worktree_status`、`mcp_init_progress`、
-  `pty_notification`、`session_interjection`、`leader_reconnected`
+  `pty_notification`、`session_interjection`、`follow_ups`、
+  `leader_version_mismatch`（x.ai/leader/version_mismatch）、
+  `leader_reconnected`
   —— 形状 `{type, params, sessionId}`。
 - sessionUpdate kind 语义化：kind 分发抽成 `dispatchSessionUpdateKind`
   （返回该 kind 是否已建模），官方 `session/update` 与
@@ -304,7 +322,8 @@ x.ai/schedulerGeneration/Revision）；`scheduled_task_deleted` 新增
   `feedback_request`、`relay_sync_status`、`auto_recovery_started/exhausted`、
   `hook_annotation`、`hook_execution`、`hooks_changed`、`plugins_changed`、
   `plugin_updates_installed`、`session_summary_generated`、`session_recap`、
-  `session_recap_unavailable`、`task_backgrounded`、`task_completed`、
+  `session_recap_unavailable`、`last_turn_summary`、`task_backgrounded`、
+  `task_completed`、
   `monitor_event`、`subagent_spawned/progress/finished`、
   `scheduled_task_created/fired/deleted`、`tool_call_delta_chunk`、
   `image_compressed`、`image_dropped`、`workflow_updated`、`goal_updated`、
@@ -319,9 +338,13 @@ x.ai/schedulerGeneration/Revision）；`scheduled_task_deleted` 新增
   stop_reason / prompt_id / usage 等字段），usage 提取保留在两个载体
   （官方载体带 size:nil、x.ai 载体不带）。
 
-> 注：grok 侧的队列方法（`x.ai/queue/*`）是 ext_notification 型，本层经
-> `XaiCall` 以 request 型发送，结果原样返回；真实 agent 会对这类方法回
-> `-32601 method_not_found`（宿主降级为 `200 {ok:false}`，不会崩）。
+> 注：grok 侧的队列方法（`x.ai/queue/*`）是 ext_notification 型（fire-
+> and-forget，无响应），本层经 `XaiNotify` 以 `_x.ai/queue/*` 通知发送，
+> 端点即写即回 `{ok:true}`；队列权威状态经 `x.ai/queue/changed` 广播回传
+> （TUI 同款：grok-build 的 pager 全以 ExtNotification 发送）。`sessionId`
+> 由宿主解析为活动会话，缺活动会话返回 404。可选 `expectedVersion`（remove/
+> interject）做陈旧编辑保护（与 shell 侧 parse_queue_edit_command 的
+> expectedVersion 语义一致）。
 
 ### 管理 / Agent 控制
 
