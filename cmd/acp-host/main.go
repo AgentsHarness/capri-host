@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -36,6 +37,9 @@ func main() {
 			PairCode:  cfg.HubPairCode,
 			Token:     cfg.HostToken,
 			LocalBase: fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+			// Optional: bypass proxy/fake-ip DNS for the QUIC transport
+			// (e.g. HUB_QUIC_HOST=203.0.113.10).
+			QUICHost: os.Getenv("HUB_QUIC_HOST"),
 		})
 		go hc.Run(ctx, bridge)
 	}
