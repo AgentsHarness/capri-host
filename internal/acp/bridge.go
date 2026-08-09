@@ -357,11 +357,32 @@ func (b *Bridge) setSessionAwaiting(id string, awaiting bool) {
 	}
 }
 
-// sessionIdFrom returns the sessionId carried by an agent notification
-// envelope, falling back to the active session (defensive: some wire forms
-// omit it while a turn is in flight).
-func (b *Bridge) sessionIdFrom(params map[string]any) string {
+// sessionIdExplicit returns the sessionId explicitly carried by
+// notification params — camelCase "sessionId" (the standard carrier key)
+// or snake_case "session_id" (some x.ai rails) — and "" when absent. NO
+// active-session fallback: the official session/update carrier always
+// carries the id, so handleSessionUpdate uses this directly — falling back
+// to the host's active session there would mis-tag events in multi-client
+// setups.
+func sessionIdExplicit(params map[string]any) string {
 	if sid, ok := params["sessionId"].(string); ok && sid != "" {
+		return sid
+	}
+	if sid, ok := params["session_id"].(string); ok && sid != "" {
+		return sid
+	}
+	return ""
+}
+
+// sessionIdFrom returns the sessionId carried by an agent notification
+// envelope: the explicit params id wins (sessionIdExplicit); otherwise the
+// active session is the defensive fallback. Only rails that genuinely
+// never carry an explicit id (machine-wide broadcasts such as
+// x.ai/announcements/update / x.ai/models/update / x.ai/leader_reconnected)
+// hit the fallback — for those the active-session tag is the host's best
+// guess. Session-scoped carriers always carry the id and never fall back.
+func (b *Bridge) sessionIdFrom(params map[string]any) string {
+	if sid := sessionIdExplicit(params); sid != "" {
 		return sid
 	}
 	b.mu.Lock()
@@ -1080,7 +1101,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// Multi-session attribution: the agent's session/update envelope carries
 	// {sessionId, update}; every derived event is tagged so clients can
 	// bucket by session (dashboard) or filter to their active session.
-	sid := b.sessionIdFrom(params)
+	// 官方载体恒带 sessionId：直接用显式 id，绝不回落活动会话（多客户端
+	// 下回落会误标到宿主的活动会话）。
+	sid := sessionIdExplicit(params)
 
 	// Every standard session/update carries the session-accumulated
 	// context token count in `_meta.totalTokens` (the TUI's ⇣ counter
@@ -1549,12 +1572,26 @@ func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag fu
 // unwrapExtMethod normalizes the two x.ai wire forms:
 //   - direct:  {"method":"x.ai/foo", "params":{...}}          -> x.ai/foo
 //   - wrapped: {"method":"_x.ai/foo","params":{"method":"x.ai/foo","params":{...}}} -> x.ai/foo
+//
+// For the wrapped leader form, an explicit sessionId carried on the OUTER
+// envelope params (leader routing meta) is preserved into the inner params
+// when the inner ones lack both id keys — so sessionIdFrom prefers the
+// explicit id instead of falling back to the host's active session.
 func unwrapExtMethod(method string, params map[string]any) (string, map[string]any) {
 	if !strings.HasPrefix(method, "_x.ai/") {
 		return method, params
 	}
 	if inner, ok := params["method"].(string); ok && strings.HasPrefix(inner, "x.ai/") {
 		if innerParams, ok := params["params"].(map[string]any); ok {
+			_, hasCamel := innerParams["sessionId"]
+			_, hasSnake := innerParams["session_id"]
+			if !hasCamel && !hasSnake {
+				if sid, ok := params["sessionId"].(string); ok && sid != "" {
+					innerParams["sessionId"] = sid
+				} else if sid, ok := params["session_id"].(string); ok && sid != "" {
+					innerParams["session_id"] = sid
+				}
+			}
 			return inner, innerParams
 		}
 		return inner, map[string]any{}

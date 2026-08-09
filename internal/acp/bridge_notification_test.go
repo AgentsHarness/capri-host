@@ -646,3 +646,85 @@ func TestSessionInfoRosterBothCarriers(t *testing.T) {
 		})
 	}
 }
+
+// ── L5: sessionId 显式 id 优先于活动会话回落 ─────────────────────────
+
+// 显式 sessionId（camelCase / snake_case）优先于活动会话回落；官方
+// session/update 载体恒带 id、缺失时绝不回落（多客户端下回落会误标）；
+// _x.ai 包装形式的 leader envelope 外层 sessionId 保全。
+func TestNotificationSessionIdExplicitPreference(t *testing.T) {
+	seedActive := func(b *Bridge) {
+		b.mu.Lock()
+		b.sessions["active-a"] = &SessionState{SessionID: "active-a"}
+		b.activeSessionID = "active-a"
+		b.mu.Unlock()
+	}
+
+	t.Run("camelCase params sessionId wins over active", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		seedActive(b)
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		// 活动会话是 active-a，但通知自带 bg-b → 必须标 bg-b。
+		b.handleXaiNotification("x.ai/task_completed",
+			map[string]any{"sessionId": "bg-b", "taskId": "t1"})
+		ev := <-ch
+		if ev["sessionId"] != "bg-b" {
+			t.Fatalf("sessionId = %v, want bg-b — 显式 id 必须压过活动会话回落", ev["sessionId"])
+		}
+	})
+
+	t.Run("snake_case session_id also honored", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		seedActive(b)
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		b.handleXaiNotification("x.ai/task_completed",
+			map[string]any{"session_id": "bg-b", "taskId": "t1"})
+		ev := <-ch
+		if ev["sessionId"] != "bg-b" {
+			t.Fatalf("sessionId = %v, want bg-b（session_id 载体）", ev["sessionId"])
+		}
+	})
+
+	t.Run("official session/update never falls back to active", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		seedActive(b)
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		// 官方载体缺 id（正常 wire 不会发生）：不带活动会话标签（保持空），
+		// 绝不误标到宿主的活动会话。
+		b.handleSessionUpdate(map[string]any{
+			"update": map[string]any{"sessionUpdate": "diff_review", "x": 1},
+		})
+		ev := <-ch
+		if sid, _ := ev["sessionId"].(string); sid != "" {
+			t.Fatalf("sessionId = %q, want empty — 官方载体不得回落活动会话", sid)
+		}
+	})
+
+	t.Run("wrapped _x.ai envelope keeps outer sessionId", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		seedActive(b)
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		// leader 包装形式：外层 envelope params 带 sessionId，内层 params
+		// 不带 → unwrapExtMethod 必须保全外层显式 id。
+		b.onAgentMessage(map[string]any{
+			"method": "_x.ai/task_completed",
+			"params": map[string]any{
+				"method":    "x.ai/task_completed",
+				"params":    map[string]any{"taskId": "t1"},
+				"sessionId": "bg-b",
+			},
+		})
+		ev := <-ch
+		if ev["sessionId"] != "bg-b" {
+			t.Fatalf("sessionId = %v, want bg-b — 外层 envelope 的显式 id 必须存活", ev["sessionId"])
+		}
+		params, _ := ev["params"].(map[string]any)
+		if params["sessionId"] != "bg-b" {
+			t.Errorf("转发 params sessionId = %v, want bg-b", params["sessionId"])
+		}
+	})
+}
