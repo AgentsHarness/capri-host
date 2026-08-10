@@ -297,7 +297,7 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 
 		// 5. Run the turn, collecting events for analysis. The drainer
 		//    goroutine consumes the subscription during the whole turn, so
-		//    long turns never overflow the 64-slot Subscribe buffer and
+		//    long turns never overflow the 512-slot Subscribe buffer and
 		//    lose update_goal / usage / summary events to Broadcast drops.
 		evCh, unsub := b.Subscribe()
 		drain := b.goalDrainConcurrent(evCh)
@@ -388,12 +388,12 @@ func (b *Bridge) goalWaitIdle(stop chan struct{}, sessionID string) bool {
 // chunk/thought/usage events) never overflow the Subscribe buffer —
 // Broadcast drops events for slow consumers, and the goal analysis must
 // see the FULL turn (update_goal / usage / summary events near the end
-// would otherwise be lost to the old 64-slot buffer). The returned stop
-// function terminates the drainer (with a short grace sweep for events
-// still in flight, mirroring the old post-turn drain) and returns the
-// collected events in turn order. The drainer only collects events; it
-// never touches goal state, so the goalLoopOwns identity guard in
-// goalAnalyze is unaffected.
+// would otherwise be lost to the old post-turn drain / smaller buffer).
+// The returned stop function terminates the drainer (with a short grace
+// sweep for events still in flight, mirroring the old post-turn drain)
+// and returns the collected events in turn order. The drainer only
+// collects events; it never touches goal state, so the goalLoopOwns
+// identity guard in goalAnalyze is unaffected.
 func (b *Bridge) goalDrainConcurrent(evCh chan Event) func() []Event {
 	var events []Event
 	stop := make(chan struct{})

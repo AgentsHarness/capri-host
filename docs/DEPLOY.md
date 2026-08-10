@@ -102,6 +102,21 @@ VITE_PROXY_TARGET=http://<hub-ip>:8787 npm run dev
 
 hub 会把 `/api/*` 请求中转到目标 host（`?host=<hostId>` 选择，默认最近在线的）。
 
+### 版本契约（FE / hub / host 必须同步）
+
+中继路径的事件模型是跨仓库契约，**不要只升其中一端**：
+
+| 能力 | 说明 |
+|------|------|
+| `(hostId, seq)` 双路去重 | 本地 SSE 与 hub `/ws/fe` 可能各推一份同源事件；FE 必须按二元组去重 |
+| chunk **不再合并** | host 上行保留每条 bridge 事件的独立 `seq` 与原文；旧逻辑把 `a`+`b`+`c` 合成一条会破坏与 SSE 的 seq 对齐 |
+| `host_status` 控制帧 | `{"v":1,"type":"host_status","ready":bool}`，**无 `seq`、不在 events 空间**；hub 须识别并不推进 per-host 事件序号 |
+| seq 空洞 + gap-pull | 慢消费者丢弃时可能看到 `1,3` 跳号；FE 用 `GET /api/events?host=&after=` 补拉，重复 seq 去重即可 |
+
+**升级 / 回滚**：`acp-fe`、`acp-hub`、`acp-host`（含内嵌 `web/dist`）请升到同一代「双路去重 + 控制帧 + 不合并 chunk」的版本；回滚也三者一起回。
+
+**旧 FE + 新 host/hub 的典型症状**：重复 chunk、host 在线/ready 异常、异常 gap-pull 或事件错位。处理：同步升级，或整体回滚到旧契约版本。
+
 ## 环境变量速查
 
 ### acp-host
@@ -168,9 +183,11 @@ cp -R dist ../acp-host/internal/server/web/dist
 |------|------------|
 | 启动日志一直刷 `配对失败… 重试` | 配对码填错或过期：hub 上 `POST /api/pairing/rotate` 换新码，host 加 `--pair-code` 重启 |
 | host 已配对过，重启还要配对 | 检查 `~/.acp-host/hub.json` 是否存在、`HUB_URL` 是否与当初一致（token 绑定 URL） |
-| 中继模式浏览器打开没内容 / 事件不更新 | 无浏览器订阅时 host 暂停上报事件（省流量），打开页面后自动恢复；不行就刷新页面重新水合 |
+| 中继模式浏览器打开没内容 / 事件不更新 | 无浏览器订阅时 host 暂停向 Hub **实时入队**事件（仍可缓冲供 resume；`host_status` 控制帧不停），打开页面后自动恢复 live；不行就刷新页面重新水合，或依赖 hub `hello.seq` / `GET /api/events` 补拉 |
+| 重复 chunk / ready 状态乱 / 事件错位 | FE 与 hub/host **版本未对齐**（见上文「版本契约」）：旧 FE 不懂 `(hostId,seq)` 去重或无 seq 的 `host_status`；同步升级或整体回滚 |
+| seq 跳号（如 1→3）后短暂缺口 | 慢订阅缓冲满时 drop 属预期；FE 应 gap-pull，不是 host bug |
 | QUIC 连不上 | UDP 8788 被防火墙挡：自动回退 WebSocket（`已连接 hub（ws）`），或在云安全组放行 UDP |
-| 前端白屏 / 旧版本 | `internal/server/web/dist` 落后于 acp-fe 最新构建，按上文重新复制产物并重启 |
+| 前端白屏 / 旧版本 | `internal/server/web/dist` 落后于 acp-fe 最新构建，按上文重新复制产物并重启；中继模式还需 FE 支持双路去重 |
 | 端口被占用 | `lsof -nP -iTCP:8765 -sTCP:LISTEN` 查占用；换 `--port` |
 | `grok` 找不到 | 装好 grok 并 `grok login`，或用 `--grok-bin` 指定路径；服务本身能起，首次提问前解决即可 |
 | 浏览器提示需要 token（中继模式） | hub 设置了 `FE_TOKEN`：在页面门禁输入同一个密钥 |

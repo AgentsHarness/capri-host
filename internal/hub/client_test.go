@@ -417,59 +417,11 @@ func TestStreamAuthFailure(t *testing.T) {
 	}
 }
 
-func TestMergeChunkEvents(t *testing.T) {
-	in := []acp.Event{
-		{"type": "chunk", "text": "hel", "sessionId": "s1"},
-		{"type": "chunk", "text": "lo", "sessionId": "s1"},
-		{"type": "thought", "text": "hmm", "sessionId": "s1"},
-		{"type": "thought", "text": "…", "sessionId": "s1"},
-		{"type": "chunk", "text": "!", "sessionId": "s1"},
-		{"type": "done", "sessionId": "s1"},
-		{"type": "chunk", "text": "a", "sessionId": "s2"},
-		{"type": "chunk", "text": "b", "sessionId": "s1"},
-	}
-	out := mergeChunkEvents(in)
-	// hello | hmm… | ! | done | s2:a | s1:b
-	if len(out) != 6 {
-		t.Fatalf("merged len = %d, want 6: %v", len(out), out)
-	}
-	if out[0]["text"] != "hello" || out[0]["type"] != "chunk" {
-		t.Errorf("out[0] = %v", out[0])
-	}
-	if out[1]["text"] != "hmm…" || out[1]["type"] != "thought" {
-		t.Errorf("out[1] = %v", out[1])
-	}
-	if out[2]["text"] != "!" {
-		t.Errorf("out[2] = %v", out[2])
-	}
-	if out[3]["type"] != "done" {
-		t.Errorf("out[3] = %v", out[3])
-	}
-	if out[4]["text"] != "a" || out[4]["sessionId"] != "s2" {
-		t.Errorf("out[4] = %v", out[4])
-	}
-	if out[5]["text"] != "b" || out[5]["sessionId"] != "s1" {
-		t.Errorf("out[5] = %v", out[5])
-	}
-}
-
-func TestMergeChunkEventsDifferentMessageID(t *testing.T) {
-	in := []acp.Event{
-		{"type": "chunk", "text": "a", "messageId": "m1"},
-		{"type": "chunk", "text": "b", "messageId": "m2"},
-	}
-	out := mergeChunkEvents(in)
-	if len(out) != 2 {
-		t.Fatalf("len = %d, want 2 (different messageId)", len(out))
-	}
-}
-
-// TestForwardLoopSeqAssignedAfterMerge is the P1 regression: seqs must be
-// assigned AFTER chunk/thought merging, so wire and replay seqs are
-// contiguous (no holes from merged-away events). Holes made the hub
-// counter jump (spurious FE gap-pulls) and made reconnect replays
-// duplicate text that a merged event already carried.
-func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
+// TestForwardLoopNoMerge is the P0 regression: hub must forward each
+// bridge event with its original seq and text. Merging chunks into one
+// "abc" event (keeping seq 1) collided with local SSE seq 1,2,3 "a","b","c"
+// and broke dual-path FE dedup.
+func TestForwardLoopNoMerge(t *testing.T) {
 	fh := newFakeHub(t)
 	ts := httptest.NewServer(fh.handler())
 	defer ts.Close()
@@ -479,7 +431,6 @@ func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
 		t.Fatalf("ensureToken: %v", err)
 	}
 	c.sendCh = make(chan []byte, 64)
-	// Hub would push subscribers>0 when a browser is listening.
 	c.setBrowserSubscribers(1)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
@@ -488,61 +439,72 @@ func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
 	go drainSendCh(ctx, c, fh)
 	go c.forwardLoop(ctx, bridge)
 
-	time.Sleep(80 * time.Millisecond) // let the subscription register
+	time.Sleep(80 * time.Millisecond)
 	bridge.Broadcast(acp.Event{"type": "chunk", "text": "a", "sessionId": "s1"})
 	bridge.Broadcast(acp.Event{"type": "chunk", "text": "b", "sessionId": "s1"})
 	bridge.Broadcast(acp.Event{"type": "chunk", "text": "c", "sessionId": "s1"})
 	bridge.Broadcast(acp.Event{"type": "done", "sessionId": "s1"})
 
-	// Collect chunk/done events (tick splits are fine — the invariant is
-	// seq contiguity and the merged text reassembling to "abc").
 	var chunks []string
 	var seqs []float64
 	sawDone := false
 	deadline := time.After(3 * time.Second)
-	for !sawDone || strings.Join(chunks, "") != "abc" {
+	for !sawDone || len(chunks) < 3 {
 		select {
 		case ev := <-fh.eventsCh:
-			t, _ := ev["type"].(string)
-			if t != "chunk" && t != "done" {
+			typ, _ := ev["type"].(string)
+			if typ != "chunk" && typ != "done" {
 				continue
 			}
 			if s, ok := ev["seq"].(float64); ok {
 				seqs = append(seqs, s)
 			}
-			if t == "chunk" {
+			if typ == "chunk" {
 				if txt, ok := ev["text"].(string); ok {
 					chunks = append(chunks, txt)
 				}
-			} else if t == "done" {
+			} else if typ == "done" {
 				sawDone = true
 			}
 		case <-deadline:
 			t.Fatalf("timed out: chunks=%v seqs=%v sawDone=%v", chunks, seqs, sawDone)
 		}
 	}
-	for i := 1; i < len(seqs); i++ {
-		if seqs[i] != seqs[i-1]+1 {
-			t.Fatalf("seq hole in %v (want contiguous after merge)", seqs)
+	if strings.Join(chunks, "") != "abc" {
+		t.Errorf("chunk texts = %v, want a,b,c separately (joined abc)", chunks)
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("chunk count = %d, want 3 unmerged wire events (got %v)", len(chunks), chunks)
+	}
+	// Bridge assigns contiguous global seq 1,2,3,4 for a,b,c,done.
+	want := []float64{1, 2, 3, 4}
+	if len(seqs) != len(want) {
+		t.Fatalf("seqs = %v, want %v", seqs, want)
+	}
+	for i := range want {
+		if seqs[i] != want[i] {
+			t.Fatalf("seqs = %v, want %v (no merge, bridge seqs preserved)", seqs, want)
 		}
 	}
-	if seqs[0] != 1 {
-		t.Errorf("first seq = %v, want 1", seqs[0])
-	}
-	// Replay must hold exactly the merged events — nothing merged-away.
 	c.seqMu.Lock()
 	n := len(c.replay)
 	c.seqMu.Unlock()
-	if n != len(seqs) {
-		t.Errorf("replay len = %d, want %d (merged events only)", n, len(seqs))
+	if n != 4 {
+		t.Errorf("replay len = %d, want 4 (all unmerged events)", n)
 	}
 }
 
-// TestHostStatusCarriesSeq: host_status must get a real seq like any
-// other event. A seq-less events frame made the hub renumber from 1,
-// resetting its per-host counter and triggering a full replay (with FE
-// re-emission) on the next reconnect.
-func TestHostStatusCarriesSeq(t *testing.T) {
+// TestForwardLoopSeqAssignedAfterMerge kept as an alias name for
+// greppability of the old regression; behavior is no-merge contiguous
+// bridge seqs (same as TestForwardLoopNoMerge).
+func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
+	TestForwardLoopNoMerge(t)
+}
+
+// TestHostStatusIsControlFrame: host_status must be a control frame
+// {"v":1,"type":"host_status","ready":…} — no seq, not an events frame,
+// not in the replay buffer — so it cannot collide with bridge.Broadcast seq.
+func TestHostStatusIsControlFrame(t *testing.T) {
 	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
 	c.sendCh = make(chan []byte, 4)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
@@ -550,29 +512,371 @@ func TestHostStatusCarriesSeq(t *testing.T) {
 	c.enqueueHostStatus(bridge)
 	select {
 	case payload := <-c.sendCh:
-		var f struct {
-			Type     string           `json:"type"`
-			SeqStart uint64           `json:"seqStart"`
-			Events   []map[string]any `json:"events"`
-		}
-		if json.Unmarshal(payload, &f) != nil || f.Type != "events" {
+		var f map[string]any
+		if json.Unmarshal(payload, &f) != nil {
 			t.Fatalf("bad frame: %s", payload)
 		}
-		if f.SeqStart != 1 || len(f.Events) != 1 {
-			t.Fatalf("frame = seqStart %d, %d events; want seqStart 1, 1 event", f.SeqStart, len(f.Events))
+		if f["type"] != "host_status" {
+			t.Fatalf("type = %v, want host_status (control frame), payload=%s", f["type"], payload)
 		}
-		if s, _ := f.Events[0]["seq"].(float64); s != 1 {
-			t.Errorf("host_status seq = %v, want 1", s)
+		if _, ok := f["seq"]; ok {
+			t.Errorf("host_status must not carry seq, got %v", f["seq"])
+		}
+		if _, ok := f["events"]; ok {
+			t.Errorf("host_status must not be an events frame, payload=%s", payload)
+		}
+		if _, ok := f["ready"]; !ok {
+			t.Errorf("host_status missing ready: %s", payload)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no host_status frame")
 	}
-	// And it lands in replay for resume.
+	// Not stored in replay (control plane only).
 	c.seqMu.Lock()
 	n := len(c.replay)
+	next := c.nextSeq
 	c.seqMu.Unlock()
-	if n != 1 {
-		t.Errorf("replay len = %d, want 1", n)
+	if n != 0 {
+		t.Errorf("replay len = %d, want 0 (host_status is not data-plane)", n)
+	}
+	if next != 0 {
+		t.Errorf("nextSeq = %d, want 0 (host_status must not bump data-plane seq)", next)
+	}
+
+	// After bridge Broadcast seq=1 and a host_status, next bridge event is seq=2.
+	c.setBrowserSubscribers(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.forwardLoop(ctx, bridge)
+	time.Sleep(50 * time.Millisecond)
+	bridge.Broadcast(acp.Event{"type": "chunk", "text": "one", "sessionId": "s1"})
+	// Wait until seq lands in replay.
+	deadline := time.After(2 * time.Second)
+	for {
+		c.seqMu.Lock()
+		got := c.nextSeq
+		c.seqMu.Unlock()
+		if got >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("bridge event never reached hub client")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	c.enqueueHostStatus(bridge) // must not advance nextSeq
+	bridge.Broadcast(acp.Event{"type": "chunk", "text": "two", "sessionId": "s1"})
+	deadline = time.After(2 * time.Second)
+	for {
+		c.seqMu.Lock()
+		got := c.nextSeq
+		c.seqMu.Unlock()
+		if got >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("second bridge event never reached hub client (nextSeq=%d)", got)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	// Drain any host_status control frames; ensure they have no seq.
+	for {
+		select {
+		case payload := <-c.sendCh:
+			var f map[string]any
+			if json.Unmarshal(payload, &f) != nil {
+				continue
+			}
+			if f["type"] == "host_status" {
+				if _, ok := f["seq"]; ok {
+					t.Errorf("control host_status carried seq: %s", payload)
+				}
+			}
+		default:
+			return
+		}
+	}
+}
+
+// TestPausedStillReplaysOnResume: while browser subscribers are 0, bridge
+// events must still enter the replay buffer (not discarded). On 0→1 the
+// host catch-up via sendReplayAfter(lastSentSeq) must deliver them.
+func TestPausedStillReplaysOnResume(t *testing.T) {
+	fh := newFakeHub(t)
+	ts := httptest.NewServer(fh.handler())
+	defer ts.Close()
+
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", StateFile: filepath.Join(t.TempDir(), "hub.json"), DisableQUIC: true})
+	if err := c.ensureToken(context.Background()); err != nil {
+		t.Fatalf("ensureToken: %v", err)
+	}
+	c.sendCh = make(chan []byte, 64)
+	c.setBrowserSubscribers(0)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go drainSendCh(ctx, c, fh)
+	go c.forwardLoop(ctx, bridge)
+
+	time.Sleep(80 * time.Millisecond)
+	bridge.Broadcast(acp.Event{"type": "chunk", "text": "paused-a", "sessionId": "s1"})
+	bridge.Broadcast(acp.Event{"type": "chunk", "text": "paused-b", "sessionId": "s1"})
+
+	// Wait until both events are in the replay buffer (flush is 50ms).
+	deadline := time.After(2 * time.Second)
+	for {
+		c.seqMu.Lock()
+		n := len(c.replay)
+		c.seqMu.Unlock()
+		if n >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("paused events never entered replay (len=%d)", n)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	// While paused, nothing should have been enqueued for uplink.
+	select {
+	case ev := <-fh.eventsCh:
+		if ev["type"] == "chunk" {
+			t.Fatalf("paused forwardLoop uploaded chunk: %v", ev)
+		}
+	case <-time.After(150 * time.Millisecond):
+		// expected
+	}
+
+	// Simulate subscribers 0→1 handler: resume catch-up from lastSentSeq.
+	c.seqMu.Lock()
+	after := c.lastSentSeq
+	c.seqMu.Unlock()
+	c.setBrowserSubscribers(1)
+	if last := c.sendReplayAfter(after); last == 0 {
+		t.Fatal("sendReplayAfter returned 0, want paused chunks replayed")
+	}
+
+	var got []string
+	deadline = time.After(3 * time.Second)
+	for len(got) < 2 {
+		select {
+		case ev := <-fh.eventsCh:
+			if ev["type"] != "chunk" {
+				continue
+			}
+			txt, _ := ev["text"].(string)
+			got = append(got, txt)
+		case <-deadline:
+			t.Fatalf("resume replay timed out: got %v", got)
+		}
+	}
+	if got[0] != "paused-a" || got[1] != "paused-b" {
+		t.Errorf("replayed chunks = %v, want [paused-a paused-b]", got)
+	}
+}
+
+// TestHandleHelloSeqEpochReset: after host process restart, local seq
+// space restarts at 0/1 while hub still holds a high LastSeq. hello must
+// NOT raise lastSentSeq to that alien value (or 0→1 catch-up dies), and
+// must emit a seq_reset control frame so hub clears its watermark.
+func TestHandleHelloSeqEpochReset(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 16)
+
+	// Simulate a prior process that had reached seq 1000 on the hub, then
+	// this fresh client process has only local events 1..2 in replay.
+	c.seqAndReplay([]acp.Event{
+		{"type": "chunk", "text": "a", "seq": uint64(1)},
+		{"type": "chunk", "text": "b", "seq": uint64(2)},
+	})
+	// nextSeq should track 2; lastSentSeq still 0 (never enqueued).
+	c.seqMu.Lock()
+	if c.nextSeq != 2 {
+		t.Fatalf("nextSeq = %d, want 2", c.nextSeq)
+	}
+	c.lastSentSeq = 0
+	c.seqMu.Unlock()
+
+	c.handleHelloSeq(1000)
+
+	// lastSentSeq must stay 0 (not polluted by hub's 1000).
+	c.seqMu.Lock()
+	if c.lastSentSeq != 0 && c.lastSentSeq != 2 {
+		// May be raised by noteLastSentSeq during critical replay enqueue.
+		// Accept 0 (nothing enqueued yet if queue full) or 2 (replay landed).
+		// Must NOT be 1000.
+		if c.lastSentSeq >= 1000 {
+			t.Fatalf("lastSentSeq = %d, must not adopt alien hub.seq=1000", c.lastSentSeq)
+		}
+	}
+	if c.lastSentSeq >= 1000 {
+		t.Fatalf("lastSentSeq = %d, must not adopt alien hub.seq=1000", c.lastSentSeq)
+	}
+	c.seqMu.Unlock()
+
+	// First frame must be seq_reset (critical, before replay events).
+	var sawReset, sawReplay bool
+	deadline := time.After(2 * time.Second)
+	for !sawReset || !sawReplay {
+		select {
+		case payload := <-c.sendCh:
+			var f map[string]any
+			if json.Unmarshal(payload, &f) != nil {
+				continue
+			}
+			switch f["type"] {
+			case "seq_reset":
+				sawReset = true
+			case "events":
+				sawReplay = true
+				evs, _ := f["events"].([]any)
+				if len(evs) < 1 {
+					t.Errorf("replay events frame empty: %s", payload)
+				}
+			}
+		case <-deadline:
+			t.Fatalf("timeout: sawReset=%v sawReplay=%v", sawReset, sawReplay)
+		}
+	}
+	if !sawReset {
+		t.Error("expected seq_reset control frame on epoch mismatch")
+	}
+}
+
+// TestHandleHelloSeqSameProcess: when hub.seq is within this process's
+// seq space, hello raises lastSentSeq and resumes after that point only.
+func TestHandleHelloSeqSameProcess(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 16)
+
+	c.seqAndReplay([]acp.Event{
+		{"type": "chunk", "text": "a", "seq": uint64(1)},
+		{"type": "chunk", "text": "b", "seq": uint64(2)},
+		{"type": "chunk", "text": "c", "seq": uint64(3)},
+	})
+	c.seqMu.Lock()
+	c.lastSentSeq = 1 // hub already has seq 1
+	c.seqMu.Unlock()
+
+	c.handleHelloSeq(1)
+
+	c.seqMu.Lock()
+	if c.lastSentSeq != 1 {
+		// After resume, noteLastSentSeq may advance to 3 from replay of 2,3.
+		if c.lastSentSeq < 1 {
+			t.Fatalf("lastSentSeq = %d, want >= 1", c.lastSentSeq)
+		}
+	}
+	c.seqMu.Unlock()
+
+	// Should NOT emit seq_reset.
+	deadline := time.After(time.Second)
+	var texts []string
+	for {
+		select {
+		case payload := <-c.sendCh:
+			var f map[string]any
+			if json.Unmarshal(payload, &f) != nil {
+				continue
+			}
+			if f["type"] == "seq_reset" {
+				t.Fatal("same-process resume must not emit seq_reset")
+			}
+			if f["type"] == "events" {
+				// Collect chunk texts from the frame.
+				raw, _ := json.Marshal(f["events"])
+				var evs []map[string]any
+				_ = json.Unmarshal(raw, &evs)
+				for _, ev := range evs {
+					if ev["type"] == "chunk" {
+						if txt, ok := ev["text"].(string); ok {
+							texts = append(texts, txt)
+						}
+					}
+				}
+				if len(texts) >= 2 {
+					// seq 2,3 = b,c
+					if texts[0] != "b" || texts[1] != "c" {
+						t.Errorf("replay texts = %v, want [b c]", texts)
+					}
+					return
+				}
+			}
+		case <-deadline:
+			if len(texts) == 0 {
+				t.Fatal("no replay events after same-process hello")
+			}
+			return
+		}
+	}
+}
+
+// TestDrainSendChOnSession: drainSendCh empties the uplink queue so a
+// reconnect cannot re-send stale frames alongside hello-driven replay.
+func TestDrainSendChOnSession(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 8)
+	c.sendCh <- []byte(`{"v":1,"type":"events","stale":true}`)
+	c.sendCh <- []byte(`{"v":1,"type":"ping"}`)
+	if len(c.sendCh) != 2 {
+		t.Fatalf("precondition: sendCh len = %d, want 2", len(c.sendCh))
+	}
+	c.drainSendCh()
+	if len(c.sendCh) != 0 {
+		t.Fatalf("after drainSendCh len = %d, want 0", len(c.sendCh))
+	}
+	// Second drain is a no-op.
+	c.drainSendCh()
+	if len(c.sendCh) != 0 {
+		t.Fatalf("second drain left %d frames", len(c.sendCh))
+	}
+}
+
+// TestIsAuthErrTight: isAuthErr must match 401 / StatusPolicyViolation /
+// "auth failed" / "no token", but not bare "token" alone.
+func TestIsAuthErrTight(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{fmt.Errorf("401 hub ws auth failed"), true},
+		{fmt.Errorf("websocket: StatusPolicyViolation"), true},
+		{fmt.Errorf("auth failed: bad credentials"), true},
+		{fmt.Errorf("401: no token"), true},
+		{fmt.Errorf("missing host token bucket config"), false},
+		{fmt.Errorf("token expired quietly"), false},
+		{fmt.Errorf("network timeout"), false},
+	}
+	for _, tc := range cases {
+		if got := isAuthErr(tc.err); got != tc.want {
+			t.Errorf("isAuthErr(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// TestEventSeqTypes: eventSeq accepts uint64/float64/int/int64/json.Number.
+func TestEventSeqTypes(t *testing.T) {
+	if eventSeq(acp.Event{"seq": uint64(7)}) != 7 {
+		t.Error("uint64")
+	}
+	if eventSeq(acp.Event{"seq": float64(8)}) != 8 {
+		t.Error("float64")
+	}
+	if eventSeq(acp.Event{"seq": int(9)}) != 9 {
+		t.Error("int")
+	}
+	if eventSeq(acp.Event{"seq": int64(10)}) != 10 {
+		t.Error("int64")
+	}
+	if eventSeq(acp.Event{"seq": json.Number("11")}) != 11 {
+		t.Error("json.Number")
+	}
+	if eventSeq(acp.Event{"seq": "nope"}) != 0 {
+		t.Error("string should be 0")
 	}
 }
 

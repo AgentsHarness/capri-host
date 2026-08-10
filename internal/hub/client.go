@@ -69,14 +69,22 @@ type Client struct {
 	// Created in Run; closed only when Run exits (not per reconnect).
 	sendCh chan []byte
 
-	// Reliability: every forwarded event gets a monotonic seq and is kept
-	// in a bounded replay buffer. After a reconnect the hub tells us its
-	// last seen seq (hello.seq); buffered events after that point are
-	// re-sent so a disconnect does not lose transcript.
-	seqMu    sync.Mutex
-	nextSeq  uint64
-	replay   []acp.Event // ring, newest at the end, capped
-	replayOf uint64 // seq of replay[0]; replay[i] has seq replayOf+i+1
+	// Reliability: every forwarded event keeps its bridge.Broadcast seq
+	// (dual-path FE dedupes by (hostId,seq)) and is kept in a bounded
+	// replay buffer. After a reconnect the hub tells us its last seen
+	// seq (hello.seq); buffered events after that point are re-sent so a
+	// disconnect does not lose transcript.
+	// lastSentSeq is the max event seq successfully put on sendCh (live
+	// or replay). Used to resume after a subscribers 0→1 transition
+	// without re-sending what the hub already got.
+	// nextSeq tracks the max data-plane seq this process has observed
+	// (bridge-assigned or fallback). Compared against hello.seq to detect
+	// host process restart: hub may still hold a high LastSeq from the
+	// previous process while this process restarts at 1.
+	seqMu       sync.Mutex
+	nextSeq     uint64
+	replay      []acp.Event // ring, newest at the end, capped
+	lastSentSeq uint64
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -139,7 +147,7 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 
 	c.sendCh = make(chan []byte, 256)
 
-	// Bridge events → hub (async queue + batch + chunk merge).
+	// Bridge events → hub (async queue + batch; no text merge — dual-path seq).
 	fwdCtx, fwdCancel := context.WithCancel(ctx)
 	defer fwdCancel()
 	go c.forwardLoop(fwdCtx, bridge)
@@ -197,7 +205,13 @@ func isAuthErr(err error) bool {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "401") || strings.Contains(s, "StatusPolicyViolation") || strings.Contains(s, "token")
+	if strings.Contains(s, "401") || strings.Contains(s, "StatusPolicyViolation") {
+		return true
+	}
+	// Match auth-specific phrases only — bare "token" is too broad
+	// (e.g. "token bucket", log lines mentioning HOST_TOKEN).
+	low := strings.ToLower(s)
+	return strings.Contains(low, "auth failed") || strings.Contains(low, "no token")
 }
 
 func ctxDone(ctx context.Context) bool {
@@ -341,21 +355,24 @@ func (c *Client) forwardingEnabled() bool {
 	return c.fwdKnown && c.forwardEvents
 }
 
-// seqAndReplay assigns the next seqs to evs (in order) and appends them
-// to the replay ring. It is called for every batch that is actually sent
-// (or attempted), so wire seqs and replay seqs are identical and
-// contiguous — the hub counter then tracks the host's sequence exactly.
+// seqAndReplay appends evs to the replay ring, keeping each event's
+// own seq when present (bridge.Broadcast 分配全局序号，本地 SSE 与中继
+// 同源 —— 前端双路去重依赖两侧 seq 一致)；无 seq 的事件（旧桥/内部
+// 事件）才由本客户端分配兜底。定位一律按事件实际 seq 比较。
 func (c *Client) seqAndReplay(evs []acp.Event) {
 	c.seqMu.Lock()
 	defer c.seqMu.Unlock()
 	for _, ev := range evs {
-		c.nextSeq++
-		ev["seq"] = c.nextSeq
+		if s := eventSeq(ev); s == 0 {
+			c.nextSeq++
+			ev["seq"] = c.nextSeq
+		} else if s > c.nextSeq {
+			c.nextSeq = s
+		}
 		c.replay = append(c.replay, ev)
 		if len(c.replay) > replayCap {
 			n := len(c.replay) - replayCap
 			c.replay = c.replay[n:]
-			c.replayOf += uint64(n)
 		}
 	}
 }
@@ -368,21 +385,21 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 		if len(batch) == 0 {
 			return
 		}
-		if !c.forwardingEnabled() {
-			// Drop queued events while nobody is listening; browsers
-			// rehydrate via /api/status and session-updates on connect.
-			batch = batch[:0]
-			return
-		}
-		// Merge FIRST, then assign seqs to the merged events: seqs on the
-		// wire (and in the replay buffer) are contiguous — no holes from
-		// merged-away events — so the hub counter never jumps, the FE does
-		// not fire spurious gap-pulls, and a reconnect replay cannot
-		// duplicate text that a merged event already carried.
-		evs := mergeChunkEvents(batch)
+		// No chunk/thought text merge on the hub path (mergeChunkEvents
+		// was removed): dual-path FE dedupes by (hostId,seq); merging
+		// would keep the first seq and concatenate text, so local SSE
+		// "a","b","c" (seq 1,2,3) would collide with hub seq1 "abc".
+		// Batching (50ms / 32) still packs multiple events into one
+		// frame — that is not text merge. Seq holes from slow-consumer
+		// drops are repaired by FE gap-pull, not by coalescing.
+		evs := batch
 		batch = make([]acp.Event, 0, 32)
+		// Always enter replay (even while browser subscribers are
+		// paused) so a later 0→1 resume can catch up.
 		c.seqAndReplay(evs)
-		c.enqueueEvents(evs)
+		if c.forwardingEnabled() {
+			c.enqueueEvents(evs)
+		}
 	}
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -393,18 +410,13 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 		case <-ctx.Done():
 			return
 		case ev := <-ch:
-			if !c.forwardingEnabled() {
-				// Discard immediately — do not buffer while paused.
-				continue
-			}
 			// Clone first: bridge.Broadcast hands the same map to every
 			// subscriber (local SSE + hub forwardLoop). Mutating the shared
-			// Event (stripFullUpdate / merge) races with handleSSE's
-			// json.Marshal and can crash the process with concurrent map write.
+			// Event (stripFullUpdate) races with handleSSE's json.Marshal
+			// and can crash the process with concurrent map write.
+			// Always buffer (paused or not) so replay stays complete.
 			ev = cloneEvent(ev)
-			// Strip bulky wire copies FE does not use on the live path.
 			stripFullUpdate(ev)
-			// Seqs are assigned in flush, after merge (see flush).
 			batch = append(batch, ev)
 			if len(batch) >= 32 {
 				flush()
@@ -414,20 +426,28 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 		case <-heartbeat.C:
 			flush()
 			// Always heartbeat: keeps hub registry ready flag fresh even
-			// with zero browser subscribers.
+			// with zero browser subscribers. Control frame, not data-plane seq.
 			c.enqueueHostStatus(bridge)
 		}
 	}
 }
 
-// eventSeq extracts the seq assigned by seqAndReplay (a uint64; float64
-// after a JSON round trip, e.g. in tests).
+// eventSeq extracts an event's seq (bridge uint64 / float64 after JSON
+// round-trip; also int/int64/json.Number for robustness).
 func eventSeq(ev acp.Event) uint64 {
 	switch s := ev["seq"].(type) {
 	case uint64:
 		return s
 	case float64:
 		return uint64(s)
+	case int:
+		return uint64(s)
+	case int64:
+		return uint64(s)
+	case json.Number:
+		if n, err := s.Int64(); err == nil && n >= 0 {
+			return uint64(n)
+		}
 	}
 	return 0
 }
@@ -445,6 +465,7 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 	}
 	select {
 	case c.sendCh <- payload:
+		c.noteLastSentSeq(evs)
 	default:
 		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留）", len(evs))
 	}
@@ -463,9 +484,28 @@ func (c *Client) enqueueEventsCritical(evs []acp.Event) {
 	}
 	select {
 	case c.sendCh <- payload:
+		c.noteLastSentSeq(evs)
 	case <-time.After(5 * time.Second):
 		log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留）", len(evs))
 	}
+}
+
+// noteLastSentSeq records the max event seq successfully put on sendCh.
+func (c *Client) noteLastSentSeq(evs []acp.Event) {
+	var max uint64
+	for _, ev := range evs {
+		if s := eventSeq(ev); s > max {
+			max = s
+		}
+	}
+	if max == 0 {
+		return
+	}
+	c.seqMu.Lock()
+	if max > c.lastSentSeq {
+		c.lastSentSeq = max
+	}
+	c.seqMu.Unlock()
 }
 
 // marshalEventsFrame builds a type:"events" frame for evs, enforcing the
@@ -499,25 +539,21 @@ func (c *Client) marshalEventsFrame(evs []acp.Event) []byte {
 // nothing was sent).
 func (c *Client) sendReplayAfter(after uint64) uint64 {
 	c.seqMu.Lock()
-	defer c.seqMu.Unlock()
 	var idx int
-	// replay[i] has seq replayOf+i+1, so the first event with seq > after
-	// sits at index after-replayOf (>= when after < replayOf). The `>=`
-	// here matters: `>` would skip one extra event and every reconnect
-	// would lose the first event after the hub's last seen seq.
+	// 第一个事件实际 seq > after 的位置。一律按事件自带 seq 比较。
 	for idx = 0; idx < len(c.replay); idx++ {
-		if c.replayOf+uint64(idx) >= after {
+		if eventSeq(c.replay[idx]) > after {
 			break
 		}
 	}
 	if idx >= len(c.replay) {
+		c.seqMu.Unlock()
 		return 0
 	}
 	evs := append([]acp.Event(nil), c.replay[idx:]...)
-	if len(evs) == 0 {
-		return 0
-	}
 	last := eventSeq(evs[len(evs)-1])
+	// Release before enqueue so noteLastSentSeq can take seqMu.
+	c.seqMu.Unlock()
 	c.enqueueReplay(evs)
 	return last
 }
@@ -557,14 +593,103 @@ func (c *Client) enqueueReplay(evs []acp.Event) {
 	flush()
 }
 
+// enqueueHostStatus sends a control frame (not an events frame) so it
+// does not consume the data-plane seq space shared with bridge.Broadcast
+// (dual-path FE dedupes by (hostId,seq)). Shape:
+//
+//	{"v":1,"type":"host_status","ready":true}
+//
+// No seq, not stored in the replay buffer. critical=false: under pressure
+// the next heartbeat will refresh the hub registry flag.
 func (c *Client) enqueueHostStatus(bridge *acp.Bridge) {
 	snap := bridge.Snapshot()
-	ev := acp.Event{"type": "host_status", "ready": snap.Ready}
-	// Assign a real seq like any other event: a seq-less events frame
-	// would make the hub renumber from 1 and reset its per-host counter,
-	// triggering a full replay (and FE re-emission) on the next reconnect.
-	c.seqAndReplay([]acp.Event{ev})
-	c.enqueueEvents([]acp.Event{ev})
+	payload, err := json.Marshal(map[string]any{
+		"v":     1,
+		"type":  "host_status",
+		"ready": snap.Ready,
+	})
+	if err != nil {
+		return
+	}
+	c.enqueueFrame(payload, false)
+}
+
+// handleHelloSeq resumes after hub hello.seq, or resets the seq epoch when
+// this process's max observed seq is below the hub watermark (typical
+// after host process restart: bridge recounts from 1 while hub still
+// holds the previous process's LastSeq).
+//
+// Without a reset, hello would push lastSentSeq to the alien high value
+// (0→1 catch-up would no-op) and hub would skip fan-out for every new
+// event with seq <= old LastSeq.
+func (c *Client) handleHelloSeq(hubSeq uint64) {
+	c.seqMu.Lock()
+	localMax := c.nextSeq
+	c.seqMu.Unlock()
+
+	// Epoch mismatch: hub remembers a higher watermark than this process
+	// has ever produced. Same-process reconnect always has nextSeq >=
+	// hubSeq (we assigned those seqs before disconnect).
+	if hubSeq > localMax {
+		log.Printf("[hub-client] seq 世代重置: hub.seq=%d > localMax=%d（host 进程重启？），请求 hub 清零并补发本地缓冲", hubSeq, localMax)
+		c.enqueueSeqReset()
+		// Do NOT advance lastSentSeq from the alien hubSeq. Replay
+		// everything this process has buffered (after 0).
+		if last := c.sendReplayAfter(0); last > 0 {
+			log.Printf("[hub-client] 世代重置后补发本地缓冲 seq 1..%d", last)
+		}
+		return
+	}
+
+	// Same process (or hub is behind): precise resume.
+	if last := c.sendReplayAfter(hubSeq); last > 0 {
+		log.Printf("[hub-client] 重连补发事件 seq %d..%d", hubSeq+1, last)
+	}
+	// Hub is caught up through hubSeq — raise watermark so a later 0→1
+	// does not re-send what hub already has. Only safe when hubSeq is in
+	// this process's seq space (hubSeq <= localMax).
+	c.seqMu.Lock()
+	if hubSeq > c.lastSentSeq {
+		c.lastSentSeq = hubSeq
+	}
+	c.seqMu.Unlock()
+}
+
+// enqueueSeqReset asks the hub to clear per-host LastSeq + event buffer
+// so a restarted host can uplink from seq 1 again. Critical: must land
+// before any subsequent events frame on the same connection.
+//
+//	{"v":1,"type":"seq_reset"}
+func (c *Client) enqueueSeqReset() {
+	payload, err := json.Marshal(map[string]any{
+		"v":    1,
+		"type": "seq_reset",
+	})
+	if err != nil {
+		return
+	}
+	c.enqueueFrame(payload, true)
+}
+
+// drainSendCh non-blocking drains the uplink queue. Called once per new
+// transport session so stale frames (and a subsequent sendReplayAfter)
+// cannot double-send after reconnect.
+func (c *Client) drainSendCh() {
+	if c.sendCh == nil {
+		return
+	}
+	n := 0
+	for {
+		select {
+		case <-c.sendCh:
+			n++
+		default:
+			if n > 0 {
+				log.Printf("[hub-client] 重连前清空发送队列 %d 帧", n)
+			}
+			return
+		}
+	}
 }
 
 // enqueueFrame queues a pre-built JSON frame. critical=true blocks briefly
@@ -586,58 +711,6 @@ func (c *Client) enqueueFrame(payload []byte, critical bool) {
 	default:
 		log.Printf("[hub-client] 发送队列满，丢弃帧")
 	}
-}
-
-// mergeChunkEvents coalesces consecutive chunk/thought events for the same
-// session into one larger text event to cut WS frame volume.
-func mergeChunkEvents(evs []acp.Event) []acp.Event {
-	if len(evs) <= 1 {
-		return evs
-	}
-	out := make([]acp.Event, 0, len(evs))
-	var cur acp.Event
-	for _, ev := range evs {
-		if cur == nil {
-			cur = cloneEvent(ev)
-			continue
-		}
-		if canMergeChunk(cur, ev) {
-			ta, _ := cur["text"].(string)
-			tb, _ := ev["text"].(string)
-			cur["text"] = ta + tb
-			// Prefer the latest messageId if present.
-			if mid, ok := ev["messageId"]; ok {
-				cur["messageId"] = mid
-			}
-			continue
-		}
-		out = append(out, cur)
-		cur = cloneEvent(ev)
-	}
-	if cur != nil {
-		out = append(out, cur)
-	}
-	return out
-}
-
-func canMergeChunk(a, b acp.Event) bool {
-	ta, _ := a["type"].(string)
-	tb, _ := b["type"].(string)
-	if ta != tb || (ta != "chunk" && ta != "thought") {
-		return false
-	}
-	sa, _ := a["sessionId"].(string)
-	sb, _ := b["sessionId"].(string)
-	if sa != sb {
-		return false
-	}
-	// Different messageIds are separate streams — do not merge.
-	ma, ha := a["messageId"]
-	mb, hb := b["messageId"]
-	if ha || hb {
-		return ha && hb && fmt.Sprint(ma) == fmt.Sprint(mb)
-	}
-	return true
 }
 
 func cloneEvent(ev acp.Event) acp.Event {
@@ -707,7 +780,19 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	log.Printf("[hub-client] 已连接 hub（ws）")
 	return c.runSession(ctx, bridge,
 		func(payload []byte) error {
-			wctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			// Write timeout: prefer the session ctx so cancel aborts the
+			// write. Cap at 30s while the session is alive. If ctx is
+			// already done, WithTimeout(ctx, …) would fail immediately
+			// with a useless error — fall back to Background + 2s so a
+			// final write attempt can still surface a socket error and
+			// exit the write loop quickly.
+			parent := ctx
+			to := 30 * time.Second
+			if ctx.Err() != nil {
+				parent = context.Background()
+				to = 2 * time.Second
+			}
+			wctx, cancel := context.WithTimeout(parent, to)
 			defer cancel()
 			return conn.Write(wctx, websocket.MessageText, payload)
 		},
@@ -800,6 +885,10 @@ func (c *Client) quicAddr() (host, port string) {
 
 // runSession runs the shared frame loop over a generic transport.
 func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, send func([]byte) error, recv func() ([]byte, error)) error {
+	// Drop stale uplink frames left from a previous session before the
+	// write loop starts, so they cannot interleave with hello-driven
+	// replay and double-send.
+	c.drainSendCh()
 	c.enqueueHostStatus(bridge)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
@@ -870,11 +959,10 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			if msg.Subscribers != nil {
 				c.setBrowserSubscribers(*msg.Subscribers)
 			}
-			// Resume: re-send events the hub missed while we were offline.
+			// Resume against hub's last-seen seq — or reset the epoch when
+			// this process cannot produce seqs that high (host restart).
 			if msg.Seq != nil {
-				if last := c.sendReplayAfter(*msg.Seq); last > 0 {
-					log.Printf("[hub-client] 重连补发事件 seq %d..%d", *msg.Seq+1, last)
-				}
+				c.handleHelloSeq(*msg.Seq)
 			}
 		case "subscribers":
 			n := 0
@@ -884,6 +972,14 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			was := c.forwardingEnabled()
 			c.setBrowserSubscribers(n)
 			if !was && c.forwardingEnabled() {
+				// Catch up events buffered while paused (they were
+				// seqAndReplay'd but never enqueued).
+				c.seqMu.Lock()
+				after := c.lastSentSeq
+				c.seqMu.Unlock()
+				if last := c.sendReplayAfter(after); last > 0 {
+					log.Printf("[hub-client] 订阅恢复补发事件 seq %d..%d", after+1, last)
+				}
 				c.enqueueHostStatus(bridge)
 			}
 		case "request":
