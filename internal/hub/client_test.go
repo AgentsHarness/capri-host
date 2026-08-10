@@ -650,6 +650,57 @@ func TestEnqueueEventsDropsOversizedFrame(t *testing.T) {
 	}
 }
 
+// TestEnqueueReplaySurvivesFullQueue: replay frames (reconnect catch-up)
+// ride the critical enqueue path — when the send queue is full, the
+// enqueue blocks (up to 5s) instead of dropping, so a busy queue cannot
+// lose the transcript the hub is waiting for after a resume.
+func TestEnqueueReplaySurvivesFullQueue(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 1) // tiny queue
+	// Fill the queue: a plain enqueueEvents would drop here.
+	c.sendCh <- []byte("stale-frame")
+
+	evs := make([]acp.Event, 0, 3)
+	for i := 1; i <= 3; i++ {
+		evs = append(evs, acp.Event{"seq": float64(i), "type": "chunk", "text": "x"})
+	}
+	replayDone := make(chan struct{})
+	go func() {
+		c.enqueueReplay(evs)
+		close(replayDone)
+	}()
+
+	// Consume the stale frame; the blocked critical send then completes.
+	select {
+	case p := <-c.sendCh:
+		if string(p) != "stale-frame" {
+			t.Fatalf("first frame = %.40s, want the stale filler", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale frame never consumed")
+	}
+	select {
+	case payload := <-c.sendCh:
+		var f struct {
+			Type     string `json:"type"`
+			SeqStart uint64 `json:"seqStart"`
+		}
+		if json.Unmarshal(payload, &f) != nil {
+			t.Fatalf("bad replay frame: %.60s", payload)
+		}
+		if f.Type != "events" || f.SeqStart != 1 {
+			t.Fatalf("replay frame = type %q seqStart %d, want events/1", f.Type, f.SeqStart)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replay frame dropped while the queue was full")
+	}
+	select {
+	case <-replayDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueueReplay never returned")
+	}
+}
+
 // TestRelayRejectsOversizedLocalResponse: a local API response over 16MB
 // must be answered with an explicit error instead of being silently
 // truncated (a 16MB+ respond frame would exceed the hub read limit and

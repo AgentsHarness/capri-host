@@ -234,11 +234,28 @@ func (b *Bridge) GoalClear() (map[string]any, error) {
 
 // goalLoop drives continuation turns while the goal is Active. It owns a
 // single goroutine per goal (stop channel closes to end it).
+//
+// The loop captures the goal pointer it owns at entry. /goal set may
+// replace b.goal while this loop is blocked (e.g. in a long
+// PromptWithOpts, up to promptTimeout); every state write below is
+// guarded by goalLoopOwns so a stale loop never pollutes the
+// replacement goal and exits as soon as it notices the swap.
 func (b *Bridge) goalLoop(stop chan struct{}) {
+	b.goalMu.Lock()
+	g := b.goal
+	b.goalMu.Unlock()
+	if g == nil {
+		return
+	}
 	for {
 		// 1. State check: only Active goals continue.
 		st := b.goalStruct()
 		if st == nil || st.Status != goalActive {
+			return
+		}
+		// 1b. Ownership: the goal was replaced by /goal set while this
+		//     loop was in flight — exit without touching the new goal.
+		if !b.goalLoopOwns(g) {
 			return
 		}
 
@@ -247,6 +264,10 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 		//    decided by the previous iteration's analysis.
 		var instruction string
 		b.goalMu.Lock()
+		if !b.goalLoopOwns(g) {
+			b.goalMu.Unlock()
+			return
+		}
 		first := b.goal.TokensUsed == 0 && !b.goal.claimedCompletion && !b.goal.verifyingRound
 		if b.goal.verifyingRound {
 			instruction = goalVerifyInstruction(st.Objective)
@@ -264,31 +285,45 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 			return
 		}
 
-		// 4. Re-check state (pause/clear may have landed while waiting).
-		if b.goalStruct().Status != goalActive {
+		// 4. Re-check state and ownership (pause/clear/set may have
+		//    landed while waiting).
+		b.goalMu.Lock()
+		owned := b.goalLoopOwns(g)
+		active := owned && b.goal.Status == goalActive
+		b.goalMu.Unlock()
+		if !active {
 			return
 		}
 
-		// 5. Run the turn, collecting events for analysis.
+		// 5. Run the turn, collecting events for analysis. The drainer
+		//    goroutine consumes the subscription during the whole turn, so
+		//    long turns never overflow the 64-slot Subscribe buffer and
+		//    lose update_goal / usage / summary events to Broadcast drops.
 		evCh, unsub := b.Subscribe()
+		drain := b.goalDrainConcurrent(evCh)
 		blocks := []ContentBlock{{"type": "text", "text": instruction}}
 		ctx, cancel := context.WithTimeout(context.Background(), promptTimeout)
 		stopReason, _, err := b.PromptWithOpts(ctx, sid, blocks, PromptOpts{})
 		cancel()
-		// Drain whatever the prompt left in the subscription buffer.
-		collected := b.goalDrainEvents(evCh)
+		// Stop the drainer and collect the turn's events (in order).
+		collected := drain()
 		unsub()
 
 		if err != nil {
 			// Transport failure (agent rebooted mid-goal) — stop the loop;
 			// the goal stays active and only /goal resume restarts it (a
-			// user message does not restart the loop).
+			// user message does not restart the loop). A stale loop
+			// (goal replaced while the prompt was in flight) must not
+			// write its failure into the new goal.
 			b.goalMu.Lock()
-			if b.goal != nil && b.goal.Status == goalActive {
+			owned := b.goalLoopOwns(g)
+			if owned && b.goal.Status == goalActive {
 				b.goal.Message = "回合失败: " + err.Error()
 			}
 			b.goalMu.Unlock()
-			b.broadcastGoal()
+			if owned {
+				b.broadcastGoal()
+			}
 			return
 		}
 
@@ -298,17 +333,23 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 		// restarts it.
 		if stopReason == "cancelled" {
 			b.goalMu.Lock()
-			if b.goal != nil && b.goal.Status == goalActive {
+			owned := b.goalLoopOwns(g)
+			if owned && b.goal.Status == goalActive {
 				b.goal.Message = "回合已取消（goal 保持活动，可用 /goal resume 继续）"
 			}
 			b.goalMu.Unlock()
-			b.broadcastGoal()
+			if owned {
+				b.broadcastGoal()
+			}
 			return
 		}
 
 		// 6. Analyze the turn (agent goal_updated / update_goal tool call
-		//    / reply text / usage).
-		if done := b.goalAnalyze(collected); done {
+		//    / reply text / usage). goalAnalyze checks goal ownership
+		//    before every state write and returns true when this loop is
+		//    stale (goal replaced) — the loop then exits without touching
+		//    the new goal.
+		if done := b.goalAnalyze(g, collected); done {
 			return
 		}
 	}
@@ -342,26 +383,56 @@ func (b *Bridge) goalWaitIdle(stop chan struct{}, sessionID string) bool {
 	}
 }
 
-// goalDrainEvents drains a subscription channel (non-blocking after a
-// short grace) into a slice for analysis.
-func (b *Bridge) goalDrainEvents(evCh chan Event) []Event {
-	var out []Event
-	// Give the broadcaster a moment to flush buffered events.
-	deadline := time.After(300 * time.Millisecond)
-	for {
-		select {
-		case ev := <-evCh:
-			out = append(out, ev)
-		case <-deadline:
-			return out
+// goalDrainConcurrent starts a background drainer that consumes a
+// subscription channel continuously, so long turns (dozens to hundreds of
+// chunk/thought/usage events) never overflow the Subscribe buffer —
+// Broadcast drops events for slow consumers, and the goal analysis must
+// see the FULL turn (update_goal / usage / summary events near the end
+// would otherwise be lost to the old 64-slot buffer). The returned stop
+// function terminates the drainer (with a short grace sweep for events
+// still in flight, mirroring the old post-turn drain) and returns the
+// collected events in turn order. The drainer only collects events; it
+// never touches goal state, so the goalLoopOwns identity guard in
+// goalAnalyze is unaffected.
+func (b *Bridge) goalDrainConcurrent(evCh chan Event) func() []Event {
+	var events []Event
+	stop := make(chan struct{})
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			select {
+			case ev := <-evCh:
+				events = append(events, ev)
+			case <-stop:
+				// Final sweep: catch events still in flight, then exit.
+				deadline := time.After(300 * time.Millisecond)
+				for {
+					select {
+					case ev := <-evCh:
+						events = append(events, ev)
+					case <-deadline:
+						return
+					}
+				}
+			}
 		}
+	}()
+	return func() []Event {
+		close(stop)
+		<-drained
+		return events
 	}
 }
 
 // goalAnalyze applies the collected turn events to the tracker and
-// decides whether the loop should stop. Returns true when the loop must
-// exit (complete / blocked / budget limited / cleared / paused mid-loop).
-func (b *Bridge) goalAnalyze(events []Event) bool {
+// decides whether the loop should stop. g is the goal pointer the
+// calling loop captured at entry: before every write to b.goal the
+// function checks goalLoopOwns(g), so a stale loop whose goal was
+// replaced by /goal set returns true immediately without touching the
+// new goal. Returns true when the loop must exit (complete / blocked /
+// budget limited / cleared / paused mid-loop / loop stale).
+func (b *Bridge) goalAnalyze(g *GoalState, events []Event) bool {
 	var text strings.Builder
 	tokensUsed := int64(0)
 	sawAgentGoalUpdate := false
@@ -404,22 +475,24 @@ func (b *Bridge) goalAnalyze(events []Event) bool {
 				// The agent session has goal mode on and reports its own
 				// state — mirror it (agent is authoritative for status).
 				b.goalMu.Lock()
-				if b.goal != nil {
-					if s, _ := u["status"].(string); s != "" {
-						b.goal.Status = s
-					}
-					if v, _ := u["verifying_completion"].(bool); v {
-						b.goal.Verifying = true
-					}
-					if m, _ := u["message"].(string); m != "" {
-						b.goal.Message = m
-					}
-					if n, ok := u["total_deliverables"].(float64); ok {
-						b.goal.TotalDeliverables = int(n)
-					}
-					if n, ok := u["completed_deliverables"].(float64); ok {
-						b.goal.CompletedDeliverables = int(n)
-					}
+				if !b.goalLoopOwns(g) {
+					b.goalMu.Unlock()
+					return true // loop stale: goal replaced
+				}
+				if s, _ := u["status"].(string); s != "" {
+					b.goal.Status = s
+				}
+				if v, _ := u["verifying_completion"].(bool); v {
+					b.goal.Verifying = true
+				}
+				if m, _ := u["message"].(string); m != "" {
+					b.goal.Message = m
+				}
+				if n, ok := u["total_deliverables"].(float64); ok {
+					b.goal.TotalDeliverables = int(n)
+				}
+				if n, ok := u["completed_deliverables"].(float64); ok {
+					b.goal.CompletedDeliverables = int(n)
 				}
 				b.goalMu.Unlock()
 			}
@@ -428,6 +501,10 @@ func (b *Bridge) goalAnalyze(events []Event) bool {
 
 	// Budget enforcement (best effort — only when a budget was set).
 	b.goalMu.Lock()
+	if !b.goalLoopOwns(g) {
+		b.goalMu.Unlock()
+		return true // loop stale: goal replaced
+	}
 	if b.goal != nil && b.goal.TokenBudget > 0 && tokensUsed > 0 {
 		b.goal.TokensUsed = tokensUsed
 		if tokensUsed > b.goal.TokenBudget {
@@ -446,6 +523,10 @@ func (b *Bridge) goalAnalyze(events []Event) bool {
 	// states and stop the loop.
 	if sawAgentGoalUpdate {
 		b.goalMu.Lock()
+		if !b.goalLoopOwns(g) {
+			b.goalMu.Unlock()
+			return true // loop stale: goal replaced
+		}
 		terminal := b.goal != nil && (b.goal.Status == goalComplete || b.goal.Status == goalCleared ||
 			b.goal.Status == goalBudgetLimited || b.goal.Status == goalUserPaused ||
 			b.goal.Status == goalBlocked)
@@ -459,6 +540,10 @@ func (b *Bridge) goalAnalyze(events []Event) bool {
 	// Tool-driven state (update_goal call with completed/blocked_reason).
 	if sawUpdateGoalCall {
 		b.goalMu.Lock()
+		if !b.goalLoopOwns(g) {
+			b.goalMu.Unlock()
+			return true // loop stale: goal replaced
+		}
 		if b.goal != nil {
 			if toolCompleted {
 				b.goal.claimedCompletion = true
@@ -485,6 +570,10 @@ func (b *Bridge) goalAnalyze(events []Event) bool {
 	// Text-driven analysis.
 	claim, blocked, evidence := analyzeGoalText(text.String())
 	b.goalMu.Lock()
+	if !b.goalLoopOwns(g) {
+		b.goalMu.Unlock()
+		return true // loop stale: goal replaced
+	}
 	if b.goal == nil {
 		b.goalMu.Unlock()
 		return true
@@ -558,6 +647,15 @@ func (b *Bridge) stopGoalLoopLocked() {
 	}
 	b.goalLoopOn = false
 	b.goalStop = nil
+}
+
+// goalLoopOwns reports whether g — the goal pointer a loop captured at
+// entry — is still the current goal. A /goal set that replaced b.goal
+// invalidates every older loop: a stale loop must stop writing state so
+// its old turn's events never pollute the new goal. Callers must hold
+// b.goalMu.
+func (b *Bridge) goalLoopOwns(g *GoalState) bool {
+	return g != nil && b.goal == g
 }
 
 // goalStruct returns a copy of the goal state as a struct (nil when no

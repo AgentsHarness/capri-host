@@ -76,10 +76,7 @@ type Client struct {
 	seqMu    sync.Mutex
 	nextSeq  uint64
 	replay   []acp.Event // ring, newest at the end, capped
-	replayOf uint64      // seq of replay[0]; replay[i] has seq replayOf+i+1
-
-	inflightMu sync.Mutex
-	inflight   map[string]context.CancelFunc // reqId → cancel of the local HTTP call
+	replayOf uint64 // seq of replay[0]; replay[i] has seq replayOf+i+1
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -110,8 +107,7 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		cfg: cfg,
 		// Generous timeout: relayed prompts can run up to 30 minutes.
-		httpc:    &http.Client{Timeout: 50 * time.Minute},
-		inflight: make(map[string]context.CancelFunc),
+		httpc: &http.Client{Timeout: 50 * time.Minute},
 	}
 }
 
@@ -443,6 +439,41 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 	if len(evs) == 0 || c.sendCh == nil {
 		return
 	}
+	payload := c.marshalEventsFrame(evs)
+	if payload == nil {
+		return
+	}
+	select {
+	case c.sendCh <- payload:
+	default:
+		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留）", len(evs))
+	}
+}
+
+// enqueueEventsCritical is the critical variant of enqueueEvents: it
+// blocks up to 5s for a send slot (enqueueFrame's critical discipline)
+// instead of dropping, so replay frames survive send-queue pressure.
+func (c *Client) enqueueEventsCritical(evs []acp.Event) {
+	if len(evs) == 0 || c.sendCh == nil {
+		return
+	}
+	payload := c.marshalEventsFrame(evs)
+	if payload == nil {
+		return
+	}
+	select {
+	case c.sendCh <- payload:
+	case <-time.After(5 * time.Second):
+		log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留）", len(evs))
+	}
+}
+
+// marshalEventsFrame builds a type:"events" frame for evs, enforcing the
+// maxFrameBytes cap (an oversized frame would exceed the hub's read limit
+// and kill the connection, livelocking the resume — the replay buffer
+// still holds the events for a later reconnect). Returns nil when the
+// frame cannot be built or must be dropped.
+func (c *Client) marshalEventsFrame(evs []acp.Event) []byte {
 	first := eventSeq(evs[0])
 	payload, err := json.Marshal(map[string]any{
 		"v":        1,
@@ -451,21 +482,13 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 		"events":   evs,
 	})
 	if err != nil {
-		return
+		return nil
 	}
-	// Hard cap: an oversized frame would exceed the hub's read limit and
-	// kill the connection (livelocking the resume). Drop it instead — the
-	// replay buffer still holds the events for a later reconnect, and the
-	// next hello may still deliver them if they fit.
 	if len(payload) > maxFrameBytes {
 		log.Printf("[hub-client] 事件帧过大（%d KB），丢弃 %d 条事件（重放缓冲已保留）", len(payload)>>10, len(evs))
-		return
+		return nil
 	}
-	select {
-	case c.sendCh <- payload:
-	default:
-		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留）", len(evs))
-	}
+	return payload
 }
 
 // sendReplayAfter re-sends buffered events with seq > after, in order,
@@ -501,8 +524,12 @@ func (c *Client) sendReplayAfter(after uint64) uint64 {
 
 // enqueueReplay packs replay events into frames of at most
 // replayFrameBudget bytes (marshaling each event once for sizing) and
-// enqueues them in order. A single event larger than the budget is sent
-// alone; enqueueEvents drops it (with a log) if it exceeds maxFrameBytes.
+// enqueues them in order via the CRITICAL path — replay is reconnect
+// catch-up, so frames must not be dropped when the send queue happens to
+// be full (enqueueEvents would silently lose them; the hub would then
+// still be missing transcript after the resume). A single event larger
+// than the budget is sent alone; marshalEventsFrame drops it (with a
+// log) if it exceeds maxFrameBytes.
 func (c *Client) enqueueReplay(evs []acp.Event) {
 	raws := make([][]byte, len(evs))
 	for i, ev := range evs {
@@ -516,7 +543,7 @@ func (c *Client) enqueueReplay(evs []acp.Event) {
 		if len(frame) == 0 {
 			return
 		}
-		c.enqueueEvents(frame)
+		c.enqueueEventsCritical(frame)
 		frame = nil
 		size = 0
 	}
@@ -874,15 +901,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 // API and posts the answer back to the hub over the WebSocket.
 func (c *Client) handleRelay(ctx context.Context, reqID, method, path string, body json.RawMessage) {
 	ctx, cancel := context.WithTimeout(ctx, 50*time.Minute)
-	c.inflightMu.Lock()
-	c.inflight[reqID] = cancel
-	c.inflightMu.Unlock()
-	defer func() {
-		c.inflightMu.Lock()
-		delete(c.inflight, reqID)
-		c.inflightMu.Unlock()
-		cancel()
-	}()
+	defer cancel()
 
 	var rd io.Reader
 	if len(body) > 0 {

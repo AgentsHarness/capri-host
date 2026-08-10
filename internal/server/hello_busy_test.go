@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -136,5 +137,63 @@ func TestSSEHelloBusyReflectsAnnouncedSessionOnly(t *testing.T) {
 	case <-promptDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("后台回合未结束")
+	}
+}
+
+// ── busy 会话的并发 prompt（FE 队列对齐 TUI 的 host 侧改动）───────
+//
+// 会话 busy 时第二个 /api/prompt 不再 409：照常转发，agent 自己排队
+// （xai-grok-shell 的权威 pending_inputs）。两个请求都 200，且 wire 上
+// 有两条 session/prompt（fake agent 顺序应答）。
+
+func TestPromptWhileBusyForwardsAndBothSucceed(t *testing.T) {
+	t.Setenv(ACPHostFakeAgentPromptDelayMs, "500")
+	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
+	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
+	s, b := newFakeAgentServer(t)
+	createActiveSession(t, s)
+
+	// A：慢回合（delay 挂住在飞）；B 在 A 在飞时发出。
+	recA := make(chan *httptest.ResponseRecorder, 1)
+	go func() { recA <- postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"a"}]}`) }()
+	waitBusy(t, b, "sess-new")
+
+	// B 在 busy 会话上：必须 200 并转发（agent 排队），而不是 409。
+	recB := postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"b"}]}`)
+	if recB.Code != http.StatusOK {
+		t.Fatalf("busy-session prompt status = %d, body=%s — want 200 (forwarded to agent queue)",
+			recB.Code, recB.Body.String())
+	}
+	if sr, _ := decodeBody(t, recB)["stopReason"].(string); sr != "end_turn" {
+		t.Fatalf("busy-session prompt body = %s, want stopReason=end_turn", recB.Body.String())
+	}
+
+	ra := <-recA
+	if ra.Code != http.StatusOK {
+		t.Fatalf("first prompt status = %d, body=%s", ra.Code, ra.Body.String())
+	}
+
+	// 两个 prompt 都转发到了 agent：wire 上有两条 session/prompt。
+	lines := readRecordedRequests(t, recordPath)
+	n := 0
+	for _, m := range lines {
+		if m["method"] == "session/prompt" {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("wire session/prompt count = %d, want 2: %v", n, lines)
+	}
+}
+
+// 404 语义保留：显式指向不存在的会话仍然 404（busy 放宽只影响 busy，
+// 不影响 404；无活动会话时的恢复/新建逻辑不动）。
+func TestPromptUnknownSessionStill404(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	rec := postJSON(t, s, "/api/prompt",
+		`{"sessionId":"sess-ghost","blocks":[{"type":"text","text":"hi"}]}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown-session prompt status = %d, body=%s, want 404",
+			rec.Code, rec.Body.String())
 	}
 }
