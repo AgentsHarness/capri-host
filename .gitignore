@@ -3,6 +3,8 @@
 
 # Binaries
 /acp-host
+/bin/
+/release/
 *.exe
 *.exe~
 *.dll
