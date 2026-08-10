@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"encoding/json"
 	"context"
 	"reflect"
 	"testing"
@@ -445,4 +446,50 @@ func TestChunkEventsCarryFullUpdate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSnapshotConcurrentModelMutation is a -race regression test for the
+// Snapshot deep-copy fix: serializing a snapshot while the session's
+// models map is mutated under the bridge lock must not race.
+func TestSnapshotConcurrentModelMutation(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "grok-3",
+		"availableModels": []any{map[string]any{"modelId": "grok-3", "name": "Grok 3"}},
+	}
+	b.sessions["s1"].modes = map[string]any{"currentModeId": "plan"}
+	b.sessions["s1"].sessionMeta = map[string]any{"kind": "fresh"}
+	b.activeSessionID = "s1"
+	b.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Mutation path mirrors readStdout: patchSessionModels /
+		// applyModelsCatalog mutate shared maps under b.mu.
+		for i := 0; i < 2000; i++ {
+			b.mu.Lock()
+			if m, ok := b.sessions["s1"].models.(map[string]any); ok {
+				m["currentModelId"] = "grok-4"
+				if av, ok := m["availableModels"].([]any); ok && len(av) > 0 {
+					if mm, ok := av[0].(map[string]any); ok {
+						mm["name"] = "Grok 4"
+					}
+				}
+			}
+			b.mu.Unlock()
+		}
+	}()
+
+	for i := 0; i < 2000; i++ {
+		snap := b.Snapshot() // serialized later by the caller, lock-free
+		if snap.Models != nil {
+			_, _ = json.Marshal(snap)
+		}
+		if snap.Roster != nil {
+			_, _ = json.Marshal(snap.Roster)
+		}
+	}
+	<-done
 }
