@@ -117,11 +117,27 @@ func NewClient(cfg Config) *Client {
 
 // Run connects the host to the hub: pairs when no token exists, forwards
 // bridge events over WebSocket, and serves relayed requests. It reconnects
-// with backoff and blocks until ctx is done.
+// with backoff and blocks until ctx is done. Pairing failures (hub down at
+// startup) retry with backoff instead of exiting permanently.
 func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
-	if err := c.ensureToken(ctx); err != nil {
-		log.Printf("[hub-client] 配对失败: %v", err)
-		return
+	// ensureToken failure must not be terminal: the hub may be briefly
+	// unreachable at boot (network flap). Retry with the same backoff the
+	// session loop uses.
+	pairBackoff := time.Second
+	for {
+		err := c.ensureToken(ctx)
+		if err == nil {
+			break
+		}
+		log.Printf("[hub-client] 配对失败: %v（%.0fs 后重试）", err, pairBackoff.Seconds())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pairBackoff):
+		}
+		if pairBackoff < 30*time.Second {
+			pairBackoff *= 2
+		}
 	}
 	log.Printf("[hub-client] connected to hub %s as %s (%s)", c.cfg.URL, c.cfg.HostID, c.cfg.HostName)
 
