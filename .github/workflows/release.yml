@@ -1,0 +1,122 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      fe_ref:
+        description: 'acp-fe (herness-console) 要构建的 ref，默认 main'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  frontend:
+    name: Build frontend (acp-fe)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout acp-fe (herness-console)
+        uses: actions/checkout@v4
+        with:
+          repository: AgentsHerness/herness-console
+          ref: ${{ inputs.fe_ref || 'main' }}
+          path: acp-fe
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: acp-fe/package-lock.json
+
+      - name: Install deps
+        working-directory: acp-fe
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: acp-fe
+        run: npm run build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-fe-dist
+          path: acp-fe/dist
+
+  build:
+    name: build (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # internal/server/web/dist 被 .gitignore 忽略、不在仓库里，
+      # 必须先把前端构建产物放进去，go:embed web/dist 才能编译。
+      - name: Install frontend dist into embed dir
+        uses: actions/download-artifact@v4
+        with:
+          name: acp-fe-dist
+          path: internal/server/web/dist
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build acp-host
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/acp-host-${GOOS}-${GOARCH}${ext}" ./cmd/acp-host
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-host-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/acp-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show built files
+        run: find dist -type f | sort
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: acp-host ${{ github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          files: dist/*/*
