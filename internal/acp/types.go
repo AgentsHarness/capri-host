@@ -102,6 +102,13 @@ type SessionState struct {
 	gitBranch   string
 	gitWorktree bool
 	gitMainRepo string
+
+	// busyCount: session/prompt turns currently in flight for this session.
+	// Busy is the boolean projection (busyCount > 0). Concurrent prompts
+	// are forwarded — the agent (xai-grok-shell) queues mid-turn turns in
+	// its own pending_inputs — so several turns can be in flight at once;
+	// only the last resolver flips the session idle. Not serialized.
+	busyCount int
 }
 
 // State returns the dashboard classification: "active" (turn in flight),

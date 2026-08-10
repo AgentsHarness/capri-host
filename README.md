@@ -18,10 +18,17 @@
 ```bash
 # 需要：Go >= 1.22，已安装并登录的 grok CLI
 cd acp-host
+./start-host.sh            # 推荐：自动增量构建 + 启动（详见 docs/DEPLOY.md）
+# 或
 go run ./cmd/acp-host
 ```
 
-默认监听 `http://localhost:8765`。
+默认监听 `http://localhost:8765`——**一个端口同时提供 API 与内置 acp-fe 前端**
+（构建产物嵌入在 `internal/server/web/dist`，`GET /` 即 Web 界面）。
+
+后台运行：`./start-host.sh -d`（日志 `bin/acp-host.log`）；`status` / `stop` 管理实例。
+中继模式（连 acp-hub）：`./start-host.sh --hub http://hub:8787 --pair-code XXXXXX`。
+完整教程（本地 / 中继、环境变量、常见问题）见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
 
 ### 环境变量
 
