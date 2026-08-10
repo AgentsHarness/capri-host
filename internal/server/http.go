@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,6 +231,9 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/debug/trigger-feedback", s.handleDebugTriggerFeedback)
 	mux.HandleFunc("POST /api/debug/arm-auto-compact", s.handleDebugArmAutoCompact)
 	mux.HandleFunc("POST /api/debug/agent", s.handleDebugAgent)
+	// ── 嵌入的 acp-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
+	// 非 API 路径回退 index.html（实现见 web.go）──
+	mux.HandleFunc("GET /", s.handleWeb)
 	// CORS for Vite dev
 	s.http = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
@@ -239,9 +243,75 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	return s
 }
 
+// ── local-origin guard for sensitive endpoints ────────────────────────
+
+// sensitiveEndpointPaths are the routes that expose privileged host
+// capabilities — arbitrary local command execution (/api/shell) and
+// API-key/auth material — and must never be reachable cross-origin from a
+// random web page. Any /api/auth/* route is sensitive too.
+var sensitiveEndpointPaths = []string{
+	"/api/shell",
+	"/api/api-key-get",
+	"/api/api-key-set",
+}
+
+// isSensitiveEndpoint reports whether r targets a sensitive endpoint.
+func isSensitiveEndpoint(r *http.Request) bool {
+	for _, p := range sensitiveEndpointPaths {
+		if r.URL.Path == p {
+			return true
+		}
+	}
+	return strings.HasPrefix(r.URL.Path, "/api/auth/")
+}
+
+// isLocalOrigin reports whether the request's Origin header (when present)
+// names a local origin: localhost / 127.0.0.1 / ::1 on any port (covers the
+// Vite dev server on another localhost port), or the exact host:port of the
+// request's own Host header (same-origin calls made through the machine's
+// LAN address). A missing Origin — curl, server-side callers, the host UI's
+// own same-origin requests — is allowed: browsers only attach Origin on
+// cross-origin or non-GET requests, and a hostile page cannot forge it to a
+// local value. `Origin: null` (sandboxed iframes) has no host and is
+// rejected.
+func isLocalOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		sensitive := isSensitiveEndpoint(r)
+		if sensitive {
+			// Sensitive endpoints never answer `*`: echo the request Origin
+			// back only when it is a local origin, so a cross-origin web
+			// page can neither read nor invoke them.
+			if origin := r.Header.Get("Origin"); origin != "" && isLocalOrigin(r) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Add("Vary", "Origin")
+			}
+			if !isLocalOrigin(r) {
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"ok": false, "error": "cross-origin request to sensitive endpoint denied",
+				})
+				return
+			}
+		} else {
+			// CORS for Vite dev: the FE runs on another localhost port and
+			// must reach every non-sensitive endpoint.
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
@@ -323,8 +393,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		"agentStartedAt":    snap.AgentStartedAt,
 	}
 	data, _ := json.Marshal(hello)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
+	if !writeSSEFrame(w, flusher, data) {
+		return // client gone before the hello even landed
+	}
 
 	ch, unsub := s.bridge.Subscribe()
 	defer unsub()
@@ -338,8 +409,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fmt.Fprintf(w, ": ping\n\n")
-			flusher.Flush()
+			if !writeSSEFrame(w, flusher, nil) {
+				return
+			}
 		case ev, ok := <-ch:
 			if !ok {
 				return
@@ -348,10 +420,31 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
+			if !writeSSEFrame(w, flusher, b) {
+				return
+			}
 		}
 	}
+}
+
+// writeSSEFrame writes one SSE frame and flushes. Returns false when the
+// client went away (write failed) or the flush failed, so the SSE handler
+// can return and unsubscribe immediately instead of blocking forever on a
+// dead reader (TCP window full / RST) — a stuck handler would leak the
+// subscription and stall every other subscriber's Broadcast.
+func writeSSEFrame(w http.ResponseWriter, flusher http.Flusher, data []byte) bool {
+	var err error
+	if data == nil {
+		// Comment frame (ticker ping); `%s` of nil would print "<nil>".
+		_, err = fmt.Fprintf(w, ": ping\n\n")
+	} else {
+		_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	}
+	if err != nil {
+		return false
+	}
+	flusher.Flush()
+	return true
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -432,7 +525,8 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 			// writeAgentError 约定：agent 侧失败（回合被 agent 拒绝，如
 			// 模型 API 400 "Internal Error"）降级为 200 + {ok:false, error}
 			// ——前端渲染成回合错误行而非连接错误；host 侧 HTTPError
-			// （404 会话不存在 / 409 上一条消息还在处理中）保留状态码。
+			// （404 会话不存在等）保留状态码。busy 会话不再 409 ——
+			// prompt 照常转发，agent 自己排队。
 			writeAgentError(w, "session/prompt", res.err)
 			return
 		}
@@ -730,13 +824,22 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		writeAgentError(w, "session/updates", err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{
+	out := map[string]any{
 		"ok":         true,
 		"sessionId":  body.SessionID,
 		"totalCount": page.TotalCount,
 		"hasMore":    page.HasMore,
 		"updates":    page.Updates,
-	})
+	}
+	if body.Stream {
+		// stream=true: the agent does not return the updates in this
+		// response — the real data arrives as session_updates_chunk SSE
+		// notifications. Mark the response so the FE knows this is the
+		// stream ack (updates is empty by design); totalCount/hasMore are
+		// still meaningful from the stream start.
+		out["streamed"] = true
+	}
+	writeJSON(w, 200, out)
 }
 
 // handleSessionRunningTasks returns the session's STILL-RUNNING tasks
@@ -1095,7 +1198,35 @@ type shellBody struct {
 const (
 	shellDefaultTimeout = 10 * time.Second
 	shellMaxTimeout     = 60 * time.Second
+	// shellMaxOutput caps each captured stream (stdout and stderr alike) so
+	// a runaway command cannot balloon memory; overflow truncates the
+	// response and flags it via `truncated`.
+	shellMaxOutput = 16 << 20 // 16 MiB
 )
+
+// cappedBuffer is a bytes.Buffer that stores at most max bytes and records
+// whether any write overflowed. Writes past the cap are dropped but report
+// the full length, so exec's io.Copy keeps draining the pipe and the child
+// never blocks on a full OS pipe buffer.
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	max      int
+	overflow bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.buf.Len() >= c.max {
+		c.overflow = true
+		return len(p), nil
+	}
+	room := c.max - c.buf.Len()
+	if len(p) > room {
+		c.buf.Write(p[:room])
+		c.overflow = true
+		return len(p), nil
+	}
+	return c.buf.Write(p)
+}
 
 // handleShell runs a command locally via os/exec (sh -c) — a pure host
 // facility that never touches the agent. Body: {command, cwd?, timeoutMs?}
@@ -1133,10 +1264,11 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type shellResult struct {
-		exitCode int
-		stdout   string
-		stderr   string
-		timedOut bool
+		exitCode  int
+		stdout    string
+		stderr    string
+		timedOut  bool
+		truncated bool
 	}
 	done := make(chan shellResult, 1)
 	go func() {
@@ -1144,9 +1276,13 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "sh", "-c", body.Command)
 		cmd.Dir = cwd
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
+		// stdout and stderr share the same 16 MiB cap; stderr is folded into
+		// the same truncation accounting, so `truncated` flips when either
+		// stream overflows.
+		stdout := &cappedBuffer{max: shellMaxOutput}
+		stderr := &cappedBuffer{max: shellMaxOutput}
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
 		// No stdin by design.
 		res := shellResult{}
 		if err := cmd.Run(); err != nil {
@@ -1160,8 +1296,9 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 				res.timedOut = true
 			}
 		}
-		res.stdout = stdout.String()
-		res.stderr = stderr.String()
+		res.stdout = stdout.buf.String()
+		res.stderr = stderr.buf.String()
+		res.truncated = stdout.overflow || stderr.overflow
 		done <- res
 	}()
 
@@ -1171,11 +1308,12 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 		return
 	case res := <-done:
 		writeJSON(w, 200, map[string]any{
-			"ok":       true,
-			"exitCode": res.exitCode,
-			"stdout":   res.stdout,
-			"stderr":   res.stderr,
-			"timedOut": res.timedOut,
+			"ok":        true,
+			"exitCode":  res.exitCode,
+			"stdout":    res.stdout,
+			"stderr":    res.stderr,
+			"timedOut":  res.timedOut,
+			"truncated": res.truncated,
 		})
 	}
 }
@@ -1280,8 +1418,8 @@ func extractTaskList(res map[string]any) []map[string]any {
 
 // writeAgentError maps an agent-backed endpoint failure to a response.
 // Three-tier contract (the frontend classifies on exactly this):
-//   - host-side HTTPError          → keep its status code (404 暂无活动会话,
-//     409 上一条消息还在处理中 — task/list convention);
+//   - host-side HTTPError          → keep its status code (404 会话不存在
+//     等；goal 端点仍用 409 表示状态冲突);
 //   - agent JSON-RPC rejection (RPCError) → 200 + {ok:false, error, code?} —
 //     the agent is alive and answered; the FE renders an operation/turn
 //     error row, never a connection error;

@@ -325,18 +325,27 @@ func (b *Bridge) broadcastRosterChange() {
 	b.Broadcast(Event{"type": "sessions_changed", "params": map[string]any{}})
 }
 
-// setSessionBusy flips a session's in-flight turn state and notifies
-// clients on transition (busy ↔ idle = dashboard active ↔ idle).
-func (b *Bridge) setSessionBusy(id string, busy bool) {
+// releaseBusy drops one in-flight prompt's claim on a session and, when
+// the LAST in-flight turn finished, flips the session idle and notifies
+// clients (busy → idle transition only — a turn that resolves while a
+// sibling is still running must not report an idle the session never
+// had). It only releases when the roster still holds the SAME session
+// object the turn started on: killProcess wipes and rebuilds the roster
+// (and a failed turn's auto-recovery may restore the session), so a stale
+// turn must not clear the busy flag of a newer turn on the restored
+// session.
+func (b *Bridge) releaseBusy(s *SessionState, sessionID string) {
 	b.mu.Lock()
-	s := b.sessions[id]
-	changed := false
-	if s != nil && s.Busy != busy {
-		s.Busy = busy
-		changed = true
+	last := false
+	if cur := b.sessions[sessionID]; cur == s && s.busyCount > 0 {
+		s.busyCount--
+		if s.busyCount == 0 {
+			s.Busy = false
+			last = true
+		}
 	}
 	b.mu.Unlock()
-	if changed {
+	if last {
 		b.broadcastRosterChange()
 	}
 }
@@ -523,11 +532,14 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	if b.booting {
 		done := b.bootDone
 		b.mu.Unlock()
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		// The waiter's own ctx may be cancelled first (e.g. the client
+		// disconnected), but that is NOT a boot failure: the boot is
+		// bounded by bootTimeout and may still succeed. Reporting ctx.Err()
+		// here would be a false failure — a caller could treat it as a
+		// wedged agent and killProcess a healthy process. Keep waiting for
+		// the in-flight boot (bootDone always closes, even on boot error)
+		// and return its real outcome.
+		<-done
 		// The in-flight boot finished; re-check its outcome.
 		b.mu.Lock()
 		ready := b.ready
@@ -1959,28 +1971,28 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 	defer b.setSessionAwaiting(cr.SessionID, false)
 	timer := time.NewTimer(approvalTimeout)
 	defer timer.Stop()
+	// Peek first: the user's answer may have landed at the same instant
+	// the approval timer fired. A plain select would pick randomly and
+	// could reply "cancelled" to a just-confirmed approval; the answer
+	// must always win.
 	select {
 	case <-cr.done:
-		b.clientReqs.Delete(reqID)
-		id := cr.AgentID
-		if cr.cancel {
-			if cr.isPermission {
-				b.respond(id, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
-			} else {
-				b.respondError(id, "已取消", -32800)
-			}
-			return
-		}
-		if cr.errMsg != "" {
-			b.respondError(id, cr.errMsg, -32001)
-			return
-		}
-		if cr.isPermission {
-			b.respond(id, permissionResult(cr.outcome, cr.meta))
-			return
-		}
-		b.respond(id, cr.result)
+		b.resolveClientRequest(reqID, cr)
+		return
+	default:
+	}
+	select {
+	case <-cr.done:
+		b.resolveClientRequest(reqID, cr)
 	case <-timer.C:
+		// Re-check once more: an answer arriving while the timer fired
+		// must not be lost to the timeout path.
+		select {
+		case <-cr.done:
+			b.resolveClientRequest(reqID, cr)
+			return
+		default:
+		}
 		b.clientReqs.Delete(reqID)
 		if cr.isPermission {
 			b.respond(cr.AgentID, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
@@ -1988,6 +2000,31 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 			b.respondError(cr.AgentID, "审批超时", -32002)
 		}
 	}
+}
+
+// resolveClientRequest writes the JSON-RPC response for a client request
+// the browser resolved before the approval timeout (cancel / error /
+// permission outcome / raw result).
+func (b *Bridge) resolveClientRequest(reqID string, cr *clientRequest) {
+	b.clientReqs.Delete(reqID)
+	id := cr.AgentID
+	if cr.cancel {
+		if cr.isPermission {
+			b.respond(id, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
+		} else {
+			b.respondError(id, "已取消", -32800)
+		}
+		return
+	}
+	if cr.errMsg != "" {
+		b.respondError(id, cr.errMsg, -32001)
+		return
+	}
+	if cr.isPermission {
+		b.respond(id, permissionResult(cr.outcome, cr.meta))
+		return
+	}
+	b.respond(id, cr.result)
 }
 
 // permissionResult wraps an ACP permission outcome with the optional
@@ -2196,7 +2233,10 @@ type PromptOpts struct {
 // known session if one was remembered; only a machine with no last-session
 // pointer starts a brand-new conversation. A failed restore is an error —
 // never silently open a blank chat. Busy is per-session: other sessions
-// can keep running turns in parallel (the agent process is multi-session).
+// can keep running turns in parallel (the agent process is multi-session),
+// and a busy session is NOT rejected — the agent accepts mid-turn
+// session/prompt and queues it in its own authoritative pending_inputs, so
+// the host forwards and the turns run in submission order.
 func (b *Bridge) Prompt(ctx context.Context, sessionID string, blocks []ContentBlock) (stopReason string, err error) {
 	sr, _, err := b.PromptWithOpts(ctx, sessionID, blocks, PromptOpts{})
 	return sr, err
@@ -2235,21 +2275,29 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		b.mu.Unlock()
 		return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
 	}
-	if s.Busy {
-		b.mu.Unlock()
-		return "", nil, &HTTPError{Code: 409, Msg: "上一条消息还在处理中"}
-	}
+	// A busy session no longer 409s: the agent accepts mid-turn
+	// session/prompt and queues it in its own pending_inputs (popped when
+	// the current turn ends), so we just forward. Busy stays the "any turn
+	// in flight" projection via busyCount — an overlapping prompt must not
+	// let the first resolver flip the session idle while the second is
+	// still running.
+	first := s.busyCount == 0
+	s.busyCount++
 	s.Busy = true
 	s.LastActiveAt = time.Now().UnixMilli()
 	// Keep last-session pointer fresh even if the user only talks to this
 	// session without re-loading it (multi-session focus via prompt).
 	b.rememberSessionLocked(sessionID, s.Cwd)
 	b.mu.Unlock()
-	b.setSessionBusy(sessionID, true)
-	b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
+	if first {
+		// 0→1 transition: announce the busy turn exactly once. A second
+		// in-flight prompt must not re-announce — the session never left
+		// busy between the two.
+		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
+	}
 
 	defer func() {
-		b.setSessionBusy(sessionID, false)
+		b.releaseBusy(s, sessionID)
 	}()
 
 	if err := b.ensureBooted(ctx); err != nil {
@@ -2636,12 +2684,49 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 	// 响应 `_meta` 原样透传（仅非空才发，absent key ≠ off）。
 	meta, _ = res["_meta"].(map[string]any)
 
+	// Snapshot the live per-session state under the lock (cheap), then run
+	// the census file reads and the lsof probe OUTSIDE it: sessionTaskCensus
+	// reads each session's updates.jsonl and probeOrphanPaths spawns lsof
+	// (bounded at 5s) — holding b.mu across that would stall every other
+	// session's event handling (state writes take b.mu) for the whole probe.
+	type liveState struct {
+		live          bool // session is in the live roster (b.sessions)
+		state         string
+		busy          bool
+		awaitingInput bool
+		lastActiveAt  int64
+		title         string
+		updatedAt     string
+	}
+	states := make(map[string]*liveState, len(sessions))
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	for _, it := range sessions {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		sid, _ := m["sessionId"].(string)
+		st := &liveState{state: "idle"}
+		if s := b.sessions[sid]; s != nil {
+			st.live = true
+			st.state = s.State()
+			st.busy = s.Busy
+			st.awaitingInput = s.AwaitingInput
+			st.lastActiveAt = s.LastActiveAt
+			// Host-side title/updatedAt win over the agent list when the
+			// session is live (agent may not persist them yet).
+			st.title = s.Title
+			st.updatedAt = s.UpdatedAt
+		}
+		states[sid] = st
+	}
+	b.mu.Unlock()
 
 	// [bg] badge census: scan each session's persisted updates for task
 	// events (best-effort; missing files stay unbadged). Orphan log paths
 	// are collected per session and probed in ONE lsof call afterwards.
+	// Lock-free: only touches the freshly-fetched session items and
+	// immutable config (grokHome).
 	census := make(map[censusKey]TaskSummary, len(sessions))
 	orphans := make(map[censusKey][]string, len(sessions))
 	for _, it := range sessions {
@@ -2666,20 +2751,18 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 			continue
 		}
 		sid, _ := m["sessionId"].(string)
-		if s := b.sessions[sid]; s != nil {
+		if st := states[sid]; st != nil && st.live {
 			m["status"] = map[string]any{
-				"state":         s.State(),
-				"busy":          s.Busy,
-				"awaitingInput": s.AwaitingInput,
-				"lastActiveAt":  s.LastActiveAt,
+				"state":         st.state,
+				"busy":          st.busy,
+				"awaitingInput": st.awaitingInput,
+				"lastActiveAt":  st.lastActiveAt,
 			}
-			// Host-side title/updatedAt win over the agent list when the
-			// session is live (agent may not persist them yet).
-			if s.Title != "" {
-				m["title"] = s.Title
+			if st.title != "" {
+				m["title"] = st.title
 			}
-			if s.UpdatedAt != "" {
-				m["updatedAt"] = s.UpdatedAt
+			if st.updatedAt != "" {
+				m["updatedAt"] = st.updatedAt
 			}
 		} else {
 			m["status"] = map[string]any{"state": "idle", "busy": false, "awaitingInput": false}
@@ -3806,16 +3889,27 @@ func (b *Bridge) MCPAuthTrigger(ctx context.Context, name string) (map[string]an
 	}, 30*time.Second)
 }
 
-// Shutdown kills grok.
+// Shutdown kills grok and stops the goal loop.
 func (b *Bridge) Shutdown() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.cmd != nil && b.cmd.Process != nil {
 		_ = b.cmd.Process.Kill()
 	}
 	if b.cancelRd != nil {
 		b.cancelRd()
 	}
+	b.mu.Unlock()
+
+	// Stop the goal loop: a continuation turn can be blocked on a
+	// 30-minute prompt or waiting for the session to go idle, and must
+	// not outlive shutdown. Same mechanism as GoalClear — close the stop
+	// channel so the loop exits at its next checkpoint. stopGoalLoopLocked
+	// guards against double-close (goalLoopOn / goalStop nil checks);
+	// the process kill above fails the in-flight RPC, so the turn unwinds
+	// promptly instead of holding the loop open.
+	b.goalMu.Lock()
+	b.stopGoalLoopLocked()
+	b.goalMu.Unlock()
 }
 
 // HTTPError carries an HTTP status.

@@ -1,6 +1,8 @@
 package acp
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,6 +43,19 @@ const (
 	tagSchedFired   = `"sessionUpdate":"scheduled_task_fired"`
 	tagRewind       = `"sessionUpdate":"rewind_marker"`
 	tagUserChunk    = `"sessionUpdate":"user_message_chunk"`
+)
+
+// Byte forms of the raw-tag pre-filters for the streaming scanner paths
+// (same trick as bridge_ext_usage.go: bytes.Contains on []byte avoids a
+// per-line string conversion).
+var (
+	tagBackgroundedB = []byte(tagBackgrounded)
+	tagCompletedB    = []byte(tagCompleted)
+	tagSchedCreatedB = []byte(tagSchedCreated)
+	tagSchedDeletedB = []byte(tagSchedDeleted)
+	tagSchedFiredB   = []byte(tagSchedFired)
+	tagRewindB       = []byte(tagRewind)
+	tagUserChunkB    = []byte(tagUserChunk)
 )
 
 // TaskEvent is one persisted task-lifecycle event, in file order. The
@@ -173,11 +188,11 @@ type rewindLine struct {
 	promptIndex *int64
 }
 
-func classifyRewindLine(line string) (isRewind bool, isUser bool, promptIdx *int64) {
+func classifyRewindLine(line []byte) (isRewind bool, isUser bool, promptIdx *int64) {
 	switch {
-	case strings.Contains(line, tagRewind):
+	case bytes.Contains(line, tagRewindB):
 		return true, false, nil
-	case strings.Contains(line, tagUserChunk):
+	case bytes.Contains(line, tagUserChunkB):
 		idx := extractPromptIndex(line)
 		return false, true, idx
 	default:
@@ -187,9 +202,9 @@ func classifyRewindLine(line string) (isRewind bool, isUser bool, promptIdx *int
 
 // extractPromptIndex reads params._meta.promptIndex from a user chunk
 // envelope (best-effort).
-func extractPromptIndex(line string) *int64 {
+func extractPromptIndex(line []byte) *int64 {
 	// Fast path: the tag is absent — nothing to extract.
-	if !strings.Contains(line, `"promptIndex"`) {
+	if !bytes.Contains(line, []byte(`"promptIndex"`)) {
 		return nil
 	}
 	var env struct {
@@ -197,7 +212,7 @@ func extractPromptIndex(line string) *int64 {
 			Meta map[string]json.RawMessage `json:"_meta"`
 		} `json:"params"`
 	}
-	if json.Unmarshal([]byte(line), &env) != nil {
+	if json.Unmarshal(line, &env) != nil {
 		return nil
 	}
 	raw, ok := env.Params.Meta["promptIndex"]
@@ -232,11 +247,11 @@ func filterRewindLines(lines []string) []string {
 	var lastIdx *int64
 
 	for _, line := range lines {
-		isRewind, isUser, promptIdx := classifyRewindLine(line)
+		isRewind, isUser, promptIdx := classifyRewindLine([]byte(line))
 		switch {
 		case isRewind:
 			target := 0
-			if idx := extractRewindTarget(line); idx != nil {
+			if idx := extractRewindTarget([]byte(line)); idx != nil {
 				target = int(*idx)
 			}
 			trunc := len(result)
@@ -267,8 +282,8 @@ func filterRewindLines(lines []string) []string {
 }
 
 // extractRewindTarget reads the rewind marker's target_prompt_index.
-func extractRewindTarget(line string) *int64 {
-	if !strings.Contains(line, `"target_prompt_index"`) {
+func extractRewindTarget(line []byte) *int64 {
+	if !bytes.Contains(line, []byte(`"target_prompt_index"`)) {
 		return nil
 	}
 	var env struct {
@@ -276,7 +291,7 @@ func extractRewindTarget(line string) *int64 {
 			Update map[string]json.RawMessage `json:"update"`
 		} `json:"params"`
 	}
-	if json.Unmarshal([]byte(line), &env) != nil {
+	if json.Unmarshal(line, &env) != nil {
 		return nil
 	}
 	raw, ok := env.Params.Update["target_prompt_index"]
@@ -301,7 +316,34 @@ func min(a, b int) int {
 
 // parseTaskEvents scans a session's updates.jsonl and returns its
 // task-lifecycle events in file order (rewind dead branches filtered).
+// Streamed line-by-line with bufio.Scanner — no ReadFile + Split
+// double-copy of multi-hundred-MB files (the scanUsageFile pattern).
+// A line longer than maxUsageLineBytes falls back to the whole-file
+// path, which has no line-length limit.
 func parseTaskEvents(path string) ([]TaskEvent, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
+	var filt rewindFilter
+	for sc.Scan() {
+		filt.feed(sc.Bytes())
+	}
+	if err := sc.Err(); err != nil {
+		if !errors.Is(err, bufio.ErrTooLong) {
+			return nil, err
+		}
+		return parseTaskEventsReadAll(path)
+	}
+	return filt.events, nil
+}
+
+// parseTaskEventsReadAll is the whole-file fallback for parseTaskEvents,
+// reached only when a single line exceeds maxUsageLineBytes.
+func parseTaskEventsReadAll(path string) ([]TaskEvent, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -309,7 +351,7 @@ func parseTaskEvents(path string) ([]TaskEvent, error) {
 	lines := filterRewindLines(strings.Split(string(raw), "\n"))
 	events := make([]TaskEvent, 0, 16)
 	for _, line := range lines {
-		ev, ok := parseTaskEventLine(line)
+		ev, ok := parseTaskEventLine([]byte(line))
 		if !ok {
 			continue
 		}
@@ -318,16 +360,70 @@ func parseTaskEvents(path string) ([]TaskEvent, error) {
 	return events, nil
 }
 
+// rewindFilter is the streaming form of filterRewindLines: lines are fed
+// one at a time and the task events of live-branch lines are kept in
+// order; events parsed from dead-branch lines (after a rewind_marker) are
+// dropped. For a file without rewind markers every line's events are
+// kept unchanged, exactly like filterRewindLines. Only the parsed events
+// are retained (never the raw lines), so memory stays proportional to the
+// event count instead of the file size.
+type rewindFilter struct {
+	events   []TaskEvent
+	evStarts []int // len(events) at each user-message run start
+	inUser   bool
+	lastIdx  *int64
+}
+
+func (f *rewindFilter) feed(line []byte) {
+	isRewind, isUser, promptIdx := classifyRewindLine(line)
+	switch {
+	case isRewind:
+		target := 0
+		if idx := extractRewindTarget(line); idx != nil {
+			target = int(*idx)
+		}
+		// Truncate at the target prompt run's start. evStarts holds
+		// event counts (events is 1:1 with the live-branch lines, so the
+		// event index at a run start is exactly the count of events that
+		// preceded it — same truncation semantics as filterRewindLines).
+		trunc := len(f.events)
+		if target < len(f.evStarts) {
+			trunc = f.evStarts[target]
+		}
+		f.events = f.events[:trunc]
+		f.evStarts = f.evStarts[:min(target, len(f.evStarts))]
+		f.inUser = false
+	case isUser:
+		newRun := !f.inUser
+		if promptIdx != nil && f.lastIdx != nil && *promptIdx != *f.lastIdx {
+			newRun = true
+		}
+		if newRun {
+			f.evStarts = append(f.evStarts, len(f.events))
+		}
+		if ev, ok := parseTaskEventLine(line); ok {
+			f.events = append(f.events, ev)
+		}
+		f.inUser = true
+		f.lastIdx = promptIdx
+	default:
+		if ev, ok := parseTaskEventLine(line); ok {
+			f.events = append(f.events, ev)
+		}
+		f.inUser = false
+	}
+}
+
 // parseTaskEventLine parses one storage envelope if it carries a
 // task/scheduled event; ok=false otherwise.
-func parseTaskEventLine(line string) (TaskEvent, bool) {
+func parseTaskEventLine(line []byte) (TaskEvent, bool) {
 	var env struct {
 		Timestamp int64 `json:"timestamp"`
 		Params    struct {
 			Update map[string]json.RawMessage `json:"update"`
 		} `json:"params"`
 	}
-	if err := json.Unmarshal([]byte(line), &env); err != nil {
+	if err := json.Unmarshal(line, &env); err != nil {
 		return TaskEvent{}, false
 	}
 	upd := env.Params.Update
@@ -557,8 +653,44 @@ func runningTasks(events []TaskEvent) []TaskEvent {
 // only lines carrying task tags are JSON-parsed (the tags are exact —
 // quotes inside JSON strings are escaped — so message text cannot
 // false-positive). Returns the counts plus the orphan log paths for a
-// shared liveness probe (one lsof for all sessions).
+// shared liveness probe (one lsof for all sessions). Streamed with
+// bufio.Scanner like parseTaskEvents; a line longer than
+// maxUsageLineBytes falls back to the whole-file path.
 func scanTaskCensus(path string) (sum TaskSummary, orphanPaths []string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return TaskSummary{}, nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
+	var events []TaskEvent
+	for sc.Scan() {
+		l := sc.Bytes()
+		if !bytes.Contains(l, tagBackgroundedB) &&
+			!bytes.Contains(l, tagCompletedB) &&
+			!bytes.Contains(l, tagSchedCreatedB) &&
+			!bytes.Contains(l, tagSchedDeletedB) &&
+			!bytes.Contains(l, tagSchedFiredB) {
+			continue
+		}
+		if ev, ok := parseTaskEventLine(l); ok {
+			events = append(events, ev)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		if !errors.Is(err, bufio.ErrTooLong) {
+			return TaskSummary{}, nil, err
+		}
+		return scanTaskCensusReadAll(path)
+	}
+	sum, orphanPaths = censusEvents(events)
+	return sum, orphanPaths, nil
+}
+
+// scanTaskCensusReadAll is the whole-file fallback for scanTaskCensus
+// (reached only when a single line exceeds maxUsageLineBytes).
+func scanTaskCensusReadAll(path string) (TaskSummary, []string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return TaskSummary{}, nil, err
@@ -572,10 +704,18 @@ func scanTaskCensus(path string) (sum TaskSummary, orphanPaths []string, err err
 			!strings.Contains(line, tagSchedFired) {
 			continue
 		}
-		if ev, ok := parseTaskEventLine(line); ok {
+		if ev, ok := parseTaskEventLine([]byte(line)); ok {
 			events = append(events, ev)
 		}
 	}
+	sum, orphanPaths := censusEvents(events)
+	return sum, orphanPaths, nil
+}
+
+// censusEvents reduces a task-event list into the badge census counts and
+// the orphan log paths (shared by the streaming and fallback paths).
+func censusEvents(events []TaskEvent) (TaskSummary, []string) {
+	var sum TaskSummary
 	for _, e := range events {
 		switch e.Kind {
 		case taskEventBackgrounded:
@@ -585,12 +725,13 @@ func scanTaskCensus(path string) (sum TaskSummary, orphanPaths []string, err err
 		}
 	}
 	sum.HasTasks = sum.HasTasks || sum.BgCount > 0
+	var orphanPaths []string
 	for _, e := range orphanedTasks(events) {
 		if e.OutputFile != "" {
 			orphanPaths = append(orphanPaths, e.OutputFile)
 		}
 	}
-	return sum, orphanPaths, nil
+	return sum, orphanPaths
 }
 
 // applyProbe fills TaskSummary.BgRunning from a pre-computed open-set.
