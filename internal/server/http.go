@@ -416,7 +416,19 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			b, err := json.Marshal(ev)
+			// 复制后附加 hostId：本地 SSE 事件需带 hostId 供前端按
+			// (hostId, seq) 与 hub 中继推回的同源事件去重（双连接时
+			// 本地 SSE 与 /ws/fe 各来一份）。不改 bridge 共享 map ——
+			// hub-client 与 SSE 订阅同一事件，改 map 会污染上传路径。
+			// 与 hub 的 stripFullUpdate 对齐：去掉大体积 fullUpdate，
+			// 避免撑爆 SSE 帧与 Subscribe 缓冲导致 Broadcast drop。
+			out := make(map[string]any, len(ev)+1)
+			for k, v := range ev {
+				out[k] = v
+			}
+			delete(out, "fullUpdate")
+			out["hostId"] = snap.HostID
+			b, err := json.Marshal(out)
 			if err != nil {
 				continue
 			}
@@ -448,7 +460,16 @@ func writeSSEFrame(w http.ResponseWriter, flusher http.Flusher, data []byte) boo
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.bridge.Snapshot())
+	snap := s.bridge.Snapshot()
+	// 部署模式由 host 配置决定：配了 HUB_URL → hub 模式（内嵌前端跨源
+	// 直连 hub 看全部 host）；否则 local 模式（前端锁定本机）。
+	if s.cfg.HubURL != "" {
+		snap.Mode = "hub"
+		snap.HubURL = s.cfg.HubURL
+	} else {
+		snap.Mode = "local"
+	}
+	writeJSON(w, http.StatusOK, snap)
 }
 
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
