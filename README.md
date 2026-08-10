@@ -414,3 +414,7 @@ Hub 模式下所有 `/api/*` 请求经 Hub 中转（`?host=` 选择目标），�
 | 语言 | Node | Go |
 | Client fs/terminal | 有，可审批执行 | **无**，依赖 Agent |
 | 前端 | 内嵌 HTML | 独立 `acp-fe` |
+
+## 友情链接
+
+- [Linux.do](https://linux.do)
