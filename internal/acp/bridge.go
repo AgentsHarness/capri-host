@@ -393,6 +393,35 @@ func (b *Bridge) sessionIdFrom(params map[string]any) string {
 	return ""
 }
 
+// cloneAny deep-copies JSON-like structures (maps/slices) so snapshots
+// handed out for lock-free serialization never share storage with live
+// bridge state (a concurrent in-place map write during json.Marshal is a
+// fatal race — "concurrent map read and map write").
+func cloneAny(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = cloneAny(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = cloneAny(val)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(t))
+		for k, val := range t {
+			out[k] = val
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func (b *Bridge) Snapshot() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -409,7 +438,16 @@ func (b *Bridge) Snapshot() Status {
 	roster := make([]SessionState, 0, len(b.sessions))
 	busy := false
 	for _, s := range b.sessions {
-		roster = append(roster, *s)
+		row := *s
+		// Deep-copy the shared map fields: the roster rows are serialized
+		// outside b.mu (SSE hello / /api/status / /api/session-state) while
+		// readStdout may still mutate them under the lock (model changes,
+		// usage updates). Sharing the maps would race the serializer.
+		row.modes = cloneAny(s.modes)
+		row.configOpts = cloneAny(s.configOpts)
+		row.models = cloneAny(s.models)
+		row.sessionMeta = cloneAny(s.sessionMeta)
+		roster = append(roster, row)
 		if s.Busy {
 			busy = true
 		}
@@ -427,10 +465,10 @@ func (b *Bridge) Snapshot() Status {
 	if act != nil {
 		sid = act.SessionID
 		cwd = act.Cwd
-		modes = act.modes
-		configOpts = act.configOpts
-		models = act.models
-		sessionMeta = act.sessionMeta
+		modes = cloneAny(act.modes)
+		configOpts = cloneAny(act.configOpts)
+		models = cloneAny(act.models)
+		sessionMeta = cloneAny(act.sessionMeta)
 	}
 	// AuthMeta/SessionMeta 是 any 字段：有类型的 nil map 装进 any 后
 	// omitempty 会失效（输出 null），所以 nil 时不装。
@@ -1005,6 +1043,13 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 		default:
 		}
 		if !sc.Scan() {
+			// Never die silently: a scan error (e.g. a line exceeding the
+			// 64MB buffer) would otherwise leave the bridge parsing nothing
+			// while the agent keeps running — every session appears frozen.
+			if err := sc.Err(); err != nil && err != io.EOF {
+				log.Printf("[acp-host] stdout 扫描错误: %v — 触发 agent 重启自愈", err)
+				go b.killProcess()
+			}
 			return
 		}
 		line := sc.Bytes()
@@ -2351,7 +2396,6 @@ func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 // Used when a turn or a boot step fails on a possibly wedged agent.
 func (b *Bridge) killProcess() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if act := b.activeSessionLocked(); act != nil {
 		b.rememberSessionLocked(act.SessionID, act.Cwd)
 	}
@@ -2369,6 +2413,14 @@ func (b *Bridge) killProcess() {
 		b.cancelRd()
 		b.cancelRd = nil
 	}
+	b.mu.Unlock()
+
+	// Fail in-flight RPCs (prompts on OTHER sessions) so they return an
+	// error immediately instead of hanging until the 30-minute prompt
+	// timeout. waitProcess only covers natural exits; this is a forced
+	// kill (wedged agent), so fail them here, outside the lock.
+	b.failAllPending(fmt.Errorf("grok 进程已重启"))
+	b.broadcastRosterChange()
 }
 
 // SetMode calls session/set_mode on the active session.
@@ -2655,6 +2707,12 @@ func (b *Bridge) SessionStateOf(sessionID string) *SessionState {
 		return nil
 	}
 	cp := *s
+	// Same deep-copy contract as Snapshot: the caller serializes this
+	// outside b.mu while readStdout may mutate the shared maps under it.
+	cp.modes = cloneAny(s.modes)
+	cp.configOpts = cloneAny(s.configOpts)
+	cp.models = cloneAny(s.models)
+	cp.sessionMeta = cloneAny(s.sessionMeta)
 	return &cp
 }
 

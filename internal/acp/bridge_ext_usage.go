@@ -218,7 +218,15 @@ func scanUsageFiles(ctx context.Context, paths []string, rep *UsageReport, from,
 		}(locals[i])
 	}
 	for _, p := range paths {
-		ch <- p
+		select {
+		case ch <- p:
+		case <-ctx.Done():
+			// Client went away mid-scan; stop feeding the workers instead
+			// of blocking forever on the unbuffered channel (producer leak).
+			close(ch)
+			wg.Wait()
+			return
+		}
 	}
 	close(ch)
 	wg.Wait()
