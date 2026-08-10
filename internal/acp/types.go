@@ -36,8 +36,15 @@ type Status struct {
 	Booting   bool           `json:"booting"`
 	SessionID string         `json:"sessionId,omitempty"`
 	Cwd       string         `json:"cwd,omitempty"`
-	HostID    string         `json:"hostId"`
-	HostName  string         `json:"hostName"`
+	HostID   string `json:"hostId"`
+	HostName string `json:"hostName"`
+	// Mode 标明部署模式："local"（未配置 HUB_URL，浏览器直连本进程）或
+	// "hub"（配置了 HUB_URL，本进程作为 hub 客户端中继，内嵌前端应跨源
+	// 直连 hub）。由 server 层在 handleStatus 填充，bridge 自身不感知。
+	Mode string `json:"mode,omitempty"`
+	// HubURL 是 hub 模式的 hub 浏览器侧入口（前端跨源直连 /ws/fe 与
+	// /api/* 用）。仅 Mode=="hub" 时非空。
+	HubURL    string         `json:"hubUrl,omitempty"`
 	HomeDir   string         `json:"homeDir,omitempty"`
 	AgentInfo map[string]any `json:"agentInfo,omitempty"`
 	// AgentCapabilities from the agent's initialize response (what the

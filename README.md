@@ -69,15 +69,32 @@ Host 与 Hub 通过 **QUIC**（UDP 8788，失败自动回退 WebSocket `/ws/host
 Hub 端 token 失效且提供了配对码时会自动重新配对。
 
 Hub 会下发浏览器订阅数（`hello.subscribers` / `{type:"subscribers",count}`）。
-**无浏览器打开 FE 时**，本机暂停向 Hub 上报 bridge 事件（chunk/tool 等），只保留
-`host_status` 心跳以更新 ready；有订阅后再恢复。浏览器重新连上后通过
-`/api/status` 与 session-updates 水合，不依赖空闲期事件。
+**无浏览器打开 FE 时**，本机暂停向 Hub **实时入队** bridge 事件（chunk/tool 等），但仍可缓冲供
+断线恢复；`host_status` 控制帧始终发送以维持 registry liveness / ready。有订阅后再恢复 live 上报。
+浏览器重新连上后可通过 `/api/status` 与 session-updates 水合，并结合 hub `hello.seq` 补拉缺口。
 
-Live 上报路径：bridge 订阅 → 50ms/32 条合批 → **同 session 连续 chunk/thought 文本合并** → 去掉
-`fullUpdate` → **合并后**分配 **seq** + 入**重放缓冲**（最近 5000 条，seq 连续无空洞）→ QUIC/WS
-`events` 帧（单帧 ≤8MB，超限丢弃并打日志；重放按 ≤1MB/帧分片）。写失败或队列满时丢弃并打日志，
-不阻塞 agent 订阅 loop；重连后按 hub `hello.seq` 精确补发断线期间事件（seq 由 host 分配、hub 原样
-保留，两端计数始终一致）。
+双路可靠性（本地 SSE + Hub 中继共享同一 seq 空间）：
+
+- **全局 seq**：`bridge.Broadcast` 分配单调递增 `seq`，本地 `/events` 与 Hub uplink **同源**；前端按
+  `(hostId, seq)` 双路去重。
+- **本地 SSE**（`GET /events`）：附带 `hostId`、保留 `seq`，线上剥掉体积大的 `fullUpdate`。
+- **Hub 上行**：保留 bridge `seq`（不重编号）；**不合并** chunk/thought 文本（仅合批成帧）。
+  同 seq ⇒ 与本地 SSE 同 payload。
+- **host_status**：控制帧 `{"v":1,"type":"host_status","ready":bool}`，**不在** events/seq 空间；
+  即使 FE 订阅数为 0 也持续发送。
+- **订阅门闩**：Hub 侧无浏览器时暂停 live 入队，host 仍可缓冲以支持 resume；`host_status` 不停。
+- **重放**：有界缓冲（约 5000 条），按 hub `hello.seq` 精确补发；帧有大小上限；重连先排空
+  send 队列再 resume。若 `hello.seq` 高于本进程已见 max（典型 **host 进程重启**，bridge 从 1
+  重计而 hub 仍记旧水位），host 发 `{"v":1,"type":"seq_reset"}` 让 hub 清零 LastSeq/缓冲，
+  **不**用陈旧 `hello.seq` 抬高 `lastSentSeq`（否则 0→1 补发与 live 会被 hub 当 stale 丢弃）。
+- **订阅缓冲**：bridge 订阅 channel 容量 **512** 事件。慢消费者 drop 时可能出现 seq 空洞（如 1、3）；
+  属预期，靠 FE gap-pull + 去重收敛，**不会**为填洞而再做 chunk 合并。
+- **版本**：FE / hub / host 需同步升级到上述契约（见 `docs/DEPLOY.md`「版本契约」）。
+
+Live 上报路径：`bridge.Broadcast`（分配 seq）→ 订阅缓冲（512）→ 50ms/32 条合批（**不合**文本）→
+剥 `fullUpdate` → 入重放缓冲（~5000）→ QUIC/WS `events` 帧（单帧 ≤8MB，超限丢弃并打日志；
+重放按 ≤1MB/帧分片）。写失败或队列满时丢弃并打日志，不阻塞 agent 订阅 loop；重连后先 drain
+send 队列，再按 hub `hello.seq` 补发断线期间事件（hub 原样保留 seq，与本地 SSE 一致）。
 
 ## API（Local / 经 Hub 中转一致）
 
@@ -85,7 +102,7 @@ Live 上报路径：bridge 订阅 → 50ms/32 条合批 → **同 session 连续
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/events` | SSE 事件流 |
+| GET | `/events` | SSE 事件流（附 `hostId`、保留 bridge `seq`；线上剥 `fullUpdate`；与 Hub 上行同源 seq，前端 `(hostId, seq)` 去重） |
 | GET | `/api/status` | 状态快照 |
 | GET | `/api/hosts` | 本机单 Host 列表（Hub 模式下此端点由 Hub 提供注册表） |
 | POST | `/api/prompt` | `{ "blocks": [{ "type":"text", "text":"..." }] }` |

@@ -94,6 +94,12 @@ type Bridge struct {
 	subscribersMu sync.Mutex
 	subscribers   map[chan Event]struct{}
 
+	// eventSeq 是广播事件的全局单调序号（Broadcast 附加到每个事件）。
+	// 本地 SSE 与 hub 中继（/ws/fe 推回）携带同一 seq，前端选中本机
+	// host 时双路（本地 SSE + hub WS）收到同一事件可按 (hostId, seq)
+	// 去重；hub-client 转发时保留该 seq（不再自行分配）。
+	eventSeq uint64
+
 	hostID   string
 	hostName string
 	homeDir  string
@@ -274,7 +280,7 @@ func mustCwd() string {
 
 // Subscribe returns a buffered event channel; call unsubscribe to remove.
 func (b *Bridge) Subscribe() (ch chan Event, unsubscribe func()) {
-	ch = make(chan Event, 64)
+	ch = make(chan Event, 512)
 	b.subscribersMu.Lock()
 	b.subscribers[ch] = struct{}{}
 	b.subscribersMu.Unlock()
@@ -299,11 +305,22 @@ func (b *Bridge) Broadcast(ev Event) {
 	}
 	b.subscribersMu.Lock()
 	defer b.subscribersMu.Unlock()
+	// 全局事件序号：所有订阅者（本地 SSE、hub-client 转发）看到同一
+	// 事件同一 seq。注意 hub-client 转发时必须保留该 seq（见其
+	// seqAndReplay），否则双路去重失效。
+	b.eventSeq++
+	ev["seq"] = b.eventSeq
 	for ch := range b.subscribers {
 		select {
 		case ch <- ev:
 		default:
-			// slow consumer: drop
+			// Slow consumer: drop. Seq still advances for other
+			// subscribers, so a lagging FE/SSE client may see a hole
+			// (e.g. 1,3). That is expected: FE gap-pulls via
+			// GET /api/events?after= and (hostId,seq) dedup makes
+			// replays of already-seen seqs harmless. Do not merge
+			// chunks just to hide holes — that breaks dual-path seq
+			// identity with the hub uplink.
 		}
 	}
 }

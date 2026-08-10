@@ -22,3 +22,4 @@
 !.vscode/extensions.json
 .idea
 .DS_Store
+internal/server/web
