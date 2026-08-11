@@ -112,6 +112,7 @@ hub 会把 `/api/*` 请求中转到目标 host（`?host=<hostId>` 选择，默�
 | chunk **不再合并** | host 上行保留每条 bridge 事件的独立 `seq` 与原文；旧逻辑把 `a`+`b`+`c` 合成一条会破坏与 SSE 的 seq 对齐 |
 | `host_status` 控制帧 | `{"v":1,"type":"host_status","ready":bool}`，**无 `seq`、不在 events 空间**；hub 须识别并不推进 per-host 事件序号 |
 | seq 空洞 + gap-pull | 慢消费者丢弃时可能看到 `1,3` 跳号；FE 用 `GET /api/events?host=&after=` 补拉，重复 seq 去重即可 |
+| relay 帧带 `hostId` | hub 下行 `request` 帧携带目标 `hostId`；host 端校验与自身 `HOST_ID` 一致才执行，不匹配拒绝（404）——防 hub 路由错误/陈旧转发。FE 侧 `/api/shell` 等独立客户端必须经 transport 带 `?host=`（不能裸 fetch 相对路径） |
 
 **升级 / 回滚**：`acp-fe`、`acp-hub`、`acp-host`（含内嵌 `web/dist`）请升到同一代「双路去重 + 控制帧 + 不合并 chunk」的版本；回滚也三者一起回。
 

@@ -365,6 +365,60 @@ func TestStreamRelayRoundTrip(t *testing.T) {
 	}
 }
 
+// A relayed request stamped with another host's hostId must be refused
+// without touching the local HTTP API — the host only executes requests
+// the hub routed to it.
+func TestStreamRelayRejectsForeignHostID(t *testing.T) {
+	fh := newFakeHub(t)
+	fh.streamFrames = []string{
+		`{"v":1,"type":"hello","service":"hub","subscribers":0}`,
+		`{"v":1,"type":"request","reqId":"r9","hostId":"h2","method":"POST","path":"/api/prompt","body":{"blocks":[{"type":"text","text":"hi"}]}}`,
+	}
+	ts := httptest.NewServer(fh.handler())
+	defer ts.Close()
+
+	hits := make(chan string, 1)
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits <- r.URL.Path // must never fire
+		writeTestJSON(w, 200, map[string]any{"ok": true})
+	}))
+	defer local.Close()
+
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", LocalBase: local.URL, StateFile: filepath.Join(t.TempDir(), "hub.json"), DisableQUIC: true})
+	if err := c.ensureToken(context.Background()); err != nil {
+		t.Fatalf("ensureToken: %v", err)
+	}
+	c.sendCh = make(chan []byte, 64)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.wsSession(ctx, bridge) }()
+
+	select {
+	case resp := <-fh.respondsCh:
+		if resp["reqId"] != "r9" {
+			t.Errorf("respond = %v, want reqId r9", resp)
+		}
+		if resp["status"] != float64(404) && resp["status"] != 404 {
+			t.Errorf("respond status = %v, want 404", resp["status"])
+		}
+		body, _ := json.Marshal(resp["body"])
+		if !bytes.Contains(body, []byte("host 未配对")) {
+			t.Errorf("respond body = %s, want host 未配对 error", body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no respond posted to hub")
+	}
+
+	select {
+	case p := <-hits:
+		t.Fatalf("local API was hit with foreign hostId: %s", p)
+	default:
+		// expected — the foreign request never reached the local API
+	}
+}
+
 func TestRunForwardsEvents(t *testing.T) {
 	fh := newFakeHub(t)
 	// Stream hello announces a listening browser so forwardLoop is armed.
@@ -1090,7 +1144,10 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
-	qtls := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+	qtls := &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		NextProtos:   []string{"acp-hub"}, // match production hub ALPN
+	}
 
 	ln, err := quic.ListenAddr("127.0.0.1:0", qtls, &quic.Config{KeepAlivePeriod: 10 * time.Second})
 	if err != nil {

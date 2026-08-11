@@ -815,6 +815,9 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	defer cancel()
 	conn, err := quic.DialAddr(dialCtx, net.JoinHostPort(host, port), &tls.Config{
 		InsecureSkipVerify: true, // hub QUIC uses self-signed certs
+		// Must match acp-hub quicTLSConfig ALPN ("acp-hub"); empty client ALPN
+		// yields CRYPTO_ERROR tls: no application protocol.
+		NextProtos: []string{"acp-hub"},
 	}, &quic.Config{KeepAlivePeriod: 10 * time.Second})
 	if err != nil {
 		return fmt.Errorf("hub quic dial %s: %w", host, err)
@@ -943,6 +946,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 		var msg struct {
 			Type        string          `json:"type"`
 			ReqID       string          `json:"reqId"`
+			HostID      string          `json:"hostId"`
 			Method      string          `json:"method"`
 			Path        string          `json:"path"`
 			Body        json.RawMessage `json:"body"`
@@ -983,7 +987,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 				c.enqueueHostStatus(bridge)
 			}
 		case "request":
-			go c.handleRelay(ctx, msg.ReqID, msg.Method, msg.Path, msg.Body)
+			go c.handleRelay(ctx, msg.ReqID, msg.HostID, msg.Method, msg.Path, msg.Body)
 		case "ping":
 			pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
 			c.enqueueFrame(pong, false)
@@ -994,8 +998,18 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 }
 
 // handleRelay executes one relayed browser request against the local HTTP
-// API and posts the answer back to the hub over the WebSocket.
-func (c *Client) handleRelay(ctx context.Context, reqID, method, path string, body json.RawMessage) {
+// API and posts the answer back to the hub over the WebSocket. The hub
+// routes by hostId and stamps every request frame with its target; a
+// frame naming another host (hub bug / stale routing) is rejected here
+// instead of executing locally. Empty hostId (pre-hostId hubs) is
+// tolerated for rolling upgrades — the hub is the trust boundary either
+// way, so the check is defense-in-depth, not auth.
+func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path string, body json.RawMessage) {
+	if hostID != "" && hostID != c.cfg.HostID {
+		log.Printf("[hub-client] 拒绝非本机中转请求: target=%s self=%s %s %s", hostID, c.cfg.HostID, method, path)
+		c.respond(reqID, 404, mustJSON(map[string]any{"ok": false, "error": "host 未配对"}))
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, 50*time.Minute)
 	defer cancel()
 
