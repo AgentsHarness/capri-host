@@ -65,7 +65,7 @@ HUB_URL=http://hub-host:8787 HUB_PAIR_CODE=DDVZRR HOST_ID=macbook HOST_NAME="Mac
 
 首次配对成功后 token 保存在 `~/.acp-host/hub.json`，之后重启无需配对码。
 Host 与 Hub 通过 **QUIC**（UDP 8788，失败自动回退 WebSocket `/ws/host`）保持一条
-双向连接：事件上行、中转请求下行、`respond` 上行。断开会自动重连（指数退避）；
+双向连接：事件上行、中转请求下行（帧携带目标 `hostId`，host 校验与自身一致才执行）、`respond` 上行。断开会自动重连（指数退避）；
 Hub 端 token 失效且提供了配对码时会自动重新配对。
 
 Hub 会下发浏览器订阅数（`hello.subscribers` / `{type:"subscribers",count}`）。
