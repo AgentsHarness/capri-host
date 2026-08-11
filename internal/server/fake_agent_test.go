@@ -209,6 +209,10 @@ func runFakeAgent() {
 			result = map[string]any{"result": map[string]any{"planMode": true}}
 		case "_x.ai/permissions/reset":
 			result = map[string]any{"ok": true}
+		case "_x.ai/internal/reload_models":
+			// Mirrors the agent's ExtMethodResult envelope
+			// ({"models": count}); the host only checks success.
+			result = map[string]any{"result": map[string]any{"models": 3}}
 		case "_x.ai/mcp/list":
 			// Top-level {servers:[…]} shape with a bare-string entry to
 			// exercise name normalization.

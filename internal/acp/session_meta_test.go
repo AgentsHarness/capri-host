@@ -185,6 +185,137 @@ func TestLoadSessionBusyFocusOnlyIgnoresMeta(t *testing.T) {
 	}
 }
 
+// agent session/load remaps a session's persisted model id to a current
+// catalog key (e.g. deepseek-v4-flash → deepseek-v4-flash-go) and answers
+// WITHOUT a reasoningEffort — the load must keep the session's last-known
+// effort (user's choice) instead of letting the FE fall back to the mapped
+// model's default (e.g. low).
+func TestLoadSessionPreservesKnownEffortWhenResponseOmitsIt(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "deepseek-v4-flash",
+		"reasoningEffort": "max",
+		"availableModels": []any{
+			map[string]any{
+				"modelId": "deepseek-v4-flash-go",
+				"name":    "DeepSeek V4 Flash Go",
+				"_meta": map[string]any{
+					"reasoningEffort": "low",
+					"reasoningEfforts": []any{
+						map[string]any{"id": "low", "value": "low"},
+						map[string]any{"id": "high", "value": "high"},
+						map[string]any{"id": "max", "value": "max"},
+					},
+				},
+			},
+		},
+	}
+	b.mu.Unlock()
+
+	// Agent answers with the mapped catalog key and NO top-level effort.
+	var resp map[string]any
+	runResolved(t, b, w, map[string]any{
+		"sessionId": "s1",
+		"models": map[string]any{
+			"currentModelId": "deepseek-v4-flash-go",
+			"availableModels": []any{
+				map[string]any{
+					"modelId": "deepseek-v4-flash-go",
+					"name":    "DeepSeek V4 Flash Go",
+					"_meta": map[string]any{
+						"reasoningEffort": "low",
+						"reasoningEfforts": []any{
+							map[string]any{"id": "low", "value": "low"},
+							map[string]any{"id": "high", "value": "high"},
+							map[string]any{"id": "max", "value": "max"},
+						},
+					},
+				},
+			},
+		},
+	}, func() error {
+		var err error
+		resp, err = b.LoadSession(ctx, "s1", "/ws")
+		return err
+	})
+
+	models, _ := resp["models"].(map[string]any)
+	if got, _ := models["reasoningEffort"].(string); got != "max" {
+		t.Errorf("load response reasoningEffort = %q, want %q (preserved user choice)", got, "max")
+	}
+	if got, _ := models["currentModelId"].(string); got != "deepseek-v4-flash-go" {
+		t.Errorf("load response currentModelId = %q, want deepseek-v4-flash-go", got)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if got, _ := b.sessions["s1"].models.(map[string]any)["reasoningEffort"].(string); got != "max" {
+		t.Errorf("roster cache reasoningEffort = %q, want %q", got, "max")
+	}
+}
+
+// An explicit reasoningEffort in the load response wins over the cached
+// value (the agent did a real model/effort switch).
+func TestLoadSessionKeepsExplicitResponseEffort(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "deepseek-v4-flash",
+		"reasoningEffort": "max",
+	}
+	b.mu.Unlock()
+
+	var resp map[string]any
+	runResolved(t, b, w, map[string]any{
+		"sessionId": "s1",
+		"models": map[string]any{
+			"currentModelId":  "deepseek-v4-pro",
+			"reasoningEffort": "high",
+		},
+	}, func() error {
+		var err error
+		resp, err = b.LoadSession(ctx, "s1", "/ws")
+		return err
+	})
+	models, _ := resp["models"].(map[string]any)
+	if got, _ := models["reasoningEffort"].(string); got != "high" {
+		t.Errorf("load response reasoningEffort = %q, want %q (explicit wins)", got, "high")
+	}
+}
+
+// Same preservation rule on session/resume.
+func TestResumeSessionPreservesKnownEffortWhenResponseOmitsIt(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "deepseek-v4-flash",
+		"reasoningEffort": "max",
+	}
+	b.mu.Unlock()
+
+	var resp map[string]any
+	runResolved(t, b, w, map[string]any{
+		"sessionId": "s1",
+		"models": map[string]any{
+			"currentModelId": "deepseek-v4-flash-go",
+		},
+	}, func() error {
+		var err error
+		resp, err = b.ResumeSession(ctx, "s1", "/ws")
+		return err
+	})
+	models, _ := resp["models"].(map[string]any)
+	if got, _ := models["reasoningEffort"].(string); got != "max" {
+		t.Errorf("resume response reasoningEffort = %q, want %q (preserved user choice)", got, "max")
+	}
+}
+
 // ── 响应 `_meta` 透传（session/new | session/load | session/resume）────
 
 // nextEvent drains the subscriber channel until an event of the wanted
