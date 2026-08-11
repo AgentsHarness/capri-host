@@ -458,6 +458,7 @@ func (b *Bridge) Snapshot() Status {
 			RequestID: key.(string),
 			Method:    cr.Method,
 			Params:    cr.Params,
+			SessionID: cr.SessionID,
 		})
 		return true
 	})
@@ -1986,6 +1987,11 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 	// Whatever happens (resolve / cancel / timeout), the session is no
 	// longer waiting on input.
 	defer b.setSessionAwaiting(cr.SessionID, false)
+	// Multi-tab: every connected client received client_request. Once this
+	// request is settled (any path), broadcast so other tabs drop the card
+	// — without this the answering tab clears locally but siblings keep a
+	// zombie permission / question UI until reload.
+	defer b.broadcastClientRequestResolved(reqID, cr.SessionID)
 	timer := time.NewTimer(approvalTimeout)
 	defer timer.Stop()
 	// Peek first: the user's answer may have landed at the same instant
@@ -2017,6 +2023,20 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 			b.respondError(cr.AgentID, "审批超时", -32002)
 		}
 	}
+}
+
+// broadcastClientRequestResolved notifies every SSE subscriber that a
+// forwarded client request (permission / x.ai question / …) is no longer
+// pending. Clients remove matching pending / xaiRequests rows by requestId.
+func (b *Bridge) broadcastClientRequestResolved(reqID, sessionID string) {
+	ev := Event{
+		"type":      "client_request_resolved",
+		"requestId": reqID,
+	}
+	if sessionID != "" {
+		ev["sessionId"] = sessionID
+	}
+	b.Broadcast(ev)
 }
 
 // resolveClientRequest writes the JSON-RPC response for a client request
@@ -2958,6 +2978,25 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	}
 	b.mu.Unlock()
 
+	// Capture the session's last-known reasoning effort BEFORE the agent
+	// call. Agent session/load remaps persisted model ids to current
+	// catalog keys (e.g. deepseek-v4-flash → deepseek-v4-flash-go) and
+	// answers WITHOUT a reasoningEffort — the FE would then fall back to
+	// the mapped model's default effort (e.g. low), silently discarding
+	// the user's choice (e.g. max). The remap broadcast can also race in
+	// while the request is in flight, so read the cache up-front rather
+	// than after the response.
+	prevEffort := ""
+	b.mu.Lock()
+	if s := b.sessions[sessionID]; s != nil {
+		if m, ok := s.models.(map[string]any); ok {
+			if e, ok := m["reasoningEffort"].(string); ok {
+				prevEffort = e
+			}
+		}
+	}
+	b.mu.Unlock()
+
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -2969,8 +3008,26 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	if len(meta) > 0 && len(meta[0]) > 0 {
 		params["_meta"] = meta[0]
 	}
+	// Multi-tab: agent session/load REPLAYS the full conversation as
+	// session/update over the shared SSE bus. The tab that called
+	// /api/session-load drops those via historyLoading + HTTP history;
+	// every OTHER tab that is viewing the same session would otherwise
+	// APPEND the replay onto its existing scrollback (doubled timeline).
+	// Announce before the agent call so peers arm the drop gate first.
+	b.Broadcast(Event{
+		"type":      "session_load_started",
+		"sessionId": sessionID,
+		"cwd":       cwd,
+	})
 	sessRes, err := b.request(ctx, "session/load", params, bootTimeout)
 	if err != nil {
+		// Peers that armed on started must unstick (reload or clear gate).
+		b.Broadcast(Event{
+			"type":      "session_load_finished",
+			"sessionId": sessionID,
+			"cwd":       cwd,
+			"ok":        false,
+		})
 		return nil, err
 	}
 
@@ -2987,6 +3044,18 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	// Prefer fields from the load response — they reflect the restored session.
 	if m, ok := sessRes["models"]; ok && m != nil {
 		act.models = m
+		// 保留用户原选的 reasoningEffort：agent 在 load 时把持久化的
+		// 模型 id 映射到当前 catalog 键（如 deepseek-v4-flash →
+		// deepseek-v4-flash-go），响应 models 缺省 effort 时用缓存值
+		// 补上，避免前端回落到新模型的默认档（如 low）静默覆盖用户
+		// 原选的 max。同一 map 同时进 act.models / sessRes / ready 事件。
+		if prevEffort != "" {
+			if mm, ok := m.(map[string]any); ok {
+				if cur, _ := mm["reasoningEffort"].(string); cur == "" {
+					mm["reasoningEffort"] = prevEffort
+				}
+			}
+		}
 	}
 	if modes, ok := sessRes["modes"]; ok && modes != nil {
 		act.modes = modes
@@ -3036,6 +3105,15 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		ev["authMeta"] = authMeta
 	}
 	b.Broadcast(ev)
+	// Replay stream is complete once session/load returns — peers can
+	// rebuild from HTTP history now (initiator already does via its own
+	// loadHistory; this flag is for multi-tab viewers of the same sid).
+	b.Broadcast(Event{
+		"type":      "session_load_finished",
+		"sessionId": sessionID,
+		"cwd":       sessCwd,
+		"ok":        true,
+	})
 	b.broadcastRosterChange()
 	return sessRes, nil
 }
@@ -3109,6 +3187,21 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	}
 	b.mu.Unlock()
 
+	// Same effort-preservation rule as LoadSession: capture the cache
+	// up-front (the remap broadcast can race in during the request), then
+	// fill a missing reasoningEffort in the resume response models with
+	// the session's last-known value.
+	prevEffort := ""
+	b.mu.Lock()
+	if s := b.sessions[sessionID]; s != nil {
+		if m, ok := s.models.(map[string]any); ok {
+			if e, ok := m["reasoningEffort"].(string); ok {
+				prevEffort = e
+			}
+		}
+	}
+	b.mu.Unlock()
+
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -3139,6 +3232,16 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	// Prefer fields from the resume response — they reflect the session.
 	if m, ok := sessRes["models"]; ok && m != nil {
 		act.models = m
+		// 同 LoadSession：响应 models 缺 reasoningEffort 时用会话已知
+		// 档位补上（agent 模型 id 映射场景），避免静默重置为用户未
+		// 选过的默认档。
+		if prevEffort != "" {
+			if mm, ok := m.(map[string]any); ok {
+				if cur, _ := mm["reasoningEffort"].(string); cur == "" {
+					mm["reasoningEffort"] = prevEffort
+				}
+			}
+		}
 	}
 	if modes, ok := sessRes["modes"]; ok && modes != nil {
 		act.modes = modes

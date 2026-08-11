@@ -163,6 +163,9 @@ type PendingReq struct {
 	RequestID string         `json:"requestId"`
 	Method    string         `json:"method"`
 	Params    map[string]any `json:"params,omitempty"`
+	// SessionID: owning session (multi-session clients filter pending on
+	// switch/resume; absent on very old hosts).
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 // SessionInfoDetail — POST /api/session-info response: authoritative live
