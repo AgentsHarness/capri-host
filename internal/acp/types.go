@@ -73,6 +73,11 @@ type Status struct {
 	// AgentStartedAt (unix ms) stamps the current agent process spawn —
 	// clients detect agent restarts by comparing it across hello events.
 	AgentStartedAt int64 `json:"agentStartedAt,omitempty"`
+	// PermissionMode is the host's process-global view of the agent's
+	// canonical permission mode (ask / auto / always-approve). Always
+	// present ("ask" = agent default): clients restore their permission
+	// badge from this on connect instead of browser storage.
+	PermissionMode string `json:"permissionMode"`
 }
 
 // SessionState is the host-side live state of one session in the roster.

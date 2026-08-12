@@ -152,25 +152,34 @@ func TestPromptWhileBusyForwardsAndBothSucceed(t *testing.T) {
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
 	s, b := newFakeAgentServer(t)
 	createActiveSession(t, s)
+	ch, unsub := b.Subscribe()
+	defer unsub()
 
 	// A：慢回合（delay 挂住在飞）；B 在 A 在飞时发出。
 	recA := make(chan *httptest.ResponseRecorder, 1)
 	go func() { recA <- postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"a"}]}`) }()
 	waitBusy(t, b, "sess-new")
 
-	// B 在 busy 会话上：必须 200 并转发（agent 排队），而不是 409。
+	// B 在 busy 会话上：必须 200（受理）并转发（agent 排队），而不是 409。
 	recB := postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"b"}]}`)
 	if recB.Code != http.StatusOK {
 		t.Fatalf("busy-session prompt status = %d, body=%s — want 200 (forwarded to agent queue)",
 			recB.Code, recB.Body.String())
 	}
-	if sr, _ := decodeBody(t, recB)["stopReason"].(string); sr != "end_turn" {
-		t.Fatalf("busy-session prompt body = %s, want stopReason=end_turn", recB.Body.String())
+	if m := decodeBody(t, recB); m["ok"] != true {
+		t.Fatalf("busy-session prompt body = %v, want ok:true", m)
 	}
 
 	ra := <-recA
 	if ra.Code != http.StatusOK {
 		t.Fatalf("first prompt status = %d, body=%s", ra.Code, ra.Body.String())
+	}
+
+	// 受理即返回后成功只能从 live 通道确认：两个回合都以 done 事件收口。
+	// 先等收口再数 wire 记录——B 的 session/prompt 行要等 fake agent
+	// 答完 A（delay 500ms）后才会被读到。
+	for i := 0; i < 2; i++ {
+		waitEvent(t, ch, func(ev acp.Event) bool { return ev["type"] == "done" })
 	}
 
 	// 两个 prompt 都转发到了 agent：wire 上有两条 session/prompt。
