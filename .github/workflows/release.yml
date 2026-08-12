@@ -41,7 +41,7 @@ jobs:
         run: npm run build
 
       - name: Upload dist
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: acp-fe-dist
           path: acp-fe/dist
@@ -72,7 +72,7 @@ jobs:
       # internal/server/web/dist 被 .gitignore 忽略、不在仓库里，
       # 必须先把前端构建产物放进去，go:embed web/dist 才能编译。
       - name: Install frontend dist into embed dir
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           name: acp-fe-dist
           path: internal/server/web/dist
@@ -94,7 +94,7 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o "dist/acp-host-${GOOS}-${GOARCH}${ext}" ./cmd/acp-host
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: acp-host-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/acp-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
@@ -108,7 +108,7 @@ jobs:
       # 只下载编译出的二进制，不要包含前端 dist（acp-fe-dist）
       # merge-multiple 让它们平铺到 dist/，再整体上传。
       - name: Download compiled binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: acp-host-*
