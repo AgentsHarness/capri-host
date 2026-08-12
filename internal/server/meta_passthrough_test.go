@@ -5,6 +5,9 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/benin/acp-host/internal/acp"
 )
 
 // meta_passthrough_test.go — 响应 `_meta` / 分页游标透传给浏览器的
@@ -12,36 +15,75 @@ import (
 // ACP_HOST_FAKE_AGENT_*_META env），host 必须原样透传；env 缺省时响应
 // 保持原 wire 形状（absent key ≠ off）。
 
-// ── POST /api/prompt：session/prompt 响应 `_meta` → 响应 `meta` ─────
+// ── POST /api/prompt：受理即返回；session/prompt 响应 `_meta` 经 SSE
+// ── done 事件的 `meta` 透传（HTTP 响应只确认受理，不再携带回合结果）──
 
-func TestPromptResponseMetaInHTTP(t *testing.T) {
-	t.Setenv(ACPHostFakeAgentPromptMeta, `{"turn_id":"t-1","cost":42}`)
-	s, _ := newFakeAgentServer(t)
+func TestPromptAcceptedImmediately(t *testing.T) {
+	// 慢速回合：POST 必须在回合结束前就返回（受理即返回），回合结果走
+	// live 通道的 done 事件。
+	t.Setenv(ACPHostFakeAgentPromptDelayMs, "600")
+	s, b := newFakeAgentServer(t)
+	createActiveSession(t, s)
+	ch, unsub := b.Subscribe()
+	defer unsub()
 
+	start := time.Now()
 	rec := postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"hi"}]}`)
+	elapsed := time.Since(start)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/api/prompt status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 	m := decodeBody(t, rec)
-	if m["stopReason"] != "end_turn" {
-		t.Errorf("stopReason = %v, want end_turn", m["stopReason"])
+	if m["ok"] != true {
+		t.Errorf("accepted body = %v, want ok:true", m)
 	}
-	want := map[string]any{"turn_id": "t-1", "cost": float64(42)}
-	if !reflect.DeepEqual(m["meta"], want) {
-		t.Errorf("meta = %v, want %v", m["meta"], want)
+	if _, has := m["stopReason"]; has {
+		t.Errorf("accept response must not carry stopReason: %v", m)
+	}
+	if _, has := m["meta"]; has {
+		t.Errorf("accept response must not carry meta: %v", m)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("accept took %v with a 600ms turn — POST must return at accept time, not turn end", elapsed)
+	}
+	// 回合结果经 live 通道送达：done 事件带 stopReason。
+	ev := waitEvent(t, ch, func(ev acp.Event) bool { return ev["type"] == "done" })
+	if ev["stopReason"] != "end_turn" {
+		t.Errorf("done stopReason = %v, want end_turn", ev["stopReason"])
 	}
 }
 
-func TestPromptResponseOmitsMetaWhenAbsent(t *testing.T) {
-	s, _ := newFakeAgentServer(t)
+func TestPromptResponseMetaViaDoneEvent(t *testing.T) {
+	t.Setenv(ACPHostFakeAgentPromptMeta, `{"turn_id":"t-1","cost":42}`)
+	s, b := newFakeAgentServer(t)
+	createActiveSession(t, s)
+	ch, unsub := b.Subscribe()
+	defer unsub()
 
 	rec := postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"hi"}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/api/prompt status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	m := decodeBody(t, rec)
-	if _, ok := m["meta"]; ok {
-		t.Errorf("response must not carry meta when the agent returned none: %v", m)
+	ev := waitEvent(t, ch, func(ev acp.Event) bool { return ev["type"] == "done" })
+	want := map[string]any{"turn_id": "t-1", "cost": float64(42)}
+	if !reflect.DeepEqual(ev["meta"], want) {
+		t.Errorf("done meta = %v, want %v", ev["meta"], want)
+	}
+}
+
+func TestPromptDoneOmitsMetaWhenAbsent(t *testing.T) {
+	s, b := newFakeAgentServer(t)
+	createActiveSession(t, s)
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	rec := postJSON(t, s, "/api/prompt", `{"blocks":[{"type":"text","text":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/prompt status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	ev := waitEvent(t, ch, func(ev acp.Event) bool { return ev["type"] == "done" })
+	if _, ok := ev["meta"]; ok {
+		t.Errorf("done must not carry meta when the agent returned none: %v", ev)
 	}
 }
 

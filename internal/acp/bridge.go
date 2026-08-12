@@ -74,6 +74,13 @@ type Bridge struct {
 	// the agent's permission mode is in-memory only and resets on restart,
 	// so the browser re-seeds its known flags to keep behavior in sync.
 	agentStartedAt int64
+	// permMode is the host's process-global view of the agent's canonical
+	// permission mode (ask / auto / always-approve). Written on every
+	// client-initiated toggle (SetPermissionMode) and every agent echo of
+	// yolo_mode_changed; reset to "ask" on agent (re)spawn. Surfaced on
+	// hello so a connecting client restores its badge from the agent's
+	// real state instead of stale browser storage.
+	permMode string
 	// Roster: every session created in this process (or loaded), keyed by
 	// sessionId, with host-side live state (busy / awaiting input).
 	sessions        map[string]*SessionState
@@ -554,6 +561,9 @@ func (b *Bridge) Snapshot() Status {
 		Capabilities:      DefaultClientCaps(),
 		Roster:            roster,
 		AgentStartedAt:    b.agentStartedAt,
+		// b.mu is already held (Snapshot locks at entry) — read the field
+		// directly, never via PermissionMode() (it would self-deadlock).
+		PermissionMode: b.permMode,
 	}
 }
 
@@ -1057,6 +1067,9 @@ func (b *Bridge) ensureProcess() error {
 	b.stdin = stdin
 	b.cancelRd = cancelRd
 	b.agentStartedAt = time.Now().UnixMilli()
+	// Fresh agent process: its in-memory permission mode is the default
+	// ask (the agent never persists it), so the host's mirror resets too.
+	b.permMode = "ask"
 	b.mu.Unlock()
 
 	go b.readStdout(rdCtx, stdout)
@@ -1856,7 +1869,15 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		b.mu.Unlock()
 		b.Broadcast(withSid(Event{"type": "git_head_changed", "params": params}))
 	case "x.ai/yolo_mode_changed":
-		b.Broadcast(withSid(Event{"type": "yolo_mode_changed", "params": params}))
+		// Permission-mode change: CLIENT-SCOPED on the agent side (applies
+		// to every resident session of the sending client), so the broadcast
+		// deliberately carries NO sessionId — withSid's active-session
+		// fallback would mis-tag it in multi-session setups and mislead
+		// frontends into treating a global toggle as session-scoped.
+		// Also mirror the agent's (echoed) mode into the host record so
+		// later hello snapshots carry the agent's real state.
+		b.recordPermissionMode(permissionModeFromParams(params))
+		b.Broadcast(Event{"type": "yolo_mode_changed", "params": params})
 	case "x.ai/mcp/server_status":
 		b.Broadcast(withSid(Event{"type": "mcp_server_status", "params": params}))
 	case "x.ai/mcp/tools_changed", "x.ai/mcp_initialized":
@@ -2412,9 +2433,14 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		b.mu.Unlock()
 		if hasLast {
 			if err := b.restoreLastSession(ctx); err != nil {
+				// 受理即返回后 prompt 的 HTTP 响应不再携带回合级错误：
+				// 恢复失败必须经 live 通道送达。会话尚不存在 → 无
+				// sessionId，前端按 host 级错误渲染（横幅 + conn error）。
+				b.broadcastPromptError("", err)
 				return "", nil, err
 			}
 		} else if err := b.NewSession(ctx, SessionConfig{}); err != nil {
+			b.broadcastPromptError("", err)
 			return "", nil, err
 		}
 		b.mu.Lock()
@@ -2423,6 +2449,10 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	if s == nil {
 		b.mu.Unlock()
+		// 显式未知会话通常被 handlePrompt 的同步检查拦成 HTTP 404；
+		// 走到这里说明是竞态（受理后会话被删）或 bridge 直连调用——
+		// 补一条 live 事件，前端按带 sessionId 的回合级错误渲染。
+		b.broadcastPromptError(sessionID, &HTTPError{Code: 404, Msg: "会话不存在"})
 		return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
 	}
 	// A busy session no longer 409s: the agent accepts mid-turn
@@ -2472,15 +2502,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	res, err := b.request(ctx, "session/prompt", params, promptTimeout)
 	if err != nil {
-		// source 标记（前端据此渲染）：agent 报错（RPCError — 进程活着、
-		// 拒绝了回合）vs 传输失败（超时/写失败 — agent 可能不可达）。
-		// 老版本客户端忽略该字段，仅按带 sessionId 的回合错误处理。
-		source := "transport"
-		var rpcErr *RPCError
-		if errors.As(err, &rpcErr) {
-			source = "agent"
-		}
-		b.Broadcast(Event{"type": "error", "message": err.Error(), "sessionId": sessionID, "source": source})
+		b.broadcastPromptError(sessionID, err)
 		// The client (browser) went away mid-turn. The agent process may be
 		// perfectly healthy — and other sessions may be running parallel
 		// turns in the same process — so never killProcess here: that would
@@ -2501,6 +2523,9 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// on this path (a failed restore leaves the user without an active
 		// chat rather than a silent blank one). The failed turn is not
 		// retried.
+		// 自愈需要区分 RPCError 与传输失败（见 broadcastPromptError 的
+		// source 判定），这里只关心"非 RPCError 即传输级"。
+		var rpcErr *RPCError
 		if !errors.As(err, &rpcErr) {
 			b.mu.Lock()
 			if s := b.sessions[sessionID]; s != nil {
@@ -2536,6 +2561,37 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	b.Broadcast(ev)
 	return sr, meta, nil
+}
+
+// broadcastPromptError surfaces a prompt-turn failure on the live channel.
+// POST /api/prompt accepts immediately and no longer carries turn-level
+// error bodies, so every turn failure must ride the SSE/WS event stream.
+// source 标记（前端据此渲染）：agent 报错（RPCError — 进程活着、拒绝了
+// 回合）vs 传输失败（超时/写失败 — agent 可能不可达）；老版本客户端忽略
+// 该字段，仅按带 sessionId 的回合错误处理。sessionId 为空（如恢复/新建
+// 会话失败，会话尚不存在）时省略该键，前端按 host 级错误渲染。
+func (b *Bridge) broadcastPromptError(sessionID string, err error) {
+	source := "transport"
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) {
+		source = "agent"
+	}
+	ev := Event{"type": "error", "message": err.Error(), "source": source}
+	if sessionID != "" {
+		ev["sessionId"] = sessionID
+	}
+	b.Broadcast(ev)
+}
+
+// HasSession reports whether the named session is in the roster — a pure
+// in-memory check with no agent interaction. handlePrompt uses it to 404
+// an explicitly-targeted unknown session synchronously, before accepting
+// the prompt.
+func (b *Bridge) HasSession(sessionID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.sessions[sessionID]
+	return ok
 }
 
 // Cancel sends session/cancel for the given session (default: active) and
@@ -4036,8 +4092,10 @@ func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[stri
 
 // PermissionsReset sends x.ai/permissions/reset: {sessionId} — clears the
 // remembered permission decisions. Like toggle_plan_mode the agent only
-// handles it as a notification (it resets ALL resident sessions, ignoring
-// the sessionId), so the host writes it without a JSON-RPC id.
+// handles it as a notification, and it resets ALL resident sessions
+// (ignoring the sessionId — the agent's handler iterates every session,
+// with no client/session scoping), so the host writes it without a
+// JSON-RPC id. Frontends should treat it as process-global.
 func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
 	return b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{"sessionId": sessionID})
 }
@@ -4047,8 +4105,14 @@ func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[st
 // always-approve). session/set_mode only understands the session-mode ids
 // (plan / default / ask), so permission modes MUST go through this
 // notification instead (TUI parity: the pager persists + fires the same
-// payload). The agent applies it to every resident session of this client,
-// no sessionId needed. 'normal' maps to the agent's 'ask' canonical; the
+// payload).
+//
+// CLIENT-SCOPED, NOT per-session: the agent applies the notification to
+// EVERY resident session of the sending client (no sessionId is sent;
+// the agent's ext_notification handler matches on clientIdentifier when
+// present, else all sessions). Frontends must treat a permission-mode
+// change as process-global — every conversation's displayed mode flips
+// together. 'normal' maps to the agent's 'ask' canonical; the
 // unknown-id fallback is 'ask' too, so a stale frontend never dead-ends.
 func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
@@ -4065,6 +4129,10 @@ func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string
 	default: // normal / ask / anything unknown → 普通（ask）模式
 		params["permission_mode"] = "ask"
 	}
+	// Record the canonical mode BEFORE the write: the agent never echoes
+	// this notification back (it is fire-and-forget), so this record is
+	// what hello carries to clients that connect later.
+	b.recordPermissionMode(permissionModeFromParams(params))
 	if err := b.write(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "_x.ai/yolo_mode_changed",
@@ -4073,6 +4141,49 @@ func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string
 		return nil, err
 	}
 	return map[string]any{"ok": true}, nil
+}
+
+// permissionModeFromParams resolves the canonical permission mode
+// (ask / auto / always-approve) out of a yolo_mode_changed params map —
+// the same shape the FE and the agent echo use.
+func permissionModeFromParams(params map[string]any) string {
+	if p, ok := params["permission_mode"].(string); ok {
+		switch p {
+		case "always-approve", "always_approve", "yolo":
+			return "always-approve"
+		case "auto":
+			return "auto"
+		case "ask", "default", "normal", "plan":
+			return "ask"
+		}
+	}
+	if y, ok := params["yolo_mode"].(bool); ok && y {
+		return "always-approve"
+	}
+	if a, ok := params["auto_mode"].(bool); ok && a {
+		return "auto"
+	}
+	return "ask"
+}
+
+// recordPermissionMode stores the canonical permission mode (b.mu held).
+// This is the host's process-global view of the agent's permission mode:
+// it is written on every client-initiated toggle AND on every agent echo
+// (agent-internal changes, e.g. /yolo, the enable-always-approve option),
+// and reset to "ask" whenever the agent process is (re)spawned — the
+// agent's permission state lives in its process memory only.
+func (b *Bridge) recordPermissionMode(mode string) {
+	b.mu.Lock()
+	b.permMode = mode
+	b.mu.Unlock()
+}
+
+// PermissionMode returns the last-known canonical permission mode
+// (ask / auto / always-approve). "ask" is the agent's default.
+func (b *Bridge) PermissionMode() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.permMode
 }
 
 // MCPList calls x.ai/mcp/list: {sessionId?} → the agent's MCP server
