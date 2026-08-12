@@ -20,13 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout acp-fe (herness-console)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: AgentsHerness/herness-console
           ref: ${{ inputs.fe_ref || 'main' }}
           path: acp-fe
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
           cache: npm
@@ -41,7 +41,7 @@ jobs:
         run: npm run build
 
       - name: Upload dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: acp-fe-dist
           path: acp-fe/dist
@@ -67,17 +67,17 @@ jobs:
             goarch: arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # internal/server/web/dist 被 .gitignore 忽略、不在仓库里，
       # 必须先把前端构建产物放进去，go:embed web/dist 才能编译。
       - name: Install frontend dist into embed dir
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: acp-fe-dist
           path: internal/server/web/dist
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
           cache: true
@@ -94,7 +94,7 @@ jobs:
           go build -trimpath -ldflags "-s -w" -o "dist/acp-host-${GOOS}-${GOARCH}${ext}" ./cmd/acp-host
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: acp-host-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/acp-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
@@ -108,7 +108,7 @@ jobs:
       # 只下载编译出的二进制，不要包含前端 dist（acp-fe-dist）
       # merge-multiple 让它们平铺到 dist/，再整体上传。
       - name: Download compiled binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           pattern: acp-host-*
@@ -118,7 +118,7 @@ jobs:
         run: find dist -type f | sort
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: acp-host ${{ github.ref_name }}
           draft: false
