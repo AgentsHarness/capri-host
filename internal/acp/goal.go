@@ -132,18 +132,17 @@ const goalLoopTurnDelay = 3 * time.Second
 
 // ── control ──────────────────────────────────────────────────────────
 
-// GoalSet starts (or restarts) an autonomous goal on the active session.
-// Returns the new state. The first turn is fired by the loop goroutine,
-// which injects the goal instruction.
-func (b *Bridge) GoalSet(ctx context.Context, objective string, tokenBudget int64) (map[string]any, error) {
+// GoalSet starts (or restarts) an autonomous goal on the given session
+// (empty sessionId resolves to the active one). Returns the new state.
+// The goal binds to the resolved session — the loop prompts that session
+// and broadcasts are tagged with it. The first turn is fired by the loop
+// goroutine, which injects the goal instruction.
+func (b *Bridge) GoalSet(ctx context.Context, sessionID, objective string, tokenBudget int64) (map[string]any, error) {
 	objective = strings.TrimSpace(objective)
 	if objective == "" {
 		return nil, &HTTPError{Code: 400, Msg: "缺少目标描述"}
 	}
-	b.mu.Lock()
-	sid := b.activeSessionID
-	b.mu.Unlock()
-	if sid == "" {
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	now := time.Now().UnixMilli()
@@ -157,7 +156,7 @@ func (b *Bridge) GoalSet(ctx context.Context, objective string, tokenBudget int6
 		TokenBudget: tokenBudget,
 		StartedAt:   now,
 		ElapsedMs:   0,
-		sessionID:   sid,
+		sessionID:   sessionID,
 	}
 	b.goalLoopOn = true
 	b.goalStop = make(chan struct{})
@@ -169,16 +168,38 @@ func (b *Bridge) GoalSet(ctx context.Context, objective string, tokenBudget int6
 	return b.goalSnapshot(), nil
 }
 
-// GoalStatus returns the current goal state (nil when no goal is set).
-func (b *Bridge) GoalStatus() map[string]any {
-	return b.goalSnapshot()
+// GoalStatus returns the current goal state of the given session (empty
+// sessionId resolves to the active one). nil state, no error when no goal
+// is set at all; 404 when a goal exists but is bound to another session.
+func (b *Bridge) GoalStatus(sessionID string) (map[string]any, error) {
+	sessionID = b.resolveSessionID(sessionID)
+	b.goalMu.Lock()
+	defer b.goalMu.Unlock()
+	if b.goal == nil {
+		return nil, nil
+	}
+	if b.goal.sessionID != sessionID {
+		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
+	}
+	return b.goalSnapshotLocked(), nil
 }
 
-// GoalPause pauses an active goal (user_paused). The current in-flight
-// continuation turn finishes; the loop stops scheduling further turns.
-func (b *Bridge) GoalPause() (map[string]any, error) {
+// GoalPause pauses an active goal (user_paused) on the given session. The
+// current in-flight continuation turn finishes; the loop stops scheduling
+// further turns. Empty sessionId resolves to the active one; a goal bound
+// to another session is a 404.
+func (b *Bridge) GoalPause(sessionID string) (map[string]any, error) {
+	sessionID = b.resolveSessionID(sessionID)
 	b.goalMu.Lock()
-	if b.goal == nil || b.goal.Status != goalActive {
+	if b.goal == nil {
+		b.goalMu.Unlock()
+		return b.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
+	}
+	if b.goal.sessionID != sessionID {
+		b.goalMu.Unlock()
+		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
+	}
+	if b.goal.Status != goalActive {
 		b.goalMu.Unlock()
 		return b.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
 	}
@@ -190,12 +211,18 @@ func (b *Bridge) GoalPause() (map[string]any, error) {
 	return b.goalSnapshot(), nil
 }
 
-// GoalResume resumes a paused goal.
-func (b *Bridge) GoalResume() (map[string]any, error) {
+// GoalResume resumes a paused goal on the given session (empty sessionId
+// resolves to the active one; a goal bound to another session is a 404).
+func (b *Bridge) GoalResume(sessionID string) (map[string]any, error) {
+	sessionID = b.resolveSessionID(sessionID)
 	b.goalMu.Lock()
 	if b.goal == nil {
 		b.goalMu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前没有目标"}
+	}
+	if b.goal.sessionID != sessionID {
+		b.goalMu.Unlock()
+		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
 	}
 	if b.goal.Status != goalUserPaused && b.goal.Status != goalBlocked {
 		b.goalMu.Unlock()
@@ -215,12 +242,19 @@ func (b *Bridge) GoalResume() (map[string]any, error) {
 	return b.goalSnapshot(), nil
 }
 
-// GoalClear clears the goal (cleared). Stops the loop.
-func (b *Bridge) GoalClear() (map[string]any, error) {
+// GoalClear clears the goal on the given session (cleared; empty sessionId
+// resolves to the active one; a goal bound to another session is a 404).
+// Stops the loop.
+func (b *Bridge) GoalClear(sessionID string) (map[string]any, error) {
+	sessionID = b.resolveSessionID(sessionID)
 	b.goalMu.Lock()
 	if b.goal == nil {
 		b.goalMu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前没有目标"}
+	}
+	if b.goal.sessionID != sessionID {
+		b.goalMu.Unlock()
+		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
 	}
 	b.goal.Status = goalCleared
 	b.goal.Message = ""

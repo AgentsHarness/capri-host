@@ -482,6 +482,35 @@ func (s *Server) handleQueueReleaseEdit(w http.ResponseWriter, r *http.Request) 
 	s.queueNotify(w, r, "x.ai/queue/release_edit", map[string]any{"sessionId": body.SessionID, "id": body.ID})
 }
 
+// handleQueueStatus — 读端点 {sessionId}：返回该会话最近一次
+// x.ai/queue/changed 的缓存快照（host 内存，不落盘；本进程存活期间
+// 从未见过该会话的队列广播时 queue 为 null）。队列状态不随
+// session/load 回放（agent 不持久化 pending_inputs），FE 在加载会话后
+// 主动拉取以对齐本地镜像。与写端点不同：不发通知、不问 agent。
+func (s *Server) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.SessionID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId"})
+		return
+	}
+	out := map[string]any{
+		"ok":        true,
+		"sessionId": body.SessionID,
+	}
+	if snap := s.bridge.QueueStatus(body.SessionID); snap != nil {
+		out["queue"] = snap
+	} else {
+		out["queue"] = nil
+	}
+	writeJSON(w, 200, out)
+}
+
 // ── Skills / Plugins / Hooks / Marketplace / Workflows ────────────────
 
 func (s *Server) handleSkillsList(w http.ResponseWriter, r *http.Request) {

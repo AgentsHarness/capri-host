@@ -728,3 +728,58 @@ func TestNotificationSessionIdExplicitPreference(t *testing.T) {
 		}
 	})
 }
+
+// ── Part 3: 队列快照缓存（/api/queue/status 数据源）──────────────
+
+// x.ai/queue/changed 到达后 QueueStatus 返回该会话的克隆快照；未广播
+// 过/未知会话返回 nil；agent 进程重建（killProcess）后缓存作废。
+func TestQueueStatusSnapshotCache(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+
+	// 空 sid 与未广播会话 → nil。
+	if snap := b.QueueStatus(""); snap != nil {
+		t.Fatalf("QueueStatus(\"\") = %v, want nil", snap)
+	}
+	if snap := b.QueueStatus("s1"); snap != nil {
+		t.Fatalf("QueueStatus before any broadcast = %v, want nil", snap)
+	}
+
+	params := map[string]any{
+		"sessionId":         "s1",
+		"entries":           []any{map[string]any{"id": "q1", "text": "hello"}},
+		"running_prompt_id": "p1",
+	}
+	b.handleXaiNotification("x.ai/queue/changed", params)
+
+	snap := b.QueueStatus("s1")
+	if snap == nil {
+		t.Fatal("QueueStatus after broadcast = nil, want snapshot")
+	}
+	if snap["sessionId"] != "s1" {
+		t.Errorf("snapshot sessionId = %v, want s1", snap["sessionId"])
+	}
+	// 快照是深拷贝：改原 params 不得污染缓存。
+	params["running_prompt_id"] = "mutated"
+	if got := b.QueueStatus("s1")["running_prompt_id"]; got != "p1" {
+		t.Errorf("cached running_prompt_id = %v, want p1（快照必须是克隆）", got)
+	}
+
+	// 其他会话不受影响。
+	if snap2 := b.QueueStatus("other"); snap2 != nil {
+		t.Errorf("QueueStatus(other) = %v, want nil", snap2)
+	}
+
+	// 再次广播 → 覆盖为最新快照。
+	b.handleXaiNotification("x.ai/queue/changed", map[string]any{
+		"sessionId": "s1", "entries": []any{}, "running_prompt_id": nil,
+	})
+	if got := b.QueueStatus("s1")["running_prompt_id"]; got != nil {
+		t.Errorf("running_prompt_id after empty broadcast = %v, want nil", got)
+	}
+
+	// agent 进程重建（同 killProcess 清空路径）→ 缓存作废。
+	b.killProcess()
+	if snap3 := b.QueueStatus("s1"); snap3 != nil {
+		t.Errorf("QueueStatus after killProcess = %v, want nil", snap3)
+	}
+}

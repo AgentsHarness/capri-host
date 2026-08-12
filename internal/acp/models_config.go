@@ -4,12 +4,42 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/BurntSushi/toml"
 )
+
+// normalizeConfigValue converts JSON-derived float64s back to integer-typed
+// TOML literals when the value is numerically integral. encoding/json has no
+// integer type for map[string]any — a FE-sent context_window=1000000 arrives
+// as float64, and BurntSushi/toml renders float64 with %g, emitting `1e+06`
+// (a valid TOML float, but the agent's schema types context_window /
+// max_retries / … as integers, so the watcher rejects the hot reload).
+// temperature / top_p stay floats (f64 in the agent schema) — even when the
+// user types an integral value, they must keep their float literal — and
+// genuinely fractional values keep their float form too.
+func normalizeConfigValue(k string, v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for nk, nv := range x {
+			out[nk] = normalizeConfigValue(nk, nv)
+		}
+		return out
+	case float64:
+		switch k {
+		case "temperature", "top_p":
+			return v
+		}
+		if x == math.Trunc(x) && x >= float64(math.MinInt64) && x < float64(math.MaxInt64) {
+			return int64(x)
+		}
+	}
+	return v
+}
 
 // config.toml 的 `[models]` / `[model.<id>]` 原子读改写 —— FE 侧「设为默认
 // 模型」与「自定义模型可视化配置」的落盘层。语义对齐 TUI（xai-grok-shell
@@ -174,7 +204,7 @@ func (b *Bridge) UpsertCustomModel(id string, values map[string]any) error {
 		if k == "id" {
 			continue
 		}
-		section[k] = v
+		section[k] = normalizeConfigValue(k, v)
 	}
 	path, err := b.ConfigTOMLPath()
 	if err != nil {

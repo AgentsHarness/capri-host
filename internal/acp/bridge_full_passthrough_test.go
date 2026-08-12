@@ -629,3 +629,78 @@ func TestXaiCall(t *testing.T) {
 		}
 	})
 }
+
+// ── NotificationMeta forwarding ─────────────────────────────────────
+
+// chunk / user_chunk / thought must carry the shell-stamped authoritative
+// timestamps (params._meta): turnStartMs (FE "Worked for Xs" anchoring),
+// agentTimestampMs (user row ts correction), and the computed elapsedMs
+// (agentTimestampMs - streamStartMs, real thought duration). Without them
+// the FE measures adopted (queue-drained) turns from the adoption moment.
+func TestStreamEventsForwardTurnStartMs(t *testing.T) {
+	meta := map[string]any{
+		"turnStartMs":      float64(1700000000000),
+		"agentTimestampMs": float64(1700000000000 + 30000),
+		"streamStartMs":    float64(1700000000000 + 20000),
+	}
+	cases := []struct {
+		name   string
+		kind   string
+		want   string
+		update map[string]any
+	}{
+		{
+			name: "agent_message_chunk",
+			kind: "agent_message_chunk",
+			want: "chunk",
+			update: map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"content":       map[string]any{"type": "text", "text": "hi"},
+			},
+		},
+		{
+			name: "user_message_chunk",
+			kind: "user_message_chunk",
+			want: "user_chunk",
+			update: map[string]any{
+				"sessionUpdate": "user_message_chunk",
+				"content":       map[string]any{"type": "text", "text": "q"},
+			},
+		},
+		{
+			name: "agent_thought_chunk",
+			kind: "agent_thought_chunk",
+			want: "thought",
+			update: map[string]any{
+				"sessionUpdate": "agent_thought_chunk",
+				"content":       map[string]any{"type": "text", "text": "think"},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+			ch, unsub := b.Subscribe()
+			defer unsub()
+			b.handleSessionUpdate(map[string]any{
+				"sessionId": "s1",
+				"_meta":     meta,
+				"update":    c.update,
+			})
+			ev := <-ch
+			if ev["type"] != c.want {
+				t.Fatalf("event type = %v, want %s", ev["type"], c.want)
+			}
+			if ev["turnStartMs"] != float64(1700000000000) {
+				t.Errorf("turnStartMs = %v, want 1700000000000（params._meta 权威盖章）", ev["turnStartMs"])
+			}
+			if ev["agentTimestampMs"] != float64(1700000030000) {
+				t.Errorf("agentTimestampMs = %v, want 1700000030000", ev["agentTimestampMs"])
+			}
+			// 只有 thought 需要 elapsedMs,但统一计算无害。asInt 侧是 int64。
+			if got, _ := ev["elapsedMs"].(int64); got != 10000 {
+				t.Errorf("elapsedMs = %v, want 10000（agentTimestampMs - streamStartMs）", ev["elapsedMs"])
+			}
+		})
+	}
+}
