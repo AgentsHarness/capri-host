@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -159,14 +158,8 @@ func (b *Bridge) dismissCampaignIds(ids []string) error {
 	}
 	// Advisory lock on campaigns_state.json.lock (the agent uses the same
 	// lock file), best-effort: a lock failure still proceeds.
-	lock, lerr := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if lerr == nil {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX)
-		defer func() {
-			_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-			_ = lock.Close()
-		}()
-	}
+	release := lockCampaignsState(path)
+	defer release()
 
 	table, existing, err := readCampaignsState(path)
 	if err != nil {
