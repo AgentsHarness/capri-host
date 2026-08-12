@@ -71,7 +71,8 @@ func TestGoalAnalyzeCompletesAfterEvidenceRound(t *testing.T) {
 	if !done {
 		t.Fatal("evidence-backed claim must terminate the goal")
 	}
-	if st := b.GoalStatus(); st["status"] != goalComplete {
+	st, _ := b.GoalStatus("s1")
+	if st["status"] != goalComplete {
 		t.Fatalf("status = %v, want complete", st["status"])
 	}
 }
@@ -95,7 +96,8 @@ func TestGoalAnalyzeBlocked(t *testing.T) {
 	if !done {
 		t.Fatal("blocked claim must terminate the goal")
 	}
-	if st := b.GoalStatus(); st["status"] != goalBlocked {
+	st, _ := b.GoalStatus("s1")
+	if st["status"] != goalBlocked {
 		t.Fatalf("status = %v, want blocked", st["status"])
 	}
 }
@@ -120,7 +122,7 @@ func TestGoalAnalyzeBudget(t *testing.T) {
 	if !done {
 		t.Fatal("budget overrun must terminate the goal")
 	}
-	st := b.GoalStatus()
+	st, _ := b.GoalStatus("s1")
 	if st["status"] != goalBudgetLimited {
 		t.Fatalf("status = %v, want budget_limited", st["status"])
 	}
@@ -167,7 +169,8 @@ func TestGoalAnalyzeAgentNotification(t *testing.T) {
 	if !done {
 		t.Fatal("agent terminal notification must end the loop")
 	}
-	if st := b.GoalStatus(); st["status"] != goalComplete {
+	st, _ := b.GoalStatus("s1")
+	if st["status"] != goalComplete {
 		t.Fatalf("status = %v, want complete", st["status"])
 	}
 }
@@ -226,7 +229,8 @@ func TestGoalAnalyzeUpdateGoalTool(t *testing.T) {
 	if !done {
 		t.Fatal("blocked_reason must terminate")
 	}
-	if st := b2.GoalStatus(); st["status"] != goalBlocked {
+	st, _ := b2.GoalStatus("s1")
+	if st["status"] != goalBlocked {
 		t.Fatalf("status = %v, want blocked", st["status"])
 	}
 }

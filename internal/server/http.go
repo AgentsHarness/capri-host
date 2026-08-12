@@ -112,6 +112,7 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/queue/interject", s.handleQueueInterject)
 	mux.HandleFunc("POST /api/queue/hold-edit", s.handleQueueHoldEdit)
 	mux.HandleFunc("POST /api/queue/release-edit", s.handleQueueReleaseEdit)
+	mux.HandleFunc("POST /api/queue/status", s.handleQueueStatus)
 	mux.HandleFunc("POST /api/skills/list", s.handleSkillsList)
 	mux.HandleFunc("POST /api/skills/toggle", s.handleSkillsToggle)
 	mux.HandleFunc("POST /api/skills/add", s.handleSkillsAdd)
@@ -662,7 +663,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 }
 
 type modeBody struct {
-	ModeID string `json:"modeId"`
+	ModeID    string `json:"modeId"`
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
@@ -684,7 +686,7 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
-	res, err := s.bridge.SetMode(r.Context(), body.ModeID)
+	res, err := s.bridge.SetMode(r.Context(), body.SessionID, body.ModeID)
 	if err != nil {
 		writeAgentError(w, "session/set-mode", err)
 		return
@@ -695,6 +697,7 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 type setModelBody struct {
 	ModelID         string `json:"modelId"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	SessionID       string `json:"sessionId,omitempty"`
 }
 
 func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
@@ -703,7 +706,7 @@ func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modelId"})
 		return
 	}
-	if err := s.bridge.SetModel(r.Context(), body.ModelID, body.ReasoningEffort); err != nil {
+	if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
 		writeAgentError(w, "session/set-model", err)
 		return
 	}
@@ -856,6 +859,12 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		"hasMore":    page.HasMore,
 		"updates":    page.Updates,
 	}
+	// promptStarts: pass through so FE can page history one user-turn at a
+	// time (see chat.ts previousTurnWindow). Omit when empty — older agents
+	// and pure offset/limit pages never set it.
+	if len(page.PromptStarts) > 0 {
+		out["promptStarts"] = page.PromptStarts
+	}
 	if body.Stream {
 		// stream=true: the agent does not return the updates in this
 		// response — the real data arrives as session_updates_chunk SSE
@@ -926,11 +935,13 @@ func (s *Server) handleGitInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// handleSessionFork forks the current session via x.ai/session/fork.
+// handleSessionFork forks the given session via x.ai/session/fork
+// ({sessionId?} empty resolves to the active one).
 type forkBody struct {
-	SourceCwd     string `json:"sourceCwd"`
-	NewCwd        string `json:"newCwd"`
-	NewSessionID  string `json:"newSessionId"`
+	SessionID    string `json:"sessionId,omitempty"`
+	SourceCwd    string `json:"sourceCwd"`
+	NewCwd       string `json:"newCwd"`
+	NewSessionID string `json:"newSessionId"`
 	SourceWorkDir string `json:"sourceWorkspaceDir"`
 }
 
@@ -950,7 +961,7 @@ func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
 	if body.SourceWorkDir != "" {
 		params["sourceWorkspaceDir"] = body.SourceWorkDir
 	}
-	res, err := s.bridge.ForkSession(r.Context(), params)
+	res, err := s.bridge.ForkSession(r.Context(), body.SessionID, params)
 	if err != nil {
 		writeAgentError(w, "session/fork", err)
 		return
@@ -958,16 +969,18 @@ func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
-// handleSessionRename renames the current session via x.ai/session/rename.
+// handleSessionRename renames the given session via x.ai/session/rename
+// ({sessionId?} empty resolves to the active one).
 func (s *Server) handleSessionRename(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Title string `json:"title"`
+		SessionID string `json:"sessionId,omitempty"`
+		Title     string `json:"title"`
 	}
 	if err := readJSON(r, &body); err != nil || body.Title == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 title"})
 		return
 	}
-	res, err := s.bridge.RenameSession(r.Context(), body.Title)
+	res, err := s.bridge.RenameSession(r.Context(), body.SessionID, body.Title)
 	if err != nil {
 		writeAgentError(w, "session/rename", err)
 		return
@@ -976,12 +989,14 @@ func (s *Server) handleSessionRename(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRecap fires x.ai/recap (fire-and-forget "where was I" summary).
+// {sessionId?} empty resolves to the active session.
 func (s *Server) handleRecap(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Auto bool `json:"auto"`
+		SessionID string `json:"sessionId,omitempty"`
+		Auto      bool   `json:"auto"`
 	}
 	_ = readJSON(r, &body)
-	res, err := s.bridge.Recap(r.Context(), body.Auto)
+	res, err := s.bridge.Recap(r.Context(), body.SessionID, body.Auto)
 	if err != nil {
 		writeAgentError(w, "session/recap", err)
 		return
@@ -989,27 +1004,38 @@ func (s *Server) handleRecap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
-// handleSessionInfo serves the active session's details on demand
+// handleSessionInfo serves the given session's details on demand
 // (TUI /session-info analog) — no client-side state reconstruction.
+// {sessionId?}: empty resolves to the active session.
 func (s *Server) handleSessionInfo(w http.ResponseWriter, r *http.Request) {
-	info := s.bridge.SessionInfo()
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = readJSON(r, &body)
+	info := s.bridge.SessionInfo(body.SessionID)
 	if info == nil {
-		writeJSON(w, 404, map[string]any{"ok": false, "error": "暂无活动会话"})
+		msg := "暂无活动会话"
+		if body.SessionID != "" {
+			msg = "未知会话"
+		}
+		writeJSON(w, 404, map[string]any{"ok": false, "error": msg})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "session": info})
 }
 
-// handleSubagentCancel cancels a subagent via x.ai/subagent/cancel.
+// handleSubagentCancel cancels a subagent via x.ai/subagent/cancel
+// ({sessionId?} empty resolves to the active session).
 func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		SessionID  string `json:"sessionId,omitempty"`
 		SubagentID string `json:"subagentId"`
 	}
 	if err := readJSON(r, &body); err != nil || body.SubagentID == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 subagentId"})
 		return
 	}
-	res, err := s.bridge.SubagentCancel(r.Context(), body.SubagentID)
+	res, err := s.bridge.SubagentCancel(r.Context(), body.SessionID, body.SubagentID)
 	if err != nil {
 		writeAgentError(w, "x.ai/subagent/cancel", err)
 		return
@@ -1017,16 +1043,18 @@ func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
-// handleTaskKill kills a background task via x.ai/task/kill.
+// handleTaskKill kills a background task via x.ai/task/kill
+// ({sessionId?} empty resolves to the active session).
 func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		TaskID string `json:"taskId"`
+		SessionID string `json:"sessionId,omitempty"`
+		TaskID    string `json:"taskId"`
 	}
 	if err := readJSON(r, &body); err != nil || body.TaskID == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 taskId"})
 		return
 	}
-	res, err := s.bridge.TaskKill(r.Context(), body.TaskID)
+	res, err := s.bridge.TaskKill(r.Context(), body.SessionID, body.TaskID)
 	if err != nil {
 		writeAgentError(w, "x.ai/task/kill", err)
 		return

@@ -46,6 +46,14 @@ type Bridge struct {
 	// racing the boot and failing with "grok 进程未运行".
 	bootDone  chan struct{}
 	bootError string
+	// bootOK marks a boot attempt that COMPLETED successfully (process up,
+	// initialize + authenticate done). It is distinct from ready: a
+	// successful boot no longer creates a session, so ready only flips once
+	// createSession / LoadSession / session/resume succeeds — between those
+	// two moments a waiter must not mistake "booted, no session yet" for a
+	// boot failure. Cleared on boot start, boot failure, killProcess and
+	// process death.
+	bootOK bool
 	agentInfo map[string]any
 	// authMeta: the `_meta` from the authenticate response (AuthMeta:
 	// email/auth_mode/team_id/team_name/is_zdr/team_role/
@@ -70,6 +78,14 @@ type Bridge struct {
 	// sessionId, with host-side live state (busy / awaiting input).
 	sessions        map[string]*SessionState
 	activeSessionID string
+
+	// queueSnapshots caches the most recent x.ai/queue/changed params per
+	// session (sessionId → params). The agent's prompt queue is in-memory
+	// only — never persisted, never replayed on session/load — so a client
+	// that missed broadcasts while disconnected would keep a stale mirror
+	// forever. Every forwarded queue_changed is stashed here and served on
+	// demand via /api/queue/status for the FE to re-align after load.
+	queueSnapshots map[string]map[string]any
 
 	// Last focused session survives process death / host restart so we can
 	// session/load it instead of session/new (which would open a blank chat).
@@ -276,6 +292,19 @@ func mustCwd() string {
 		return "."
 	}
 	return wd
+}
+
+// normCwd 去掉 cwd 的尾部斜杠(根目录 "/" 除外),保证同一工作区的
+// "/a/b" 与 "/a/b/" 在 grok 侧落进同一个会话目录,不再分裂成两个
+// 编码目录(如 …/acp-host 与 …/acp-host%2F)。
+func normCwd(cwd string) string {
+	if cwd == "" {
+		return cwd
+	}
+	if t := strings.TrimRight(cwd, "/"); t != "" {
+		return t
+	}
+	return "/"
 }
 
 // Subscribe returns a buffered event channel; call unsubscribe to remove.
@@ -543,13 +572,13 @@ func (b *Bridge) Boot(ctx context.Context) error {
 // process).
 func (b *Bridge) ensureBooted(ctx context.Context) error {
 	b.mu.Lock()
-	if b.ready {
+	// bootOK: the process is up and initialize + authenticate already
+	// succeeded (just no session active yet) — nothing left to boot.
+	if b.ready || b.bootOK {
 		b.mu.Unlock()
 		return nil
 	}
 	if b.booting {
-		done := b.bootDone
-		b.mu.Unlock()
 		// The waiter's own ctx may be cancelled first (e.g. the client
 		// disconnected), but that is NOT a boot failure: the boot is
 		// bounded by bootTimeout and may still succeed. Reporting ctx.Err()
@@ -557,13 +586,43 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		// wedged agent and killProcess a healthy process. Keep waiting for
 		// the in-flight boot (bootDone always closes, even on boot error)
 		// and return its real outcome.
+		//
+		// A finished boot has three outcomes, and a waiter must not
+		// misread any of them:
+		//   - ready: a session became active — done.
+		//   - bootError: the boot failed — report its real error.
+		//   - bootOK: the boot succeeded but no session is active yet
+		//     (ensureBooted never creates a session; ready only flips once
+		//     createSession / LoadSession / session/resume succeeds). This
+		//     is NOT a boot failure — return nil so the caller proceeds to
+		//     establish its own session on the booted process.
+		// A waiter that wakes from a bootDone a NEWER boot has already
+		// replaced (booting=true with a different channel) must chain onto
+		// that newer boot instead of inventing a failure: its outcome
+		// fields are reset (bootOK=false, bootError=""), so judging them
+		// would report "agent 启动失败" against a healthy process. In
+		// production a finished boot flips booting=false and closes its
+		// bootDone in one critical section (the boot role's defer), so
+		// booting=true with the SAME channel means the channel was closed
+		// without a live boot behind it — treat it as a finished boot and
+		// judge its outcome.
+		done := b.bootDone
+		b.mu.Unlock()
 		<-done
-		// The in-flight boot finished; re-check its outcome.
 		b.mu.Lock()
 		ready := b.ready
 		errMsg := b.bootError
+		ok := b.bootOK
+		booting := b.booting
+		sameDone := b.bootDone == done
 		b.mu.Unlock()
-		if ready {
+		if booting && !sameDone {
+			// The boot we waited on ended and a newer one is in flight —
+			// chain onto it (each recursion waits on a strictly newer
+			// bootDone, so this cannot loop on the same boot).
+			return b.ensureBooted(ctx)
+		}
+		if ready || ok {
 			return nil
 		}
 		if errMsg != "" {
@@ -573,6 +632,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	}
 	b.booting = true
 	b.bootError = ""
+	b.bootOK = false
 	b.bootDone = make(chan struct{})
 	b.mu.Unlock()
 
@@ -664,6 +724,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	authMeta := b.authMeta
 	hostID := b.hostID
 	hostName := b.hostName
+	b.bootOK = true
 	b.mu.Unlock()
 	if noSession {
 		ev := Event{
@@ -794,6 +855,7 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	if cwd == "" {
 		cwd = mustCwd()
 	}
+	cwd = normCwd(cwd)
 	addDirs := sc.AdditionalDirectories
 	if addDirs == nil {
 		addDirs = []string{}
@@ -960,6 +1022,7 @@ func (b *Bridge) setBootError(msg string) {
 	b.mu.Lock()
 	b.bootError = msg
 	b.ready = false
+	b.bootOK = false
 	b.mu.Unlock()
 }
 
@@ -1025,9 +1088,13 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 		b.cmd = nil
 		b.stdin = nil
 		b.ready = false
+		b.bootOK = false
 		b.sessions = make(map[string]*SessionState)
 		b.activeSessionID = ""
 		b.textBuf = ""
+		// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
+		// 一并作废，避免 /api/queue/status 回放过期队列。
+		b.queueSnapshots = nil
 		// lastSessionID / lastSessionCwd intentionally survive.
 		if b.cancelRd != nil {
 			b.cancelRd()
@@ -1242,6 +1309,38 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	}
 }
 
+// attachStreamMeta copies the shell-stamped NotificationMeta (params._meta)
+// onto a typed stream event:
+//   - turnStartMs → ev["turnStartMs"]: authoritative turn start — without
+//     it the FE measures adopted (queue-drained) turns from the adoption
+//     moment and renders fake "Worked for 0.0s" markers.
+//   - agentTimestampMs → ev["agentTimestampMs"]: authoritative send time
+//     (user_chunk echoes fix the optimistic user row's ts with it).
+//   - agentTimestampMs - streamStartMs → ev["elapsedMs"]: real thought
+//     duration (live thought blocks otherwise seal against the local
+//     first-seen timer, understating turns adopted mid-flight).
+//
+// turn_completed already carries params._meta as `meta`; only the
+// high-frequency stream events need this.
+func attachStreamMeta(ev Event, params map[string]any) Event {
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok || len(meta) == 0 {
+		return ev
+	}
+	if v, ok := meta["turnStartMs"]; ok {
+		ev["turnStartMs"] = v
+	}
+	if v, ok := meta["agentTimestampMs"]; ok {
+		ev["agentTimestampMs"] = v
+	}
+	if agent, ok1 := asInt(meta["agentTimestampMs"]); ok1 {
+		if start, ok2 := asInt(meta["streamStartMs"]); ok2 && agent >= start {
+			ev["elapsedMs"] = agent - start
+		}
+	}
+	return ev
+}
+
 // dispatchSessionUpdateKind routes one sessionUpdate `update` to its typed
 // events. Returns whether the kind is modeled (handled): true → the caller
 // must NOT emit the generic session_notification (FE 消费 typed 事件);
@@ -1276,7 +1375,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			b.mu.Lock()
 			b.textBuf += text
 			b.mu.Unlock()
-			ev := Event{"type": "chunk", "text": text}
+			ev := attachStreamMeta(Event{"type": "chunk", "text": text}, params)
 			if mid, ok := update["messageId"]; ok {
 				ev["messageId"] = mid
 			}
@@ -1325,7 +1424,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 客户端显示值在下一段 live 更新前保留）。
 		b.genRate.reset(sid)
 		if text := contentText(update["content"]); text != "" {
-			ev := Event{"type": "user_chunk", "text": text}
+			ev := attachStreamMeta(Event{"type": "user_chunk", "text": text}, params)
 			// Forward the chunk + content-block meta (wire shape:
 			// update._meta = ContentChunk.meta → hideFromScrollback;
 			// update.content._meta = TextContent.meta → displayText /
@@ -1359,7 +1458,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	case "agent_thought_chunk":
 		// content is typically { "type":"text", "text":"..." }; accept a few shapes
 		if text := contentText(update["content"]); text != "" {
-			ev := Event{"type": "thought", "text": text}
+			ev := attachStreamMeta(Event{"type": "thought", "text": text}, params)
 			// Forward the chunk meta verbatim (hideFromScrollback etc.)
 			// so live rendering treats it like the replay path does.
 			if meta, ok := update["_meta"].(map[string]any); ok {
@@ -1808,6 +1907,20 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		b.Broadcast(withSid(Event{"type": "session_updates_chunk", "params": params}))
 	case "x.ai/queue/changed":
 		// prompt 队列变更（session/prompt_queue.rs QUEUE_CHANGED_METHOD）。
+		// 队列状态不落盘、load 不回放 —— 缓存最近一次快照，供
+		// /api/queue/status 在 FE load 会话后主动拉取对齐镜像
+		// （断线期间错过的广播靠它补上）。cloneAny 隔离副本，快照
+		// 与后续 broadcast 序列化互不共享存储。
+		if sid != "" {
+			b.mu.Lock()
+			if b.queueSnapshots == nil {
+				b.queueSnapshots = map[string]map[string]any{}
+			}
+			if snap, ok := cloneAny(params).(map[string]any); ok {
+				b.queueSnapshots[sid] = snap
+			}
+			b.mu.Unlock()
+		}
 		b.Broadcast(withSid(Event{"type": "queue_changed", "params": params}))
 	case "x.ai/config_changed":
 		// 配置变更（MCP 初始化取消 / agent/app.rs leader 广播）。
@@ -2490,9 +2603,13 @@ func (b *Bridge) killProcess() {
 	b.cmd = nil
 	b.stdin = nil
 	b.ready = false
+	b.bootOK = false
 	b.sessions = make(map[string]*SessionState)
 	b.activeSessionID = ""
 	b.textBuf = ""
+	// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
+	// 一并作废，避免 /api/queue/status 回放过期队列。
+	b.queueSnapshots = nil
 	// lastSessionID / lastSessionCwd intentionally survive.
 	if b.cancelRd != nil {
 		b.cancelRd()
@@ -2508,46 +2625,35 @@ func (b *Bridge) killProcess() {
 	b.broadcastRosterChange()
 }
 
-// SetMode calls session/set_mode on the active session.
-func (b *Bridge) SetMode(ctx context.Context, modeID string) (map[string]any, error) {
+// SetMode calls session/set_mode on the given session (empty sessionId
+// resolves to the active one).
+func (b *Bridge) SetMode(ctx context.Context, sessionID, modeID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	b.mu.Lock()
-	act := b.activeSessionLocked()
-	var sid string
-	if act != nil {
-		sid = act.SessionID
-	}
-	b.mu.Unlock()
-	if sid == "" {
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, errors.New("没有活跃会话")
 	}
 	return b.request(ctx, "session/set_mode", map[string]any{
-		"sessionId": sid,
+		"sessionId": sessionID,
 		"modeId":    modeID,
 	}, 30*time.Second)
 }
 
 // SetModel calls session/set_model (grok's /model switch; the wire method
 // is snake_case per the ACP method table). An optional reasoningEffort is
-// forwarded in _meta, matching how the TUI applies --effort.
-func (b *Bridge) SetModel(ctx context.Context, modelID, reasoningEffort string) error {
+// forwarded in _meta, matching how the TUI applies --effort. Empty
+// sessionId resolves to the active session; the cache patch targets the
+// resolved session.
+func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) error {
 	if err := b.Boot(ctx); err != nil {
 		return err
 	}
-	b.mu.Lock()
-	act := b.activeSessionLocked()
-	var sid string
-	if act != nil {
-		sid = act.SessionID
-	}
-	b.mu.Unlock()
-	if sid == "" {
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return errors.New("没有活跃会话")
 	}
 	params := map[string]any{
-		"sessionId": sid,
+		"sessionId": sessionID,
 		"modelId":   modelID,
 	}
 	if reasoningEffort != "" {
@@ -2563,21 +2669,21 @@ func (b *Bridge) SetModel(ctx context.Context, modelID, reasoningEffort string) 
 	b.mu.Lock()
 	var models any
 	var name string
-	if act := b.sessions[sid]; act != nil {
+	if act := b.sessions[sessionID]; act != nil {
 		b.patchSessionModels(act, modelID, reasoningEffort)
 		models = act.models
 		name = modelDisplayName(models, modelID)
 	}
 	b.mu.Unlock()
 	if models != nil {
-		b.Broadcast(Event{"type": "models_update", "params": models, "sessionId": sid})
+		b.Broadcast(Event{"type": "models_update", "params": models, "sessionId": sessionID})
 	}
 	b.Broadcast(Event{
 		"type":            "model",
 		"modelId":         modelID,
 		"modelName":       name,
 		"reasoningEffort": reasoningEffort,
-		"sessionId":       sid,
+		"sessionId":       sessionID,
 	})
 	return nil
 }
@@ -2836,14 +2942,20 @@ func (b *Bridge) SessionStateOf(sessionID string) *SessionState {
 	return &cp
 }
 
-// SessionInfo returns authoritative live details of the active session
-// (TUI /session-info analog), served on demand via POST /api/session-info:
-// roster fields, tracked context usage / git head, and the model from the
-// session's SessionModelState catalog. Nil when no session is active.
-func (b *Bridge) SessionInfo() *SessionInfoDetail {
+// SessionInfo returns authoritative live details of the given session
+// (empty sessionId resolves to the active one; TUI /session-info analog),
+// served on demand via POST /api/session-info: roster fields, tracked
+// context usage / git head, and the model from the session's
+// SessionModelState catalog. Nil when the session is unknown or none is
+// active.
+func (b *Bridge) SessionInfo(sessionID string) *SessionInfoDetail {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	act := b.activeSessionLocked()
+	if sessionID == "" && act != nil {
+		sessionID = act.SessionID
+	}
+	act = b.sessions[sessionID]
 	if act == nil {
 		return nil
 	}
@@ -3323,6 +3435,9 @@ func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string
 
 	b.mu.Lock()
 	delete(b.sessions, sessionID)
+	if b.queueSnapshots != nil {
+		delete(b.queueSnapshots, sessionID)
+	}
 	if b.activeSessionID == sessionID {
 		b.activeSessionID = ""
 	}
@@ -3341,10 +3456,16 @@ func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string
 // Each element of Updates is the full JSONL storage envelope
 // {timestamp, method, params}, as returned by the x.ai/session/updates
 // extension.
+//
+// PromptStarts is the agent-side index of every user-message turn start
+// (line offsets in updates.jsonl). Present on turnIndex responses; the
+// FE uses it for per-turn history paging (load one previous user turn).
+// Empty/nil when the agent omitted it (offset/limit pages, older agents).
 type UpdatesPage struct {
-	Updates    []any `json:"updates"`
-	TotalCount int   `json:"totalCount"`
-	HasMore    bool  `json:"hasMore"`
+	Updates      []any `json:"updates"`
+	TotalCount   int   `json:"totalCount"`
+	HasMore      bool  `json:"hasMore"`
+	PromptStarts []int `json:"promptStarts,omitempty"`
 }
 
 // SessionUpdatesOpts carries the optional x.ai/session/updates request
@@ -3399,7 +3520,26 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 	total, _ := res["totalCount"].(float64)
 	hasMore, _ := res["hasMore"].(bool)
 	page := UpdatesPage{Updates: updates, TotalCount: int(total), HasMore: hasMore}
-	log.Printf("[acp-host] session updates via _x.ai/session/updates ok (total=%d)", page.TotalCount)
+	// promptStarts: agent returns []number (JSON → []any of float64).
+	// Required for FE turn-based history paging; dropping it forced the
+	// FE onto offset pages that can cut mid-turn between two user messages.
+	if raw, ok := res["promptStarts"].([]any); ok && len(raw) > 0 {
+		ps := make([]int, 0, len(raw))
+		for _, v := range raw {
+			switch n := v.(type) {
+			case float64:
+				ps = append(ps, int(n))
+			case int:
+				ps = append(ps, n)
+			case int64:
+				ps = append(ps, int(n))
+			}
+		}
+		if len(ps) > 0 {
+			page.PromptStarts = ps
+		}
+	}
+	log.Printf("[acp-host] session updates via _x.ai/session/updates ok (total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
 	return page, nil
 }
 
@@ -3544,26 +3684,59 @@ func (b *Bridge) XaiNotify(ctx context.Context, method string, params map[string
 	return map[string]any{"ok": true}, nil
 }
 
-// ForkSession calls x.ai/session/fork: forks the current session into a new
-// one (optionally a git worktree). Params follow the TUI's fork payload:
+// QueueStatus returns the cached most-recent x.ai/queue/changed snapshot
+// for a session (nil when the host has not seen any queue broadcast for it
+// since this process started, e.g. after an agent restart). The agent's
+// prompt queue is in-memory only — never persisted, never replayed on
+// session/load — so this cache is the only way for a client to re-align its
+// queue mirror after loading a session. The returned map is a deep clone:
+// callers may serialize it without racing the live broadcast handler.
+func (b *Bridge) QueueStatus(sessionID string) map[string]any {
+	if sessionID == "" {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.queueSnapshots == nil {
+		return nil
+	}
+	snap, ok := b.queueSnapshots[sessionID]
+	if !ok {
+		return nil
+	}
+	if cloned, ok := cloneAny(snap).(map[string]any); ok {
+		return cloned
+	}
+	return nil
+}
+
+// ForkSession calls x.ai/session/fork: forks the given session into a new
+// one (optionally a git worktree). Empty sessionId resolves to the active
+// session; sourceSessionId / sourceCwd / newCwd come from the resolved
+// session's live state (unknown id → empty fields, the agent 404s).
+// Params follow the TUI's fork payload:
 // {sourceSessionId, sourceCwd, newCwd, sessionKind:"fork", newSessionId?}.
-func (b *Bridge) ForkSession(ctx context.Context, params map[string]any) (map[string]any, error) {
+func (b *Bridge) ForkSession(ctx context.Context, sessionID string, params map[string]any) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
+	sid := b.resolveSessionID(sessionID)
 	b.mu.Lock()
-	act := b.activeSessionLocked()
-	var sid, cwd string
-	if act != nil {
-		sid = act.SessionID
-		cwd = act.Cwd
+	var act *SessionState
+	if sid != "" {
+		act = b.sessions[sid]
 	}
 	b.mu.Unlock()
 	p := map[string]any{
-		"sourceSessionId": sid,
-		"sourceCwd":       cwd,
-		"newCwd":          cwd,
+		"sourceSessionId": "",
+		"sourceCwd":       "",
+		"newCwd":          "",
 		"sessionKind":     "fork",
+	}
+	if act != nil {
+		p["sourceSessionId"] = act.SessionID
+		p["sourceCwd"] = act.Cwd
+		p["newCwd"] = act.Cwd
 	}
 	for k, v := range params {
 		p[k] = v
@@ -3571,20 +3744,14 @@ func (b *Bridge) ForkSession(ctx context.Context, params map[string]any) (map[st
 	return b.request(ctx, "_x.ai/session/fork", p, 60*time.Second)
 }
 
-// RenameSession calls x.ai/session/rename: {sessionId, title}.
-func (b *Bridge) RenameSession(ctx context.Context, title string) (map[string]any, error) {
+// RenameSession calls x.ai/session/rename: {sessionId, title} (empty
+// sessionId resolves to the active one; unknown id → agent 404).
+func (b *Bridge) RenameSession(ctx context.Context, sessionID, title string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	b.mu.Lock()
-	act := b.activeSessionLocked()
-	var sid string
-	if act != nil {
-		sid = act.SessionID
-	}
-	b.mu.Unlock()
 	return b.request(ctx, "_x.ai/session/rename", map[string]any{
-		"sessionId": sid,
+		"sessionId": b.resolveSessionID(sessionID),
 		"title":     title,
 	}, 30*time.Second)
 }
@@ -3592,51 +3759,40 @@ func (b *Bridge) RenameSession(ctx context.Context, title string) (map[string]an
 // Recap fires x.ai/recap (fire-and-forget "where was I" summary; the recap
 // arrives later as a SessionRecap session/update). Returns the ack.
 // Recap calls x.ai/recap: {sessionId, auto} — triggers a session recap.
-// The sessionId defaults to the active session (404 when none is active).
-func (b *Bridge) Recap(ctx context.Context, auto bool) (map[string]any, error) {
+// Empty sessionId resolves to the active session (404 when none is active).
+func (b *Bridge) Recap(ctx context.Context, sessionID string, auto bool) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	b.mu.Lock()
-	act := b.activeSessionLocked()
-	var sid string
-	if act != nil {
-		sid = act.SessionID
-	}
-	b.mu.Unlock()
-	if sid == "" {
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/recap", map[string]any{
-		"sessionId": sid,
+		"sessionId": sessionID,
 		"auto":      auto,
 	}, 30*time.Second)
 }
 
-// SubagentCancel calls x.ai/subagent/cancel: {subagentId}.
-func (b *Bridge) SubagentCancel(ctx context.Context, subagentID string) (map[string]any, error) {
+// SubagentCancel calls x.ai/subagent/cancel: {sessionId, subagentId}
+// (empty sessionId resolves to the active one; unknown id → agent 404).
+func (b *Bridge) SubagentCancel(ctx context.Context, sessionID, subagentID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
 	return b.request(ctx, "_x.ai/subagent/cancel", map[string]any{
+		"sessionId":  b.resolveSessionID(sessionID),
 		"subagentId": subagentID,
 	}, 30*time.Second)
 }
 
-// TaskKill calls x.ai/task/kill: {sessionId, taskId}.
-func (b *Bridge) TaskKill(ctx context.Context, taskID string) (map[string]any, error) {
+// TaskKill calls x.ai/task/kill: {sessionId, taskId} (empty sessionId
+// resolves to the active one; unknown id → agent 404).
+func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	b.mu.Lock()
-	act := b.activeSessionLocked()
-	var sid string
-	if act != nil {
-		sid = act.SessionID
-	}
-	b.mu.Unlock()
 	return b.request(ctx, "_x.ai/task/kill", map[string]any{
-		"sessionId": sid,
+		"sessionId": b.resolveSessionID(sessionID),
 		"taskId":    taskID,
 	}, 30*time.Second)
 }
@@ -3692,6 +3848,9 @@ func (b *Bridge) SessionDelete(ctx context.Context, sessionID string) (map[strin
 	// to restore the deleted one (same cleanup as CloseSession).
 	b.mu.Lock()
 	delete(b.sessions, sessionID)
+	if b.queueSnapshots != nil {
+		delete(b.queueSnapshots, sessionID)
+	}
 	if b.activeSessionID == sessionID {
 		b.activeSessionID = ""
 	}
