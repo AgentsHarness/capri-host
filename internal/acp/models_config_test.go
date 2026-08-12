@@ -250,3 +250,42 @@ base_url = "https://api.example.com/v1"
 		t.Errorf("model section must be gone:\n%s", out)
 	}
 }
+
+// TestCustomModelsWritesIntegerLiterals 回归：FE 经 JSON 提交的整数配置
+// （context_window=1000000 等）被 encoding/json 解成 float64，若原样交给
+// BurntSushi/toml 会写成 `1e+06`（合法 TOML float，但 agent 侧 schema 是
+// 整数类型，热加载会拒绝）。落盘必须还原为整数字面量；temperature / top_p
+// 保持浮点（top_p=1 写为 1.0）。
+func TestCustomModelsWritesIntegerLiterals(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	if err := b.UpsertCustomModel("big-ctx", map[string]any{
+		"model":                 "big-ctx",
+		"base_url":              "https://api.example.com/v1",
+		"context_window":        float64(1000000), // 模拟 JSON 数字解码
+		"max_completion_tokens": float64(200000),
+		"max_retries":           float64(3),
+		"temperature":           float64(0.7),
+		"top_p":                 float64(1),
+	}); err != nil {
+		t.Fatalf("UpsertCustomModel: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(raw)
+	for _, want := range []string{
+		"context_window = 1000000",
+		"max_completion_tokens = 200000",
+		"max_retries = 3",
+		"temperature = 0.7",
+		"top_p = 1.0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config.toml missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "1e+06") {
+		t.Errorf("config.toml must not contain float exponent literal:\n%s", out)
+	}
+}
