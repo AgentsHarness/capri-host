@@ -24,11 +24,19 @@ type setDefaultModelBody struct {
 // session default), so a single FE call covers both. Session switch runs
 // first (TUI parity: the switch is the primary action, persistence is the
 // preference side-effect).
+//
+// 用户选择优先（TUI persist_models_default 语义）：写 config.toml 前先把
+// 触及 models.default 的活动 campaign 加入 dismissed_ids——否则新建会话仍
+// 会按活动值（如 grok-4.6 推广）选模型，「配置变了但 agent 没变」。dismiss
+// 是 best-effort：失败只记日志，配置写入照常（与 TUI 一致）。
 func (s *Server) handleSetDefaultModel(w http.ResponseWriter, r *http.Request) {
 	var body setDefaultModelBody
 	if err := readJSON(r, &body); err != nil || body.ModelID == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modelId"})
 		return
+	}
+	if err := s.bridge.DismissModelDefaultCampaigns(r.Context()); err != nil {
+		log.Printf("[acp-host] campaign dismiss 失败（配置仍会写入，活动可能继续覆盖默认模型）: %v", err)
 	}
 	if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
 		writeAgentError(w, "session/set-model", err)
