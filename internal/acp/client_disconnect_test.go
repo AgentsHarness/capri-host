@@ -125,3 +125,78 @@ func TestEnsureBootedWaiterSeesBootFailure(t *testing.T) {
 		t.Fatalf("ensureBooted = %v, want 'boom'", err)
 	}
 }
+
+// A waiter must NOT mistake "boot succeeded but no session active yet"
+// (ready=false, bootOK=true) for a boot failure. ensureBooted never
+// creates a session — ready only flips once createSession/LoadSession
+// succeeds — so after a successful boot a waiter wakes to ready=false and
+// must proceed (its caller establishes its own session) instead of
+// reporting the misleading "agent 启动失败". This is the state hit by
+// concurrent restoreLastSession calls right after an agent respawn.
+func TestEnsureBootedWaiterSeesBootOK(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	b.mu.Lock()
+	b.booting = true
+	b.bootDone = make(chan struct{})
+	b.bootOK = true // boot finished successfully, session/load still in flight
+	b.ready = false
+	close(b.bootDone) // the in-flight boot finished successfully
+	b.mu.Unlock()
+
+	if err := b.ensureBooted(context.Background()); err != nil {
+		t.Fatalf("ensureBooted = %v, want nil (boot succeeded, no session yet)", err)
+	}
+}
+
+// A waiter that wakes from the bootDone of a boot which ALREADY ended
+// while a NEWER boot is in flight must chain onto the newer boot's
+// bootDone instead of inventing a failure. The transitioner goroutine
+// blocks on b.mu until the waiter has released it — the waiter releases
+// the lock only after capturing the old bootDone and is then blocked on
+// it — so the transition deterministically lands mid-wait. (Should the
+// transitioner win the lock first, the waiter simply starts on the newer
+// channel; every interleaving ends with nil, so the test never flakes,
+// and the old-bootDone interleaving fails the pre-fix code.)
+func TestEnsureBootedWaiterChainsToNewerBoot(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	b.mu.Lock()
+	b.booting = true
+	b.bootDone = make(chan struct{}) // the OLD boot's channel (open)
+	b.mu.Unlock()
+
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- b.ensureBooted(context.Background()) }()
+
+	go func() {
+		// Phase 1: the boot the waiter waited on ends AND a newer boot
+		// starts, in one critical section (a finished boot flips
+		// booting=false and closes its bootDone together, like the boot
+		// role's defer; the newer boot resets the outcome fields and
+		// installs a fresh channel).
+		b.mu.Lock()
+		b.booting = false
+		close(b.bootDone)
+		b.booting = true
+		b.bootDone = make(chan struct{})
+		b.ready = false
+		b.bootError = ""
+		b.bootOK = false
+		b.mu.Unlock()
+		// Phase 2: finish the newer boot with a ready session so the
+		// waiter (chained onto it) can return nil.
+		b.mu.Lock()
+		b.ready = true
+		b.booting = false
+		close(b.bootDone)
+		b.mu.Unlock()
+	}()
+
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("ensureBooted = %v, want nil (chained onto the newer boot)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ensureBooted did not return after the newer boot finished")
+	}
+}

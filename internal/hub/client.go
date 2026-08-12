@@ -833,6 +833,15 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	defer stream.Close()
 
 	send := func(payload []byte) error {
+		// 写超时与 WS 路径对齐（30s）：QUIC stream.Write 在流控/拥塞窗口
+		// 耗尽（对端停止 ACK）时会无限期阻塞。若无 deadline，writeLoop
+		// 会静默卡死且重连永不触发——readLoop 因 hub keepalive 仍能收包
+		// 而"看似正常"，整条上行通道就悄悄死掉。每次发送前设 deadline，
+		// 返回前清除，避免残留影响后续复用。
+		if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			return fmt.Errorf("hub quic set write deadline: %w", err)
+		}
+		defer stream.SetWriteDeadline(time.Time{})
 		var lenBuf [4]byte
 		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
 		if _, err := stream.Write(lenBuf[:]); err != nil {

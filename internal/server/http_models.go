@@ -15,6 +15,7 @@ import (
 type setDefaultModelBody struct {
 	ModelID         string `json:"modelId"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	SessionID       string `json:"sessionId,omitempty"`
 }
 
 // handleSetDefaultModel persists `[models].default` (+ optional
@@ -29,7 +30,7 @@ func (s *Server) handleSetDefaultModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modelId"})
 		return
 	}
-	if err := s.bridge.SetModel(r.Context(), body.ModelID, body.ReasoningEffort); err != nil {
+	if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
 		writeAgentError(w, "session/set-model", err)
 		return
 	}

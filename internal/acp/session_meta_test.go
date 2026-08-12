@@ -110,6 +110,47 @@ func TestCreateSessionOmitsMetaWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestCreateSessionNormalizesCwdTrailingSlash — 新建会话时 cwd 必须去掉
+// 尾部斜杠("/ws/" → "/ws"):带斜杠的 cwd 会让 grok 把同一工作区存进
+// 两个不同的编码会话目录(如 …/acp-host 与 …/acp-host%2F),导致
+// session/list 按工作区过滤时新旧会话互相看不到。
+func TestCreateSessionNormalizesCwdTrailingSlash(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	runResolved(t, b, w, map[string]any{"sessionId": "s2"}, func() error {
+		return b.NewSession(ctx, SessionConfig{Cwd: "/ws/"})
+	})
+
+	method, params := lastRequestParams(t, w)
+	if method != "session/new" {
+		t.Fatalf("method = %q, want session/new", method)
+	}
+	if cwd, _ := params["cwd"].(string); cwd != "/ws" {
+		t.Errorf(`params["cwd"] = %q, want "/ws" (trailing slash stripped)`, cwd)
+	}
+	// The roster must record the normalized cwd so ready events / status
+	// snapshots don't leak the trailing slash back to clients.
+	if st := b.SessionStateOf("s2"); st == nil || st.Cwd != "/ws" {
+		t.Errorf("roster Cwd = %v, want /ws", st)
+	}
+}
+
+// TestCreateSessionKeepsRootSlash — 根目录 "/" 不能被 trim 成空串。
+func TestCreateSessionKeepsRootSlash(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+
+	runResolved(t, b, w, map[string]any{"sessionId": "s2"}, func() error {
+		return b.NewSession(ctx, SessionConfig{Cwd: "/"})
+	})
+
+	_, params := lastRequestParams(t, w)
+	if cwd, _ := params["cwd"].(string); cwd != "/" {
+		t.Errorf(`params["cwd"] = %q, want "/" (root slash preserved)`, cwd)
+	}
+}
+
 func TestLoadSessionForwardsMeta(t *testing.T) {
 	b, w := metaReadyBridge(t)
 	ctx := context.Background()

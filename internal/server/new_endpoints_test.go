@@ -67,6 +67,46 @@ func TestSessionDeleteDefaultsToActiveSession(t *testing.T) {
 	}
 }
 
+// ── POST /api/session-info ──────────────────────────────────────────
+
+// TestSessionInfoEndpoint — {sessionId?}: empty resolves to the active
+// session; an explicit unknown sessionId is a local 404.
+func TestSessionInfoEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	// No active session, empty sessionId → 404 暂无活动会话.
+	rec := postJSON(t, s, "/api/session-info", `{}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); !strings.Contains(m["error"].(string), "暂无活动会话") {
+		t.Fatalf("resp = %s, want 暂无活动会话", rec.Body.String())
+	}
+
+	// Unknown explicit sessionId → 404 未知会话.
+	rec = postJSON(t, s, "/api/session-info", `{"sessionId":"nope"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown-sid status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); !strings.Contains(m["error"].(string), "未知会话") {
+		t.Fatalf("resp = %s, want 未知会话", rec.Body.String())
+	}
+
+	// Active session: empty sessionId resolves to it; explicit id matches.
+	sid := createActiveSession(t, s)
+	for _, body := range []string{`{}`, `{"sessionId":"` + sid + `"}`} {
+		rec = postJSON(t, s, "/api/session-info", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		m := decodeBody(t, rec)
+		info, _ := m["session"].(map[string]any)
+		if info == nil || info["sessionId"] != sid {
+			t.Fatalf("resp = %s, want session.sessionId = %s", rec.Body.String(), sid)
+		}
+	}
+}
+
 // ── POST /api/compact ───────────────────────────────────────────────
 
 func TestCompactEndpoint(t *testing.T) {
