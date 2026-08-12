@@ -15,7 +15,12 @@ import (
 	"github.com/benin/acp-host/internal/server"
 )
 
+// version is stamped at build time via
+// go build -ldflags "-X main.version=<git-sha>-<timestamp>".
+var version = "0.1.3"
+
 func main() {
+	log.Printf("[acp-host] version %s", version)
 	cfg := config.Load()
 	bridge := acp.NewBridge(acp.GrokConfig{
 		Bin:      cfg.GrokBin,

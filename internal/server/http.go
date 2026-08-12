@@ -365,6 +365,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// 防御性：告知前置代理（nginx 等）不要缓冲流式响应——SSE 一旦被
+	// 缓冲，回合事件会成批到达，前端实时性受损（有时还会撑爆代理缓冲）。
+	w.Header().Set("X-Accel-Buffering", "no-buffering")
 
 	snap := s.bridge.Snapshot()
 	// hello 的 busy 只反映被 announce 的会话（snap.SessionID）本身，而非
@@ -396,6 +399,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		"agentCapabilities": snap.AgentCapabilities,
 		"roster":            snap.Roster,
 		"agentStartedAt":    snap.AgentStartedAt,
+		"permissionMode":    snap.PermissionMode,
 	}
 	data, _ := json.Marshal(hello)
 	if !writeSSEFrame(w, flusher, data) {
@@ -513,56 +517,30 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "blocks 不能为空"})
 		return
 	}
-	ctx := r.Context()
-	// Run the turn on an independent context, not r.Context(). Previously the
-	// turn was driven by the client connection, so a browser crash mid-turn
-	// cancelled the whole turn (Prompt() sent session/cancel) even though the
-	// grok agent process itself was perfectly healthy. Now a client disconnect
-	// just releases the HTTP handler while the turn keeps running — progress
-	// and completion are observable via SSE, and only an explicit /api/cancel
-	// stops it. For a live client, the handler still blocks and returns the
-	// stopReason as before.
-	type result struct {
-		stopReason string
-		meta       map[string]any // 响应的 `_meta`（仅非空才发）
-		err        error
+	// 显式指向的会话必须存在（纯内存检查，无 agent 交互）：未知会话在
+	// 受理前同步 404，不走受理流程。未显式指定会话（缺省 active）时
+	// 跳过——无活动会话时的恢复/新建是 agent roundtrip，留在后台完成，
+	// 失败经 SSE error 事件送达（bridge.PromptWithOpts 的广播）。
+	if body.SessionID != "" && !s.bridge.HasSession(body.SessionID) {
+		writeJSON(w, 404, map[string]any{"ok": false, "error": "会话不存在"})
+		return
 	}
-	done := make(chan result, 1)
+	// 受理即返回：POST 只确认"已受理"（{ok:true}），回合在后台跑，结果
+	// （done / error / cancelled + meta）全部经 live 通道（SSE/WS）送达。
+	// 请求不再在反代（Cloudflare ~100s / nginx）前挂到回合结束，反代超时
+	// （524/504）从根上消失。回合执行路径不变：context.Background() 使
+	// 客户端断开不会取消回合——浏览器 crash / 关页后回合照常跑完，进度
+	// 与结果仍走 live 通道，只有显式 /api/cancel 能停它。
 	go func() {
-		var sr string
-		var meta map[string]any
-		var err error
 		if s.promptFn != nil {
 			// Test-injected promptFn keeps its exact contract.
-			sr, err = s.promptFn(context.Background(), body.SessionID, body.Blocks)
-		} else {
-			sr, meta, err = s.bridge.PromptWithOpts(context.Background(), body.SessionID, body.Blocks,
-				acp.PromptOpts{MessageID: body.MessageID, Meta: body.Meta})
-		}
-		done <- result{sr, meta, err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		// Client went away mid-turn; the turn continues in the background.
-		return
-	case res := <-done:
-		if res.err != nil {
-			// writeAgentError 约定：agent 侧失败（回合被 agent 拒绝，如
-			// 模型 API 400 "Internal Error"）降级为 200 + {ok:false, error}
-			// ——前端渲染成回合错误行而非连接错误；host 侧 HTTPError
-			// （404 会话不存在等）保留状态码。busy 会话不再 409 ——
-			// prompt 照常转发，agent 自己排队。
-			writeAgentError(w, "session/prompt", res.err)
+			_, _ = s.promptFn(context.Background(), body.SessionID, body.Blocks)
 			return
 		}
-		out := map[string]any{"ok": true, "stopReason": res.stopReason}
-		// 响应的 `_meta` 原样透传给浏览器（仅非空才带，absent key ≠ off）。
-		if len(res.meta) > 0 {
-			out["meta"] = res.meta
-		}
-		writeJSON(w, 200, out)
-	}
+		_, _, _ = s.bridge.PromptWithOpts(context.Background(), body.SessionID, body.Blocks,
+			acp.PromptOpts{MessageID: body.MessageID, Meta: body.Meta})
+	}()
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 type cancelBody struct {
