@@ -85,6 +85,15 @@ type Client struct {
 	nextSeq     uint64
 	replay      []acp.Event // ring, newest at the end, capped
 	lastSentSeq uint64
+
+	// enqueueMu serializes replay and live event enqueues so frames
+	// reach the hub in strictly increasing seq order. Without it, a live
+	// batch (higher seqs) could land between replay frames after a
+	// reconnect: the hub's stale-seq gate (s <= last seen) would then
+	// drop every replay event that follows — and those events are absent
+	// from the hub's gap-pull buffer too, so the transcript is
+	// permanently lost.
+	enqueueMu sync.Mutex
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -455,12 +464,41 @@ func eventSeq(ev acp.Event) uint64 {
 // enqueueEvents pushes a type:"events" frame onto the async send queue.
 // Non-blocking: if the writer is stuck or disconnected, drop the batch
 // rather than stall the bridge subscriber (replay buffer still holds it).
+// The enqueueMu ordering lock keeps live frames strictly after any
+// in-progress replay so the hub never sees a higher seq first (see
+// enqueueReplay).
 func (c *Client) enqueueEvents(evs []acp.Event) {
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
+	c.enqueueEventsLocked(evs, false)
+}
+
+// enqueueEventsCritical is the critical variant of enqueueEvents: it
+// blocks up to 5s for a send slot (enqueueFrame's critical discipline)
+// instead of dropping, so replay frames survive send-queue pressure.
+func (c *Client) enqueueEventsCritical(evs []acp.Event) {
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
+	c.enqueueEventsLocked(evs, true)
+}
+
+// enqueueEventsLocked is the shared body of enqueueEvents /
+// enqueueEventsCritical; the caller must hold enqueueMu.
+func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 	if len(evs) == 0 || c.sendCh == nil {
 		return
 	}
 	payload := c.marshalEventsFrame(evs)
 	if payload == nil {
+		return
+	}
+	if critical {
+		select {
+		case c.sendCh <- payload:
+			c.noteLastSentSeq(evs)
+		case <-time.After(5 * time.Second):
+			log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留）", len(evs))
+		}
 		return
 	}
 	select {
@@ -468,25 +506,6 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 		c.noteLastSentSeq(evs)
 	default:
 		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留）", len(evs))
-	}
-}
-
-// enqueueEventsCritical is the critical variant of enqueueEvents: it
-// blocks up to 5s for a send slot (enqueueFrame's critical discipline)
-// instead of dropping, so replay frames survive send-queue pressure.
-func (c *Client) enqueueEventsCritical(evs []acp.Event) {
-	if len(evs) == 0 || c.sendCh == nil {
-		return
-	}
-	payload := c.marshalEventsFrame(evs)
-	if payload == nil {
-		return
-	}
-	select {
-	case c.sendCh <- payload:
-		c.noteLastSentSeq(evs)
-	case <-time.After(5 * time.Second):
-		log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留）", len(evs))
 	}
 }
 
@@ -538,6 +557,11 @@ func (c *Client) marshalEventsFrame(evs []acp.Event) []byte {
 // hub's read limit. Returns the seq of the last re-sent event (0 when
 // nothing was sent).
 func (c *Client) sendReplayAfter(after uint64) uint64 {
+	// Ordering lock first (enqueueMu → seqMu, matching enqueueEvents):
+	// held across the whole replay so no live frame can land before the
+	// replay frames — see enqueueReplay for why that would lose events.
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
 	c.seqMu.Lock()
 	var idx int
 	// 第一个事件实际 seq > after 的位置。一律按事件自带 seq 比较。
@@ -554,7 +578,7 @@ func (c *Client) sendReplayAfter(after uint64) uint64 {
 	last := eventSeq(evs[len(evs)-1])
 	// Release before enqueue so noteLastSentSeq can take seqMu.
 	c.seqMu.Unlock()
-	c.enqueueReplay(evs)
+	c.enqueueReplayLocked(evs)
 	return last
 }
 
@@ -567,6 +591,20 @@ func (c *Client) sendReplayAfter(after uint64) uint64 {
 // than the budget is sent alone; marshalEventsFrame drops it (with a
 // log) if it exceeds maxFrameBytes.
 func (c *Client) enqueueReplay(evs []acp.Event) {
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
+	c.enqueueReplayLocked(evs)
+}
+
+// enqueueReplayLocked packs replay events into frames and enqueues them
+// in order; the caller must hold enqueueMu. The lock spans the whole
+// marshal + flush so no live frame can land before the replay frames:
+// the hub's stale-seq gate would otherwise drop the replay events that
+// arrive after higher live seqs — and they are absent from the hub's
+// gap-pull buffer too, so the transcript would be permanently lost.
+// Live enqueues simply wait for the lock and then land after the
+// replay, in strictly increasing seq order.
+func (c *Client) enqueueReplayLocked(evs []acp.Event) {
 	raws := make([][]byte, len(evs))
 	for i, ev := range evs {
 		if raw, err := json.Marshal(ev); err == nil {
@@ -579,7 +617,11 @@ func (c *Client) enqueueReplay(evs []acp.Event) {
 		if len(frame) == 0 {
 			return
 		}
-		c.enqueueEventsCritical(frame)
+		// Frames are sent via the CRITICAL path — replay is reconnect
+		// catch-up, so frames must not be dropped when the send queue
+		// happens to be full (a dropped replay frame would leave the hub
+		// missing transcript after the resume).
+		c.enqueueEventsLocked(frame, true)
 		frame = nil
 		size = 0
 	}
