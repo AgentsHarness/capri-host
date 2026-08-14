@@ -732,7 +732,7 @@ func TestNotificationSessionIdExplicitPreference(t *testing.T) {
 // ── Part 3: 队列快照缓存（/api/queue/status 数据源）──────────────
 
 // x.ai/queue/changed 到达后 QueueStatus 返回该会话的克隆快照；未广播
-// 过/未知会话返回 nil；agent 进程重建（killProcess）后缓存作废。
+// 过/未知会话返回 nil；agent 进程重建（resetRoster 清理）后缓存作废。
 func TestQueueStatusSnapshotCache(t *testing.T) {
 	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 
@@ -777,9 +777,9 @@ func TestQueueStatusSnapshotCache(t *testing.T) {
 		t.Errorf("running_prompt_id after empty broadcast = %v, want nil", got)
 	}
 
-	// agent 进程重建（同 killProcess 清空路径）→ 缓存作废。
-	b.killProcess()
+	// agent 进程重建（同 resetRoster 清空路径）→ 缓存作废。
+	b.resetRoster("test")
 	if snap3 := b.QueueStatus("s1"); snap3 != nil {
-		t.Errorf("QueueStatus after killProcess = %v, want nil", snap3)
+		t.Errorf("QueueStatus after resetRoster = %v, want nil", snap3)
 	}
 }

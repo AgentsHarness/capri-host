@@ -51,8 +51,7 @@ type Bridge struct {
 	// successful boot no longer creates a session, so ready only flips once
 	// createSession / LoadSession / session/resume succeeds — between those
 	// two moments a waiter must not mistake "booted, no session yet" for a
-	// boot failure. Cleared on boot start, boot failure, killProcess and
-	// process death.
+	// boot failure. Cleared on boot start, boot failure and process death.
 	bootOK bool
 	agentInfo map[string]any
 	// authMeta: the `_meta` from the authenticate response (AuthMeta:
@@ -97,8 +96,8 @@ type Bridge struct {
 	// Last focused session survives process death / host restart so we can
 	// session/load it instead of session/new (which would open a blank chat).
 	// Written whenever createSession / LoadSession makes a session active;
-	// also snapshotted into killProcess / waitProcess before the roster is
-	// wiped. Persisted under ~/.acp-host/last-session.json.
+	// also snapshotted into resetRoster before the roster is wiped.
+	// Persisted under ~/.acp-host/last-session.json.
 	lastSessionID  string
 	lastSessionCwd string
 
@@ -383,8 +382,8 @@ func (b *Bridge) broadcastRosterChange() {
 // clients (busy → idle transition only — a turn that resolves while a
 // sibling is still running must not report an idle the session never
 // had). It only releases when the roster still holds the SAME session
-// object the turn started on: killProcess wipes and rebuilds the roster
-// (and a failed turn's auto-recovery may restore the session), so a stale
+// object the turn started on: resetRoster wipes and rebuilds the roster
+// (and a user-requested restart may restore the session), so a stale
 // turn must not clear the busy flag of a newer turn on the restored
 // session.
 func (b *Bridge) releaseBusy(s *SessionState, sessionID string) {
@@ -592,8 +591,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		// The waiter's own ctx may be cancelled first (e.g. the client
 		// disconnected), but that is NOT a boot failure: the boot is
 		// bounded by bootTimeout and may still succeed. Reporting ctx.Err()
-		// here would be a false failure — a caller could treat it as a
-		// wedged agent and killProcess a healthy process. Keep waiting for
+		// here would be a false failure. Keep waiting for
 		// the in-flight boot (bootDone always closes, even on boot error)
 		// and return its real outcome.
 		//
@@ -688,13 +686,8 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		"_meta": initMetaSeeds(),
 	}, bootTimeout)
 	if err != nil {
-		// A live-but-wedged process can fail initialize repeatedly; kill it so
-		// the next Boot spawns a fresh agent instead of reusing it. A client
-		// that disconnected mid-boot is NOT a wedged agent — leave the
-		// process running so the next boot attempt can retry initialize on it.
-		if !errors.Is(err, context.Canceled) {
-			b.killProcess()
-		}
+		// 假设 agent 可靠：初始化失败直接报错，不杀进程、不自愈。
+		// 进程要不要重启由用户通过重启接口决定。
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
 		return err
@@ -715,9 +708,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	}
 
 	if err := b.authenticate(ctx, initRes); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			b.killProcess()
-		}
+		// 同 initialize：只报错，不杀进程。
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
 		return err
@@ -888,11 +879,7 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 
 	sessRes, err := b.request(ctx, "session/new", params, bootTimeout)
 	if err != nil {
-		// A client that disconnected mid-request is not an agent failure —
-		// keep the process so other sessions / the next attempt survive.
-		if !errors.Is(err, context.Canceled) {
-			b.killProcess()
-		}
+		// 假设 agent 可靠：创建失败直接报错，不杀进程、不自愈。
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
 		return err
@@ -900,7 +887,8 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 
 	sid, _ := sessRes["sessionId"].(string)
 	if sid == "" {
-		b.killProcess()
+		// 协议级异常：agent 应答了但没给 sessionId —— 报错返回，不杀
+		// 进程；是否需要重启由用户决定。
 		err := errors.New("session/new 未返回 sessionId")
 		b.setBootError(err.Error())
 		b.Broadcast(Event{"type": "error", "message": err.Error()})
@@ -1090,43 +1078,22 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 	}
 	b.mu.Lock()
 	same := b.cmd == cmd
-	lastID, lastCwd := b.lastSessionID, b.lastSessionCwd
-	if same {
-		// Snapshot the active session before wiping the in-memory roster so
-		// the next prompt can session/load it instead of opening a blank chat.
-		if act := b.activeSessionLocked(); act != nil {
-			b.rememberSessionLocked(act.SessionID, act.Cwd)
-			lastID, lastCwd = act.SessionID, act.Cwd
-		}
-		b.cmd = nil
-		b.stdin = nil
-		b.ready = false
-		b.bootOK = false
-		b.sessions = make(map[string]*SessionState)
-		b.activeSessionID = ""
-		b.textBuf = ""
-		// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
-		// 一并作废，避免 /api/queue/status 回放过期队列。
-		b.queueSnapshots = nil
-		// lastSessionID / lastSessionCwd intentionally survive.
-		if b.cancelRd != nil {
-			b.cancelRd()
-			b.cancelRd = nil
-		}
-	}
 	b.mu.Unlock()
 	if !same {
+		// 进程已被外部清理取代（host 不再主动 killProcess，此分支仅
+		// 防御）：补一条实际死亡时间戳，时间线才完整。
+		if cmd.Process != nil {
+			log.Printf("[acp-host] agent process %d reaped (superseded, code=%d)", cmd.Process.Pid, code)
+		}
 		return
 	}
-	b.failAllPending(fmt.Errorf("grok 进程已退出 (code=%d)", code))
-	_ = lastID
-	_ = lastCwd
+	lastID, _ := b.resetRoster("process-exit")
 	log.Printf("[acp-host] grok process exited (code=%d), lastSession=%s", code, lastID)
 	b.Broadcast(Event{
-		"type": "status",
-		"text": "连接HOST异常，请检查后重试",
+		"type":   "status",
+		"text":   "连接HOST异常，请检查后重试",
+		"action": "restart-agent", // 进程已死：唯一恢复动作是用户重启
 	})
-	b.broadcastRosterChange()
 }
 
 func (b *Bridge) readStderr(r io.Reader) {
@@ -1156,9 +1123,19 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 			// Never die silently: a scan error (e.g. a line exceeding the
 			// 64MB buffer) would otherwise leave the bridge parsing nothing
 			// while the agent keeps running — every session appears frozen.
+			// 只报错：让在飞 RPC 立即失败返回，不杀进程（假设 agent
+			// 可靠，进程生命周期交给外部/用户重启接口）。
 			if err := sc.Err(); err != nil && err != io.EOF {
-				log.Printf("[acp-host] stdout 扫描错误: %v — 触发 agent 重启自愈", err)
-				go b.killProcess()
+				log.Printf("[acp-host] stdout 扫描错误: %v — agent 输出通道已损坏", err)
+				b.failAllPending(fmt.Errorf("agent 输出通道已损坏: %v", err))
+				// 进程可能还活着但输出已不可用，后续每回合都会失败：
+				// 唯一出路是用户重启 agent，必须广播出来，否则前端只
+				// 看到回合级错误、反复重试无果。
+				b.Broadcast(Event{
+					"type":   "status",
+					"text":   "agent 输出通道异常，请重启 agent",
+					"action": "restart-agent",
+				})
 			}
 			return
 		}
@@ -1486,11 +1463,11 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		}
 		return true
 	case "tool_call":
-		// 工具执行打断生成段：seal 冻结速率（active:false 不受节流
-		// 限制；本段从未发布过速率则静默）。
-		if rate, ok := b.genRate.seal(sid); ok {
-			b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": false}))
-		}
+		// 工具执行打断生成段：复位段状态（新段从首包重新计时）并广播
+		// active:false（不带 rate）——前端收到后清除速率显示（只在输
+		// 出过程中显示）。
+		b.genRate.reset(sid)
+		b.Broadcast(tag(Event{"type": "gen_rate", "active": false}))
 		b.Broadcast(tag(Event{"type": "tool_call", "toolCall": update}))
 		return true
 	case "tool_call_update":
@@ -1587,19 +1564,10 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		b.handleModelSwitchKind(sid, update, tag)
 		return true
 	case "turn_completed", "response_completed":
-		// 回合终态：seal 生成段并冻结速率（同 tool_call）；update 携带
-		// 真实 usage 时改发精确值（真实 token / 累计生成时长）并自校准
-		// 估算系数（见 genrate.go sealWithUsage）。
-		var rate float64
-		var ok bool
-		if real, has := usageRealTokens(update); has {
-			rate, ok = b.genRate.sealWithUsage(sid, real)
-		} else {
-			rate, ok = b.genRate.seal(sid)
-		}
-		if ok {
-			b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": false}))
-		}
+		// 回合终态：复位段状态并广播 active:false（不带 rate）——前端
+		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
+		b.genRate.reset(sid)
+		b.Broadcast(tag(Event{"type": "gen_rate", "active": false}))
 		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
 		// prompt_id / usage 等字段）；usage 提取保留在两个载体
 		// （handleSessionUpdate / handleXaiNotification）。
@@ -2342,6 +2310,9 @@ func (b *Bridge) respondError(id any, message string, code int) {
 	})
 }
 
+// request 是标准 JSON-RPC 请求：固定 timeout，不因 agent 活动而顺延。
+// （曾有过按会话活跃度顺延 prompt 截止时刻的设计，2026-08-14 取消：
+// 默认 agent 可靠，超时到点即报错，不做续命式的自愈。）
 func (b *Bridge) request(ctx context.Context, method string, params map[string]any, timeout time.Duration) (map[string]any, error) {
 	id := b.nextAgentID.Add(1)
 	key := idKey(id)
@@ -2505,10 +2476,10 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		b.broadcastPromptError(sessionID, err)
 		// The client (browser) went away mid-turn. The agent process may be
 		// perfectly healthy — and other sessions may be running parallel
-		// turns in the same process — so never killProcess here: that would
-		// abort every session's work, not just this one. Cancel the orphaned
-		// turn so the session does not stay busy for the full promptTimeout,
-		// and return; the client can simply resend.
+		// turns in the same process — so nothing is killed or cancelled
+		// process-wide: cancel the orphaned turn so the session does not
+		// stay busy for the full promptTimeout, and return; the client can
+		// simply resend.
 		if errors.Is(err, context.Canceled) {
 			b.Cancel(sessionID)
 			b.Broadcast(Event{"type": "status", "text": "连接已断开，本次回复已取消，请重新发送", "sessionId": sessionID})
@@ -2516,35 +2487,16 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		}
 		// A plain JSON-RPC error is the AGENT rejecting the turn (e.g. the
 		// model API's 400 "Internal Error: …") — the process answered and is
-		// healthy; the error event above already surfaced the failure, no
-		// self-heal needed. Only transport-level failures (timeout / write
-		// error / boot failure — anything but RPCError) suggest a wedged
-		// process: kill it and reload the SAME session — never session/new
-		// on this path (a failed restore leaves the user without an active
-		// chat rather than a silent blank one). The failed turn is not
-		// retried.
-		// 自愈需要区分 RPCError 与传输失败（见 broadcastPromptError 的
-		// source 判定），这里只关心"非 RPCError 即传输级"。
+		// healthy; the error event above already surfaced the failure.
+		// Transport-level failures (timeout / write error) are logged and
+		// surfaced the same way — the host never kills or restarts the
+		// agent on its own (assume the agent is reliable; the process
+		// lifecycle belongs to the user via the restart endpoint). The
+		// failed turn is not retried.
+		// 留痕底层错误：区分超时 / 写失败 / 进程退出，事后才能还原事故。
 		var rpcErr *RPCError
 		if !errors.As(err, &rpcErr) {
-			b.mu.Lock()
-			if s := b.sessions[sessionID]; s != nil {
-				b.rememberSessionLocked(s.SessionID, s.Cwd)
-			} else if sessionID != "" {
-				b.rememberSessionLocked(sessionID, b.lastSessionCwd)
-			}
-			b.mu.Unlock()
-
-			b.killProcess()
-			rebootCtx, cancel := context.WithTimeout(context.Background(), bootTimeout)
-			defer cancel()
-			if rebootErr := b.restoreLastSession(rebootCtx); rebootErr != nil {
-				log.Printf("[acp-host] auto-recovery failed: %v", rebootErr)
-			}
-			// Surface a single user-facing line regardless of whether the
-			// background restore succeeded — the turn itself still failed and
-			// the user needs to check the host / resend.
-			b.Broadcast(Event{"type": "status", "text": "连接HOST异常，请检查后重试"})
+			log.Printf("[acp-host] prompt transport failure (session=%s): %v", sessionID, err)
 		}
 		return "", nil, err
 	}
@@ -2644,18 +2596,17 @@ func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 	b.Broadcast(Event{"type": "cancelled", "sessionId": sid})
 }
 
-// killProcess kills the grok agent process (if any) and resets the in-memory
-// roster, so the next Boot starts from a fresh process. The last-session
-// pointer is preserved so restoreLastSession can session/load it.
-// Used when a turn or a boot step fails on a possibly wedged agent.
-func (b *Bridge) killProcess() {
+// resetRoster 清理 agent 进程死亡后的 in-memory 状态：清空 roster 与
+// 队列快照缓存、保留 lastSession 指针、让所有在飞 RPC 立即失败返回。
+// 只做清理，绝不杀进程 —— 2026-08-14 起 host 假设 agent 可靠，进程
+// 生命周期完全交给外部，host 只在进程退出后把状态收拾干净并报错。
+// 返回清理前快照的 lastSession（active 优先），供调用方打日志。
+func (b *Bridge) resetRoster(reason string) (string, string) {
 	b.mu.Lock()
 	if act := b.activeSessionLocked(); act != nil {
 		b.rememberSessionLocked(act.SessionID, act.Cwd)
 	}
-	if b.cmd != nil && b.cmd.Process != nil {
-		_ = b.cmd.Process.Kill()
-	}
+	lastID, lastCwd := b.lastSessionID, b.lastSessionCwd
 	b.cmd = nil
 	b.stdin = nil
 	b.ready = false
@@ -2672,13 +2623,40 @@ func (b *Bridge) killProcess() {
 		b.cancelRd = nil
 	}
 	b.mu.Unlock()
-
-	// Fail in-flight RPCs (prompts on OTHER sessions) so they return an
-	// error immediately instead of hanging until the 30-minute prompt
-	// timeout. waitProcess only covers natural exits; this is a forced
-	// kill (wedged agent), so fail them here, outside the lock.
-	b.failAllPending(fmt.Errorf("grok 进程已重启"))
+	log.Printf("[acp-host] agent state reset (reason=%s)", reason)
+	b.failAllPending(fmt.Errorf("grok 进程已退出或不可用"))
 	b.broadcastRosterChange()
+	return lastID, lastCwd
+}
+
+// RestartAgent 由用户显式调用（host 从不自动杀 agent —— 假设 agent
+// 可靠，有问题只报错；但保留手动重启通道）：杀掉当前 agent 进程（如
+// 有）、清理状态、重新 Boot 并恢复上次会话。任一环节失败都返回错误，
+// 由调用方报给用户。
+func (b *Bridge) RestartAgent(ctx context.Context) error {
+	// 先摘掉引用再杀，waitProcess 醒来时 b.cmd 已置 nil，走防御分支
+	// 只补一条 reap 日志，不会误发"连接HOST异常"广播。
+	b.mu.Lock()
+	cmd := b.cmd
+	b.mu.Unlock()
+	// lastID 是 resetRoster 清理前快照（active 优先），锁内取值，
+	// 无竞态 —— 不要直接读 b.lastSessionID（会被并发 prompt 写）。
+	lastID, _ := b.resetRoster("user-restart")
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if err := b.Boot(ctx); err != nil {
+		return fmt.Errorf("重启失败: %w", err)
+	}
+	// 用快照判断是否需要恢复；restoreLastSession 内部再按锁内最新值
+	// 执行（重启间隙若有并发 prompt 更新了 lastSession，恢复它即可）。
+	if lastID != "" {
+		if err := b.restoreLastSession(ctx); err != nil {
+			return fmt.Errorf("重启后恢复会话失败: %w", err)
+		}
+	}
+	log.Printf("[acp-host] agent restarted (user request)")
+	return nil
 }
 
 // SetMode calls session/set_mode on the given session (empty sessionId
