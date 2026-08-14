@@ -39,6 +39,7 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/prompt", s.handlePrompt)
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
+	mux.HandleFunc("POST /api/agent-restart", s.handleAgentRestart)
 	mux.HandleFunc("POST /api/permission-response", s.handlePermission)
 	mux.HandleFunc("POST /api/client-response", s.handleClientResponse)
 	mux.HandleFunc("POST /api/session", s.handleSession)
@@ -573,6 +574,25 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		meta["rewindIfPristine"] = *body.RewindIfPristine
 	}
 	s.bridge.CancelWithMeta(body.SessionID, meta)
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// handleAgentRestart restarts the grok agent process on user request:
+// kill the current process (if any), clear host state, boot a fresh agent
+// and restore the last session. The host never restarts the agent on its
+// own — this endpoint is the only restart path (assume the agent is
+// reliable; failures surface as errors, and the user decides when to
+// restart).
+func (s *Server) handleAgentRestart(w http.ResponseWriter, r *http.Request) {
+	// 重启是服务端状态操作，用独立超时而非 r.Context()：客户端中途断
+	// 开不应取消重启流程 —— kill 之后 boot 失败会留下无进程状态。
+	// 4 分钟 = acp 包 bootTimeout(2min) × 2，覆盖杀进程 + boot + 恢复。
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	if err := s.bridge.RestartAgent(ctx); err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 

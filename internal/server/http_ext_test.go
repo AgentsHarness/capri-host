@@ -270,3 +270,22 @@ func TestQueueEndpointsValidation(t *testing.T) {
 		t.Fatalf("no-session-with-explicit-sid status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
 }
+
+// 用户主动重启 agent（/api/agent-restart）：杀掉旧进程、重新 boot、
+// 恢复上次会话，之后 host 一切正常。host 从不自动重启 —— 这是唯一
+// 的重启通道。
+func TestAgentRestartEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	sid := createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/agent-restart", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent-restart status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	// 新进程已 boot、会话已恢复：会话级端点照常工作。
+	rec2 := postJSON(t, s, "/api/session-updates", `{"sessionId":"`+sid+`","cwd":"/ws"}`)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("session-updates after restart status = %d, want 200 (body=%s)", rec2.Code, rec2.Body.String())
+	}
+}
