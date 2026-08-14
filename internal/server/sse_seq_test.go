@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 )
 
 // readSSEData reads lines until the next "data: " frame and returns its

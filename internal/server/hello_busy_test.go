@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 )
 
 // hello_busy_test.go — SSE hello 的 busy 语义（F2 审计项）：hello 只反映

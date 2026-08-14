@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // usageServer 构造一个直扫本地 grok home 的 Server（usage-report 纯本地

@@ -9,11 +9,11 @@ import (
 	"strings"
 )
 
-// webDist 是 acp-fe 的生产构建产物（index.html + 内容哈希的 assets），
-// 从 ../acp-fe/dist 复制而来。嵌入二进制后 host 一个进程一个端口同时
+// webDist 是 capri-fe 的生产构建产物（index.html + 内容哈希的 assets），
+// 从 ../capri-fe/dist 复制而来。嵌入二进制后 host 一个进程一个端口同时
 // 提供 API 与 TUI Web 界面 —— 部署无需 nginx / 静态服务器。
 //
-// 更新方式：cd acp-fe && npm run build && cp -R dist ../acp-host/internal/server/web/dist
+// 更新方式：cd capri-fe && npm run build && cp -R dist ../capri-host/internal/server/web/dist
 //
 //go:embed web/dist
 var webDist embed.FS
@@ -65,7 +65,7 @@ func isAPIOrLivePath(p string) bool {
 		strings.HasPrefix(p, "/events/")
 }
 
-// handleWeb 服务嵌入的 acp-fe SPA：
+// handleWeb 服务嵌入的 capri-fe SPA：
 //   - 存在的文件按原样返回（assets 带长缓存）；
 //   - 其余非 API 的 GET 一律回退到 index.html（前端路由）；
 //   - 未注册的 /api/*、/events/* 保持 JSON 404，不会落到 SPA 壳。

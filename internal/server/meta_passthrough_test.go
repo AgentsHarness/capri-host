@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 )
 
 // meta_passthrough_test.go — 响应 `_meta` / 分页游标透传给浏览器的

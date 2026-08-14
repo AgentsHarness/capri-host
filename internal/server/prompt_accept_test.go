@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // prompt_accept_test.go — POST /api/prompt 受理即返回（async accept）的

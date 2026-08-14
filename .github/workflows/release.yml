@@ -91,13 +91,13 @@ jobs:
           ext=""
           [ "$GOOS" = "windows" ] && ext=".exe"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/acp-host-${GOOS}-${GOARCH}${ext}" ./cmd/acp-host
+          go build -trimpath -ldflags "-s -w" -o "dist/capri-host-${GOOS}-${GOARCH}${ext}" ./cmd/capri-host
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: acp-host-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/acp-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          name: capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/capri-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
           if-no-files-found: error
 
   release:
@@ -111,7 +111,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           path: dist
-          pattern: acp-host-*
+          pattern: capri-host-*
           merge-multiple: true
 
       - name: Show built files

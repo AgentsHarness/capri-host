@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // newLocalServer builds a Server whose bridge never talks to a real

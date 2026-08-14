@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // newFakeAgentServerWithGrokHome builds a fake-agent server whose bridge
