@@ -35,9 +35,9 @@ func TestRememberSessionPersistsAndSurvivesKill(t *testing.T) {
 		t.Fatalf("persisted = %+v, want sess-abc /tmp/ws", st)
 	}
 
-	// killProcess must wipe the in-memory roster but keep the last-session
+	// resetRoster must wipe the in-memory roster but keep the last-session
 	// pointer so restoreLastSession can session/load it.
-	b.killProcess()
+	b.resetRoster("test")
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.sessions) != 0 {
