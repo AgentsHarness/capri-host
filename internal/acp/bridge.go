@@ -2,6 +2,7 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -949,21 +950,36 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 
 func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	methodsRaw, _ := init["authMethods"].([]any)
-	methods := map[string]bool{}
+	var methodIDs []string
 	for _, m := range methodsRaw {
 		mm, _ := m.(map[string]any)
 		if id, _ := mm["id"].(string); id != "" {
-			methods[id] = true
+			methodIDs = append(methodIDs, id)
 		}
 	}
+	// 透传 agent 的认证信息：客户端不做能力判断（不检查 XAI_API_KEY
+	// 等环境变量），完全采用 agent 广告的方法——agent 只在有可用凭证
+	// 时才广告对应方法（env key / BYOK / 登录态），认证端还会按
+	// `[auth] preferred_method` 兜底校验，客户端自行推导 api_key vs
+	// session 曾导致 OIDC refresh 回归。
+	// 优先采用 agent 声明的 defaultAuthMethodId（agent 是权威），
+	// 未声明时取广告列表的第一个方法。
 	var methodID string
-	if os.Getenv("XAI_API_KEY") != "" && methods["xai.api_key"] {
-		methodID = "xai.api_key"
-	} else if methods["cached_token"] {
-		methodID = "cached_token"
+	if meta, ok := init["meta"].(map[string]any); ok {
+		if id, _ := meta["defaultAuthMethodId"].(string); id != "" {
+			for _, m := range methodIDs {
+				if m == id {
+					methodID = id
+					break
+				}
+			}
+		}
+	}
+	if methodID == "" && len(methodIDs) > 0 {
+		methodID = methodIDs[0]
 	}
 	if methodID == "" {
-		return errors.New("没有可用的认证方式，请先运行 `grok login`，或设置环境变量 XAI_API_KEY")
+		return errors.New("没有可用的认证方式：agent 未广告任何认证方法（请先运行 `grok login`，或设置 XAI_API_KEY / per-model api_key）")
 	}
 	// The agent's AuthRequestMeta (mvp_agent/mod.rs:1203) reads
 	// headless/reauth/use_oauth/force_interactive/request_seq from the
@@ -1108,29 +1124,39 @@ func (b *Bridge) readStderr(r io.Reader) {
 }
 
 func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
-	sc := bufio.NewScanner(r)
-	// 64MB max token: x.ai/session/updates can return a very large single-line
-	// JSON array for big sessions; a too-small buffer would silently kill the
-	// read loop (and wedge the whole bridge).
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	// 不用 bufio.Scanner：其单行上限（曾为 64MB）在
+	// x.ai/session/updates 返回超大单行 JSON 时会把整条 stdout 通道
+	// 打成永久损坏（Scanner 超长后不可恢复，所有在飞 RPC 全部失败、
+	// 前端要求重启 agent）。改用 Reader 手动按行切分，只保留一个
+	// 512MB 的防御上限防内存失控；JSON-RPC 行本来就整体驻留内存。
+	br := bufio.NewReaderSize(r, 64*1024)
+	const maxLineBytes = 512 << 20 // 512MB 单行防御上限
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if !sc.Scan() {
-			// Never die silently: a scan error (e.g. a line exceeding the
-			// 64MB buffer) would otherwise leave the bridge parsing nothing
-			// while the agent keeps running — every session appears frozen.
-			// 只报错：让在飞 RPC 立即失败返回，不杀进程（假设 agent
-			// 可靠，进程生命周期交给外部/用户重启接口）。
-			if err := sc.Err(); err != nil && err != io.EOF {
+		line, err := br.ReadBytes('\n')
+		if len(line) > maxLineBytes {
+			log.Printf("[capri-host] stdout 单行超过 %dMB 上限（%d 字节），agent 输出通道已损坏", maxLineBytes>>20, len(line))
+			b.failAllPending(fmt.Errorf("agent 输出通道已损坏: 单行 %d 字节超上限", len(line)))
+			b.Broadcast(Event{
+				"type":   "status",
+				"text":   "agent 输出通道异常，请重启 agent",
+				"action": "restart-agent",
+			})
+			return
+		}
+		if err != nil {
+			// EOF 且该行有内容：处理完最后一行再退出（Scanner 对无
+			// 尾随换行的最后一行同样会返回）。
+			if len(line) > 0 && err == io.EOF {
+				b.handleStdoutLine(line)
+			}
+			if err != io.EOF {
 				log.Printf("[capri-host] stdout 扫描错误: %v — agent 输出通道已损坏", err)
 				b.failAllPending(fmt.Errorf("agent 输出通道已损坏: %v", err))
-				// 进程可能还活着但输出已不可用，后续每回合都会失败：
-				// 唯一出路是用户重启 agent，必须广播出来，否则前端只
-				// 看到回合级错误、反复重试无果。
 				b.Broadcast(Event{
 					"type":   "status",
 					"text":   "agent 输出通道异常，请重启 agent",
@@ -1139,16 +1165,20 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 			}
 			return
 		}
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var msg map[string]any
-		if err := json.Unmarshal(line, &msg); err != nil {
-			continue
-		}
-		b.onAgentMessage(msg)
+		b.handleStdoutLine(line)
 	}
+}
+
+func (b *Bridge) handleStdoutLine(line []byte) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 {
+		return
+	}
+	var msg map[string]any
+	if err := json.Unmarshal(line, &msg); err != nil {
+		return
+	}
+	b.onAgentMessage(msg)
 }
 
 func (b *Bridge) onAgentMessage(msg map[string]any) {
