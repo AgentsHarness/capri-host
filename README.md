@@ -1,6 +1,6 @@
-# acp-host
+# capri-host
 
-本机 Host 服务（Go）：拉起 `grok agent stdio`，把 ACP 会话暴露给前端 / acp-hub。
+本机 Host 服务（Go）：拉起 `grok agent stdio`，把 ACP 会话暴露给前端 / capri-hub。
 
 ## 设计
 
@@ -9,8 +9,8 @@
 - Host 只做：进程管理、会话、流式事件转发、可选 `session/request_permission` 审批中继。
 
 ```
-浏览器 (acp-fe) ──HTTP/SSE──▶ acp-host ──stdio──▶ grok agent
-浏览器 (acp-fe) ──WS+HTTP──▶ acp-hub ──QUIC/WS──▶ acp-host × N ──stdio──▶ grok agent
+浏览器 (capri-fe) ──HTTP/SSE──▶ capri-host ──stdio──▶ grok agent
+浏览器 (capri-fe) ──WS+HTTP──▶ capri-hub ──QUIC/WS──▶ capri-host × N ──stdio──▶ grok agent
 ```
 
 ## 运行
@@ -23,11 +23,11 @@ cd acp-host
 go run ./cmd/acp-host
 ```
 
-默认监听 `http://localhost:8765`——**一个端口同时提供 API 与内置 acp-fe 前端**
+默认监听 `http://localhost:8765`——**一个端口同时提供 API 与内置 capri-fe 前端**
 （构建产物嵌入在 `internal/server/web/dist`，`GET /` 即 Web 界面）。
 
 后台运行：`./start-host.sh -d`（日志 `bin/acp-host.log`）；`status` / `stop` 管理实例。
-中继模式（连 acp-hub）：`./start-host.sh --hub http://hub:8787 --pair-code XXXXXX`。
+中继模式（连 capri-hub）：`./start-host.sh --hub http://hub:8787 --pair-code XXXXXX`。
 完整教程（本地 / 中继、环境变量、常见问题）见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
 
 ### 环境变量
@@ -39,7 +39,7 @@ go run ./cmd/acp-host
 | `HOST_ID` | `local` | Host 标识（多 Host 时用） |
 | `HOST_NAME` | `Local Host` | 展示名 |
 | `XAI_API_KEY` | — | 可选；否则用 `grok login` 缓存 |
-| `HUB_URL` | — | 设置后进入 **Hub 中继模式**：配对并连接 acp-hub |
+| `HUB_URL` | — | 设置后进入 **Hub 中继模式**：配对并连接 capri-hub |
 | `HUB_PAIR_CODE` | — | 一次性配对码（Hub 启动日志 / `GET /api/pairing` 查看） |
 | `HOST_TOKEN` | — | 已配对的 token（优先级最高；否则用 `~/.acp-host/hub.json` 持久化的 token，再否则用配对码） |
 | `ACP_INIT_CLIENT_IDENTIFIER` | — | initialize `_meta.clientIdentifier`（客户端标识，如 `acp-fe`；缺省省略） |
@@ -409,11 +409,11 @@ Hub 模式下所有 `/api/*` 请求经 Hub 中转（`?host=` 选择目标），�
 
 ## 与 acp-chat 差异
 
-| | acp-chat (旧) | acp-host (新) |
+| | acp-chat (旧) | capri-host (新) |
 |--|---------------|---------------|
 | 语言 | Node | Go |
 | Client fs/terminal | 有，可审批执行 | **无**，依赖 Agent |
-| 前端 | 内嵌 HTML | 独立 `acp-fe` |
+| 前端 | 内嵌 HTML | 独立 `capri-fe` |
 
 ## 友情链接
 
