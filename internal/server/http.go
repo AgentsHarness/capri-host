@@ -55,6 +55,7 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/session-updates", s.handleSessionUpdates)
 	mux.HandleFunc("POST /api/session-running-tasks", s.handleSessionRunningTasks)
 	mux.HandleFunc("POST /api/usage-report", s.handleUsageReport)
+	mux.HandleFunc("POST /api/session-stats", s.handleSessionStats)
 	mux.HandleFunc("POST /api/git-info", s.handleGitInfo)
 	mux.HandleFunc("POST /api/session-fork", s.handleSessionFork)
 	mux.HandleFunc("POST /api/session-rename", s.handleSessionRename)
