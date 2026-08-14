@@ -677,7 +677,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		"clientInfo": map[string]any{
 			"name":    "capri-host",
 			"title":   "ACP Host",
-			"version": "0.2.0",
+			"version": "0.2.1",
 		},
 		// `_meta` mirrors the Grok Build TUI's build_initialize_meta
 		// (xai-grok-pager/src/acp/mod.rs): clientType defaults to the
@@ -761,7 +761,7 @@ func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
 // which the host approximates with its own release constant.
 const (
 	initClientType    = "grok-pager"
-	initClientVersion = "0.2.0"
+	initClientVersion = "0.2.1"
 )
 
 // initMetaSeeds builds the initialize request `_meta` (the TUI's
