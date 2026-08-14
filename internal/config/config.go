@@ -8,13 +8,19 @@ import (
 type Config struct {
 	Port    int
 	GrokBin string
-	// Hub relay mode: set HUB_URL to pair with acp-hub and serve
+	// Hub relay mode: set HUB_URL to pair with capri-hub and serve
 	// requests through it (hub is the browser-facing endpoint).
 	HubURL      string
 	HubPairCode string
 	HostToken   string
 	HostID      string
 	HostName    string
+	// Inbound access token for this host's own HTTP API (/api/*, /events).
+	// Set FE_TOKEN (or ACCESS_TOKEN) to require it; empty = open (local
+	// trusted default, matching the pre-token behavior). Same secret
+	// semantics as the hub's FE_TOKEN — deploy the same value so the
+	// browser gate and the host port share one credential.
+	AccessToken string
 }
 
 func Load() Config {
@@ -36,6 +42,7 @@ func Load() Config {
 		HostToken:   os.Getenv("HOST_TOKEN"),
 		HostID:      envOr("HOST_ID", "local"),
 		HostName:    envOr("HOST_NAME", "Local Host"),
+		AccessToken: envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")),
 	}
 }
 

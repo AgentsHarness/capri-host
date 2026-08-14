@@ -16,7 +16,7 @@ import (
 func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
-	t.Setenv("ACP_INIT_CLIENT_IDENTIFIER", "acp-fe")
+	t.Setenv("ACP_INIT_CLIENT_IDENTIFIER", "capri-fe")
 	t.Setenv("ACP_INIT_SYSTEM_PROMPT_OVERRIDE", "BE HELPFUL")
 	t.Setenv("ACP_INIT_MCP_APPS", "1")
 	t.Setenv("ACP_CAP_CODE_NAVIGATION", "true")
@@ -37,12 +37,12 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 	if !ok {
 		t.Fatalf("initialize params carry no _meta: %v", params)
 	}
-	if meta["clientType"] != "grok-pager" || meta["clientVersion"] != "0.1.0" {
-		t.Errorf("_meta clientType/clientVersion = %v/%v, want grok-pager/0.1.0",
+	if meta["clientType"] != "grok-pager" || meta["clientVersion"] != "0.2.0" {
+		t.Errorf("_meta clientType/clientVersion = %v/%v, want grok-pager/0.2.0",
 			meta["clientType"], meta["clientVersion"])
 	}
-	if meta["clientIdentifier"] != "acp-fe" {
-		t.Errorf("_meta clientIdentifier = %v, want acp-fe", meta["clientIdentifier"])
+	if meta["clientIdentifier"] != "capri-fe" {
+		t.Errorf("_meta clientIdentifier = %v, want capri-fe", meta["clientIdentifier"])
 	}
 	if meta["systemPromptOverride"] != "BE HELPFUL" {
 		t.Errorf("_meta systemPromptOverride = %v, want BE HELPFUL", meta["systemPromptOverride"])
@@ -94,7 +94,7 @@ func TestInitializeOmitsEnvSeedsWhenAbsent(t *testing.T) {
 	req := findRequest(t, readRecordedRequests(t, recordPath), "initialize")
 	params, _ := req["params"].(map[string]any)
 	meta, _ := params["_meta"].(map[string]any)
-	want := map[string]any{"clientType": "grok-pager", "clientVersion": "0.1.0"}
+	want := map[string]any{"clientType": "grok-pager", "clientVersion": "0.2.0"}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("_meta = %v, want %v (env seeds omitted when absent)", meta, want)
 	}

@@ -112,7 +112,7 @@ func TestCreateSessionOmitsMetaWhenAbsent(t *testing.T) {
 
 // TestCreateSessionNormalizesCwdTrailingSlash — 新建会话时 cwd 必须去掉
 // 尾部斜杠("/ws/" → "/ws"):带斜杠的 cwd 会让 grok 把同一工作区存进
-// 两个不同的编码会话目录(如 …/acp-host 与 …/acp-host%2F),导致
+// 两个不同的编码会话目录(如 …/capri-host 与 …/capri-host%2F),导致
 // session/list 按工作区过滤时新旧会话互相看不到。
 func TestCreateSessionNormalizesCwdTrailingSlash(t *testing.T) {
 	b, w := metaReadyBridge(t)

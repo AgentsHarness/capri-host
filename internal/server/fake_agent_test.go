@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // ACPHostFakeAgentEnv is the env var that switches the test binary into
@@ -242,7 +242,7 @@ func runFakeAgent() {
 // re-executed as a fake agent, so agent-backed endpoints round-trip fully.
 // LastSessionFile is redirected to a temp path: the fake agent process is
 // killed at cleanup, and waitProcess would otherwise persist the test's
-// active session over the real ~/.acp-host/last-session.json.
+// active session over the real ~/.capri-host/last-session.json.
 func newFakeAgentServer(t *testing.T) (*Server, *acp.Bridge) {
 	t.Helper()
 	t.Setenv(ACPHostFakeAgentEnv, "1")

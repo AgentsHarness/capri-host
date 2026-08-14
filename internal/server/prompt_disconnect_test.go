@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // prompt_disconnect_test.go — 受理即返回（async accept）语义：

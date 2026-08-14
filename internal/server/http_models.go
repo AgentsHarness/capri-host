@@ -36,7 +36,7 @@ func (s *Server) handleSetDefaultModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.bridge.DismissModelDefaultCampaigns(r.Context()); err != nil {
-		log.Printf("[acp-host] campaign dismiss 失败（配置仍会写入，活动可能继续覆盖默认模型）: %v", err)
+		log.Printf("[capri-host] campaign dismiss 失败（配置仍会写入，活动可能继续覆盖默认模型）: %v", err)
 	}
 	if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
 		writeAgentError(w, "session/set-model", err)
@@ -105,7 +105,7 @@ func (s *Server) handleCustomModelDelete(w http.ResponseWriter, r *http.Request)
 // the next reload/restart, so it is logged rather than failing the request.
 func (s *Server) reloadModels(r *http.Request) bool {
 	if err := s.bridge.ReloadModels(r.Context()); err != nil {
-		log.Printf("[acp-host] 模型目录重载失败（配置已写入，将在下次重载/重启生效）: %v", err)
+		log.Printf("[capri-host] 模型目录重载失败（配置已写入，将在下次重载/重启生效）: %v", err)
 		return false
 	}
 	return true
