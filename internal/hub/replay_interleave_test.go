@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 )
 
 // TestReplayLiveInterleaveNoLoss is a regression test for the reconnect

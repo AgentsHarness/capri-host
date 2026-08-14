@@ -1,4 +1,4 @@
-module github.com/benin/acp-host
+module github.com/AgentsHarness/capri-host
 
 go 1.26.2
 

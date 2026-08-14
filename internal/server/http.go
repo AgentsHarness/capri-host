@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 type Server struct {
@@ -238,13 +238,15 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/debug/trigger-feedback", s.handleDebugTriggerFeedback)
 	mux.HandleFunc("POST /api/debug/arm-auto-compact", s.handleDebugArmAutoCompact)
 	mux.HandleFunc("POST /api/debug/agent", s.handleDebugAgent)
-	// ── 嵌入的 acp-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
+	// ── 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
 	// 非 API 路径回退 index.html（实现见 web.go）──
 	mux.HandleFunc("GET /", s.handleWeb)
-	// CORS for Vite dev
+	// CORS for Vite dev. withAuth sits INSIDE withCORS so preflight
+	// OPTIONS (which never carries Authorization) is answered by CORS
+	// without tripping the token gate.
 	s.http = &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           withCORS(mux),
+		Handler:           withCORS(withAuth(mux, cfg.AccessToken)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
@@ -320,7 +322,10 @@ func withCORS(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		// Authorization: the FE attaches Bearer on every API call; the
+		// preflight must admit it or cross-origin direct host calls (hub
+		// mode 双连接) would be blocked by the browser.
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -329,10 +334,76 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
+// ── inbound access-token gate ─────────────────────────────────────────
+
+// authRequiredForPath reports whether a path requires the configured
+// access token. Exemptions (by design, the FE's boot probes):
+//   - `GET /`            — SPA static assets; browsers cannot attach custom
+//     headers to script/style loads, and the page itself is public.
+//   - `GET /api/hosts`   — detectMode()/probeAccess() must reach it before
+//     any token exists. It carries no conversation data; the response
+//     declares `authRequired` so the FE knows to show the gate. Its 401
+//     semantics belong to the HUB (the FE uses 401 to tell "this is a
+//     hub, not a host") — a host must never 401 here.
+//
+// Everything else under /api/* and the /events SSE stream is gated.
+func authRequiredForPath(path string) bool {
+	if strings.HasPrefix(path, "/api/") {
+		return path != "/api/hosts"
+	}
+	return path == "/events"
+}
+
+// withAuth gates /api/* (except /api/hosts) and /events with the host's
+// access token when one is configured; empty token disables the gate
+// (local trusted default). Accepted transports:
+//   - Authorization: Bearer <token>   (the FE's apiFetch always sends it)
+//   - ?token=<token>                  (EventSource cannot set headers)
+func withAuth(next http.Handler, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" || !authRequiredForPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if tokenEqual(bearerToken(r.Header.Get("Authorization")), token) ||
+			tokenEqual(strings.TrimSpace(r.URL.Query().Get("token")), token) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"ok": false, "error": "需要有效的访问 token",
+		})
+	})
+}
+
+// bearerToken extracts the token from an Authorization header
+// ("Bearer <token>", case-insensitive prefix, trimmed).
+func bearerToken(auth string) string {
+	auth = strings.TrimSpace(auth)
+	const prefix = "Bearer "
+	if len(auth) >= len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+		return strings.TrimSpace(auth[len(prefix):])
+	}
+	return ""
+}
+
+// tokenEqual compares two tokens in constant time so the shared secret
+// cannot be fingerprinted via timing (same scheme as capri-hub).
+func tokenEqual(a, b string) bool {
+	if a == "" || b == "" || len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
 func (s *Server) ListenAndServe() error {
-	log.Printf("[acp-host] listening on http://localhost:%d", s.cfg.Port)
-	log.Printf("[acp-host] grok bin=%s hostId=%s name=%q", s.cfg.GrokBin, s.cfg.HostID, s.cfg.HostName)
-	log.Printf("[acp-host] mode=agent-only (no client fs/terminal)")
+	log.Printf("[capri-host] listening on http://localhost:%d", s.cfg.Port)
+	log.Printf("[capri-host] grok bin=%s hostId=%s name=%q", s.cfg.GrokBin, s.cfg.HostID, s.cfg.HostName)
+	log.Printf("[capri-host] mode=agent-only (no client fs/terminal)")
 	return s.http.ListenAndServe()
 }
 
@@ -486,6 +557,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	// Local mode: single host (this process). Multi-host comes via Hub.
 	snap := s.bridge.Snapshot()
+	// authRequired: this host requires the access token on its API (the
+	// FE reads it in probeAccess to decide whether to show the gate —
+	// /api/hosts itself stays open so boot probing works pre-token).
 	writeJSON(w, http.StatusOK, map[string]any{
 		"hosts": []map[string]any{
 			{
@@ -496,6 +570,7 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 				"local":    true,
 			},
 		},
+		"authRequired": s.cfg.AccessToken != "",
 	})
 }
 

@@ -18,7 +18,7 @@ import (
 // ── Persisted task timeline ─────────────────────────────────────────────
 //
 // The TUI rebuilds its tasks pane from the FULL replay of a session's
-// stored updates on session/load; acp-fe only replays the newest history
+// stored updates on session/load; capri-fe only replays the newest history
 // page (HISTORY_PAGE_SIZE=100), so task_backgrounded events older than the
 // page never materialize as rows. These helpers scan the session's
 // updates.jsonl directly (same file the agent reads) and extract the task

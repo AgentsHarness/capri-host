@@ -2,7 +2,7 @@
 .playwright-cli/
 
 # Binaries
-/acp-host
+/capri-host
 /bin/
 /release/
 *.exe

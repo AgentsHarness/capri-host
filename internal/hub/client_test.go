@@ -23,12 +23,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )
 
-// fakeHub stands in for acp-hub in tests (WS transport).
+// fakeHub stands in for capri-hub in tests (WS transport).
 type fakeHub struct {
 	t            *testing.T
 	pairOK       bool // pair succeeds only when code == "ABC123"
@@ -1146,7 +1146,7 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	qtls := &tls.Config{
 		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		NextProtos:   []string{"acp-hub"}, // match production hub ALPN
+		NextProtos:   []string{"capri-hub"}, // match production hub ALPN
 	}
 
 	ln, err := quic.ListenAddr("127.0.0.1:0", qtls, &quic.Config{KeepAlivePeriod: 10 * time.Second})
