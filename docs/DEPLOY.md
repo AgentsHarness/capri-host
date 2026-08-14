@@ -1,18 +1,18 @@
-# acp-host 启动与部署教程
+# capri-host 启动与部署教程
 
-`acp-host` 启动后**一个进程、一个端口同时提供两样东西**：
+`capri-host` 启动后**一个进程、一个端口同时提供两样东西**：
 
 1. **ACP 后端 API**（`/api/*`、`/events` SSE 事件流）
-2. **内置前端**（acp-fe 构建产物嵌入在二进制里，`GET /` 直接返回 Web 界面）
+2. **内置前端**（capri-fe 构建产物嵌入在二进制里，`GET /` 直接返回 Web 界面）
 
 所以部署时不需要 nginx、不需要单独跑静态服务器，把二进制扔到机器上就能用。
 
 ```
 本地模式：
-  浏览器 ──http://host:8765──▶ acp-host（API + 内置前端）──stdio──▶ grok agent
+  浏览器 ──http://host:8765──▶ capri-host（API + 内置前端）──stdio──▶ grok agent
 
 中继模式（多机 / 远程访问）：
-  浏览器 ──http://hub:8787──▶ acp-hub ──QUIC(UDP:8788)/WS──▶ acp-host × N ──stdio──▶ grok
+  浏览器 ──http://hub:8787──▶ capri-hub ──QUIC(UDP:8788)/WS──▶ capri-host × N ──stdio──▶ grok
 ```
 
 ## 前置条件
@@ -21,7 +21,7 @@
 |------|------|
 | Go ≥ 1.26 | 构建用（go.mod 要求）；跑现成二进制则不需要 |
 | `grok` CLI | 已安装并登录（`grok login`），或设置 `XAI_API_KEY` |
-| （中继模式）`acp-hub` | 另一台机器上的 hub 进程（`../acp-hub`） |
+| （中继模式）`capri-hub` | 另一台机器上的 hub 进程（`../acp-hub`） |
 
 ## 方式一：本地模式（单机）
 
@@ -36,7 +36,7 @@ cd acp-host
 http://localhost:8765
 ```
 
-就是完整的 acp-fe 界面，不需要再单独启动 `npm run dev`。
+就是完整的 capri-fe 界面，不需要再单独启动 `npm run dev`。
 
 常用变体：
 
@@ -114,13 +114,13 @@ hub 会把 `/api/*` 请求中转到目标 host（`?host=<hostId>` 选择，默�
 | seq 空洞 + gap-pull | 慢消费者丢弃时可能看到 `1,3` 跳号；FE 用 `GET /api/events?host=&after=` 补拉，重复 seq 去重即可 |
 | relay 帧带 `hostId` | hub 下行 `request` 帧携带目标 `hostId`；host 端校验与自身 `HOST_ID` 一致才执行，不匹配拒绝（404）——防 hub 路由错误/陈旧转发。FE 侧 `/api/shell` 等独立客户端必须经 transport 带 `?host=`（不能裸 fetch 相对路径） |
 
-**升级 / 回滚**：`acp-fe`、`acp-hub`、`acp-host`（含内嵌 `web/dist`）请升到同一代「双路去重 + 控制帧 + 不合并 chunk」的版本；回滚也三者一起回。
+**升级 / 回滚**：`capri-fe`、`capri-hub`、`capri-host`（含内嵌 `web/dist`）请升到同一代「双路去重 + 控制帧 + 不合并 chunk」的版本；回滚也三者一起回。
 
 **旧 FE + 新 host/hub 的典型症状**：重复 chunk、host 在线/ready 异常、异常 gap-pull 或事件错位。处理：同步升级，或整体回滚到旧契约版本。
 
 ## 环境变量速查
 
-### acp-host
+### capri-host
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
@@ -128,13 +128,13 @@ hub 会把 `/api/*` 请求中转到目标 host（`?host=<hostId>` 选择，默�
 | `GROK_BIN` | `grok` | grok 可执行文件 |
 | `HOST_ID` | `local` | Host 标识（多 Host 区分） |
 | `HOST_NAME` | `Local Host` | 界面展示名 |
-| `HUB_URL` | — | 设置后进入中继模式，连接 acp-hub |
+| `HUB_URL` | — | 设置后进入中继模式，连接 capri-hub |
 | `HUB_PAIR_CODE` | — | 一次性配对码（hub 日志 / `GET /api/pairing`） |
 | `HOST_TOKEN` | — | 已配对 token，优先于配对码和 `~/.acp-host/hub.json` |
 | `XAI_API_KEY` | — | 可选；否则用 `grok login` 缓存 |
 | `HUB_QUIC_HOST` | — | 强制 QUIC 拨号地址（域名经代理丢 UDP 时用） |
 
-### acp-hub（中继模式的服务端）
+### capri-hub（中继模式的服务端）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
@@ -188,7 +188,7 @@ cp -R dist ../acp-host/internal/server/web/dist
 | 重复 chunk / ready 状态乱 / 事件错位 | FE 与 hub/host **版本未对齐**（见上文「版本契约」）：旧 FE 不懂 `(hostId,seq)` 去重或无 seq 的 `host_status`；同步升级或整体回滚 |
 | seq 跳号（如 1→3）后短暂缺口 | 慢订阅缓冲满时 drop 属预期；FE 应 gap-pull，不是 host bug |
 | QUIC 连不上 | UDP 8788 被防火墙挡：自动回退 WebSocket（`已连接 hub（ws）`），或在云安全组放行 UDP |
-| 前端白屏 / 旧版本 | `internal/server/web/dist` 落后于 acp-fe 最新构建，按上文重新复制产物并重启；中继模式还需 FE 支持双路去重 |
+| 前端白屏 / 旧版本 | `internal/server/web/dist` 落后于 capri-fe 最新构建，按上文重新复制产物并重启；中继模式还需 FE 支持双路去重 |
 | 端口被占用 | `lsof -nP -iTCP:8765 -sTCP:LISTEN` 查占用；换 `--port` |
 | `grok` 找不到 | 装好 grok 并 `grok login`，或用 `--grok-bin` 指定路径；服务本身能起，首次提问前解决即可 |
 | 浏览器提示需要 token（中继模式） | hub 设置了 `FE_TOKEN`：在页面门禁输入同一个密钥 |
