@@ -15,9 +15,9 @@ import (
 	"github.com/AgentsHarness/capri-host/internal/server"
 )
 
-// version is stamped at build time via
-// go build -ldflags "-X main.version=<git-sha>-<timestamp>".
-var version = "0.2.1"
+// version rides acp.Version, which release builds stamp via
+// -ldflags "-X .../internal/acp.Version=<tag>"; local builds show "dev".
+var version = acp.Version
 
 func main() {
 	log.Printf("[capri-host] version %s", version)

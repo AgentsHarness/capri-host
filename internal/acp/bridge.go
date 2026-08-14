@@ -677,7 +677,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		"clientInfo": map[string]any{
 			"name":    "capri-host",
 			"title":   "ACP Host",
-			"version": "0.2.1",
+			"version": Version,
 		},
 		// `_meta` mirrors the Grok Build TUI's build_initialize_meta
 		// (xai-grok-pager/src/acp/mod.rs): clientType defaults to the
@@ -755,14 +755,17 @@ func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
 	return b.createSession(ctx, sc)
 }
 
-// initClientType / initClientVersion mirror the Grok Build TUI's initialize
-// `_meta` (xai-grok-pager/src/client_identity.rs): PAGER_CLIENT_TYPE is the
-// literal "grok-pager"; PAGER_CLIENT_VERSION is the build-time crate version,
-// which the host approximates with its own release constant.
-const (
-	initClientType    = "grok-pager"
-	initClientVersion = "0.2.1"
-)
+// Version is stamped at build time via
+// go build -ldflags "-X github.com/AgentsHarness/capri-host/internal/acp.Version=<tag>".
+// Plain `go build` / `go run` falls back to "dev". It feeds both the
+// initialize `clientInfo.version` and the `_meta` clientVersion, so the
+// released binary's version always equals its git tag.
+var Version = "dev"
+
+// initClientType mirrors the Grok Build TUI's initialize `_meta`
+// (xai-grok-pager/src/client_identity.rs): PAGER_CLIENT_TYPE is the literal
+// "grok-pager"; clientVersion rides acp.Version (build-time injected).
+const initClientType = "grok-pager"
 
 // initMetaSeeds builds the initialize request `_meta` (the TUI's
 // build_initialize_meta analog): clientType/clientVersion always present,
@@ -775,7 +778,7 @@ const (
 func initMetaSeeds() map[string]any {
 	meta := map[string]any{
 		"clientType":    initClientType,
-		"clientVersion": initClientVersion,
+		"clientVersion": Version,
 	}
 	addStringEnv(meta, "clientIdentifier", "ACP_INIT_CLIENT_IDENTIFIER")
 	addStringEnv(meta, "clientSource", "ACP_INIT_CLIENT_SOURCE")
