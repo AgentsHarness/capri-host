@@ -167,10 +167,10 @@ func TestPromptConcurrentBusyRefcount(t *testing.T) {
 	}
 }
 
-// 传输失败（killProcess 自愈）路径在并发 prompt 下不 panic、不误清：
-// B 的写失败触发 killProcess（roster 清空 + 全部 pending 失败），A 也随
-// 之失败；restoreLastSession 重建的会话对象与 A/B 启动时的对象不是同一
-// 个，releaseBusy 必须跳过（不得把新会话的 busy 清掉）。
+// 传输失败（roster 清理）路径在并发 prompt 下不 panic、不误清：
+// agent 进程死亡触发 resetRoster（roster 清空 + 全部 pending 失败），
+// A、B 都随之失败；restoreLastSession 重建的会话对象与 A/B 启动时的
+// 对象不是同一个，releaseBusy 必须跳过（不得把新会话的 busy 清掉）。
 func TestPromptConcurrentTransportFailureNoPanic(t *testing.T) {
 	b, w := metaReadyBridge(t)
 	b.mu.Lock()
@@ -195,27 +195,27 @@ func TestPromptConcurrentTransportFailureNoPanic(t *testing.T) {
 	}()
 	waitLineCount(t, w, 2)
 
-	// 模拟 agent 进程死亡：killProcess（生产路径中由传输失败触发），
-	// 两个 pending RPC 都随之失败返回。
-	b.killProcess()
+	// 模拟 agent 进程死亡：resetRoster（生产路径中由 waitProcess 在
+	// 进程退出时触发），两个 pending RPC 都随之失败返回。
+	b.resetRoster("test")
 	for i, done := range []chan error{doneA, doneB} {
 		select {
 		case err := <-done:
 			if err == nil {
-				t.Fatalf("prompt %c must fail after killProcess", 'a'+i)
+				t.Fatalf("prompt %c must fail after resetRoster", 'a'+i)
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("prompt %c never returned after killProcess", 'a'+i)
+			t.Fatalf("prompt %c never returned after resetRoster", 'a'+i)
 		}
 	}
 
-	// roster 已重建（killProcess 清空 + restore 失败时为空）：无 panic，
+	// roster 已重建（resetRoster 清空 + restore 失败时为空）：无 panic，
 	// 无残留 busy 引用。
 	b.mu.Lock()
 	st := b.sessions["s1"]
 	if st != nil && (st.Busy || st.busyCount != 0) {
 		b.mu.Unlock()
-		t.Fatalf("session state after killProcess = busy:%v count:%d, want idle",
+		t.Fatalf("session state after resetRoster = busy:%v count:%d, want idle",
 			st.Busy, st.busyCount)
 	}
 	b.mu.Unlock()
