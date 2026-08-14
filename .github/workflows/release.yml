@@ -91,7 +91,7 @@ jobs:
           ext=""
           [ "$GOOS" = "windows" ] && ext=".exe"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/capri-host-${GOOS}-${GOARCH}${ext}" ./cmd/capri-host
+          go build -trimpath -ldflags "-s -w -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/capri-host-${GOOS}-${GOARCH}${ext}" ./cmd/capri-host
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
