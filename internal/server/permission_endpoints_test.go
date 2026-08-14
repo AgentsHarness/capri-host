@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 )
 
 // waitPendingPermission polls the bridge until the fake agent's

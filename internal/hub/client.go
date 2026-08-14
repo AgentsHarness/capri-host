@@ -1,5 +1,5 @@
-// Package hub implements the acp-host side of the hub relay: pairing with
-// acp-hub (pairing code → token), forwarding local bridge events over
+// Package hub implements the capri-host side of the hub relay: pairing with
+// capri-hub (pairing code → token), forwarding local bridge events over
 // WebSocket or QUIC, and serving relayed browser requests by executing
 // them against this host's local HTTP API.
 package hub
@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/benin/acp-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 )
@@ -36,7 +36,12 @@ type Config struct {
 	PairCode  string // one-time pairing code; ignored when a token exists
 	Token     string // existing token (HOST_TOKEN); takes precedence
 	LocalBase string // this host's local HTTP base, e.g. http://127.0.0.1:8765
-	StateFile string // token persistence path (default ~/.acp-host/hub.json)
+	// AccessToken is this host's inbound API token (FE_TOKEN). Relayed
+	// requests execute against LocalBase, which now gates /api/* — the
+	// client re-attaches the token so hub-mode traffic passes its own
+	// gate. Empty when the host API is open.
+	AccessToken string
+	StateFile   string // token persistence path (default ~/.capri-host/hub.json)
 	// QUICPort is the hub's QUIC UDP port for the host transport
 	// (default 8788). QUIC is tried first, WebSocket falls back.
 	QUICPort int
@@ -296,7 +301,7 @@ func (c *Client) stateFileLocked() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".acp-host", "hub.json")
+	return filepath.Join(home, ".capri-host", "hub.json")
 }
 
 func (c *Client) loadStateLocked() *stateFile {
@@ -857,9 +862,9 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	defer cancel()
 	conn, err := quic.DialAddr(dialCtx, net.JoinHostPort(host, port), &tls.Config{
 		InsecureSkipVerify: true, // hub QUIC uses self-signed certs
-		// Must match acp-hub quicTLSConfig ALPN ("acp-hub"); empty client ALPN
+		// Must match capri-hub quicTLSConfig ALPN ("capri-hub"); empty client ALPN
 		// yields CRYPTO_ERROR tls: no application protocol.
-		NextProtos: []string{"acp-hub"},
+		NextProtos: []string{"capri-hub"},
 	}, &quic.Config{KeepAlivePeriod: 10 * time.Second})
 	if err != nil {
 		return fmt.Errorf("hub quic dial %s: %w", host, err)
@@ -1074,6 +1079,11 @@ func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path st
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// LocalBase 的 /api/* 已配置入站 token（FE_TOKEN）时，中继请求必须
+	// 带上它，否则 hub 模式下所有 API 会 401。
+	if c.cfg.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.AccessToken)
+	}
 	res, err := c.httpc.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {

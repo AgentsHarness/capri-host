@@ -29,22 +29,22 @@
 
 ```bash
 # 二进制（从 Releases 下载后）
-./acp-host-darwin-arm64
+./capri-host-darwin-arm64
 
 # 或源码
-go run ./cmd/acp-host
+go run ./cmd/capri-host
 ```
 
 打开 <http://localhost:8765>。
 
 ```bash
-PORT=9000 HOST_NAME="我的 Mac" GROK_BIN=/opt/grok/bin/grok go run ./cmd/acp-host
+PORT=9000 HOST_NAME="我的 Mac" GROK_BIN=/opt/grok/bin/grok go run ./cmd/capri-host
 ```
 
 后台跑：
 
 ```bash
-nohup go run ./cmd/acp-host > acp-host.log 2>&1 &
+nohup go run ./cmd/capri-host > capri-host.log 2>&1 &
 ```
 
 ## 远程 / 多机
@@ -55,7 +55,7 @@ nohup go run ./cmd/acp-host > acp-host.log 2>&1 &
 
 ```bash
 cd capri-hub
-FE_TOKEN=$(openssl rand -hex 24) go run ./cmd/acp-hub
+FE_TOKEN=$(openssl rand -hex 24) go run ./cmd/capri-hub
 ```
 
 - HTTP `:8787`，QUIC UDP `:8788`（安全组放行 UDP 更稳；不放行自动回退 WebSocket）
@@ -71,10 +71,10 @@ curl -X POST http://<hub>:8787/api/pairing/rotate
 ```bash
 HUB_URL=http://<hub>:8787 HUB_PAIR_CODE=XXXXXX \
 HOST_ID=macbook HOST_NAME="办公室 Mac" \
-  go run ./cmd/acp-host
+  go run ./cmd/capri-host
 ```
 
-配对成功后 token 在 `~/.acp-host/hub.json`，之后只需带 `HUB_URL`。每台机器用不同的 `HOST_ID`。
+配对成功后 token 在 `~/.capri-host/hub.json`，之后只需带 `HUB_URL`。每台机器用不同的 `HOST_ID`。
 
 ### 3. 打开浏览器
 
@@ -92,6 +92,7 @@ HOST_ID=macbook HOST_NAME="办公室 Mac" \
 | `GROK_BIN` | `grok` | grok 可执行文件 |
 | `HOST_ID` | `local` | 多 Host 区分 |
 | `HOST_NAME` | `Local Host` | 界面展示名 |
+| `FE_TOKEN` | — | 本机接口访问密钥（`/api/*`、`/events`）。配了之后浏览器首次打开需要输入；与 Hub 的 `FE_TOKEN` 同语义，部署时建议配同一个值 |
 | `HUB_URL` | — | 设置后进入中继模式 |
 | `HUB_PAIR_CODE` | — | 一次性配对码 |
 | `HOST_TOKEN` | — | 已配对 token，优先于配对码 |
@@ -130,7 +131,7 @@ macOS `~/Library/LaunchAgents/com.capri.host.plist`：
   <key>Label</key><string>com.capri.host</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/绝对路径/acp-host</string>
+    <string>/绝对路径/capri-host</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -139,8 +140,8 @@ macOS `~/Library/LaunchAgents/com.capri.host.plist`：
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/绝对路径/acp-host.log</string>
-  <key>StandardErrorPath</key><string>/绝对路径/acp-host.log</string>
+  <key>StandardOutPath</key><string>/绝对路径/capri-host.log</string>
+  <key>StandardErrorPath</key><string>/绝对路径/capri-host.log</string>
 </dict>
 </plist>
 ```
@@ -153,7 +154,7 @@ Description=capri-host
 After=network-online.target
 
 [Service]
-ExecStart=/绝对路径/acp-host
+ExecStart=/绝对路径/capri-host
 Restart=always
 Environment=HOST_NAME=我的服务器
 
@@ -166,11 +167,11 @@ WantedBy=multi-user.target
 | 现象 | 处理 |
 |------|------|
 | 配对一直失败 | 码填错或过期：Hub 上 `POST /api/pairing/rotate`，Host 带新码重启 |
-| 重启还要配对 | 看 `~/.acp-host/hub.json` 是否在、`HUB_URL` 是否和当初一致 |
+| 重启还要配对 | 看 `~/.capri-host/hub.json` 是否在、`HUB_URL` 是否和当初一致 |
 | 中继模式打开没内容 | 没有浏览器订阅时 Host 会暂停实时上报（省流量），打开页面后会恢复；不行就刷新 |
 | 重复输出 / 状态乱 | FE、Hub、Host 版本没对齐，三者一起升或一起回 |
 | QUIC 连不上 | UDP 8788 被挡，会自动走 WebSocket，功能不受影响 |
 | 端口被占 | `lsof -nP -iTCP:8765 -sTCP:LISTEN`，或换 `PORT` |
 | 找不到 `grok` | 先 `grok login`，或设 `GROK_BIN` |
-| 浏览器要 token | Hub 设了 `FE_TOKEN`，在页面门禁输入同一个密钥 |
+| 浏览器要 token | Hub 或 Host 设了 `FE_TOKEN`，在页面门禁输入同一个密钥 |
 | 前端白屏 / 旧界面 | 按上文重新拷贝 capri-fe 构建产物并重启 Host |

@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// webDistAssetNames lists the files embedded from acp-fe/dist (excluding
+// webDistAssetNames lists the files embedded from capri-fe/dist (excluding
 // index.html itself) so tests can reference a real asset path.
 func webDistAssetNames(t *testing.T) []string {
 	t.Helper()
@@ -36,7 +36,7 @@ func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
 	return rec
 }
 
-// GET / serves the embedded acp-fe SPA shell (index.html).
+// GET / serves the embedded capri-fe SPA shell (index.html).
 func TestWebServesIndex(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
 	rec := get(t, s, "/")

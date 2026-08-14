@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/benin/acp-host/internal/acp"
-	"github.com/benin/acp-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 func writeFakeSession(t *testing.T, grokHome, cwd, sessionID string, lines []string) {

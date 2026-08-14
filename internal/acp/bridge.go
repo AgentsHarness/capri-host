@@ -97,7 +97,7 @@ type Bridge struct {
 	// session/load it instead of session/new (which would open a blank chat).
 	// Written whenever createSession / LoadSession makes a session active;
 	// also snapshotted into resetRoster before the roster is wiped.
-	// Persisted under ~/.acp-host/last-session.json.
+	// Persisted under ~/.capri-host/last-session.json.
 	lastSessionID  string
 	lastSessionCwd string
 
@@ -131,7 +131,7 @@ type GrokConfig struct {
 	Bin      string
 	HostID   string
 	HostName string
-	// LastSessionFile overrides the default ~/.acp-host/last-session.json
+	// LastSessionFile overrides the default ~/.capri-host/last-session.json
 	// so tests can inject a temp path without touching the real home.
 	LastSessionFile string
 	// GrokHome overrides the grok data dir (~/.grok) used to locate
@@ -214,7 +214,7 @@ func (b *Bridge) lastSessionPath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".acp-host", "last-session.json")
+	return filepath.Join(home, ".capri-host", "last-session.json")
 }
 
 // loadLastSessionFile reads the persisted last-session pointer (best-effort).
@@ -285,10 +285,10 @@ func (b *Bridge) restoreLastSession(ctx context.Context) error {
 		cwd = mustCwd()
 	}
 	if _, err := b.LoadSession(ctx, sid, cwd); err != nil {
-		log.Printf("[acp-host] restore session %s failed: %v", sid, err)
+		log.Printf("[capri-host] restore session %s failed: %v", sid, err)
 		return fmt.Errorf("恢复会话失败: %w", err)
 	}
-	log.Printf("[acp-host] restored session %s (cwd=%s)", sid, cwd)
+	log.Printf("[capri-host] restored session %s (cwd=%s)", sid, cwd)
 	return nil
 }
 
@@ -302,7 +302,7 @@ func mustCwd() string {
 
 // normCwd 去掉 cwd 的尾部斜杠(根目录 "/" 除外),保证同一工作区的
 // "/a/b" 与 "/a/b/" 在 grok 侧落进同一个会话目录,不再分裂成两个
-// 编码目录(如 …/acp-host 与 …/acp-host%2F)。
+// 编码目录(如 …/capri-host 与 …/capri-host%2F)。
 func normCwd(cwd string) string {
 	if cwd == "" {
 		return cwd
@@ -674,9 +674,9 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 			"meta": initCapabilitiesMeta(),
 		},
 		"clientInfo": map[string]any{
-			"name":    "acp-host",
+			"name":    "capri-host",
 			"title":   "ACP Host",
-			"version": "0.1.0",
+			"version": "0.2.0",
 		},
 		// `_meta` mirrors the Grok Build TUI's build_initialize_meta
 		// (xai-grok-pager/src/acp/mod.rs): clientType defaults to the
@@ -703,7 +703,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	// surface we use is small and stable. (JSON numbers decode as float64.)
 	if pv, ok := initRes["protocolVersion"]; ok {
 		if n, isNum := asInt(pv); !isNum || n != protocolVersion {
-			log.Printf("[acp-host] agent protocolVersion = %v, host expects %d (continuing)", pv, protocolVersion)
+			log.Printf("[capri-host] agent protocolVersion = %v, host expects %d (continuing)", pv, protocolVersion)
 		}
 	}
 
@@ -760,7 +760,7 @@ func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
 // which the host approximates with its own release constant.
 const (
 	initClientType    = "grok-pager"
-	initClientVersion = "0.1.0"
+	initClientVersion = "0.2.0"
 )
 
 // initMetaSeeds builds the initialize request `_meta` (the TUI's
@@ -1064,7 +1064,7 @@ func (b *Bridge) ensureProcess() error {
 	go b.readStderr(stderr)
 	go b.waitProcess(cmd)
 
-	log.Printf("[acp-host] spawned %s agent stdio pid=%d", b.cfg.Bin, cmd.Process.Pid)
+	log.Printf("[capri-host] spawned %s agent stdio pid=%d", b.cfg.Bin, cmd.Process.Pid)
 	return nil
 }
 
@@ -1083,12 +1083,12 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 		// 进程已被外部清理取代（host 不再主动 killProcess，此分支仅
 		// 防御）：补一条实际死亡时间戳，时间线才完整。
 		if cmd.Process != nil {
-			log.Printf("[acp-host] agent process %d reaped (superseded, code=%d)", cmd.Process.Pid, code)
+			log.Printf("[capri-host] agent process %d reaped (superseded, code=%d)", cmd.Process.Pid, code)
 		}
 		return
 	}
 	lastID, _ := b.resetRoster("process-exit")
-	log.Printf("[acp-host] grok process exited (code=%d), lastSession=%s", code, lastID)
+	log.Printf("[capri-host] grok process exited (code=%d), lastSession=%s", code, lastID)
 	b.Broadcast(Event{
 		"type":   "status",
 		"text":   "连接HOST异常，请检查后重试",
@@ -1126,7 +1126,7 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 			// 只报错：让在飞 RPC 立即失败返回，不杀进程（假设 agent
 			// 可靠，进程生命周期交给外部/用户重启接口）。
 			if err := sc.Err(); err != nil && err != io.EOF {
-				log.Printf("[acp-host] stdout 扫描错误: %v — agent 输出通道已损坏", err)
+				log.Printf("[capri-host] stdout 扫描错误: %v — agent 输出通道已损坏", err)
 				b.failAllPending(fmt.Errorf("agent 输出通道已损坏: %v", err))
 				// 进程可能还活着但输出已不可用，后续每回合都会失败：
 				// 唯一出路是用户重启 agent，必须广播出来，否则前端只
@@ -1672,7 +1672,7 @@ func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any
 
 // handleModelSwitchKind applies model_auto_switched / model_changed
 // (extensions/notification.rs SessionUpdate::ModelAutoSwitched /
-// ModelChanged; 字段名以 acp-fe chat.ts:3242-3260 与 grok 源码为准):
+// ModelChanged; 字段名以 capri-fe chat.ts:3242-3260 与 grok 源码为准):
 //   - model_changed:       model_id/modelId + reasoning_effort/reasoningEffort
 //   - model_auto_switched: previous_model_id/new_model_id/reason（无 effort）
 //
@@ -2496,7 +2496,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// 留痕底层错误：区分超时 / 写失败 / 进程退出，事后才能还原事故。
 		var rpcErr *RPCError
 		if !errors.As(err, &rpcErr) {
-			log.Printf("[acp-host] prompt transport failure (session=%s): %v", sessionID, err)
+			log.Printf("[capri-host] prompt transport failure (session=%s): %v", sessionID, err)
 		}
 		return "", nil, err
 	}
@@ -2623,7 +2623,7 @@ func (b *Bridge) resetRoster(reason string) (string, string) {
 		b.cancelRd = nil
 	}
 	b.mu.Unlock()
-	log.Printf("[acp-host] agent state reset (reason=%s)", reason)
+	log.Printf("[capri-host] agent state reset (reason=%s)", reason)
 	b.failAllPending(fmt.Errorf("grok 进程已退出或不可用"))
 	b.broadcastRosterChange()
 	return lastID, lastCwd
@@ -2655,7 +2655,7 @@ func (b *Bridge) RestartAgent(ctx context.Context) error {
 			return fmt.Errorf("重启后恢复会话失败: %w", err)
 		}
 	}
-	log.Printf("[acp-host] agent restarted (user request)")
+	log.Printf("[capri-host] agent restarted (user request)")
 	return nil
 }
 
@@ -3573,7 +3573,7 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 			page.PromptStarts = ps
 		}
 	}
-	log.Printf("[acp-host] session updates via _x.ai/session/updates ok (total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
+	log.Printf("[capri-host] session updates via _x.ai/session/updates ok (total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
 	return page, nil
 }
 

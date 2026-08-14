@@ -25,7 +25,7 @@ func TestInitMetaSeedsDefaults(t *testing.T) {
 	meta := initMetaSeeds()
 	// clientType/clientVersion mirror the TUI's PAGER_CLIENT_TYPE /
 	// PAGER_CLIENT_VERSION (build-time → host constant).
-	want := map[string]any{"clientType": "grok-pager", "clientVersion": "0.1.0"}
+	want := map[string]any{"clientType": "grok-pager", "clientVersion": "0.2.0"}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("initMetaSeeds = %v, want %v (env-driven keys must be omitted when absent)", meta, want)
 	}
@@ -43,7 +43,7 @@ func TestInitMetaSeedsEnvDriven(t *testing.T) {
 	meta := initMetaSeeds()
 	want := map[string]any{
 		"clientType":           "grok-pager",
-		"clientVersion":        "0.1.0",
+		"clientVersion":        "0.2.0",
 		"clientIdentifier":     "my-editor",
 		"clientSource":         "web",
 		"systemPromptOverride": "YOU ARE A PIRATE.",
