@@ -17,7 +17,7 @@ import (
 
 // version is stamped at build time via
 // go build -ldflags "-X main.version=<git-sha>-<timestamp>".
-var version = "0.2.0"
+var version = "0.2.1"
 
 func main() {
 	log.Printf("[capri-host] version %s", version)
