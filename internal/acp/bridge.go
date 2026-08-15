@@ -64,7 +64,6 @@ type Bridge struct {
 	// initAgentCapabilities is the `agentCapabilities` object from the
 	// agent's initialize response, surfaced in Status/Snapshot.
 	initAgentCapabilities any
-	textBuf               string
 	// genRate 是 per-session 的生成输出速率（字符/s）估算器（见
 	// genrate.go）：chunk 到达时观察、tool_call / 回合终态收尾、
 	// user_message_chunk 复位；节流后广播 gen_rate 事件。
@@ -556,7 +555,6 @@ func (b *Bridge) Snapshot() Status {
 		SessionMeta:       sessionMeta,
 		Models:            models,
 		BootError:         b.bootError,
-		Text:              b.textBuf,
 		PendingRequests:   pending,
 		Capabilities:      DefaultClientCaps(),
 		Roster:            roster,
@@ -915,7 +913,6 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	s.sessionMeta = sessRes["_meta"]
 	b.activeSessionID = sid
 	b.rememberSessionLocked(sid, cwd)
-	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
 	modes := s.modes
@@ -1398,9 +1395,6 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	switch kind {
 	case "agent_message_chunk":
 		if text := contentText(update["content"]); text != "" {
-			b.mu.Lock()
-			b.textBuf += text
-			b.mu.Unlock()
 			ev := attachStreamMeta(Event{"type": "chunk", "text": text}, params)
 			if mid, ok := update["messageId"]; ok {
 				ev["messageId"] = mid
@@ -2657,7 +2651,6 @@ func (b *Bridge) resetRoster(reason string) (string, string) {
 	b.bootOK = false
 	b.sessions = make(map[string]*SessionState)
 	b.activeSessionID = ""
-	b.textBuf = ""
 	// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
 	// 一并作废，避免 /api/queue/status 回放过期队列。
 	b.queueSnapshots = nil
@@ -3117,7 +3110,6 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		}
 		b.activeSessionID = sessionID
 		b.rememberSessionLocked(sessionID, s.Cwd)
-		b.textBuf = ""
 		b.ready = true
 		b.bootError = ""
 		sessRes := map[string]any{"busy": true}
@@ -3228,7 +3220,6 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
-	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the load response — they reflect the restored session.
@@ -3328,7 +3319,6 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		}
 		b.activeSessionID = sessionID
 		b.rememberSessionLocked(sessionID, s.Cwd)
-		b.textBuf = ""
 		b.ready = true
 		b.bootError = ""
 		sessRes := map[string]any{"busy": true}
@@ -3416,7 +3406,6 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
-	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the resume response — they reflect the session.
