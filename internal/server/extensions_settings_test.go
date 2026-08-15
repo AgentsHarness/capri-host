@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
@@ -218,6 +219,87 @@ token = "never-exposed"
 	// Unknown sections must not leak into the response.
 	if _, has := m["secret-stuff"]; has {
 		t.Errorf("resp = %s, want no unknown sections", rec.Body.String())
+	}
+}
+
+// POST /api/settings writes only the FE-consumed [ui] scalars and
+// returns the same GET payload. Other keys / sections survive.
+func TestSettingsUpdateEndpoint(t *testing.T) {
+	grok := withFakeGrokHome(t)
+	s := newLocalServer(t)
+	path := filepath.Join(grok, "config.toml")
+	os.WriteFile(path, []byte(`
+[ui]
+yolo = true
+permission_mode = "ask"
+theme = "dark"
+
+[models]
+default = "grok-4"
+`), 0o644)
+
+	rec := postJSON(t, s, "/api/settings", `{
+		"collapsed_edit_blocks": true,
+		"page_flip_on_send": false,
+		"remember_tool_approvals": true,
+		"permission_mode": "always-approve"
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, body=%s", m["ok"], rec.Body.String())
+	}
+	ui, _ := m["ui"].(map[string]any)
+	if ui["collapsed_edit_blocks"] != true ||
+		ui["page_flip_on_send"] != false ||
+		ui["remember_tool_approvals"] != true ||
+		ui["permission_mode"] != "always-approve" ||
+		ui["theme"] != "dark" ||
+		ui["yolo"] != true {
+		t.Errorf("ui = %v", ui)
+	}
+	models, _ := m["models"].(map[string]any)
+	if models["default"] != "grok-4" {
+		t.Errorf("models = %v, want default preserved", models)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{
+		"collapsed_edit_blocks",
+		"page_flip_on_send",
+		"remember_tool_approvals",
+		"always-approve",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("config.toml missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestSettingsUpdateRejectsUnknownAndEmpty(t *testing.T) {
+	withFakeGrokHome(t)
+	s := newLocalServer(t)
+
+	rec := postJSON(t, s, "/api/settings", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty: status = %d, want 400", rec.Code)
+	}
+
+	// Struct decode drops unknown keys; with nothing left → 400.
+	rec = postJSON(t, s, "/api/settings", `{"theme":"dark","yolo":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-only: status = %d, want 400", rec.Code)
+	}
+
+	rec = postJSON(t, s, "/api/settings", `{"permission_mode":"yolo"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad mode: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
 	}
 }
 
