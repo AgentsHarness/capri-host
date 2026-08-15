@@ -22,22 +22,18 @@ import (
 //   - toolDurationMs   工具总耗时：Σ (completed tool_call_update 的
 //     _meta.agentTimestampMs − 对应 tool_call 的 agentTimestampMs)。
 //     老数据无 _meta → 该工具跳过；全无则省略；
-//   - firstTokenAvgMs  用户发出 → 本回合第一个可见字，每回合只计一次：
-//     首个 thought/message chunk 的 agentTimestampMs − 回合起点
-//     （user_message 的 agentTimestampMs，_meta.turnStartMs 优先）；
-//   - tokensPerSec     Σ outputTokens / 生成窗口 × 1000。每流窗口见
-//     streamGenWindow：真流式用「首包 → 末包」，Grok 一次性大包用
-//     「streamStart → 末包」。窗口与 usage 按回合配对（pending，见
-//     accumulateUsage）——进行中回合不进分母。无生成窗口时回退
-//     llmDurationMs；
+//   - firstTokenAvgMs  用户发出 → 本回合第一条 LLM 流起点，每回合只计一次：
+//     首个带 streamStartMs 的 thought/message chunk 的 streamStartMs −
+//     回合起点（user_message 的 agentTimestampMs，_meta.turnStartMs 优先）。
+//     不含 thought 整包生成时间；缺 streamStartMs 的回合跳过；
+//   - tokensPerSec     Σ outputTokens / 生成窗口 × 1000。每流窗口 =
+//     末包 − streamStart（与 live gen_rate、firstToken 同一时间零点，
+//     含 thought 首包生成）。缺 streamStart 时回退首包 → 末包。窗口
+//     与 usage 按回合配对（pending，见 accumulateUsage）——进行中回合
+//     不进分母。无生成窗口时回退 llmDurationMs；
 //   - cacheHitRate     Σ cachedReadTokens / Σ inputTokens（钳制 [0,1]）；
 //   - inputTokens / outputTokens / totalTokens / cachedReadTokens /
 //     modelCalls：Σ usage（与 usage-report 同源同口径）。
-
-// genWindowMinTailMs：末包 − 首包短于此，视为首包一次性吐出（Grok 常见
-// thought 大包 + 2ms 正文尾巴），分母用末包 − streamStart；否则视为真
-// 流式，分母用末包 − 首包（不含等到首字的时间）。
-const genWindowMinTailMs = 500
 
 // SessionStats 是一次单会话聚合的结果（字段全 optional 语义：老数据
 // 缺 _meta 时 toolDurationMs / firstTokenAvgMs 省略，前端显示 '—'）。
@@ -68,7 +64,7 @@ type sessionStatsAccumulator struct {
 	toolStarts map[string]int64
 	// 最近一个 LLM 流的起点（去重新流）。
 	lastStreamStartMs int64
-	// 本回合是否已记过首 token（每回合只计第一个可见字）。
+	// 本回合是否已记过首 token（每回合只计第一条流的 streamStart）。
 	turnFirstChunkSeen bool
 	// 首 token 延迟累计（ms）与回合数。
 	firstTokenSumMs int64
@@ -206,9 +202,10 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 			}
 		}
 	case "agent_thought_chunk", "agent_message_chunk":
-		// 首 token：本回合第一个可见字相对用户发出的时刻。
-		if agentTsMs > 0 && !a.turnFirstChunkSeen && a.turnStartMs > 0 && agentTsMs >= a.turnStartMs {
-			a.firstTokenSumMs += agentTsMs - a.turnStartMs
+		// 首 token：本回合第一条 LLM 流的 streamStart − 用户发出。
+		// 缺 streamStartMs 则等后续同回合 chunk，不把可见字时间当成流起点。
+		if !a.turnFirstChunkSeen && a.turnStartMs > 0 && streamStartMs > 0 && streamStartMs >= a.turnStartMs {
+			a.firstTokenSumMs += streamStartMs - a.turnStartMs
 			a.firstTokenCount++
 			a.turnFirstChunkSeen = true
 		}
@@ -273,24 +270,19 @@ func (a *sessionStatsAccumulator) accumulateUsage(usage map[string]any) {
 	}
 }
 
-// streamGenWindow 一条 LLM 流的生成窗口（ms）。
-// 真流式（末包 − 首包 ≥ genWindowMinTailMs）用首包→末包；否则首包即
-// 整段输出，用末包 − streamStart。
+// streamGenWindow 一条 LLM 流的生成窗口（ms）：末包 − streamStart。
+// 缺 streamStart 时回退首包 → 末包（老数据）。
 func streamGenWindow(first, last, streamStart int64) int64 {
 	if last <= 0 {
 		return 0
 	}
-	var tail int64
-	if first > 0 && last > first {
-		tail = last - first
-	}
-	if tail >= genWindowMinTailMs {
-		return tail
-	}
 	if streamStart > 0 && last > streamStart {
 		return last - streamStart
 	}
-	return tail
+	if first > 0 && last > first {
+		return last - first
+	}
+	return 0
 }
 
 // closeStream 封口当前流：窗口差额计入 pending。幂等。
