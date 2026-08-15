@@ -65,8 +65,8 @@ type Bridge struct {
 	// agent's initialize response, surfaced in Status/Snapshot.
 	initAgentCapabilities any
 	textBuf               string
-	// genRate 是 per-session 的生成输出速率（tok/s）估算器（见
-	// genrate.go）：chunk 到达时观察、tool_call / 回合终态 seal、
+	// genRate 是 per-session 的生成输出速率（字符/s）估算器（见
+	// genrate.go）：chunk 到达时观察、tool_call / 回合终态收尾、
 	// user_message_chunk 复位；节流后广播 gen_rate 事件。
 	genRate *genRateTracker
 	// agentStartedAt (unix ms) stamps the CURRENT agent process spawn.
@@ -967,8 +967,11 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	// session 曾导致 OIDC refresh 回归。
 	// 优先采用 agent 声明的 defaultAuthMethodId（agent 是权威），
 	// 未声明时取广告列表的第一个方法。
+	// 注意：initialize 响应的认证字段在 `_meta`（带下划线，与请求侧
+	// 一致）；读 `meta` 会永远落空而回退到第一个方法（xai.api_key），
+	// 导致 session 认证（OIDC/cached_token）失效、模型请求 401。
 	var methodID string
-	if meta, ok := init["meta"].(map[string]any); ok {
+	if meta, ok := init["_meta"].(map[string]any); ok {
 		if id, _ := meta["defaultAuthMethodId"].(string); id != "" {
 			for _, m := range methodIDs {
 				if m == id {
@@ -1425,12 +1428,12 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			// field of the agent_message_chunk payload is ever dropped.
 			ev["fullUpdate"] = update
 			b.Broadcast(tag(ev))
-			// 生成输出速率（按流式字符估算 + usage 自校准，见 genrate.go）：
-			// 与 chunk 同轨广播，节流后每个 session 每 ≥250ms 至多一条
-			// active。时间源优先 _meta.agentTimestampMs（agentClock=true，
-			// 取消 800ms 空闲封顶等防攒包启发式）。
-			now, agentClock := metaAgentTs(params)
-			if rate, ok := b.genRate.observe(sid, text, now, agentClock); ok {
+			// 生成输出速率（按流式字符估算，见 genrate.go）：与 chunk 同轨
+			// 广播，节流后每个 session 每 ≥250ms 至多一条 active。时间源
+			// 优先 _meta.agentTimestampMs + streamStartMs（agent 累计口径：
+			// 速率 = 流起点之后的全部字符 / 墙钟，含首包）。
+			now, streamStartMs, agentClock := metaAgentTs(params)
+			if rate, ok := b.genRate.observe(sid, text, now, agentClock, streamStartMs); ok {
 				b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": true}))
 			}
 		}
@@ -1489,8 +1492,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			}
 			b.Broadcast(tag(ev))
 			// 思考文本同样更新生成速率（见 genrate.go）。
-			now, agentClock := metaAgentTs(params)
-			if rate, ok := b.genRate.observe(sid, text, now, agentClock); ok {
+			now, streamStartMs, agentClock := metaAgentTs(params)
+			if rate, ok := b.genRate.observe(sid, text, now, agentClock, streamStartMs); ok {
 				b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": true}))
 			}
 		}
@@ -1693,6 +1696,14 @@ func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any
 	ev := Event{
 		"type":   "scheduled_task_deleted",
 		"taskId": pick([]map[string]any{task, update, params}, "taskId", "task_id"),
+	}
+	// reason 归一化（1.0.4 起 SessionUpdate::ScheduledTaskDeleted 带
+	// reason：completed/expired/deleted/shutdown）：依次从 update →
+	// params → task 提取，无来源时缺省 unknown（旧宿主/旧版本数据）。
+	if reason, _ := pick([]map[string]any{update, params, task}, "reason").(string); reason != "" {
+		ev["reason"] = reason
+	} else {
+		ev["reason"] = "unknown"
 	}
 	// rawParams preserves the full original params (e.g. session_id +
 	// _meta.eventId / scheduler generation-revision stamps).
