@@ -421,8 +421,9 @@ func TestModelsUpdateCarriesRaw(t *testing.T) {
 	}
 }
 
-// chunk / user_chunk 事件附加完整原始 update（fullUpdate）。
-func TestChunkEventsCarryFullUpdate(t *testing.T) {
+// chunk / user_chunk 事件不携带完整原始 update（fullUpdate）：typed 字段即
+// wire 契约，两条出口（SSE / hub）本就剥离该键，FE 无消费者。
+func TestChunkEventsCarryNoFullUpdate(t *testing.T) {
 	for _, tc := range []struct {
 		kind string
 		want string
@@ -444,9 +445,8 @@ func TestChunkEventsCarryFullUpdate(t *testing.T) {
 			if ev["type"] != tc.want {
 				t.Fatalf("event type = %v, want %s", ev["type"], tc.want)
 			}
-			full, ok := ev["fullUpdate"].(map[string]any)
-			if !ok || !reflect.DeepEqual(full, update) {
-				t.Errorf("fullUpdate = %v, want the entire original update map", ev["fullUpdate"])
+			if _, ok := ev["fullUpdate"]; ok {
+				t.Errorf("chunk event must not carry fullUpdate: %v", ev["fullUpdate"])
 			}
 		})
 	}

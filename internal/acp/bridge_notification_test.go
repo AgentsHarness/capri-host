@@ -436,15 +436,16 @@ func TestTurnCompletedTypedAndUsage(t *testing.T) {
 	if !sawTurnUsage {
 		t.Error("no usage extraction for turn_completed")
 	}
-	// 双 usage（carrier totalTokens + turn 提取）都到达。
+	// 仅 turn 提取一条 usage（carrier 级顶部广播对回合终态已跳过——
+	// 提取事件携带同 `used` + usage 对象，是严格超集）。
 	var usageCount int
 	for _, ev := range events {
 		if ev["type"] == "usage" {
 			usageCount++
 		}
 	}
-	if usageCount < 2 {
-		t.Errorf("usage events = %d, want carrier-level + turn extraction", usageCount)
+	if usageCount != 1 {
+		t.Errorf("usage events = %d, want exactly 1 (turn extraction only)", usageCount)
 	}
 }
 
