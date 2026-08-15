@@ -99,9 +99,10 @@ func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
 						t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
 					}
 				case "usage":
-					// 仅 turn 提取的 usage 事件同时带 carrier 级 used 与 usage 对象。
+					// 仅 turn 提取的 usage 事件带 carrier 级 used；
+					// usage 账本对象不再透传（FE 零消费）。
 					if used, ok := asInt(ev["used"]); ok && used == 1234 {
-						if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
+						if _, hasObj := ev["usage"]; !hasObj {
 							sawUsage = true
 						}
 					}
@@ -113,7 +114,7 @@ func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
 			t.Error("no typed turn_completed event")
 		}
 		if !sawUsage {
-			t.Error("no merged usage event (used=1234 + usage object) for turn_completed")
+			t.Error("no usage event (used=1234, no usage object) for turn_completed")
 		}
 	})
 	t.Run("response_completed", func(t *testing.T) {
@@ -146,7 +147,7 @@ func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
 					}
 				case "usage":
 					if used, ok := asInt(ev["used"]); ok && used == 1234 {
-						if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
+						if _, hasObj := ev["usage"]; !hasObj {
 							sawUsage = true
 						}
 					}
@@ -158,7 +159,7 @@ func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
 			t.Error("response_completed must not broadcast a typed event")
 		}
 		if !sawUsage {
-			t.Error("no merged usage event (used=1234 + usage object) for response_completed")
+			t.Error("no usage event (used=1234, no usage object) for response_completed")
 		}
 		if !sawGenRate {
 			t.Error("no gen_rate active:false for response_completed")
