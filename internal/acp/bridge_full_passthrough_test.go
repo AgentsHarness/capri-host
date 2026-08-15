@@ -61,65 +61,109 @@ func TestSessionUpdateFullPassthrough(t *testing.T) {
 	}
 }
 
-// turn_completed / response_completed over the session/update carrier must
-// yield the typed turn_completed/response_completed event (FE 回合封口语义,
-// update verbatim) and a usage event extracted from _meta.totalTokens +
-// update.usage (handleXaiNotification parity). The merged usage event
-// carries used (int64 from asInt) and the turn's usage object passed
-// through untouched. Modeled → no generic session_notification.
+// turn_completed / response_completed 都是回合终态 kind：usage 提取一致
+// （_meta.totalTokens + update.usage，handleXaiNotification parity），但只有
+// turn_completed 发 typed 事件（FE 回合封口语义, update verbatim）。
+// response_completed 实测从不被 agent 发出（updates.jsonl 3383/3383 回合
+// 终态均为 turn_completed），FE 也无消费（turnEnd.ts 无 case，events.ts
+// 重写回 generic 后 notifApps.ts 显式忽略）——只保留副作用（gen_rate
+// active:false、usage 提取）。Modeled → 均无 generic session_notification。
 func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
-	for _, kind := range []string{"turn_completed", "response_completed"} {
-		t.Run(kind, func(t *testing.T) {
-			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
-			ch, unsub := b.Subscribe()
-			defer unsub()
-			usage := map[string]any{"totalTokens": float64(55)}
-			b.handleSessionUpdate(map[string]any{
-				"sessionId": "s1",
-				"_meta":     map[string]any{"totalTokens": float64(1234)},
-				"update": map[string]any{
-					"sessionUpdate": kind,
-					"usage":         usage,
-				},
-			})
-			var sawTyped, sawUsage bool
-			var events []Event
-			deadline := time.Now().Add(300 * time.Millisecond)
-			for time.Now().Before(deadline) {
-				select {
-				case ev := <-ch:
-					events = append(events, ev)
-					switch ev["type"] {
-					case "session_notification":
-						t.Errorf("unexpected generic session_notification for modeled kind %s: %v", kind, ev)
-					case kind:
-						sawTyped = true
-						if !reflect.DeepEqual(ev["update"], map[string]any{"sessionUpdate": kind, "usage": usage}) {
-							t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
-						}
-						if ev["sessionId"] != "s1" {
-							t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
-						}
-					case "usage":
-						// Only the turn-completed extraction carries BOTH
-						// the carrier-level used count and the usage object.
-						if used, ok := asInt(ev["used"]); ok && used == 1234 {
-							if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
-								sawUsage = true
-							}
+	t.Run("turn_completed", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		usage := map[string]any{"totalTokens": float64(55)}
+		b.handleSessionUpdate(map[string]any{
+			"sessionId": "s1",
+			"_meta":     map[string]any{"totalTokens": float64(1234)},
+			"update": map[string]any{
+				"sessionUpdate": "turn_completed",
+				"usage":         usage,
+			},
+		})
+		var sawTyped, sawUsage bool
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			select {
+			case ev := <-ch:
+				switch ev["type"] {
+				case "session_notification":
+					t.Errorf("unexpected generic session_notification for modeled kind turn_completed: %v", ev)
+				case "turn_completed":
+					sawTyped = true
+					if !reflect.DeepEqual(ev["update"], map[string]any{"sessionUpdate": "turn_completed", "usage": usage}) {
+						t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
+					}
+					if ev["sessionId"] != "s1" {
+						t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+					}
+				case "usage":
+					// 仅 turn 提取的 usage 事件同时带 carrier 级 used 与 usage 对象。
+					if used, ok := asInt(ev["used"]); ok && used == 1234 {
+						if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
+							sawUsage = true
 						}
 					}
-				case <-time.After(20 * time.Millisecond):
 				}
+			case <-time.After(20 * time.Millisecond):
 			}
-			if !sawTyped {
-				t.Errorf("no typed %s event", kind)
-			}
-			if !sawUsage {
-				t.Errorf("no merged usage event (used=1234 + usage object) for %s", kind)
-			}
+		}
+		if !sawTyped {
+			t.Error("no typed turn_completed event")
+		}
+		if !sawUsage {
+			t.Error("no merged usage event (used=1234 + usage object) for turn_completed")
+		}
+	})
+	t.Run("response_completed", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		usage := map[string]any{"totalTokens": float64(55)}
+		b.handleSessionUpdate(map[string]any{
+			"sessionId": "s1",
+			"_meta":     map[string]any{"totalTokens": float64(1234)},
+			"update": map[string]any{
+				"sessionUpdate": "response_completed",
+				"usage":         usage,
+			},
 		})
-	}
+		var sawTyped, sawUsage, sawGenRate bool
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			select {
+			case ev := <-ch:
+				switch ev["type"] {
+				case "session_notification":
+					t.Errorf("unexpected generic session_notification for modeled kind response_completed: %v", ev)
+				case "turn_completed", "response_completed":
+					sawTyped = true
+					t.Errorf("no typed event expected for response_completed, got %s: %v", ev["type"], ev)
+				case "gen_rate":
+					if active, _ := ev["active"].(bool); !active {
+						sawGenRate = true
+					}
+				case "usage":
+					if used, ok := asInt(ev["used"]); ok && used == 1234 {
+						if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
+							sawUsage = true
+						}
+					}
+				}
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		if sawTyped {
+			t.Error("response_completed must not broadcast a typed event")
+		}
+		if !sawUsage {
+			t.Error("no merged usage event (used=1234 + usage object) for response_completed")
+		}
+		if !sawGenRate {
+			t.Error("no gen_rate active:false for response_completed")
+		}
+	})
 }
 
 // ── chunk meta forwarding ───────────────────────────────────────────

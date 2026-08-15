@@ -1275,18 +1275,23 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 下回落会误标到宿主的活动会话）。
 	sid := sessionIdExplicit(params)
 
+	update, _ := params["update"].(map[string]any)
 	// Every standard session/update carries the session-accumulated
 	// context token count in `_meta.totalTokens` (the TUI's ⇣ counter
 	// source, "Accumulated token count across the session"). Surface it
 	// as a usage event so clients can render live context usage — this
 	// is the field x.ai extension notifications do NOT carry.
-	if meta, ok := params["_meta"].(map[string]any); ok {
-		if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
-			b.trackUsage(sid, used, 0)
-			b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+	// turn_completed / response_completed 跳过此顶部广播：回合终态的
+	// usage 提取（下方）会广播同 `used` + usage 对象的超集事件，此处
+	// 再发就是严格重复。
+	if k, _ := update["sessionUpdate"].(string); k != "turn_completed" && k != "response_completed" {
+		if meta, ok := params["_meta"].(map[string]any); ok {
+			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
+				b.trackUsage(sid, used, 0)
+				b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+			}
 		}
 	}
-	update, _ := params["update"].(map[string]any)
 	if update == nil {
 		return
 	}
@@ -1423,9 +1428,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 					}
 				}
 			}
-			// fullUpdate carries the ENTIRE original update map so no
-			// field of the agent_message_chunk payload is ever dropped.
-			ev["fullUpdate"] = update
+			// 不携带 fullUpdate（整份 update）：typed 字段即 wire 契约，
+			// 两条出口（SSE / hub）本就剥离该键，且 FE 无消费者。
 			b.Broadcast(tag(ev))
 			// 生成输出速率（按流式字符估算，见 genrate.go）：与 chunk 同轨
 			// 广播，节流后每个 session 每 ≥250ms 至多一条 active。时间源
@@ -1469,9 +1473,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 					}
 				}
 			}
-			// fullUpdate carries the ENTIRE original update map so no
-			// field of the user_message_chunk payload is ever dropped.
-			ev["fullUpdate"] = update
+			// 同 agent_message_chunk：不携带 fullUpdate（typed 字段即 wire 契约）。
 			b.Broadcast(tag(ev))
 		}
 		for _, img := range contentImages(update["content"]) {
@@ -1603,6 +1605,14 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
 		b.genRate.reset(sid)
 		b.Broadcast(tag(Event{"type": "gen_rate", "active": false}))
+		// response_completed 不广播 typed 事件：agent 实测从不发该
+		// kind（updates.jsonl 3383/3383 回合终态均为 turn_completed），
+		// FE 对 typed response_completed 无消费（turnEnd.ts 无 case，
+		// events.ts 重写回 generic 后 notifApps 显式忽略）。保留副作用
+		// （gen_rate 复位 / 调用方 usage 提取），省掉整份 update 白传。
+		if kind == "response_completed" {
+			return true
+		}
 		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
 		// prompt_id / usage 等字段）；usage 提取保留在两个载体
 		// （handleSessionUpdate / handleXaiNotification）。
