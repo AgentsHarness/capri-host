@@ -219,7 +219,7 @@ func TestScheduledTaskDeletedKindNormalized(t *testing.T) {
 	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 	ch, unsub := b.Subscribe()
 	defer unsub()
-	update := map[string]any{"sessionUpdate": "scheduled_task_deleted", "task_id": "loop-1"}
+	update := map[string]any{"sessionUpdate": "scheduled_task_deleted", "task_id": "loop-1", "reason": "expired"}
 	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
 	var ev Event
 	deadline := time.Now().Add(2 * time.Second)
@@ -237,6 +237,10 @@ func TestScheduledTaskDeletedKindNormalized(t *testing.T) {
 	}
 	if ev["taskId"] != "loop-1" || ev["sessionId"] != "s1" {
 		t.Fatalf("event = %v, want scheduled_task_deleted loop-1", ev)
+	}
+	// reason 归一化：update.reason 透传到事件（无 reason 时才是 unknown）。
+	if ev["reason"] != "expired" {
+		t.Errorf("reason = %v, want expired", ev["reason"])
 	}
 	rawParams, ok := ev["rawParams"].(map[string]any)
 	if !ok || rawParams["sessionId"] != "s1" {

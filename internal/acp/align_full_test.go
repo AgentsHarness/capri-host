@@ -377,6 +377,10 @@ func TestScheduledTaskDeletedPreservesRawParams(t *testing.T) {
 	if meta, ok := ev["meta"].(map[string]any); !ok || meta["eventId"] != "evt-10" {
 		t.Errorf("meta = %v, want full _meta", ev["meta"])
 	}
+	// 无 reason 来源（update/params/task 都没有）→ 缺省 unknown。
+	if ev["reason"] != "unknown" {
+		t.Errorf("reason = %v, want unknown", ev["reason"])
+	}
 }
 
 // models/update: 保留合并后的 models_update 广播，并附加原始 params。
