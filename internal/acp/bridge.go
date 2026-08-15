@@ -147,7 +147,11 @@ type lastSessionFile struct {
 
 type rpcResult struct {
 	result map[string]any
-	err    error
+	// raw carries a JSON-RPC result that is NOT a JSON object (e.g. the
+	// bare array workspace_list_recent returns). requestRaw() returns it
+	// verbatim; request() keeps the old behavior of coercing it to {}.
+	raw any
+	err error
 }
 
 // RPCError is a JSON-RPC error reply from the agent — the agent process
@@ -1231,12 +1235,13 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 			// healthy — callers distinguish this from transport failures
 			// (timeout etc.) and skip the kill+restore self-heal.
 			c <- rpcResult{err: &RPCError{Code: code, Msg: em}}
+		} else if m, ok := msg["result"].(map[string]any); ok {
+			c <- rpcResult{result: m}
 		} else {
-			res, _ := msg["result"].(map[string]any)
-			if res == nil {
-				res = map[string]any{}
-			}
-			c <- rpcResult{result: res}
+			// Non-object result (a bare array, e.g. workspace_list_recent's
+			// payload): keep it verbatim instead of coercing to {}, which
+			// swallowed the data. requestRaw() surfaces it as-is.
+			c <- rpcResult{raw: msg["result"]}
 		}
 		return
 	}
@@ -2351,7 +2356,23 @@ func (b *Bridge) respondError(id any, message string, code int) {
 // request 是标准 JSON-RPC 请求：固定 timeout，不因 agent 活动而顺延。
 // （曾有过按会话活跃度顺延 prompt 截止时刻的设计，2026-08-14 取消：
 // 默认 agent 可靠，超时到点即报错，不做续命式的自愈。）
+// 返回的 result 按对象处理：非对象 result（如裸数组）保持旧行为被
+// 规整为 {}。需要原样拿到任意 JSON 值的调用方用 requestRaw。
 func (b *Bridge) request(ctx context.Context, method string, params map[string]any, timeout time.Duration) (map[string]any, error) {
+	res, err := b.requestRaw(ctx, method, params, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := res.(map[string]any); ok {
+		return m, nil
+	}
+	return map[string]any{}, nil
+}
+
+// requestRaw 与 request 相同，但 result 原样返回（任意 JSON 值：对象、
+// 数组、标量、nil），不做对象规整。x.ai 扩展方法里唯一返回裸数组的
+// workspace_list_recent 必须走这里，否则数组会被 request 吞成 {}。
+func (b *Bridge) requestRaw(ctx context.Context, method string, params map[string]any, timeout time.Duration) (any, error) {
 	id := b.nextAgentID.Add(1)
 	key := idKey(id)
 	ch := make(chan rpcResult, 1)
@@ -2383,6 +2404,9 @@ func (b *Bridge) request(ctx context.Context, method string, params map[string]a
 		}
 		return nil, fmt.Errorf("%s 超时", method)
 	case res := <-ch:
+		if res.raw != nil {
+			return res.raw, res.err
+		}
 		return res.result, res.err
 	}
 }
@@ -3691,7 +3715,10 @@ func runGit(cwd string, args ...string) string {
 // whose value is "" (empty string), it is replaced with the active
 // session's id; when no session is active this returns HTTPError 404.
 // Keys absent from params are left absent. 60s timeout.
-func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
+// The result is the JSON-RPC result VERBATIM (any JSON value): most x.ai
+// methods return an object, but workspace_list_recent returns a bare
+// array — coercing it to a map would swallow the data into {}.
+func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]any) (any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -3707,7 +3734,7 @@ func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]a
 			params[k] = sid
 		}
 	}
-	return b.request(ctx, "_"+method, params, 60*time.Second)
+	return b.requestRaw(ctx, "_"+method, params, 60*time.Second)
 }
 
 // XaiNotify sends a client→agent x.ai extension NOTIFICATION (fire-and-forget,

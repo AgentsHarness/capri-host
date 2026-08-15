@@ -18,7 +18,7 @@ type recordingStdin struct {
 }
 
 type callResult struct {
-	res map[string]any
+	res any
 	err error
 }
 
@@ -157,7 +157,7 @@ func TestExtensionMethodsWirePayloads(t *testing.T) {
 			if cr.err != nil {
 				t.Fatalf("call error: %v", cr.err)
 			}
-			if cr.res["ok"] != true {
+			if cr.res.(map[string]any)["ok"] != true {
 				t.Errorf("result = %v, want ok:true", cr.res)
 			}
 			msg := w.last()
@@ -320,7 +320,7 @@ func TestAdminExtensionMethodsWirePayloads(t *testing.T) {
 			if cr.err != nil {
 				t.Fatalf("call error: %v", cr.err)
 			}
-			if cr.res["ok"] != true {
+			if cr.res.(map[string]any)["ok"] != true {
 				t.Errorf("result = %v, want ok:true", cr.res)
 			}
 			msg := w.last()

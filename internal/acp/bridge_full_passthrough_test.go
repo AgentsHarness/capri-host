@@ -403,8 +403,8 @@ func TestPromptWithOptsWire(t *testing.T) {
 	if cr.err != nil {
 		t.Fatalf("PromptWithOpts: %v", cr.err)
 	}
-	if cr.res["stopReason"] != "end_turn" {
-		t.Errorf("stopReason = %v, want end_turn", cr.res["stopReason"])
+	if cr.res.(map[string]any)["stopReason"] != "end_turn" {
+		t.Errorf("stopReason = %v, want end_turn", cr.res.(map[string]any)["stopReason"])
 	}
 
 	msg := w.last()
@@ -481,9 +481,9 @@ func TestPromptResponseMetaPassthrough(t *testing.T) {
 	if cr.err != nil {
 		t.Fatalf("PromptWithOpts: %v", cr.err)
 	}
-	meta, ok := cr.res["meta"].(map[string]any)
+	meta, ok := cr.res.(map[string]any)["meta"].(map[string]any)
 	if !ok || meta["turn_id"] != "t-1" || meta["cost"] != float64(42) {
-		t.Errorf("returned meta = %v, want {turn_id:t-1 cost:42}", cr.res["meta"])
+		t.Errorf("returned meta = %v, want {turn_id:t-1 cost:42}", cr.res.(map[string]any)["meta"])
 	}
 
 	// The done event must carry the same meta under `meta`.
@@ -567,7 +567,7 @@ func TestXaiCall(t *testing.T) {
 			t.Fatalf("XaiCall: %v", cr.err)
 		}
 		// RAW result: the ExtMethodResult envelope is not unwrapped.
-		if _, ok := cr.res["result"].(map[string]any); !ok {
+		if _, ok := cr.res.(map[string]any)["result"].(map[string]any); !ok {
 			t.Errorf("result = %v, want raw envelope passthrough", cr.res)
 		}
 		msg := w.last()
@@ -626,6 +626,40 @@ func TestXaiCall(t *testing.T) {
 		var he *HTTPError
 		if !errors.As(err, &he) || he.Code != 404 {
 			t.Fatalf("err = %v, want HTTPError 404", err)
+		}
+	})
+
+	t.Run("bare array result passes through verbatim", func(t *testing.T) {
+		// workspace_list_recent's payload is a bare array; it must NOT be
+		// coerced to {} (the regression this test guards).
+		b, w := readyBridge()
+		done := make(chan callResult, 1)
+		go func() {
+			res, err := b.XaiCall(ctx, "x.ai/foo", map[string]any{})
+			done <- callResult{res, err}
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if msg := w.last(); msg != nil {
+				if id := msg["id"]; id != nil {
+					if ch, ok := b.pending.LoadAndDelete(idKey(id)); ok {
+						ch.(chan rpcResult) <- rpcResult{raw: []any{map[string]any{"id": "s1"}}}
+						break
+					}
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cr := <-done
+		if cr.err != nil {
+			t.Fatalf("XaiCall: %v", cr.err)
+		}
+		arr, ok := cr.res.([]any)
+		if !ok || len(arr) != 1 {
+			t.Fatalf("result = %v, want bare array passthrough", cr.res)
+		}
+		if m, _ := arr[0].(map[string]any); m["id"] != "s1" {
+			t.Errorf("array[0] = %v, want {id:s1}", arr[0])
 		}
 	})
 }

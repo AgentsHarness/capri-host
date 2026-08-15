@@ -27,7 +27,8 @@ func extBridgeCall(t *testing.T, b *Bridge, w *recordingStdin, call func() (map[
 	if cr.err != nil {
 		t.Fatalf("call error: %v", cr.err)
 	}
-	return cr.res
+	m, _ := cr.res.(map[string]any)
+	return m
 }
 
 // wireParams returns the params of the last request the bridge wrote.
