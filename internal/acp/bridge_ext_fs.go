@@ -22,9 +22,19 @@ import "context"
 //   - *bool / *int nil → key omitted (grok applies its serde default)
 //   - plain bool → always sent (false == the grok default, identical wire)
 
-// xaiResult unwraps the XaiCall result envelope (see UnwrapExtResult).
-func xaiResult(res map[string]any, err error) (map[string]any, error) {
-	return UnwrapExtResult(res), err
+// xaiResult unwraps the XaiCall result envelope to a map (see
+// UnwrapExtResult). All fs/git/search/terminal/code methods return object
+// payloads; a non-object result is coerced to {} (the pre-any-typing
+// behavior of request()).
+func xaiResult(res any, err error) (map[string]any, error) {
+	if err != nil {
+		return nil, err
+	}
+	m, ok := UnwrapExtResult(res).(map[string]any)
+	if !ok {
+		return map[string]any{}, nil
+	}
+	return m, nil
 }
 
 // ── fs (x.ai/fs/*) ────────────────────────────────────────────────────

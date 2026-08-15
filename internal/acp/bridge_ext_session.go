@@ -9,12 +9,21 @@ import (
 
 // xaiCallUnwrapped is the common shape of every typed wrapper: XaiCall
 // followed by UnwrapExtResult, with the error short-circuited.
+// xaiCallUnwrapped is XaiCall + UnwrapExtResult, typed to the object
+// payloads every session-summaries / history method returns. A non-object
+// result is coerced to {} (the pre-any-typing behavior of request());
+// workspace_list_recent is the one bare-array method and has its own
+// wrapper below.
 func (b *Bridge) xaiCallUnwrapped(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
 	res, err := b.XaiCall(ctx, method, params)
 	if err != nil {
 		return nil, err
 	}
-	return UnwrapExtResult(res), nil
+	m, ok := UnwrapExtResult(res).(map[string]any)
+	if !ok {
+		return map[string]any{}, nil
+	}
+	return m, nil
 }
 
 // xaiNotify writes a fire-and-forget `_x.ai/<method>` notification (no
@@ -246,10 +255,16 @@ func (b *Bridge) SessionSummariesWorkspaceList(ctx context.Context) (map[string]
 // SessionSummariesWorkspaceListRecent calls
 // x.ai/session_summaries/workspace_list_recent — the most recently touched
 // sessions. Wire keys: {limit} — required (clamped to 10000 by the agent).
-func (b *Bridge) SessionSummariesWorkspaceListRecent(ctx context.Context, limit int) (map[string]any, error) {
-	return b.xaiCallUnwrapped(ctx, "x.ai/session_summaries/workspace_list_recent", map[string]any{
+// Unlike the other session_summaries methods this one returns a BARE
+// ARRAY, so the result is typed any and passed through unwrapped.
+func (b *Bridge) SessionSummariesWorkspaceListRecent(ctx context.Context, limit int) (any, error) {
+	res, err := b.XaiCall(ctx, "x.ai/session_summaries/workspace_list_recent", map[string]any{
 		"limit": limit,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return UnwrapExtResult(res), nil
 }
 
 // WorkspacesList calls x.ai/workspaces/list — cloud workspace pages. Wire
