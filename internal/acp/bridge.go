@@ -68,6 +68,10 @@ type Bridge struct {
 	// genrate.go）：chunk 到达时观察、tool_call / 回合终态收尾、
 	// user_message_chunk 复位；节流后广播 gen_rate 事件。
 	genRate *genRateTracker
+	// usageLastUsed 是 per-session 上次广播的 _meta.totalTokens（流水期
+	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
+	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
+	usageLastUsed map[string]int64
 	// agentStartedAt (unix ms) stamps the CURRENT agent process spawn.
 	// Clients compare it across hello events to detect an agent restart —
 	// the agent's permission mode is in-memory only and resets on restart,
@@ -199,6 +203,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		subscribers: make(map[chan Event]struct{}),
 		bootDone:    make(chan struct{}),
 		genRate:     newGenRateTracker(),
+		usageLastUsed: make(map[string]int64),
 	}
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
@@ -1282,13 +1287,21 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// as a usage event so clients can render live context usage — this
 	// is the field x.ai extension notifications do NOT carry.
 	// turn_completed / response_completed 跳过此顶部广播：回合终态的
-	// usage 提取（下方）会广播同 `used` + usage 对象的超集事件，此处
-	// 再发就是严格重复。
+	// usage 提取（下方）会广播同 `used` 的终态事件，此处再发就是
+	// 严格重复。其余 kind 值去重：实测流水期 _meta.totalTokens 在一段
+	// 输出内恒定（同一 used 连续 70+ 条），只广播值变化——上下文计数
+	// 器无需逐条刷新。
 	if k, _ := update["sessionUpdate"].(string); k != "turn_completed" && k != "response_completed" {
 		if meta, ok := params["_meta"].(map[string]any); ok {
 			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
-				b.trackUsage(sid, used, 0)
-				b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+				b.mu.Lock()
+				last := b.usageLastUsed[sid]
+				b.usageLastUsed[sid] = used
+				b.mu.Unlock()
+				if used != last {
+					b.trackUsage(sid, used, 0)
+					b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+				}
 			}
 		}
 	}
@@ -1312,14 +1325,13 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	}
 
 	// grok ships usage inside turn_completed / response_completed
-	// updates instead of the standard usage_update carrier — surface it
-	// as a normal usage event, exactly like handleXaiNotification does:
-	//   - used:  context-window usage, `_meta.totalTokens` (the TUI ⇣
-	//            counter source).
-	//   - usage: the standard TurnCompleted/ResponseCompleted usage
-	//            object passed through untouched.
-	// typed 事件（dispatch 已发）是 FE 回合封口语义；usage 提取保留在此
-	// （官方载体带 size:nil；x.ai 载体不带 —— 保持原状，不统一）。
+	// updates instead of the standard usage_update carrier — surface the
+	// context-window `used` (_meta.totalTokens, the TUI ⇣ counter source)
+	// as a normal usage event, exactly like handleXaiNotification does.
+	// 实测 FE 只 merge used/size（tools.ts 从未读 usage 对象），回合
+	// 账本对象是死字段——不再透传。typed 事件（dispatch 已发）是 FE
+	// 回合封口语义；usage 提取保留在此（官方载体带 size:nil；x.ai 载体
+	// 不带 —— 保持原状，不统一）。
 	if kind, _ := update["sessionUpdate"].(string); kind == "turn_completed" || kind == "response_completed" {
 		ev := Event{"type": "usage"}
 		if meta, ok := params["_meta"].(map[string]any); ok {
@@ -1328,12 +1340,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 				b.trackUsage(sid, used, 0)
 			}
 		}
-		if u, ok := update["usage"].(map[string]any); ok {
-			ev["usage"] = u
-		}
-		// Only broadcast when there is something to update —
-		// an empty usage event (no _meta.totalTokens, no usage
-		// object) would otherwise null the client's `used`.
+		// Only broadcast when there is something to update — an empty
+		// usage event (no _meta.totalTokens) would otherwise null the
+		// client's `used`.
 		if len(ev) > 1 {
 			ev["size"] = nil
 			ev["sessionId"] = sid
@@ -1832,21 +1841,13 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		}
 		// grok ships usage inside response_completed / turn_completed
 		// notifications instead of the standard usage_update carrier —
-		// surface it as a normal usage event so clients can show live
-		// token counts while busy. Two distinct numbers ride the same
-		// event, both from standard fields:
-		//   - used:  context-window usage, `_meta.totalTokens` when the
-		//            agent provides it (the TUI ⇣ counter source).
-		//            x.ai notifications don't carry it, so on turn end
-		//            we simply keep the last known usage (same as the
-		//            TUI, which only refreshes from meta.totalTokens).
-		//   - usage: the standard TurnCompleted/ResponseCompleted usage
-		//            object passed through untouched (totalTokens is the
-		//            TURN-ACCUMULATED count across every model call in
-		//            the turn — NOT a context-window size). The client
-		//            separates the two; no custom field names.
-		// typed 事件（dispatch 已发）是 FE 回合封口语义；usage 提取保留在
-		// 此（x.ai 载体不带 size:nil，官方载体带 —— 保持原状，不统一）。
+		// surface the context-window `used` (_meta.totalTokens, the TUI
+		// ⇣ counter source) as a normal usage event. x.ai notifications
+		// usually don't carry it (keep the last known usage on turn end,
+		// same as the TUI). 实测 FE 只 merge used/size，usage 账本对象
+		// 是死字段——不再透传。typed 事件（dispatch 已发）是 FE 回合
+		// 封口语义；usage 提取保留在此（x.ai 载体不带 size:nil，官方
+		// 载体带 —— 保持原状，不统一）。
 		if up, ok := params["update"].(map[string]any); ok {
 			if kind, _ := up["sessionUpdate"].(string); kind == "response_completed" || kind == "turn_completed" {
 				ev := Event{"type": "usage"}
@@ -1856,12 +1857,9 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 						b.trackUsage(sid, used, 0)
 					}
 				}
-				if u, ok := up["usage"].(map[string]any); ok {
-					ev["usage"] = u
-				}
 				// Only broadcast when there is something to update —
-				// an empty usage event (no _meta.totalTokens, no usage
-				// object) would otherwise null the client's `used`.
+				// an empty usage event (no _meta.totalTokens) would
+				// otherwise null the client's `used`.
 				if len(ev) > 1 {
 					b.Broadcast(withSid(ev))
 				}
