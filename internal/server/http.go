@@ -90,6 +90,7 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/mcp-auth-trigger", s.handleMCPAuthTrigger)
 	mux.HandleFunc("GET /api/extensions", s.handleExtensions)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
+	mux.HandleFunc("POST /api/settings", s.handleSettingsUpdate)
 	// ── x.ai 扩展直通（完整对齐；实现见 http_ext.go）──
 	mux.HandleFunc("POST /api/xai-call", s.handleXaiCall)
 	mux.HandleFunc("POST /api/session-resume", s.handleSessionResume)
@@ -1831,21 +1832,79 @@ func (s *Server) handleExtensions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, scanExtensions(home))
 }
 
-// handleSettings — GET /api/settings: the SAFE, read-only subset of
-// ~/.grok/config.toml ({ui, session, models, cli} sections, scalar values
-// only). The file is never written; a missing file yields {}.
+// handleSettings — GET /api/settings: the SAFE subset of config.toml
+// ({ui, session, models, cli} sections, scalar values only). A missing
+// file yields {}. Writes go through POST /api/settings (whitelist).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		writeJSON(w, 200, map[string]any{})
+	writeJSON(w, 200, s.settingsPayload())
+}
+
+type settingsUpdateBody struct {
+	CollapsedEditBlocks   *bool   `json:"collapsed_edit_blocks"`
+	PageFlipOnSend        *bool   `json:"page_flip_on_send"`
+	RememberToolApprovals *bool   `json:"remember_tool_approvals"`
+	PermissionMode        *string `json:"permission_mode"`
+}
+
+// handleSettingsUpdate — POST /api/settings: patch the FE-consumed [ui]
+// scalars into config.toml. Unknown keys never reach the file (the
+// struct drops them). Response is the same payload as GET.
+func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
+	var body settingsUpdateBody
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效 JSON"})
 		return
 	}
-	sections := parseConfigTOML(filepath.Join(home, ".grok", "config.toml"))
+	patch := map[string]any{}
+	if body.CollapsedEditBlocks != nil {
+		patch["collapsed_edit_blocks"] = *body.CollapsedEditBlocks
+	}
+	if body.PageFlipOnSend != nil {
+		patch["page_flip_on_send"] = *body.PageFlipOnSend
+	}
+	if body.RememberToolApprovals != nil {
+		patch["remember_tool_approvals"] = *body.RememberToolApprovals
+	}
+	if body.PermissionMode != nil {
+		patch["permission_mode"] = *body.PermissionMode
+	}
+	if len(patch) == 0 {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要至少一个设置项"})
+		return
+	}
+	if err := s.bridge.SetUiSettings(patch); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	out := s.settingsPayload()
+	out["ok"] = true
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) settingsTOMLPath() string {
+	if s.bridge != nil {
+		if p, err := s.bridge.ConfigTOMLPath(); err == nil && p != "" {
+			return p
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".grok", "config.toml")
+}
+
+func (s *Server) settingsPayload() map[string]any {
+	path := s.settingsTOMLPath()
+	if path == "" {
+		return map[string]any{}
+	}
+	sections := parseConfigTOML(path)
 	out := map[string]any{}
 	for _, name := range []string{"ui", "session", "models", "cli"} {
 		if kv, ok := sections[name]; ok && len(kv) > 0 {
 			out[name] = kv
 		}
 	}
-	writeJSON(w, 200, out)
+	return out
 }
