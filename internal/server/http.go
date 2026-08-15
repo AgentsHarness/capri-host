@@ -458,7 +458,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		"busy":              helloBusy,
 		"sessionId":         snap.SessionID,
 		"cwd":               snap.Cwd,
-		"text":              snap.Text,
 		"error":             snap.BootError,
 		"agentInfo":         snap.AgentInfo,
 		"modes":             snap.Modes,

@@ -65,7 +65,6 @@ type Status struct {
 	// SessionModelState from the latest session/new or session/load.
 	Models          any          `json:"models,omitempty"`
 	BootError       string       `json:"bootError,omitempty"`
-	Text            string       `json:"text,omitempty"`
 	PendingRequests []PendingReq `json:"pendingRequests,omitempty"`
 	Capabilities    ClientCaps   `json:"capabilities"`
 	// Live per-session states (dashboard active/idle/awaiting classification).
