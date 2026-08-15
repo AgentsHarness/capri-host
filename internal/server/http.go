@@ -977,8 +977,11 @@ func (s *Server) handleSessionRunningTasks(w http.ResponseWriter, r *http.Reques
 }
 
 // handleGitInfo returns the git branch/worktree state for a session cwd
-// (x.ai/git/info + local worktree probe), so the frontend can show the
-// status-bar branch without waiting for a git_head_changed notification.
+// (x.ai/git/info + the agent's git_head_changed stash / local worktree
+// probe), so the frontend can show the status-bar branch without waiting
+// for a git_head_changed notification. The sessionId anchors the stash
+// lookup (agent three-way worktree detection); cwd alone falls back to the
+// local probe.
 type gitInfoBody struct {
 	SessionID string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
@@ -994,7 +997,7 @@ func (s *Server) handleGitInfo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
 		return
 	}
-	info, err := s.bridge.GitInfo(r.Context(), body.Cwd)
+	info, err := s.bridge.GitInfo(r.Context(), body.SessionID, body.Cwd)
 	if err != nil {
 		// Non-repo / agent error → empty state, not a hard failure.
 		writeJSON(w, 200, map[string]any{
