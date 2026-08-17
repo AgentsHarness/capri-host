@@ -3645,9 +3645,14 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 // GitInfo returns the git branch/worktree state for a cwd. The branch comes
 // from the protocol method `_x.ai/git/info` (GitInfoData.currentBranch);
 // worktree state is not part of that payload (the TUI probes it locally
-// with git2), so it is probed here with the standard git plumbing commands
-// `rev-parse --git-dir` vs `--git-common-dir`.
-func (b *Bridge) GitInfo(ctx context.Context, cwd string) (map[string]any, error) {
+// with git2), so it is taken from the agent's own three-way probe — the
+// `x.ai/git_head_changed` stash (linked `git worktree`, grok standalone
+// clone marker, worktree DB record — exactly the TUI's get_worktree_info) —
+// when the session has one for this cwd. Otherwise it falls back to the
+// local probe, which mirrors the same detection minus the worktree DB:
+// the `.git/grok-worktree-source` back-pointer for standalone clones, then
+// `rev-parse --git-dir` vs `--git-common-dir` for linked worktrees.
+func (b *Bridge) GitInfo(ctx context.Context, sessionID, cwd string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -3666,17 +3671,47 @@ func (b *Bridge) GitInfo(ctx context.Context, cwd string) (map[string]any, error
 			out["branch"] = br
 		}
 	}
-	// Not a git repo (or the agent errored) → empty branch, no worktree.
-	isWorktree, mainRepo := probeWorktree(cwd)
+	// Worktree state: agent's three-way stash first (only valid while the
+	// session's cwd matches), local probe as the fallback — a fresh session
+	// may not have emitted git_head_changed yet.
+	isWorktree, mainRepo := b.stashedWorktree(sessionID, cwd)
+	if !isWorktree && mainRepo == "" {
+		isWorktree, mainRepo = probeWorktree(cwd)
+	}
 	out["isWorktree"] = isWorktree
 	out["mainRepo"] = mainRepo
 	return out, nil
 }
 
-// probeWorktree reports whether cwd lives in a linked worktree and, if so,
+// stashedWorktree returns the worktree state the AGENT reported for a
+// session via `x.ai/git_head_changed` (the agent's get_worktree_info is the
+// same three-way probe the TUI uses: linked git worktree, grok standalone
+// clone marker, worktree DB record). The stash is written for the session's
+// current location only — a session that moved (cd) keeps the stash of its
+// previous cwd, so the query cwd must match the session cwd.
+func (b *Bridge) stashedWorktree(sessionID, cwd string) (bool, string) {
+	if sessionID == "" || cwd == "" {
+		return false, ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.sessions[sessionID]
+	if s == nil || s.Cwd == "" || s.Cwd != normCwd(cwd) {
+		return false, ""
+	}
+	return s.gitWorktree, s.gitMainRepo
+}
+
+// probeWorktree reports whether cwd lives in a grok worktree and, if so,
 // the main repo path (shortened to ~/… under $HOME). Mirrors the TUI's
-// get_worktree_info (git-dir != common-dir ⇒ worktree).
+// get_worktree_info minus the worktree metadata DB (a Go-side read of the
+// Rust DB format is deferred): the standalone-clone marker is checked first
+// (priority, matching the TUI), then the linked-worktree check
+// (git-dir != common-dir ⇒ worktree).
 func probeWorktree(cwd string) (bool, string) {
+	if main, ok := grokMarkerMainRepo(cwd); ok {
+		return true, shortenHome(main)
+	}
 	gitDir := runGit(cwd, "rev-parse", "--git-dir")
 	commonDir := runGit(cwd, "rev-parse", "--git-common-dir")
 	if gitDir == "" || commonDir == "" || gitDir == commonDir {
@@ -3687,14 +3722,46 @@ func probeWorktree(cwd string) (bool, string) {
 		abs = filepath.Join(cwd, commonDir)
 	}
 	abs = filepath.Clean(abs)
-	mainRoot := filepath.Dir(abs)
-	if home, err := os.UserHomeDir(); err == nil {
-		if rel, err := filepath.Rel(home, mainRoot); err == nil &&
-			rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			mainRoot = "~/" + rel
+	return true, shortenHome(filepath.Dir(abs))
+}
+
+// grokMarkerMainRepo walks up from cwd looking for a `.git` directory that
+// carries the standalone-clone back-pointer `grok-worktree-source` (written
+// by the fast-worktree copy; the content is the source repo root). The scan
+// stops at the first existing `.git` — a nested independent repo must not
+// inherit its parent's marker (matches the TUI's ancestor walk).
+func grokMarkerMainRepo(cwd string) (string, bool) {
+	dir := filepath.Clean(cwd)
+	for {
+		if contents, err := os.ReadFile(filepath.Join(dir, ".git", "grok-worktree-source")); err == nil {
+			if trimmed := strings.TrimSpace(string(contents)); trimmed != "" {
+				return trimmed, true
+			}
 		}
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return "", false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
 	}
-	return true, mainRoot
+}
+
+// shortenHome tilde-collapses a path under $HOME to `~/…`, with a
+// component-prefix guard (`/Users/benin` must not match `/Users/benin2`).
+// Paths outside $HOME are returned verbatim.
+func shortenHome(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	rel, err := filepath.Rel(home, path)
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "~/" + rel
+	}
+	return path
 }
 
 // runGit executes git plumbing in cwd and returns trimmed stdout ("" on
