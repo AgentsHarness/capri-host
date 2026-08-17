@@ -29,6 +29,10 @@
 浏览器  ──远程──▶  capri-hub        ──▶  capri-host × N  ──▶  grok
 ```
 
+## 截图
+
+![Capri Host 界面](docs/screenshot.png)
+
 ## 快速开始
 
 1、安装并登录 [`Grok Build`](https://x.ai/cli)（或设置 `XAI_API_KEY`）。
