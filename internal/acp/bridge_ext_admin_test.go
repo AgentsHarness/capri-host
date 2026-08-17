@@ -118,7 +118,7 @@ func TestExtAdminMethodsWirePayloads(t *testing.T) {
 			if cr.err != nil {
 				t.Fatalf("call error: %v", cr.err)
 			}
-			if cr.res["ok"] != true {
+			if cr.res.(map[string]any)["ok"] != true {
 				t.Errorf("result = %v, want unwrapped ok:true", cr.res)
 			}
 			msg := w.last()
@@ -237,7 +237,7 @@ func TestExtAdminOptionalFieldOmission(t *testing.T) {
 			if cr.err != nil {
 				t.Fatalf("call error: %v", cr.err)
 			}
-			if cr.res["ok"] != true {
+			if cr.res.(map[string]any)["ok"] != true {
 				t.Errorf("result = %v, want ok:true", cr.res)
 			}
 			msg := w.last()

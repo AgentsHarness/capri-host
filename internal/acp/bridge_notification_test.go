@@ -422,8 +422,9 @@ func TestTurnCompletedTypedAndUsage(t *testing.T) {
 					t.Errorf("typed meta = %v, want params._meta preserved", ev["meta"])
 				}
 			case "usage":
-				// turn 提取的 usage 事件带 usage 对象。
-				if _, ok := ev["usage"].(map[string]any); ok {
+				// turn 提取的 usage 事件带 carrier 级 used（usage
+				// 账本对象不再透传）。
+				if used, ok := asInt(ev["used"]); ok && used == 1234 {
 					sawTurnUsage = true
 				}
 			}
@@ -436,15 +437,57 @@ func TestTurnCompletedTypedAndUsage(t *testing.T) {
 	if !sawTurnUsage {
 		t.Error("no usage extraction for turn_completed")
 	}
-	// 双 usage（carrier totalTokens + turn 提取）都到达。
+	// 仅 turn 提取一条 usage（carrier 级顶部广播对回合终态已跳过，
+	// 提取事件只带 `used`，不含 usage 账本对象）。
 	var usageCount int
 	for _, ev := range events {
 		if ev["type"] == "usage" {
 			usageCount++
 		}
 	}
-	if usageCount < 2 {
-		t.Errorf("usage events = %d, want carrier-level + turn extraction", usageCount)
+	if usageCount != 1 {
+		t.Errorf("usage events = %d, want exactly 1 (turn extraction only)", usageCount)
+	}
+}
+
+// 流水期 usage 顶部广播按值去重：同一 _meta.totalTokens 重复到达只广播
+// 一次，值变化才再发——实测输出段内 token 数恒定，连续 70+ 条同值。
+func TestUsageStreamDedupByValue(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	send := func(used float64, kind string) {
+		b.handleSessionUpdate(map[string]any{
+			"sessionId": "s1",
+			"_meta":     map[string]any{"totalTokens": used},
+			"update":    map[string]any{"sessionUpdate": kind},
+		})
+	}
+	send(100, "agent_message_chunk") // 首次：发
+	send(100, "agent_message_chunk") // 同值：跳过
+	send(200, "agent_message_chunk") // 变值：发
+	send(200, "agent_thought_chunk") // 同值：跳过
+	deadline := time.Now().Add(300 * time.Millisecond)
+	var usageEvents []Event
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "usage" {
+				usageEvents = append(usageEvents, ev)
+			}
+		case <-time.After(20 * time.Millisecond):
+			goto done
+		}
+	}
+done:
+	if len(usageEvents) != 2 {
+		t.Fatalf("usage events = %d, want 2 (value changes only)", len(usageEvents))
+	}
+	if u1, _ := asInt(usageEvents[0]["used"]); u1 != 100 {
+		t.Errorf("usage[0].used = %v, want 100", usageEvents[0]["used"])
+	}
+	if u2, _ := asInt(usageEvents[1]["used"]); u2 != 200 {
+		t.Errorf("usage[1].used = %v, want 200", usageEvents[1]["used"])
 	}
 }
 

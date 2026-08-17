@@ -64,11 +64,14 @@ type Bridge struct {
 	// initAgentCapabilities is the `agentCapabilities` object from the
 	// agent's initialize response, surfaced in Status/Snapshot.
 	initAgentCapabilities any
-	textBuf               string
 	// genRate 是 per-session 的生成输出速率（字符/s）估算器（见
 	// genrate.go）：chunk 到达时观察、tool_call / 回合终态收尾、
 	// user_message_chunk 复位；节流后广播 gen_rate 事件。
 	genRate *genRateTracker
+	// usageLastUsed 是 per-session 上次广播的 _meta.totalTokens（流水期
+	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
+	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
+	usageLastUsed map[string]int64
 	// agentStartedAt (unix ms) stamps the CURRENT agent process spawn.
 	// Clients compare it across hello events to detect an agent restart —
 	// the agent's permission mode is in-memory only and resets on restart,
@@ -148,7 +151,11 @@ type lastSessionFile struct {
 
 type rpcResult struct {
 	result map[string]any
-	err    error
+	// raw carries a JSON-RPC result that is NOT a JSON object (e.g. the
+	// bare array workspace_list_recent returns). requestRaw() returns it
+	// verbatim; request() keeps the old behavior of coercing it to {}.
+	raw any
+	err error
 }
 
 // RPCError is a JSON-RPC error reply from the agent — the agent process
@@ -196,6 +203,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		subscribers: make(map[chan Event]struct{}),
 		bootDone:    make(chan struct{}),
 		genRate:     newGenRateTracker(),
+		usageLastUsed: make(map[string]int64),
 	}
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
@@ -556,7 +564,6 @@ func (b *Bridge) Snapshot() Status {
 		SessionMeta:       sessionMeta,
 		Models:            models,
 		BootError:         b.bootError,
-		Text:              b.textBuf,
 		PendingRequests:   pending,
 		Capabilities:      DefaultClientCaps(),
 		Roster:            roster,
@@ -915,7 +922,6 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	s.sessionMeta = sessRes["_meta"]
 	b.activeSessionID = sid
 	b.rememberSessionLocked(sid, cwd)
-	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
 	modes := s.modes
@@ -1234,12 +1240,13 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 			// healthy — callers distinguish this from transport failures
 			// (timeout etc.) and skip the kill+restore self-heal.
 			c <- rpcResult{err: &RPCError{Code: code, Msg: em}}
+		} else if m, ok := msg["result"].(map[string]any); ok {
+			c <- rpcResult{result: m}
 		} else {
-			res, _ := msg["result"].(map[string]any)
-			if res == nil {
-				res = map[string]any{}
-			}
-			c <- rpcResult{result: res}
+			// Non-object result (a bare array, e.g. workspace_list_recent's
+			// payload): keep it verbatim instead of coercing to {}, which
+			// swallowed the data. requestRaw() surfaces it as-is.
+			c <- rpcResult{raw: msg["result"]}
 		}
 		return
 	}
@@ -1273,18 +1280,31 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 下回落会误标到宿主的活动会话）。
 	sid := sessionIdExplicit(params)
 
+	update, _ := params["update"].(map[string]any)
 	// Every standard session/update carries the session-accumulated
 	// context token count in `_meta.totalTokens` (the TUI's ⇣ counter
 	// source, "Accumulated token count across the session"). Surface it
 	// as a usage event so clients can render live context usage — this
 	// is the field x.ai extension notifications do NOT carry.
-	if meta, ok := params["_meta"].(map[string]any); ok {
-		if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
-			b.trackUsage(sid, used, 0)
-			b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+	// turn_completed / response_completed 跳过此顶部广播：回合终态的
+	// usage 提取（下方）会广播同 `used` 的终态事件，此处再发就是
+	// 严格重复。其余 kind 值去重：实测流水期 _meta.totalTokens 在一段
+	// 输出内恒定（同一 used 连续 70+ 条），只广播值变化——上下文计数
+	// 器无需逐条刷新。
+	if k, _ := update["sessionUpdate"].(string); k != "turn_completed" && k != "response_completed" {
+		if meta, ok := params["_meta"].(map[string]any); ok {
+			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
+				b.mu.Lock()
+				last := b.usageLastUsed[sid]
+				b.usageLastUsed[sid] = used
+				b.mu.Unlock()
+				if used != last {
+					b.trackUsage(sid, used, 0)
+					b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+				}
+			}
 		}
 	}
-	update, _ := params["update"].(map[string]any)
 	if update == nil {
 		return
 	}
@@ -1305,14 +1325,13 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	}
 
 	// grok ships usage inside turn_completed / response_completed
-	// updates instead of the standard usage_update carrier — surface it
-	// as a normal usage event, exactly like handleXaiNotification does:
-	//   - used:  context-window usage, `_meta.totalTokens` (the TUI ⇣
-	//            counter source).
-	//   - usage: the standard TurnCompleted/ResponseCompleted usage
-	//            object passed through untouched.
-	// typed 事件（dispatch 已发）是 FE 回合封口语义；usage 提取保留在此
-	// （官方载体带 size:nil；x.ai 载体不带 —— 保持原状，不统一）。
+	// updates instead of the standard usage_update carrier — surface the
+	// context-window `used` (_meta.totalTokens, the TUI ⇣ counter source)
+	// as a normal usage event, exactly like handleXaiNotification does.
+	// 实测 FE 只 merge used/size（tools.ts 从未读 usage 对象），回合
+	// 账本对象是死字段——不再透传。typed 事件（dispatch 已发）是 FE
+	// 回合封口语义；usage 提取保留在此（官方载体带 size:nil；x.ai 载体
+	// 不带 —— 保持原状，不统一）。
 	if kind, _ := update["sessionUpdate"].(string); kind == "turn_completed" || kind == "response_completed" {
 		ev := Event{"type": "usage"}
 		if meta, ok := params["_meta"].(map[string]any); ok {
@@ -1321,12 +1340,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 				b.trackUsage(sid, used, 0)
 			}
 		}
-		if u, ok := update["usage"].(map[string]any); ok {
-			ev["usage"] = u
-		}
-		// Only broadcast when there is something to update —
-		// an empty usage event (no _meta.totalTokens, no usage
-		// object) would otherwise null the client's `used`.
+		// Only broadcast when there is something to update — an empty
+		// usage event (no _meta.totalTokens) would otherwise null the
+		// client's `used`.
 		if len(ev) > 1 {
 			ev["size"] = nil
 			ev["sessionId"] = sid
@@ -1398,9 +1414,6 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	switch kind {
 	case "agent_message_chunk":
 		if text := contentText(update["content"]); text != "" {
-			b.mu.Lock()
-			b.textBuf += text
-			b.mu.Unlock()
 			ev := attachStreamMeta(Event{"type": "chunk", "text": text}, params)
 			if mid, ok := update["messageId"]; ok {
 				ev["messageId"] = mid
@@ -1424,9 +1437,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 					}
 				}
 			}
-			// fullUpdate carries the ENTIRE original update map so no
-			// field of the agent_message_chunk payload is ever dropped.
-			ev["fullUpdate"] = update
+			// 不携带 fullUpdate（整份 update）：typed 字段即 wire 契约，
+			// 两条出口（SSE / hub）本就剥离该键，且 FE 无消费者。
 			b.Broadcast(tag(ev))
 			// 生成输出速率（按流式字符估算，见 genrate.go）：与 chunk 同轨
 			// 广播，节流后每个 session 每 ≥250ms 至多一条 active。时间源
@@ -1470,9 +1482,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 					}
 				}
 			}
-			// fullUpdate carries the ENTIRE original update map so no
-			// field of the user_message_chunk payload is ever dropped.
-			ev["fullUpdate"] = update
+			// 同 agent_message_chunk：不携带 fullUpdate（typed 字段即 wire 契约）。
 			b.Broadcast(tag(ev))
 		}
 		for _, img := range contentImages(update["content"]) {
@@ -1604,6 +1614,14 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
 		b.genRate.reset(sid)
 		b.Broadcast(tag(Event{"type": "gen_rate", "active": false}))
+		// response_completed 不广播 typed 事件：agent 实测从不发该
+		// kind（updates.jsonl 3383/3383 回合终态均为 turn_completed），
+		// FE 对 typed response_completed 无消费（turnEnd.ts 无 case，
+		// events.ts 重写回 generic 后 notifApps 显式忽略）。保留副作用
+		// （gen_rate 复位 / 调用方 usage 提取），省掉整份 update 白传。
+		if kind == "response_completed" {
+			return true
+		}
 		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
 		// prompt_id / usage 等字段）；usage 提取保留在两个载体
 		// （handleSessionUpdate / handleXaiNotification）。
@@ -1823,21 +1841,13 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		}
 		// grok ships usage inside response_completed / turn_completed
 		// notifications instead of the standard usage_update carrier —
-		// surface it as a normal usage event so clients can show live
-		// token counts while busy. Two distinct numbers ride the same
-		// event, both from standard fields:
-		//   - used:  context-window usage, `_meta.totalTokens` when the
-		//            agent provides it (the TUI ⇣ counter source).
-		//            x.ai notifications don't carry it, so on turn end
-		//            we simply keep the last known usage (same as the
-		//            TUI, which only refreshes from meta.totalTokens).
-		//   - usage: the standard TurnCompleted/ResponseCompleted usage
-		//            object passed through untouched (totalTokens is the
-		//            TURN-ACCUMULATED count across every model call in
-		//            the turn — NOT a context-window size). The client
-		//            separates the two; no custom field names.
-		// typed 事件（dispatch 已发）是 FE 回合封口语义；usage 提取保留在
-		// 此（x.ai 载体不带 size:nil，官方载体带 —— 保持原状，不统一）。
+		// surface the context-window `used` (_meta.totalTokens, the TUI
+		// ⇣ counter source) as a normal usage event. x.ai notifications
+		// usually don't carry it (keep the last known usage on turn end,
+		// same as the TUI). 实测 FE 只 merge used/size，usage 账本对象
+		// 是死字段——不再透传。typed 事件（dispatch 已发）是 FE 回合
+		// 封口语义；usage 提取保留在此（x.ai 载体不带 size:nil，官方
+		// 载体带 —— 保持原状，不统一）。
 		if up, ok := params["update"].(map[string]any); ok {
 			if kind, _ := up["sessionUpdate"].(string); kind == "response_completed" || kind == "turn_completed" {
 				ev := Event{"type": "usage"}
@@ -1847,12 +1857,9 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 						b.trackUsage(sid, used, 0)
 					}
 				}
-				if u, ok := up["usage"].(map[string]any); ok {
-					ev["usage"] = u
-				}
 				// Only broadcast when there is something to update —
-				// an empty usage event (no _meta.totalTokens, no usage
-				// object) would otherwise null the client's `used`.
+				// an empty usage event (no _meta.totalTokens) would
+				// otherwise null the client's `used`.
 				if len(ev) > 1 {
 					b.Broadcast(withSid(ev))
 				}
@@ -2357,7 +2364,23 @@ func (b *Bridge) respondError(id any, message string, code int) {
 // request 是标准 JSON-RPC 请求：固定 timeout，不因 agent 活动而顺延。
 // （曾有过按会话活跃度顺延 prompt 截止时刻的设计，2026-08-14 取消：
 // 默认 agent 可靠，超时到点即报错，不做续命式的自愈。）
+// 返回的 result 按对象处理：非对象 result（如裸数组）保持旧行为被
+// 规整为 {}。需要原样拿到任意 JSON 值的调用方用 requestRaw。
 func (b *Bridge) request(ctx context.Context, method string, params map[string]any, timeout time.Duration) (map[string]any, error) {
+	res, err := b.requestRaw(ctx, method, params, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := res.(map[string]any); ok {
+		return m, nil
+	}
+	return map[string]any{}, nil
+}
+
+// requestRaw 与 request 相同，但 result 原样返回（任意 JSON 值：对象、
+// 数组、标量、nil），不做对象规整。x.ai 扩展方法里唯一返回裸数组的
+// workspace_list_recent 必须走这里，否则数组会被 request 吞成 {}。
+func (b *Bridge) requestRaw(ctx context.Context, method string, params map[string]any, timeout time.Duration) (any, error) {
 	id := b.nextAgentID.Add(1)
 	key := idKey(id)
 	ch := make(chan rpcResult, 1)
@@ -2389,6 +2412,9 @@ func (b *Bridge) request(ctx context.Context, method string, params map[string]a
 		}
 		return nil, fmt.Errorf("%s 超时", method)
 	case res := <-ch:
+		if res.raw != nil {
+			return res.raw, res.err
+		}
 		return res.result, res.err
 	}
 }
@@ -2657,7 +2683,6 @@ func (b *Bridge) resetRoster(reason string) (string, string) {
 	b.bootOK = false
 	b.sessions = make(map[string]*SessionState)
 	b.activeSessionID = ""
-	b.textBuf = ""
 	// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
 	// 一并作废，避免 /api/queue/status 回放过期队列。
 	b.queueSnapshots = nil
@@ -3117,7 +3142,6 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		}
 		b.activeSessionID = sessionID
 		b.rememberSessionLocked(sessionID, s.Cwd)
-		b.textBuf = ""
 		b.ready = true
 		b.bootError = ""
 		sessRes := map[string]any{"busy": true}
@@ -3228,7 +3252,6 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
-	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the load response — they reflect the restored session.
@@ -3328,7 +3351,6 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		}
 		b.activeSessionID = sessionID
 		b.rememberSessionLocked(sessionID, s.Cwd)
-		b.textBuf = ""
 		b.ready = true
 		b.bootError = ""
 		sessRes := map[string]any{"busy": true}
@@ -3416,7 +3438,6 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
-	b.textBuf = ""
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the resume response — they reflect the session.
@@ -3769,7 +3790,10 @@ func runGit(cwd string, args ...string) string {
 // whose value is "" (empty string), it is replaced with the active
 // session's id; when no session is active this returns HTTPError 404.
 // Keys absent from params are left absent. 60s timeout.
-func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
+// The result is the JSON-RPC result VERBATIM (any JSON value): most x.ai
+// methods return an object, but workspace_list_recent returns a bare
+// array — coercing it to a map would swallow the data into {}.
+func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]any) (any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
@@ -3785,7 +3809,7 @@ func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]a
 			params[k] = sid
 		}
 	}
-	return b.request(ctx, "_"+method, params, 60*time.Second)
+	return b.requestRaw(ctx, "_"+method, params, 60*time.Second)
 }
 
 // XaiNotify sends a client→agent x.ai extension NOTIFICATION (fire-and-forget,

@@ -121,7 +121,7 @@ func TestExtSessionMethodsWirePayloads(t *testing.T) {
 			if cr.err != nil {
 				t.Fatalf("call error: %v", cr.err)
 			}
-			if cr.res["ok"] != true {
+			if cr.res.(map[string]any)["ok"] != true {
 				t.Errorf("result = %v, want unwrapped ok:true", cr.res)
 			}
 			msg := w.last()
@@ -152,7 +152,7 @@ func TestExtSessionMethodBareResult(t *testing.T) {
 	if cr.err != nil {
 		t.Fatal(cr.err)
 	}
-	if cr.res["usage"] == nil {
+	if cr.res.(map[string]any)["usage"] == nil {
 		t.Errorf("result = %v, want bare usage passthrough", cr.res)
 	}
 }

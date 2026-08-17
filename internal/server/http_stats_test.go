@@ -91,9 +91,9 @@ func TestSessionStatsEndpoint(t *testing.T) {
 	eq("llmDurationMs", 27000)
 	// 工具耗时 = 7000 − 6000。
 	eq("toolDurationMs", 1000)
-	// 首 token = 用户发出 → 本回合第一个可见字，每回合一次：
-	// (5200−3000 + 22500−20000) / 2 = 2350。工具后的第二流不计入。
-	eq("firstTokenAvgMs", 2350)
+	// 首 token = 用户发出 → 本回合第一条流的 streamStart，每回合一次：
+	// (5000−3000 + 22000−20000) / 2 = 2000。工具后的第二流不计入。
+	eq("firstTokenAvgMs", 2000)
 	// 吞吐 = 输出 token / 生成窗口。三流都是单包，窗口 = Σ(末包 −
 	// streamStart) = (5200−5000)+(8300−8000)+(22500−22000) = 1000ms
 	// → 300 / 1000 × 1000 = 300 tok/s。
@@ -197,10 +197,10 @@ func TestSessionStatsInProgressTurnNotCounted(t *testing.T) {
 	if got, _ := stats["tokensPerSec"].(float64); got != 500 {
 		t.Errorf("tokensPerSec = %v, want 500（进行中回合不得提前计入分母）", got)
 	}
-	// 首 token 每回合第一个字：回合 1 为 2500−1000=1500，回合 2 进行中
-	// 已见到字 12100−10000=2100 → (1500+2100)/2 = 1800。
-	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1800 {
-		t.Errorf("firstTokenAvgMs = %v, want 1800（(1500+2100)/2）", got)
+	// 首 token = streamStart − 用户发出：回合 1 为 2000−1000=1000，
+	// 回合 2 进行中已见到流 12000−10000=2000 → (1000+2000)/2 = 1500。
+	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1500 {
+		t.Errorf("firstTokenAvgMs = %v, want 1500（(1000+2000)/2）", got)
 	}
 }
 
@@ -276,12 +276,12 @@ func TestSessionStatsStrayNoSsChunkNotPoison(t *testing.T) {
 	}
 }
 
-// 真流式（首包后持续 ≥500ms）：分母用首包 → 末包，不含等到首字。
-func TestSessionStatsStreamingUsesFirstToLast(t *testing.T) {
+// 真流式也用 streamStart → 末包（含 thought 首包生成时间）。
+func TestSessionStatsStreamingUsesStreamStartToLast(t *testing.T) {
 	home := t.TempDir()
 	sid := "s1"
-	// ss=1000，首包@2000，末包@3000。尾巴 1000ms ≥500 → 窗口 1000，
-	// 不是 3000−1000=2000。out=200 → 200 tok/s。
+	// ss=1000，首包@2000，末包@3000。窗口 = 3000−1000=2000，
+	// 不是 3000−2000=1000。out=200 → 100 tok/s。
 	lines := []string{
 		statsSessionLine(sid,
 			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
@@ -303,12 +303,44 @@ func TestSessionStatsStreamingUsesFirstToLast(t *testing.T) {
 	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
 	m := decodeBody(t, rec)
 	stats, _ := m["stats"].(map[string]any)
-	if got, _ := stats["tokensPerSec"].(float64); got != 200 {
-		t.Errorf("tokensPerSec = %v, want 200（真流式用首包→末包）", got)
+	if got, _ := stats["tokensPerSec"].(float64); got != 100 {
+		t.Errorf("tokensPerSec = %v, want 100（streamStart→末包，不是首包→末包）", got)
 	}
-	// 首 token = 2000 − 100 = 1900（用户发出 → 第一个字，不是 1000−100）。
-	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1900 {
-		t.Errorf("firstTokenAvgMs = %v, want 1900", got)
+	// 首 token = streamStart − 用户发出 = 1000 − 100 = 900
+	// （不含 thought 包生成 2000−1000）。
+	if got, _ := stats["firstTokenAvgMs"].(float64); got != 900 {
+		t.Errorf("firstTokenAvgMs = %v, want 900", got)
+	}
+}
+
+// 首包缺 streamStartMs：等后续同回合 chunk，不用可见字时间冒充流起点。
+func TestSessionStatsFirstTokenWaitsForStreamStart(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		// 可见字先到，但没有 streamStart → 还不能记首 token。
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": "a"}},
+			map[string]any{"agentTimestampMs": float64(2500)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "b"}},
+			map[string]any{"agentTimestampMs": float64(2800), "streamStartMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 50, "totalTokens": 150,
+				"modelCalls": 1, "apiDurationMs": 3000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1000 {
+		t.Errorf("firstTokenAvgMs = %v, want 1000（2000−1000，不是 2500−1000）", got)
 	}
 }
 
