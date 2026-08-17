@@ -61,65 +61,110 @@ func TestSessionUpdateFullPassthrough(t *testing.T) {
 	}
 }
 
-// turn_completed / response_completed over the session/update carrier must
-// yield the typed turn_completed/response_completed event (FE 回合封口语义,
-// update verbatim) and a usage event extracted from _meta.totalTokens +
-// update.usage (handleXaiNotification parity). The merged usage event
-// carries used (int64 from asInt) and the turn's usage object passed
-// through untouched. Modeled → no generic session_notification.
+// turn_completed / response_completed 都是回合终态 kind：usage 提取一致
+// （_meta.totalTokens + update.usage，handleXaiNotification parity），但只有
+// turn_completed 发 typed 事件（FE 回合封口语义, update verbatim）。
+// response_completed 实测从不被 agent 发出（updates.jsonl 3383/3383 回合
+// 终态均为 turn_completed），FE 也无消费（turnEnd.ts 无 case，events.ts
+// 重写回 generic 后 notifApps.ts 显式忽略）——只保留副作用（gen_rate
+// active:false、usage 提取）。Modeled → 均无 generic session_notification。
 func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
-	for _, kind := range []string{"turn_completed", "response_completed"} {
-		t.Run(kind, func(t *testing.T) {
-			b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
-			ch, unsub := b.Subscribe()
-			defer unsub()
-			usage := map[string]any{"totalTokens": float64(55)}
-			b.handleSessionUpdate(map[string]any{
-				"sessionId": "s1",
-				"_meta":     map[string]any{"totalTokens": float64(1234)},
-				"update": map[string]any{
-					"sessionUpdate": kind,
-					"usage":         usage,
-				},
-			})
-			var sawTyped, sawUsage bool
-			var events []Event
-			deadline := time.Now().Add(300 * time.Millisecond)
-			for time.Now().Before(deadline) {
-				select {
-				case ev := <-ch:
-					events = append(events, ev)
-					switch ev["type"] {
-					case "session_notification":
-						t.Errorf("unexpected generic session_notification for modeled kind %s: %v", kind, ev)
-					case kind:
-						sawTyped = true
-						if !reflect.DeepEqual(ev["update"], map[string]any{"sessionUpdate": kind, "usage": usage}) {
-							t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
-						}
-						if ev["sessionId"] != "s1" {
-							t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
-						}
-					case "usage":
-						// Only the turn-completed extraction carries BOTH
-						// the carrier-level used count and the usage object.
-						if used, ok := asInt(ev["used"]); ok && used == 1234 {
-							if u, ok := ev["usage"].(map[string]any); ok && reflect.DeepEqual(u, usage) {
-								sawUsage = true
-							}
+	t.Run("turn_completed", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		usage := map[string]any{"totalTokens": float64(55)}
+		b.handleSessionUpdate(map[string]any{
+			"sessionId": "s1",
+			"_meta":     map[string]any{"totalTokens": float64(1234)},
+			"update": map[string]any{
+				"sessionUpdate": "turn_completed",
+				"usage":         usage,
+			},
+		})
+		var sawTyped, sawUsage bool
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			select {
+			case ev := <-ch:
+				switch ev["type"] {
+				case "session_notification":
+					t.Errorf("unexpected generic session_notification for modeled kind turn_completed: %v", ev)
+				case "turn_completed":
+					sawTyped = true
+					if !reflect.DeepEqual(ev["update"], map[string]any{"sessionUpdate": "turn_completed", "usage": usage}) {
+						t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
+					}
+					if ev["sessionId"] != "s1" {
+						t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+					}
+				case "usage":
+					// 仅 turn 提取的 usage 事件带 carrier 级 used；
+					// usage 账本对象不再透传（FE 零消费）。
+					if used, ok := asInt(ev["used"]); ok && used == 1234 {
+						if _, hasObj := ev["usage"]; !hasObj {
+							sawUsage = true
 						}
 					}
-				case <-time.After(20 * time.Millisecond):
 				}
+			case <-time.After(20 * time.Millisecond):
 			}
-			if !sawTyped {
-				t.Errorf("no typed %s event", kind)
-			}
-			if !sawUsage {
-				t.Errorf("no merged usage event (used=1234 + usage object) for %s", kind)
-			}
+		}
+		if !sawTyped {
+			t.Error("no typed turn_completed event")
+		}
+		if !sawUsage {
+			t.Error("no usage event (used=1234, no usage object) for turn_completed")
+		}
+	})
+	t.Run("response_completed", func(t *testing.T) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		ch, unsub := b.Subscribe()
+		defer unsub()
+		usage := map[string]any{"totalTokens": float64(55)}
+		b.handleSessionUpdate(map[string]any{
+			"sessionId": "s1",
+			"_meta":     map[string]any{"totalTokens": float64(1234)},
+			"update": map[string]any{
+				"sessionUpdate": "response_completed",
+				"usage":         usage,
+			},
 		})
-	}
+		var sawTyped, sawUsage, sawGenRate bool
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			select {
+			case ev := <-ch:
+				switch ev["type"] {
+				case "session_notification":
+					t.Errorf("unexpected generic session_notification for modeled kind response_completed: %v", ev)
+				case "turn_completed", "response_completed":
+					sawTyped = true
+					t.Errorf("no typed event expected for response_completed, got %s: %v", ev["type"], ev)
+				case "gen_rate":
+					if active, _ := ev["active"].(bool); !active {
+						sawGenRate = true
+					}
+				case "usage":
+					if used, ok := asInt(ev["used"]); ok && used == 1234 {
+						if _, hasObj := ev["usage"]; !hasObj {
+							sawUsage = true
+						}
+					}
+				}
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		if sawTyped {
+			t.Error("response_completed must not broadcast a typed event")
+		}
+		if !sawUsage {
+			t.Error("no usage event (used=1234, no usage object) for response_completed")
+		}
+		if !sawGenRate {
+			t.Error("no gen_rate active:false for response_completed")
+		}
+	})
 }
 
 // ── chunk meta forwarding ───────────────────────────────────────────
@@ -403,8 +448,8 @@ func TestPromptWithOptsWire(t *testing.T) {
 	if cr.err != nil {
 		t.Fatalf("PromptWithOpts: %v", cr.err)
 	}
-	if cr.res["stopReason"] != "end_turn" {
-		t.Errorf("stopReason = %v, want end_turn", cr.res["stopReason"])
+	if cr.res.(map[string]any)["stopReason"] != "end_turn" {
+		t.Errorf("stopReason = %v, want end_turn", cr.res.(map[string]any)["stopReason"])
 	}
 
 	msg := w.last()
@@ -481,9 +526,9 @@ func TestPromptResponseMetaPassthrough(t *testing.T) {
 	if cr.err != nil {
 		t.Fatalf("PromptWithOpts: %v", cr.err)
 	}
-	meta, ok := cr.res["meta"].(map[string]any)
+	meta, ok := cr.res.(map[string]any)["meta"].(map[string]any)
 	if !ok || meta["turn_id"] != "t-1" || meta["cost"] != float64(42) {
-		t.Errorf("returned meta = %v, want {turn_id:t-1 cost:42}", cr.res["meta"])
+		t.Errorf("returned meta = %v, want {turn_id:t-1 cost:42}", cr.res.(map[string]any)["meta"])
 	}
 
 	// The done event must carry the same meta under `meta`.
@@ -567,7 +612,7 @@ func TestXaiCall(t *testing.T) {
 			t.Fatalf("XaiCall: %v", cr.err)
 		}
 		// RAW result: the ExtMethodResult envelope is not unwrapped.
-		if _, ok := cr.res["result"].(map[string]any); !ok {
+		if _, ok := cr.res.(map[string]any)["result"].(map[string]any); !ok {
 			t.Errorf("result = %v, want raw envelope passthrough", cr.res)
 		}
 		msg := w.last()
@@ -626,6 +671,40 @@ func TestXaiCall(t *testing.T) {
 		var he *HTTPError
 		if !errors.As(err, &he) || he.Code != 404 {
 			t.Fatalf("err = %v, want HTTPError 404", err)
+		}
+	})
+
+	t.Run("bare array result passes through verbatim", func(t *testing.T) {
+		// workspace_list_recent's payload is a bare array; it must NOT be
+		// coerced to {} (the regression this test guards).
+		b, w := readyBridge()
+		done := make(chan callResult, 1)
+		go func() {
+			res, err := b.XaiCall(ctx, "x.ai/foo", map[string]any{})
+			done <- callResult{res, err}
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if msg := w.last(); msg != nil {
+				if id := msg["id"]; id != nil {
+					if ch, ok := b.pending.LoadAndDelete(idKey(id)); ok {
+						ch.(chan rpcResult) <- rpcResult{raw: []any{map[string]any{"id": "s1"}}}
+						break
+					}
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cr := <-done
+		if cr.err != nil {
+			t.Fatalf("XaiCall: %v", cr.err)
+		}
+		arr, ok := cr.res.([]any)
+		if !ok || len(arr) != 1 {
+			t.Fatalf("result = %v, want bare array passthrough", cr.res)
+		}
+		if m, _ := arr[0].(map[string]any); m["id"] != "s1" {
+			t.Errorf("array[0] = %v, want {id:s1}", arr[0])
 		}
 	})
 }
