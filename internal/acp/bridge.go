@@ -1375,6 +1375,9 @@ func attachStreamMeta(ev Event, params map[string]any) Event {
 	if v, ok := meta["agentTimestampMs"]; ok {
 		ev["agentTimestampMs"] = v
 	}
+	if v, ok := meta["streamStartMs"]; ok {
+		ev["streamStartMs"] = v
+	}
 	if agent, ok1 := asInt(meta["agentTimestampMs"]); ok1 {
 		if start, ok2 := asInt(meta["streamStartMs"]); ok2 && agent >= start {
 			ev["elapsedMs"] = agent - start
