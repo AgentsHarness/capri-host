@@ -776,6 +776,9 @@ func TestStreamEventsForwardTurnStartMs(t *testing.T) {
 			if ev["agentTimestampMs"] != float64(1700000030000) {
 				t.Errorf("agentTimestampMs = %v, want 1700000030000", ev["agentTimestampMs"])
 			}
+			if ev["streamStartMs"] != float64(1700000020000) {
+				t.Errorf("streamStartMs = %v, want 1700000020000", ev["streamStartMs"])
+			}
 			// 只有 thought 需要 elapsedMs,但统一计算无害。asInt 侧是 int64。
 			if got, _ := ev["elapsedMs"].(int64); got != 10000 {
 				t.Errorf("elapsedMs = %v, want 10000（agentTimestampMs - streamStartMs）", ev["elapsedMs"])
