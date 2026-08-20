@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
@@ -51,6 +52,11 @@ type Config struct {
 	// the hub domain resolves through a proxy/fake-ip that drops UDP.
 	// Default: the URL host + QUICPort.
 	QUICHost string
+	// QUICInsecure disables QUIC server-certificate verification
+	// (HUB_QUIC_INSECURE=1). Only for a self-signed hub you control on a
+	// trusted network — see quicTLSClientConfig for why the default
+	// verifies whenever the hub URL is https.
+	QUICInsecure bool
 }
 
 // Client forwards events to the hub and executes relayed requests against
@@ -99,10 +105,31 @@ type Client struct {
 	// from the hub's gap-pull buffer too, so the transcript is
 	// permanently lost.
 	enqueueMu sync.Mutex
+
+	// subsGen is the highest subscriber-count generation applied (see
+	// applySubscribers). Reset per session: a restarted hub counts from
+	// low again.
+	subsGen atomic.Uint64
+
+	// lastRecvUnixNano is when the last downlink frame arrived, for the
+	// session idle watchdog (see sessionIdleTimeout).
+	lastRecvUnixNano atomic.Int64
+
+	// needCatchUp is set when a live events frame was dropped because the
+	// send queue was full. Those seqs never reach the hub, so the FE's
+	// gap-pull (which reads the hub's buffer) can never fill the hole
+	// either — its ordered-delivery buffer then waits for a predecessor
+	// that will never arrive. The heartbeat re-sends from lastSentSeq to
+	// close the gap once the pressure passes.
+	needCatchUp atomic.Bool
 }
 
 // replayCap bounds the host-side replay buffer (events).
 const replayCap = 5000
+
+// replayHighWater is where seqAndReplay compacts back down to replayCap
+// (amortized, see seqAndReplay).
+const replayHighWater = 2 * replayCap
 
 // maxFrameBytes caps any single events frame. The hub's host WS read
 // limit is 32MB; keeping frames well below it means an oversized frame
@@ -117,6 +144,21 @@ const maxFrameBytes = 8 << 20
 // one multi-MB frame would exceed the hub read limit and repeat the
 // reconnect forever. Replay is chunked to this budget instead.
 const replayFrameBudget = 1 << 20
+
+// healthySessionMin is how long a hub session must last to count as
+// healthy and reset the reconnect backoff (see Run).
+const healthySessionMin = 60 * time.Second
+
+// sessionIdleTimeout fails a hub session that has received NOTHING for
+// this long. The hub pings every 25s and answers our 10s pings, so silence
+// this long means the link is dead even though the socket still looks
+// open. Without it a half-open TCP connection (NAT rebind, silent
+// middlebox drop, laptop sleep) wedges the host permanently: reads block
+// forever, writes keep succeeding into the kernel buffer, no error ever
+// surfaces, and the reconnect loop is never entered — the host looks
+// online in the hub registry while uploading nothing. The hub has always
+// had the mirror-image guard (hostReadTimeout); the host had none.
+const sessionIdleTimeout = 75 * time.Second
 
 // NewClient returns a hub client. LocalBase defaults to 127.0.0.1:8765.
 func NewClient(cfg Config) *Client {
@@ -173,6 +215,7 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 	for ctx.Err() == nil {
 		// QUIC first (loss-resilient, connection-migrating), WS fallback.
 		err := error(nil)
+		sessionStart := time.Now()
 		if c.cfg.DisableQUIC {
 			err = c.wsSession(ctx, bridge)
 		} else {
@@ -184,6 +227,16 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 		}
 		if ctx.Err() != nil {
 			break
+		}
+		// A session that stayed up is evidence the hub is healthy: reset
+		// the backoff. Without this, the delay only ever grows and pins at
+		// 30s for the rest of the process — so a single blip after hours of
+		// uptime costs 30 seconds of downtime, and every later blip does
+		// too. Only sessions shorter than the threshold keep escalating
+		// (that is the case backoff exists for: a hub that rejects or drops
+		// us immediately).
+		if time.Since(sessionStart) >= healthySessionMin {
+			backoff = time.Second
 		}
 		// Pause forwarding until the next hello re-arms subscribers.
 		c.fwdMu.Lock()
@@ -384,9 +437,16 @@ func (c *Client) seqAndReplay(evs []acp.Event) {
 			c.nextSeq = s
 		}
 		c.replay = append(c.replay, ev)
-		if len(c.replay) > replayCap {
-			n := len(c.replay) - replayCap
-			c.replay = c.replay[n:]
+		if len(c.replay) > replayHighWater {
+			// Compact into a FRESH array rather than resliceing: Go keeps
+			// the whole backing array alive for as long as any slice of it
+			// is, so `c.replay = c.replay[n:]` would pin every dropped
+			// Event map (session updates can be large) until the next
+			// reallocation — roughly doubling steady-state memory. Compact
+			// at the high-water mark so the copy stays amortized O(1).
+			trimmed := make([]acp.Event, replayCap, replayHighWater)
+			copy(trimmed, c.replay[len(c.replay)-replayCap:])
+			c.replay = trimmed
 		}
 	}
 }
@@ -439,6 +499,18 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 			flush()
 		case <-heartbeat.C:
 			flush()
+			// A live frame dropped under send-queue pressure left a hole
+			// the FE cannot repair on its own (the events never reached the
+			// hub's gap-pull buffer). Re-send from the last acknowledged
+			// seq via the critical path now that the burst has passed.
+			if c.needCatchUp.Swap(false) && c.forwardingEnabled() {
+				c.seqMu.Lock()
+				after := c.lastSentSeq
+				c.seqMu.Unlock()
+				if last := c.sendReplayAfter(after); last > 0 {
+					log.Printf("[hub-client] 补发被丢弃的事件 seq %d..%d", after+1, last)
+				}
+			}
 			// Always heartbeat: keeps hub registry ready flag fresh even
 			// with zero browser subscribers. Control frame, not data-plane seq.
 			c.enqueueHostStatus(bridge)
@@ -510,7 +582,12 @@ func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 	case c.sendCh <- payload:
 		c.noteLastSentSeq(evs)
 	default:
-		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留）", len(evs))
+		// Dropped: the hub will never see these seqs, and neither will the
+		// FE's gap-pull (it reads the hub's buffer). Flag a catch-up so the
+		// heartbeat re-sends from lastSentSeq instead of leaving a hole the
+		// FE can only wait forever on.
+		c.needCatchUp.Store(true)
+		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(evs))
 	}
 }
 
@@ -567,6 +644,14 @@ func (c *Client) sendReplayAfter(after uint64) uint64 {
 	// replay frames — see enqueueReplay for why that would lose events.
 	c.enqueueMu.Lock()
 	defer c.enqueueMu.Unlock()
+	return c.sendReplayAfterLocked(after)
+}
+
+// sendReplayAfterLocked is sendReplayAfter's body; the caller must hold
+// enqueueMu. Callers that must emit a frame IMMEDIATELY BEFORE the replay
+// (seq_reset — see handleHelloSeq) hold the lock across both so nothing
+// can be interleaved between them.
+func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 	c.seqMu.Lock()
 	var idx int
 	// 第一个事件实际 seq > after 的位置。一律按事件自带 seq 比较。
@@ -679,10 +764,22 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 	// hubSeq (we assigned those seqs before disconnect).
 	if hubSeq > localMax {
 		log.Printf("[hub-client] seq 世代重置: hub.seq=%d > localMax=%d（host 进程重启？），请求 hub 清零并补发本地缓冲", hubSeq, localMax)
-		c.enqueueSeqReset()
+		// enqueueMu must span BOTH the seq_reset frame and the replay it
+		// authorizes. Taking it only inside sendReplayAfter would let a
+		// concurrent live batch (forwardLoop) slip in between, producing
+		// the uplink order [seq_reset][live seq 200…][replay seq 1…]: the
+		// hub zeroes its watermark, jumps to 200 on the live frame, then
+		// drops the entire replay as stale — and those events are gone
+		// from its gap-pull buffer too (seq_reset cleared it), so the
+		// transcript is permanently lost. This is exactly the hazard the
+		// enqueueMu doc describes; the reset path just wasn't covered.
+		c.enqueueMu.Lock()
+		c.enqueueSeqResetLocked()
+		last := c.sendReplayAfterLocked(0)
+		c.enqueueMu.Unlock()
 		// Do NOT advance lastSentSeq from the alien hubSeq. Replay
 		// everything this process has buffered (after 0).
-		if last := c.sendReplayAfter(0); last > 0 {
+		if last > 0 {
 			log.Printf("[hub-client] 世代重置后补发本地缓冲 seq 1..%d", last)
 		}
 		return
@@ -708,6 +805,14 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 //
 //	{"v":1,"type":"seq_reset"}
 func (c *Client) enqueueSeqReset() {
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
+	c.enqueueSeqResetLocked()
+}
+
+// enqueueSeqResetLocked is enqueueSeqReset's body; the caller must hold
+// enqueueMu (handleHelloSeq keeps it across the reset + the replay).
+func (c *Client) enqueueSeqResetLocked() {
 	payload, err := json.Marshal(map[string]any{
 		"v":    1,
 		"type": "seq_reset",
@@ -858,14 +963,10 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 		return err
 	}
 	host, port := c.quicAddr()
-	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, quicDialTimeout)
 	defer cancel()
-	conn, err := quic.DialAddr(dialCtx, net.JoinHostPort(host, port), &tls.Config{
-		InsecureSkipVerify: true, // hub QUIC uses self-signed certs
-		// Must match capri-hub quicTLSConfig ALPN ("capri-hub"); empty client ALPN
-		// yields CRYPTO_ERROR tls: no application protocol.
-		NextProtos: []string{"capri-hub"},
-	}, &quic.Config{KeepAlivePeriod: 10 * time.Second})
+	conn, err := quic.DialAddr(dialCtx, net.JoinHostPort(host, port), c.quicTLSClientConfig(host),
+		&quic.Config{KeepAlivePeriod: 10 * time.Second})
 	if err != nil {
 		return fmt.Errorf("hub quic dial %s: %w", host, err)
 	}
@@ -919,6 +1020,62 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	return c.runSession(ctx, bridge, send, recv)
 }
 
+// quicDialTimeout bounds the QUIC handshake before falling back to
+// WebSocket. 3s was too tight for a lossy mobile / intercontinental path
+// (the handshake needs ~2 RTT, and quic-go retries a lost Initial after
+// ~1s), so a perfectly usable QUIC path was being abandoned for the
+// slower TCP fallback. WS fallback is still immediate on real failure.
+const quicDialTimeout = 8 * time.Second
+
+// quicTLSClientConfig builds the TLS config for the QUIC host transport.
+//
+// The hub deliberately REFUSES to run QUIC with a self-signed certificate
+// once FE_TOKEN is set (see its quicTLSConfig), i.e. it treats a real
+// certificate as a production requirement. That requirement bought nothing
+// while this client dialed with InsecureSkipVerify unconditionally: anyone
+// able to answer on the hub's UDP port could impersonate it, receive this
+// host's token, and then drive relayed requests — which execute agent
+// operations (shell, file writes) on this machine. The WebSocket path has
+// always verified TLS normally via https://, so QUIC was the odd one out.
+//
+// Policy: verify whenever the hub URL is https (production), skip for a
+// plain-http hub (localhost / lab, where there is no certificate to trust
+// anyway), and allow an explicit HUB_QUIC_INSECURE=1 escape hatch. A
+// verification failure is not fatal — Run falls back to WebSocket, which
+// carries the same frames over verified TLS.
+func (c *Client) quicTLSClientConfig(dialHost string) *tls.Config {
+	// Must match capri-hub quicTLSConfig ALPN ("capri-hub"); an empty
+	// client ALPN yields CRYPTO_ERROR "tls: no application protocol".
+	conf := &tls.Config{NextProtos: []string{"capri-hub"}}
+	if c.cfg.QUICInsecure || !strings.HasPrefix(strings.TrimSpace(c.cfg.URL), "https://") {
+		conf.InsecureSkipVerify = true
+		return conf
+	}
+	// Verify against the hub's DNS name from HUB_URL, not the dial target:
+	// HUB_QUIC_HOST may legitimately point at a raw IP to bypass a
+	// proxy/fake-ip resolver, and the certificate still names the domain.
+	conf.ServerName = c.urlHostname()
+	if conf.ServerName == "" {
+		conf.ServerName = dialHost
+	}
+	return conf
+}
+
+// urlHostname returns the hostname part of the configured hub URL.
+func (c *Client) urlHostname() string {
+	u := strings.TrimRight(strings.TrimSpace(c.cfg.URL), "/")
+	for _, p := range []string{"https://", "http://", "wss://", "ws://"} {
+		u = strings.TrimPrefix(u, p)
+	}
+	if i := strings.IndexByte(u, '/'); i >= 0 {
+		u = u[:i]
+	}
+	if h, _, err := net.SplitHostPort(u); err == nil {
+		return h
+	}
+	return u
+}
+
 // quicAddr resolves the hub QUIC endpoint: HUB_QUIC_HOST override wins,
 // else the URL host + QUICPort.
 func (c *Client) quicAddr() (host, port string) {
@@ -948,14 +1105,20 @@ func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, send func([
 	// write loop starts, so they cannot interleave with hello-driven
 	// replay and double-send.
 	c.drainSendCh()
+	// New session ⇒ new hub process possibly, whose subscriber-count
+	// generation counter restarts low. Clear our high-water mark or every
+	// count from a restarted hub would look stale and be ignored.
+	c.subsGen.Store(0)
+	c.markRecv()
 	c.enqueueHostStatus(bridge)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() { errCh <- c.writeLoop(sessCtx, send) }()
 	go func() { errCh <- c.readLoop(sessCtx, recv, bridge) }()
+	go func() { errCh <- c.idleWatchdog(sessCtx) }()
 
 	select {
 	case <-ctx.Done():
@@ -966,6 +1129,34 @@ func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, send func([
 			return errors.New("hub 关闭了连接")
 		}
 		return err
+	}
+}
+
+// markRecv records that a frame arrived (idle watchdog liveness).
+func (c *Client) markRecv() {
+	c.lastRecvUnixNano.Store(time.Now().UnixNano())
+}
+
+// idleWatchdog fails the session when no frame has arrived for
+// sessionIdleTimeout, so the reconnect loop can take over. See
+// sessionIdleTimeout for why the transport's own error reporting is not
+// enough (half-open sockets never report anything).
+func (c *Client) idleWatchdog(ctx context.Context) error {
+	t := time.NewTicker(sessionIdleTimeout / 3)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			last := c.lastRecvUnixNano.Load()
+			if last == 0 {
+				continue
+			}
+			if idle := time.Since(time.Unix(0, last)); idle >= sessionIdleTimeout {
+				return fmt.Errorf("hub 静默 %.0fs（无任何下行帧），判定链路已死", idle.Seconds())
+			}
+		}
 	}
 }
 
@@ -999,6 +1190,8 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 		if err != nil {
 			return err
 		}
+		// Any downlink frame (ping included) proves the link is alive.
+		c.markRecv()
 		var msg struct {
 			Type        string          `json:"type"`
 			ReqID       string          `json:"reqId"`
@@ -1007,7 +1200,9 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			Path        string          `json:"path"`
 			Body        json.RawMessage `json:"body"`
 			Count       *int            `json:"count"`       // type:"subscribers"
-			Subscribers *int            `json:"subscribers"` // type:"hello"
+			Subscribers *int            `json:"subscribers"` // type:"hello" / "ping"
+			SubsGen     *uint64         `json:"subsGen"`     // type:"ping" — ordering stamp
+			Gen         *uint64         `json:"gen"`         // type:"subscribers" — ordering stamp
 			Seq         *uint64         `json:"seq"`         // type:"hello" — hub's last seen seq
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
@@ -1017,7 +1212,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 		switch msg.Type {
 		case "hello":
 			if msg.Subscribers != nil {
-				c.setBrowserSubscribers(*msg.Subscribers)
+				c.applySubscribers(*msg.Subscribers, 0, bridge)
 			}
 			// Resume against hub's last-seen seq — or reset the epoch when
 			// this process cannot produce seqs that high (host restart).
@@ -1029,27 +1224,70 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			if msg.Count != nil {
 				n = *msg.Count
 			}
-			was := c.forwardingEnabled()
-			c.setBrowserSubscribers(n)
-			if !was && c.forwardingEnabled() {
-				// Catch up events buffered while paused (they were
-				// seqAndReplay'd but never enqueued).
-				c.seqMu.Lock()
-				after := c.lastSentSeq
-				c.seqMu.Unlock()
-				if last := c.sendReplayAfter(after); last > 0 {
-					log.Printf("[hub-client] 订阅恢复补发事件 seq %d..%d", after+1, last)
-				}
-				c.enqueueHostStatus(bridge)
+			var gen uint64
+			if msg.Gen != nil {
+				gen = *msg.Gen
 			}
+			c.applySubscribers(n, gen, bridge)
 		case "request":
 			go c.handleRelay(ctx, msg.ReqID, msg.HostID, msg.Method, msg.Path, msg.Body)
 		case "ping":
+			// The hub re-asserts the authoritative subscriber count on its
+			// ping, so a `subscribers` frame lost to a write error or a
+			// superseded connection self-heals within one ping interval
+			// instead of leaving us paused while a browser waits on a
+			// frozen page.
+			if msg.Subscribers != nil {
+				var gen uint64
+				if msg.SubsGen != nil {
+					gen = *msg.SubsGen
+				}
+				c.applySubscribers(*msg.Subscribers, gen, bridge)
+			}
 			pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
 			c.enqueueFrame(pong, false)
 		case "pong":
 			// ignore
 		}
+	}
+}
+
+// applySubscribers applies a hub subscriber-count update, ignoring frames
+// that lost a race with a newer one.
+//
+// The count is ABSOLUTE state that decides whether we upload bridge events
+// at all, and the hub writes its notifications from one goroutine per host
+// — so a browser refresh (unsubscribe → 0, resubscribe → 1, microseconds
+// apart) can arrive as 1 then 0. Applying the stale 0 pauses our uplink
+// while host_status heartbeats keep us "online": the user's freshly
+// reloaded page looks connected and never updates. `gen` is the hub's
+// monotonic stamp; gen==0 means a hub too old to send one (apply as
+// before). On a 0→1 transition we also replay what was buffered while
+// paused.
+func (c *Client) applySubscribers(count int, gen uint64, bridge *acp.Bridge) {
+	if gen > 0 {
+		for {
+			prev := c.subsGen.Load()
+			if gen <= prev {
+				return // superseded by a newer count already applied
+			}
+			if c.subsGen.CompareAndSwap(prev, gen) {
+				break
+			}
+		}
+	}
+	was := c.forwardingEnabled()
+	c.setBrowserSubscribers(count)
+	if !was && c.forwardingEnabled() {
+		// Catch up events buffered while paused (they were seqAndReplay'd
+		// but never enqueued).
+		c.seqMu.Lock()
+		after := c.lastSentSeq
+		c.seqMu.Unlock()
+		if last := c.sendReplayAfter(after); last > 0 {
+			log.Printf("[hub-client] 订阅恢复补发事件 seq %d..%d", after+1, last)
+		}
+		c.enqueueHostStatus(bridge)
 	}
 }
 
