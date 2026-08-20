@@ -46,6 +46,11 @@ func main() {
 			// Optional: bypass proxy/fake-ip DNS for the QUIC transport
 			// (e.g. HUB_QUIC_HOST=203.0.113.10).
 			QUICHost: os.Getenv("HUB_QUIC_HOST"),
+			// Escape hatch for a self-signed hub on a trusted network.
+			// Leave unset in production: the QUIC transport otherwise
+			// verifies the hub certificate whenever HUB_URL is https
+			// (a failure just falls back to WebSocket over verified TLS).
+			QUICInsecure: os.Getenv("HUB_QUIC_INSECURE") == "1",
 		})
 		go hc.Run(ctx, bridge)
 	}

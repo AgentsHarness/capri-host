@@ -1260,6 +1260,10 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 		HostID:    "h1",
 		Token:     "tok123",
 		LocalBase: local.URL,
+		// The in-test hub is self-signed; an https URL otherwise makes the
+		// QUIC transport verify the certificate (see quicTLSClientConfig
+		// and TestQUICTLSPolicy).
+		QUICInsecure: true,
 	})
 	c.sendCh = make(chan []byte, 64)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
@@ -1327,4 +1331,272 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// TestQUICTLSPolicy pins the QUIC certificate-verification policy. The hub
+// refuses to serve QUIC with a self-signed certificate once FE_TOKEN is set
+// (its quicTLSConfig), so treating every hub as untrusted here would make
+// that requirement meaningless: whoever answers on the hub's UDP port could
+// impersonate it, collect this host's token and drive relayed requests,
+// which execute agent operations on this machine.
+func TestQUICTLSPolicy(t *testing.T) {
+	cases := []struct {
+		name       string
+		url        string
+		insecure   bool
+		wantSkip   bool
+		wantServer string
+	}{
+		{
+			name:       "https verifies against the hub domain",
+			url:        "https://hub.example.com",
+			wantSkip:   false,
+			wantServer: "hub.example.com",
+		},
+		{
+			name:       "https with port still verifies the hostname",
+			url:        "https://hub.example.com:8787/",
+			wantSkip:   false,
+			wantServer: "hub.example.com",
+		},
+		{
+			name:     "plain http is a lab/localhost hub — nothing to verify",
+			url:      "http://127.0.0.1:8787",
+			wantSkip: true,
+		},
+		{
+			name:     "explicit opt-out wins over https",
+			url:      "https://hub.example.com",
+			insecure: true,
+			wantSkip: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewClient(Config{URL: tc.url, QUICInsecure: tc.insecure})
+			conf := c.quicTLSClientConfig("203.0.113.10")
+			if conf.InsecureSkipVerify != tc.wantSkip {
+				t.Errorf("InsecureSkipVerify = %v, want %v", conf.InsecureSkipVerify, tc.wantSkip)
+			}
+			if len(conf.NextProtos) != 1 || conf.NextProtos[0] != "capri-hub" {
+				t.Errorf("NextProtos = %v, want [capri-hub] (hub ALPN)", conf.NextProtos)
+			}
+			if !tc.wantSkip && conf.ServerName != tc.wantServer {
+				// HUB_QUIC_HOST may point at a raw IP to dodge a fake-ip
+				// resolver; the certificate still names the domain.
+				t.Errorf("ServerName = %q, want %q (hub domain, not the dial IP)", conf.ServerName, tc.wantServer)
+			}
+		})
+	}
+}
+
+// TestSubscribersGenGate: an out-of-order subscriber count must not pause
+// event upload. The hub writes these frames from one goroutine per host, so
+// a browser refresh (0 then 1, microseconds apart) can arrive reversed —
+// applying the stale 0 leaves the host silent while the reloaded page waits.
+func TestSubscribersGenGate(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	c.sendCh = make(chan []byte, 8)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	// Newest first (gen 7 = "one browser"), then the stale gen 6 = "none".
+	c.applySubscribers(1, 7, bridge)
+	if !c.forwardingEnabled() {
+		t.Fatal("count=1 gen=7 should enable forwarding")
+	}
+	c.applySubscribers(0, 6, bridge)
+	if !c.forwardingEnabled() {
+		t.Fatal("stale gen=6 count=0 must be ignored — host would go silent")
+	}
+	// A genuinely newer zero still applies.
+	c.applySubscribers(0, 8, bridge)
+	if c.forwardingEnabled() {
+		t.Fatal("gen=8 count=0 should pause forwarding")
+	}
+	// gen==0 (hub too old to stamp) always applies.
+	c.applySubscribers(1, 0, bridge)
+	if !c.forwardingEnabled() {
+		t.Fatal("unstamped count must still be applied (legacy hub)")
+	}
+}
+
+// TestReplayRingCompaction: the ring must stay bounded AND drop its old
+// events for real — a plain reslice keeps the whole backing array (and every
+// Event map in it) reachable until the next reallocation.
+func TestReplayRingCompaction(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	for i := 1; i <= replayHighWater+5; i++ {
+		c.seqAndReplay([]acp.Event{{"type": "chunk", "seq": uint64(i)}})
+		c.seqMu.Lock()
+		n := len(c.replay)
+		c.seqMu.Unlock()
+		if n > replayHighWater {
+			t.Fatalf("replay len = %d after %d events, must stay <= %d", n, i, replayHighWater)
+		}
+	}
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	if cap(c.replay) != replayHighWater {
+		t.Errorf("cap = %d, want %d (fresh compacted array, not a reslice)", cap(c.replay), replayHighWater)
+	}
+	// Oldest retained seq after the compaction at replayHighWater+1.
+	wantFirst := uint64(replayHighWater + 1 - replayCap + 1)
+	if got := eventSeq(c.replay[0]); got != wantFirst {
+		t.Errorf("first replay seq = %d, want %d", got, wantFirst)
+	}
+	if got := eventSeq(c.replay[len(c.replay)-1]); got != uint64(replayHighWater+5) {
+		t.Errorf("last replay seq = %d, want %d", got, replayHighWater+5)
+	}
+}
+
+// TestSeqResetOrderedBeforeReplay: seq_reset and the replay it authorizes
+// must reach the hub back-to-back. If a live batch slips between them the
+// hub zeroes its watermark, jumps to the live seq, then discards the whole
+// replay as stale — and it is gone from the hub's gap-pull buffer too
+// (seq_reset cleared it), so that transcript is lost for good.
+func TestSeqResetOrderedBeforeReplay(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	c.sendCh = make(chan []byte, 256)
+	// Buffer some events from "this process" (seq 1..3).
+	c.seqAndReplay([]acp.Event{
+		{"type": "chunk", "seq": uint64(1)},
+		{"type": "chunk", "seq": uint64(2)},
+		{"type": "chunk", "seq": uint64(3)},
+	})
+
+	// Hub claims seq 900 — higher than anything this process produced, so
+	// handleHelloSeq must ask for a reset and replay from scratch.
+	var live sync.WaitGroup
+	live.Add(1)
+	gate := make(chan struct{})
+	go func() {
+		defer live.Done()
+		<-gate // race a live batch against the reset+replay
+		c.enqueueEvents([]acp.Event{{"type": "chunk", "seq": uint64(4)}})
+	}()
+	close(gate)
+	c.handleHelloSeq(900)
+	live.Wait()
+
+	// Drain the queue and assert seq_reset is immediately followed by the
+	// replay frames, with no live frame wedged in between.
+	var kinds []string
+	var firstEventSeqAfterReset uint64
+	sawReset := false
+	for {
+		select {
+		case p := <-c.sendCh:
+			var f struct {
+				Type     string  `json:"type"`
+				SeqStart uint64  `json:"seqStart"`
+				Events   []any   `json:"events"`
+				Ready    *bool   `json:"ready"`
+				TS       float64 `json:"ts"`
+			}
+			if json.Unmarshal(p, &f) != nil {
+				continue
+			}
+			kinds = append(kinds, f.Type)
+			if f.Type == "seq_reset" {
+				sawReset = true
+				continue
+			}
+			if sawReset && f.Type == "events" && firstEventSeqAfterReset == 0 {
+				firstEventSeqAfterReset = f.SeqStart
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if !sawReset {
+		t.Fatalf("no seq_reset frame was enqueued: %v", kinds)
+	}
+	if firstEventSeqAfterReset != 1 {
+		t.Fatalf("first events frame after seq_reset had seqStart=%d, want 1 "+
+			"(a live frame jumped the reset → hub drops the replay); frames: %v",
+			firstEventSeqAfterReset, kinds)
+	}
+}
+
+// TestPingReassertsSubscribers drives the real frame loop: after a stale
+// `subscribers:0` has paused the uplink, the hub's next ping — which now
+// carries the authoritative count — must resume it.
+//
+// This is the recovery path for a lost or reordered subscribers frame. Before
+// the count was re-asserted on the ping, a host that ended up paused while a
+// browser was actually watching stayed paused for the life of the connection:
+// host_status heartbeats kept it "online" in the registry, so the user saw a
+// connected-looking page that never updated again.
+func TestPingReassertsSubscribers(t *testing.T) {
+	fh := newFakeHub(t)
+	fh.streamFrames = []string{
+		`{"v":1,"type":"hello","service":"hub","subscribers":0}`,
+		// A browser IS connected, but this frame lost the race / was lost.
+		`{"v":1,"type":"subscribers","count":0,"gen":9}`,
+		// The periodic ping carries the truth.
+		`{"v":1,"type":"ping","ts":1,"subscribers":1,"subsGen":10}`,
+	}
+	ts := httptest.NewServer(fh.handler())
+	defer ts.Close()
+
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", StateFile: filepath.Join(t.TempDir(), "hub.json"), DisableQUIC: true})
+	if err := c.ensureToken(context.Background()); err != nil {
+		t.Fatalf("ensureToken: %v", err)
+	}
+	c.sendCh = make(chan []byte, 64)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.wsSession(ctx, bridge) }()
+
+	deadline := time.After(3 * time.Second)
+	for !c.forwardingEnabled() {
+		select {
+		case <-deadline:
+			t.Fatal("ping-carried subscriber count never resumed forwarding")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// TestStalePingSubscribersIgnored: a ping whose subsGen is older than the
+// count we already applied must not undo it (same reordering hazard as the
+// subscribers frames themselves).
+func TestStalePingSubscribersIgnored(t *testing.T) {
+	fh := newFakeHub(t)
+	fh.streamFrames = []string{
+		`{"v":1,"type":"hello","service":"hub","subscribers":0}`,
+		`{"v":1,"type":"subscribers","count":1,"gen":20}`,
+		// Older stamp: must be ignored, or the host goes silent.
+		`{"v":1,"type":"ping","ts":1,"subscribers":0,"subsGen":19}`,
+	}
+	ts := httptest.NewServer(fh.handler())
+	defer ts.Close()
+
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", StateFile: filepath.Join(t.TempDir(), "hub.json"), DisableQUIC: true})
+	if err := c.ensureToken(context.Background()); err != nil {
+		t.Fatalf("ensureToken: %v", err)
+	}
+	c.sendCh = make(chan []byte, 64)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.wsSession(ctx, bridge) }()
+
+	deadline := time.After(3 * time.Second)
+	for !c.forwardingEnabled() {
+		select {
+		case <-deadline:
+			t.Fatal("forwarding never enabled after subscribers:1")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	// Give the stale ping time to (wrongly) take effect.
+	time.Sleep(300 * time.Millisecond)
+	if !c.forwardingEnabled() {
+		t.Fatal("stale ping subsGen=19 disabled forwarding — ordering gate failed")
+	}
 }
