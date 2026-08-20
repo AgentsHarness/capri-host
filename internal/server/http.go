@@ -475,12 +475,20 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		"permissionMode":    snap.PermissionMode,
 	}
 	data, _ := json.Marshal(hello)
-	if !writeSSEFrame(w, flusher, data) {
+	rc := http.NewResponseController(w)
+	if !writeSSEFrame(w, flusher, rc, data) {
 		return // client gone before the hello even landed
 	}
 
 	ch, unsub := s.bridge.Subscribe()
 	defer unsub()
+
+	// Per-frame write deadline (rc above). writeSSEFrame only detects a
+	// client that ERRORS; a half-open client (dead laptop, dropped Wi-Fi,
+	// no RST) never errors — the write just blocks on a full TCP window
+	// forever, and with it this handler, its subscription and its
+	// 512-event channel. Requests have no default write timeout here, so
+	// the deadline must be set explicitly; each frame refreshes it.
 
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
@@ -491,7 +499,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !writeSSEFrame(w, flusher, nil) {
+			if !writeSSEFrame(w, flusher, rc, nil) {
 				return
 			}
 		case ev, ok := <-ch:
@@ -514,19 +522,30 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			if !writeSSEFrame(w, flusher, b) {
+			if !writeSSEFrame(w, flusher, rc, b) {
 				return
 			}
 		}
 	}
 }
 
+// sseWriteTimeout bounds a single SSE frame write. Long enough that a
+// briefly stalled mobile link is not dropped mid-turn, short enough that a
+// dead peer cannot pin the handler (and its bridge subscription) forever.
+const sseWriteTimeout = 30 * time.Second
+
 // writeSSEFrame writes one SSE frame and flushes. Returns false when the
-// client went away (write failed) or the flush failed, so the SSE handler
-// can return and unsubscribe immediately instead of blocking forever on a
-// dead reader (TCP window full / RST) — a stuck handler would leak the
-// subscription and stall every other subscriber's Broadcast.
-func writeSSEFrame(w http.ResponseWriter, flusher http.Flusher, data []byte) bool {
+// client went away (write failed, flush failed, or the write blocked past
+// sseWriteTimeout), so the SSE handler can return and unsubscribe
+// immediately instead of blocking forever on a dead reader (TCP window
+// full / RST) — a stuck handler would leak the subscription and its
+// buffered channel for as long as the socket lingers.
+func writeSSEFrame(w http.ResponseWriter, flusher http.Flusher, rc *http.ResponseController, data []byte) bool {
+	if rc != nil {
+		// Not all ResponseWriters support deadlines (middleware wrappers,
+		// httptest); ignore ErrNotSupported and write without one.
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+	}
 	var err error
 	if data == nil {
 		// Comment frame (ticker ping); `%s` of nil would print "<nil>".
