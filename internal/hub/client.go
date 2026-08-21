@@ -6,6 +6,7 @@ package hub
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -129,6 +130,12 @@ type Client struct {
 	// that will never arrive. The heartbeat re-sends from lastSentSeq to
 	// close the gap once the pressure passes.
 	needCatchUp atomic.Bool
+
+	// deflateOK is armed by the hub's hello echo ("deflate":true) after we
+	// offered compression in the QUIC auth frame / WS handshake. Until then
+	// (or with an old hub) every frame goes out as raw JSON — see
+	// PROTOCOL.md for the wire format.
+	deflateOK atomic.Bool
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -930,6 +937,9 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	opts := &websocket.DialOptions{
 		HTTPHeader: http.Header{
 			"Authorization": []string{"Bearer " + tok},
+			// Offer uplink compression; armed only when the hub's hello
+			// echoes "deflate":true (see PROTOCOL.md).
+			"X-Capri-Deflate": []string{"1"},
 		},
 	}
 	conn, resp, err := websocket.Dial(dialCtx, c.wsURL(), opts)
@@ -962,6 +972,16 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 		}
 		wctx, cancel := context.WithTimeout(parent, to)
 		defer cancel()
+		if c.deflateOK.Load() {
+			if zp, ok := deflatePayload(payload); ok {
+				frame := make([]byte, 0, len(zp)+1)
+				frame = append(frame, deflateMagicWS)
+				frame = append(frame, zp...)
+				wmu.Lock()
+				defer wmu.Unlock()
+				return conn.Write(wctx, websocket.MessageBinary, frame)
+			}
+		}
 		wmu.Lock()
 		defer wmu.Unlock()
 		return conn.Write(wctx, websocket.MessageText, payload)
@@ -1044,8 +1064,15 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 				return fmt.Errorf("hub quic set write deadline: %w", err)
 			}
 			defer stream.SetWriteDeadline(time.Time{})
+			flag := uint32(0)
+			if c.deflateOK.Load() {
+				if zp, ok := deflatePayload(payload); ok {
+					payload = zp
+					flag = deflateFlagQUIC
+				}
+			}
 			var lenBuf [4]byte
-			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload))|flag)
 			if _, err := stream.Write(lenBuf[:]); err != nil {
 				return err
 			}
@@ -1059,7 +1086,7 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 			if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
 				return nil, err
 			}
-			n := binary.BigEndian.Uint32(lenBuf[:])
+			n := binary.BigEndian.Uint32(lenBuf[:]) &^ deflateFlagQUIC
 			if n > 32<<20 {
 				return nil, fmt.Errorf("frame too large: %d", n)
 			}
@@ -1069,7 +1096,10 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 		}
 	}
 
-	auth, _ := json.Marshal(map[string]any{"v": 1, "type": "auth", "token": tok})
+	// Auth rides stream A, uncompressed (negotiation has not happened yet).
+	// The "deflate":true field offers uplink compression; the hub arms it by
+	// echoing "deflate":true in its hello (see PROTOCOL.md).
+	auth, _ := json.Marshal(map[string]any{"v": 1, "type": "auth", "token": tok, "deflate": true})
 	if err := quicSend(streamA)(auth); err != nil {
 		return fmt.Errorf("hub quic auth send: %w", err)
 	}
@@ -1208,6 +1238,9 @@ func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, tr frameTra
 	// write loop starts, so they cannot interleave with hello-driven
 	// replay and double-send.
 	c.drainSendCh()
+	// Compression is armed per session by the hub's hello echo; a stale
+	// flag from a previous session must not leak into this one.
+	c.deflateOK.Store(false)
 	// New session ⇒ new hub process possibly, whose subscriber-count
 	// generation counter restarts low. Clear our high-water mark or every
 	// count from a restarted hub would look stale and be ignored.
@@ -1331,6 +1364,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			SubsGen     *uint64         `json:"subsGen"`     // type:"ping" — ordering stamp
 			Gen         *uint64         `json:"gen"`         // type:"subscribers" — ordering stamp
 			Seq         *uint64         `json:"seq"`         // type:"hello" — hub's last seen seq
+			Deflate     *bool           `json:"deflate"`     // type:"hello" — uplink compression ack
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			log.Printf("[hub-client] 忽略无法解析的中转消息: %v", err)
@@ -1340,6 +1374,14 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 		case "hello":
 			if msg.Subscribers != nil {
 				c.applySubscribers(*msg.Subscribers, 0, bridge)
+			}
+			// Hub echoed our compression offer (we sent "deflate":true in
+			// the QUIC auth frame / X-Capri-Deflate:1 on the WS dial):
+			// arm uplink flate for events/respond frames.
+			if msg.Deflate != nil && *msg.Deflate {
+				if c.deflateOK.CompareAndSwap(false, true) {
+					log.Printf("[hub-client] 上行压缩已启用（deflate）")
+				}
 			}
 			// Resume against hub's last-seen seq — or reset the epoch when
 			// this process cannot produce seqs that high (host restart).
@@ -1504,6 +1546,64 @@ func (c *Client) enqueueReqFrame(payload []byte) {
 	case <-time.After(5 * time.Second):
 		log.Printf("[hub-client] 中转响应帧入队超时（队列满），丢弃 reqId 帧")
 	}
+}
+
+// ── uplink compression (host → hub) ───────────────────────────────────
+
+// minCompressSize is the payload floor below which a frame is sent raw:
+// flate headers + small-input overhead usually make tiny frames BIGGER, and
+// the hub→FE path uses the same threshold.
+const minCompressSize = 256
+
+// deflateMagicWS prefixes a compressed frame on the WebSocket transport
+// (binary message: [0x01][flate stream]). See PROTOCOL.md.
+const deflateMagicWS = 0x01
+
+// deflateFlagQUIC is OR'd into the 4-byte big-endian length prefix on the
+// QUIC transport to mark a flate-compressed payload (bit 31; the effective
+// frame cap stays far below 2^31 so the flag bit is always free).
+const deflateFlagQUIC = 1 << 31
+
+var flateWriterPool = sync.Pool{
+	// NewWriter never fails for a valid level.
+	New: func() any {
+		w, _ := flate.NewWriter(nil, flate.DefaultCompression)
+		return w
+	},
+}
+
+var flateBufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// deflatePayload flate-compresses payload (RFC 1951 raw deflate, matching
+// the hub→FE writer). Returns (nil, false) when compression is not worth it
+// (too small, or no gain) — the caller then sends the raw JSON.
+func deflatePayload(payload []byte) ([]byte, bool) {
+	if len(payload) < minCompressSize {
+		return nil, false
+	}
+	buf := flateBufPool.Get().(*bytes.Buffer)
+	w := flateWriterPool.Get().(*flate.Writer)
+	defer func() {
+		w.Reset(nil)
+		flateWriterPool.Put(w)
+	}()
+	buf.Reset()
+	defer flateBufPool.Put(buf)
+	w.Reset(buf)
+	if _, err := w.Write(payload); err != nil {
+		return nil, false
+	}
+	if err := w.Close(); err != nil {
+		return nil, false
+	}
+	if buf.Len() >= len(payload) {
+		return nil, false
+	}
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, true
 }
 
 func mustJSON(v any) json.RawMessage {
