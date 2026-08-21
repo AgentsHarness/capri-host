@@ -1,15 +1,14 @@
 # host↔hub 上行压缩协议（deflate）
 
-状态：**host 侧已实现**（capri-host `internal/hub/client.go`）。hub 侧代理并行实施
-同一约定；若 hub 侧仓库的 `internal/hub/PROTOCOL.md` 与本文有出入，以先合并者为准
-并对齐。
+状态：**双侧已实现并对齐**（capri-host `internal/hub/client.go`、acp-hub
+`cmd/capri-hub/main.go`）。本文件与 acp-hub `internal/hub/PROTOCOL.md` 保持一致。
 
 ## 1. 协商
 
 1. host 发出压缩提议：
    - QUIC：auth 帧增加字段 `"deflate":true`
      （`{"v":1,"type":"auth","token":"…","deflate":true}`）。
-   - WebSocket：`GET /ws/host` 握手请求头 `X-Capri-Deflate: 1`。
+   - WebSocket：`GET /ws/host` 握手请求头 `X-Hub-Deflate: 1`（hub 亦接受 `?deflate=1`）。
 2. hub 在 hello 帧中回声确认：`{"v":1,"type":"hello",…,"deflate":true}`。
    - 回声为 true ⇒ 本次会话内 host 对 **events 帧与 respond 帧**的载荷启用
      flate 压缩（见 §2 wire format）。
@@ -37,8 +36,8 @@ bit  31        bits 30..0
 ### 2.2 WebSocket
 
 - 裸帧保持现状：**text** 消息，UTF-8 JSON。
-- 压缩帧：**binary** 消息，格式 `[0x01][raw deflate 流]`——首字节魔数 `0x01`，
-  其余为压缩载荷。hub 按 message type 区分，无需逐帧试探。
+- 压缩帧：**binary** 消息，载荷**整体**为 raw deflate 流（无魔数/前缀）。
+  hub 按 message type 区分，无需逐帧试探。
 
 ## 3. 何时压缩
 
@@ -51,5 +50,5 @@ bit  31        bits 30..0
 ## 4. 实现要点（host 侧）
 
 - writer / buffer 来自 `sync.Pool`（`flateWriterPool` / `flateBufPool`）。
-- 压缩在会话写闭包内做（QUIC 置标志位 / WS 拼 `[0x01]…]` 前缀并改 binary），
-  队列中始终是未压缩 JSON，便于重放/补发逻辑复用。
+- 压缩在会话写闭包内做（QUIC 置标志位 / WS 改 binary），队列中始终是未压缩
+  JSON，便于重放/补发逻辑复用。
