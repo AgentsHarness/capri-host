@@ -939,7 +939,7 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 			"Authorization": []string{"Bearer " + tok},
 			// Offer uplink compression; armed only when the hub's hello
 			// echoes "deflate":true (see PROTOCOL.md).
-			"X-Capri-Deflate": []string{"1"},
+			"X-Hub-Deflate": []string{"1"},
 		},
 	}
 	conn, resp, err := websocket.Dial(dialCtx, c.wsURL(), opts)
@@ -974,12 +974,9 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 		defer cancel()
 		if c.deflateOK.Load() {
 			if zp, ok := deflatePayload(payload); ok {
-				frame := make([]byte, 0, len(zp)+1)
-				frame = append(frame, deflateMagicWS)
-				frame = append(frame, zp...)
 				wmu.Lock()
 				defer wmu.Unlock()
-				return conn.Write(wctx, websocket.MessageBinary, frame)
+				return conn.Write(wctx, websocket.MessageBinary, zp)
 			}
 		}
 		wmu.Lock()
@@ -1376,7 +1373,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 				c.applySubscribers(*msg.Subscribers, 0, bridge)
 			}
 			// Hub echoed our compression offer (we sent "deflate":true in
-			// the QUIC auth frame / X-Capri-Deflate:1 on the WS dial):
+			// the QUIC auth frame / X-Hub-Deflate:1 on the WS dial):
 			// arm uplink flate for events/respond frames.
 			if msg.Deflate != nil && *msg.Deflate {
 				if c.deflateOK.CompareAndSwap(false, true) {
@@ -1554,10 +1551,6 @@ func (c *Client) enqueueReqFrame(payload []byte) {
 // flate headers + small-input overhead usually make tiny frames BIGGER, and
 // the hub→FE path uses the same threshold.
 const minCompressSize = 256
-
-// deflateMagicWS prefixes a compressed frame on the WebSocket transport
-// (binary message: [0x01][flate stream]). See PROTOCOL.md.
-const deflateMagicWS = 0x01
 
 // deflateFlagQUIC is OR'd into the 4-byte big-endian length prefix on the
 // QUIC transport to mark a flate-compressed payload (bit 31; the effective

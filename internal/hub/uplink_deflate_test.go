@@ -71,7 +71,7 @@ func TestWSUplinkDeflateNegotiated(t *testing.T) {
 			gotEvents := make(chan map[string]any, 8)
 			sawHeader := ""
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				sawHeader = r.Header.Get("X-Capri-Deflate")
+				sawHeader = r.Header.Get("X-Hub-Deflate")
 				conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 				if err != nil {
 					return
@@ -92,14 +92,12 @@ func TestWSUplinkDeflateNegotiated(t *testing.T) {
 						return
 					}
 					if mt == websocket.MessageBinary {
-						if len(data) < 1 || data[0] != deflateMagicWS {
-							t.Errorf("binary frame without 0x%02x prefix", deflateMagicWS)
-							return
-						}
 						mu.Lock()
 						sawBinary = true
 						mu.Unlock()
-						rc := flate.NewReader(bytes.NewReader(data[1:]))
+						// Hub wire rule: a binary message IS the raw-deflate
+						// stream (no magic prefix). See PROTOCOL.md.
+						rc := flate.NewReader(bytes.NewReader(data))
 						raw, err := io.ReadAll(rc)
 						if err != nil {
 							t.Errorf("inflate: %v", err)
@@ -177,7 +175,7 @@ func TestWSUplinkDeflateNegotiated(t *testing.T) {
 				t.Error("expected raw text uplink frames")
 			}
 			if sawHeader != "1" {
-				t.Errorf("X-Capri-Deflate offer header = %q, want 1", sawHeader)
+				t.Errorf("X-Hub-Deflate offer header = %q, want 1", sawHeader)
 			}
 		})
 	}
