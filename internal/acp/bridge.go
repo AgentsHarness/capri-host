@@ -354,19 +354,54 @@ func (b *Bridge) Broadcast(ev Event) {
 	// seqAndReplay），否则双路去重失效。
 	b.eventSeq++
 	ev["seq"] = b.eventSeq
+	critical := !droppableEventType(ev["type"])
 	for ch := range b.subscribers {
+		if !critical {
+			// 慢消费者：可丢事件（chunk/thought 等流式噪声）直接丢弃，
+			// seq 照常前进，落后方靠 FE gap-pull 补。不要为了填洞而合并
+			// chunk——会破坏与 hub 上行一致的双路 seq。
+			select {
+			case ch <- ev:
+			default:
+			}
+			continue
+		}
+		// 关键事件（终态 done/turn_completed、error、client_request、
+		// roster 变更等）永不主动丢弃：丢掉它们会让 FE 永远等不到终态。
+		// 改为有界阻塞等待慢消费者腾出位置；仅在极端超时（消费者已死
+		// 而未注销）时兜底丢弃并大声告警。阻塞期间持有 subscribersMu，
+		// 后续 Broadcast 排队——全局 seq 顺序因此得以保持。
 		select {
 		case ch <- ev:
-		default:
-			// Slow consumer: drop. Seq still advances for other
-			// subscribers, so a lagging FE/SSE client may see a hole
-			// (e.g. 1,3). That is expected: FE gap-pulls via
-			// GET /api/events?after= and (hostId,seq) dedup makes
-			// replays of already-seen seqs harmless. Do not merge
-			// chunks just to hide holes — that breaks dual-path seq
-			// identity with the hub uplink.
+		case <-time.After(broadcastCriticalTimeout):
+			log.Printf("[bridge] 关键事件 %v 投递超时（订阅者阻塞 %s），被迫丢弃 seq=%v",
+				ev["type"], broadcastCriticalTimeout, ev["seq"])
 		}
 	}
+}
+
+// broadcastCriticalTimeout bounds how long Broadcast blocks on a full
+// subscriber channel for a critical (non-droppable) event before giving up.
+// SSE 消费者循环读取，正常情况下远不会触及该上限；到达即说明消费者已经
+// 死亡（连接半开、进程卡死）而未注销。
+const broadcastCriticalTimeout = 5 * time.Second
+
+// droppableEventType reports whether an event type is lossy-tolerable stream
+// noise: dropping one (or several) of these under backpressure costs at most
+// transient UI jitter that FE gap-pull can repair or ignore. Everything else
+// (terminal states like done/turn_completed, errors, client_request, roster
+// and permission changes) is critical and is never dropped voluntarily.
+func droppableEventType(t any) bool {
+	s, ok := t.(string)
+	if !ok {
+		return false
+	}
+	switch s {
+	case "chunk", "user_chunk", "thought", "gen_rate", "log",
+		"session_updates_chunk", "search_fuzzy_status", "search_content_status":
+		return true
+	}
+	return false
 }
 
 // ── roster helpers ────────────────────────────────────────────────
