@@ -80,6 +80,13 @@ type Client struct {
 	// Created in Run; closed only when Run exits (not per reconnect).
 	sendCh chan []byte
 
+	// reqCh carries relay respond frames (type:"respond") to the request
+	// plane write loop. With the QUIC transport these ride a dedicated
+	// stream (stream B) so a 16MB fs/read-file answer cannot head-of-line
+	// block the small event/ping frames on the control stream; over WS it
+	// multiplexes onto the same connection. Created in Run next to sendCh.
+	reqCh chan []byte
+
 	// Reliability: every forwarded event keeps its bridge.Broadcast seq
 	// (dual-path FE dedupes by (hostId,seq)) and is kept in a bounded
 	// replay buffer. After a reconnect the hub tells us its last seen
@@ -202,6 +209,7 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 	log.Printf("[hub-client] connected to hub %s as %s (%s)", c.cfg.URL, c.cfg.HostID, c.cfg.HostName)
 
 	c.sendCh = make(chan []byte, 256)
+	c.reqCh = make(chan []byte, 64)
 
 	// Bridge events → hub (async queue + batch; no text merge — dual-path seq).
 	fwdCtx, fwdCancel := context.WithCancel(ctx)
@@ -823,24 +831,27 @@ func (c *Client) enqueueSeqResetLocked() {
 	c.enqueueFrame(payload, true)
 }
 
-// drainSendCh non-blocking drains the uplink queue. Called once per new
+// drainSendCh non-blocking drains the uplink queues. Called once per new
 // transport session so stale frames (and a subsequent sendReplayAfter)
 // cannot double-send after reconnect.
 func (c *Client) drainSendCh() {
-	if c.sendCh == nil {
-		return
-	}
 	n := 0
-	for {
-		select {
-		case <-c.sendCh:
-			n++
-		default:
-			if n > 0 {
-				log.Printf("[hub-client] 重连前清空发送队列 %d 帧", n)
-			}
-			return
+	for _, ch := range []chan []byte{c.sendCh, c.reqCh} {
+		if ch == nil {
+			continue
 		}
+		for {
+			select {
+			case <-ch:
+				n++
+			default:
+				goto next
+			}
+		}
+	next:
+	}
+	if n > 0 {
+		log.Printf("[hub-client] 重连前清空发送队列 %d 帧", n)
 	}
 }
 
@@ -906,7 +917,9 @@ func (c *Client) hostToken() (string, error) {
 	return c.token, nil
 }
 
-// wsSession dials the hub WebSocket and runs the shared frame loop.
+// wsSession dials the hub WebSocket and runs the shared frame loop. Over WS
+// there is a single connection, so both planes multiplex onto it (the
+// request-plane writer shares the connection under a write mutex).
 func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	tok, err := c.hostToken()
 	if err != nil {
@@ -930,33 +943,51 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	log.Printf("[hub-client] 已连接 hub（ws）")
-	return c.runSession(ctx, bridge,
-		func(payload []byte) error {
-			// Write timeout: prefer the session ctx so cancel aborts the
-			// write. Cap at 30s while the session is alive. If ctx is
-			// already done, WithTimeout(ctx, …) would fail immediately
-			// with a useless error — fall back to Background + 2s so a
-			// final write attempt can still surface a socket error and
-			// exit the write loop quickly.
-			parent := ctx
-			to := 30 * time.Second
-			if ctx.Err() != nil {
-				parent = context.Background()
-				to = 2 * time.Second
-			}
-			wctx, cancel := context.WithTimeout(parent, to)
-			defer cancel()
-			return conn.Write(wctx, websocket.MessageText, payload)
-		},
-		func() ([]byte, error) {
+
+	// coder/websocket forbids concurrent writes; both planes share the
+	// connection under this mutex.
+	var wmu sync.Mutex
+	write := func(payload []byte) error {
+		// Write timeout: prefer the session ctx so cancel aborts the
+		// write. Cap at 30s while the session is alive. If ctx is
+		// already done, WithTimeout(ctx, …) would fail immediately
+		// with a useless error — fall back to Background + 2s so a
+		// final write attempt can still surface a socket error and
+		// exit the write loop quickly.
+		parent := ctx
+		to := 30 * time.Second
+		if ctx.Err() != nil {
+			parent = context.Background()
+			to = 2 * time.Second
+		}
+		wctx, cancel := context.WithTimeout(parent, to)
+		defer cancel()
+		wmu.Lock()
+		defer wmu.Unlock()
+		return conn.Write(wctx, websocket.MessageText, payload)
+	}
+	return c.runSession(ctx, bridge, frameTransport{
+		sendControl: write,
+		sendRequest: write,
+		recvControl: func() ([]byte, error) {
 			_, data, err := conn.Read(ctx)
 			return data, err
 		},
-	)
+	})
 }
 
-// quicSession dials the hub over QUIC (UDP): one bidirectional stream,
-// 4-byte length-prefixed JSON frames, first frame carries the auth token.
+// quicSession dials the hub over QUIC (UDP): two bidirectional streams with
+// 4-byte length-prefixed JSON frames.
+//
+// Stream A (control/event plane), opened first: auth, events, ping/pong,
+// host_status, seq_reset, and the hub's hello/subscribers downlink.
+// Stream B (request plane): relayed request downlink + respond uplink.
+//
+// Frames are self-describing (JSON "type"), so the hub's stream Accept loop
+// dispatches purely by frame type; keeping the planes on separate streams
+// removes QUIC head-of-line blocking between a 16MB relay answer (which
+// saturates the stream's flow-control window for seconds) and the small,
+// latency-sensitive event/ping frames. See PROTOCOL.md.
 func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	tok, err := c.hostToken()
 	if err != nil {
@@ -965,59 +996,103 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	host, port := c.quicAddr()
 	dialCtx, cancel := context.WithTimeout(ctx, quicDialTimeout)
 	defer cancel()
+	// KeepAlivePeriod 15s: with the control plane on its own stream (T1),
+	// a lazier keepalive suffices and saves mobile battery. 0-RTT is NOT
+	// enabled: quic-go's early data replays the transport's 0-RTT write
+	// path wholesale — there is no per-frame (hello/ping only) granularity
+	// — so a replayed auth/events frame could reach the hub twice. Raw
+	// JSON fallback keeps the link correct without it.
 	conn, err := quic.DialAddr(dialCtx, net.JoinHostPort(host, port), c.quicTLSClientConfig(host),
-		&quic.Config{KeepAlivePeriod: 10 * time.Second})
+		&quic.Config{KeepAlivePeriod: quicKeepAlive})
 	if err != nil {
 		return fmt.Errorf("hub quic dial %s: %w", host, err)
 	}
 	defer conn.CloseWithError(0, "")
 
-	sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
-	stream, err := conn.OpenStreamSync(sctx)
-	scancel()
-	if err != nil {
-		return fmt.Errorf("hub quic open stream: %w", err)
+	openStream := func() (*quic.Stream, error) {
+		sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
+		defer scancel()
+		s, err := conn.OpenStreamSync(sctx)
+		if err != nil {
+			return nil, fmt.Errorf("hub quic open stream: %w", err)
+		}
+		return s, nil
 	}
-	defer stream.Close()
-
-	send := func(payload []byte) error {
-		// 写超时与 WS 路径对齐（30s）：QUIC stream.Write 在流控/拥塞窗口
-		// 耗尽（对端停止 ACK）时会无限期阻塞。若无 deadline，writeLoop
-		// 会静默卡死且重连永不触发——readLoop 因 hub keepalive 仍能收包
-		// 而"看似正常"，整条上行通道就悄悄死掉。每次发送前设 deadline，
-		// 返回前清除，避免残留影响后续复用。
-		if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			return fmt.Errorf("hub quic set write deadline: %w", err)
-		}
-		defer stream.SetWriteDeadline(time.Time{})
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-		if _, err := stream.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		_, err := stream.Write(payload)
+	streamA, err := openStream()
+	if err != nil {
 		return err
 	}
-	recv := func() ([]byte, error) {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-			return nil, err
+	defer streamA.Close()
+	// Stream B failure is not fatal: an older hub may cap bidirectional
+	// streams at 1. Fall back to sharing stream A (WS-equivalent behavior).
+	streamB, err2 := openStream()
+	if err2 != nil {
+		log.Printf("[hub-client] 请求平面独立流创建失败（%v），中转响应与事件共用单流", err2)
+		streamB = streamA
+	} else {
+		defer streamB.Close()
+	}
+
+	quicSend := func(stream *quic.Stream) func([]byte) error {
+		return func(payload []byte) error {
+			// 写超时与 WS 路径对齐（30s）：QUIC stream.Write 在流控/拥塞窗口
+			// 耗尽（对端停止 ACK）时会无限期阻塞。若无 deadline，writeLoop
+			// 会静默卡死且重连永不触发——readLoop 因 hub keepalive 仍能收包
+			// 而"看似正常"，整条上行通道就悄悄死掉。每次发送前设 deadline，
+			// 返回前清除，避免残留影响后续复用。
+			if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				return fmt.Errorf("hub quic set write deadline: %w", err)
+			}
+			defer stream.SetWriteDeadline(time.Time{})
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+			if _, err := stream.Write(lenBuf[:]); err != nil {
+				return err
+			}
+			_, err := stream.Write(payload)
+			return err
 		}
-		n := binary.BigEndian.Uint32(lenBuf[:])
-		if n > 32<<20 {
-			return nil, fmt.Errorf("frame too large: %d", n)
+	}
+	quicRecv := func(stream *quic.Stream) func() ([]byte, error) {
+		return func() ([]byte, error) {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+				return nil, err
+			}
+			n := binary.BigEndian.Uint32(lenBuf[:])
+			if n > 32<<20 {
+				return nil, fmt.Errorf("frame too large: %d", n)
+			}
+			buf := make([]byte, n)
+			_, err := io.ReadFull(stream, buf)
+			return buf, err
 		}
-		buf := make([]byte, n)
-		_, err := io.ReadFull(stream, buf)
-		return buf, err
 	}
 
 	auth, _ := json.Marshal(map[string]any{"v": 1, "type": "auth", "token": tok})
-	if err := send(auth); err != nil {
+	if err := quicSend(streamA)(auth); err != nil {
 		return fmt.Errorf("hub quic auth send: %w", err)
 	}
+	// A QUIC stream only becomes visible to the peer once a frame
+	// references it — OpenStreamSync alone transmits nothing, so the hub's
+	// AcceptStream would block forever and its request downlink could never
+	// attach to stream B. Prime the stream with a no-op pong (ignored by
+	// the hub's type dispatch) so the hub can accept and route it.
+	noop, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
+	if err := quicSend(streamB)(noop); err != nil {
+		return fmt.Errorf("hub quic request-plane prime: %w", err)
+	}
 	log.Printf("[hub-client] 已连接 hub（quic %s:%s）", host, port)
-	return c.runSession(ctx, bridge, send, recv)
+
+	tr := frameTransport{
+		sendControl: quicSend(streamA),
+		sendRequest: quicSend(streamB),
+		recvControl: quicRecv(streamA),
+	}
+	if streamB != streamA {
+		tr.recvRequest = quicRecv(streamB)
+	}
+	return c.runSession(ctx, bridge, tr)
 }
 
 // quicDialTimeout bounds the QUIC handshake before falling back to
@@ -1026,6 +1101,13 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 // ~1s), so a perfectly usable QUIC path was being abandoned for the
 // slower TCP fallback. WS fallback is still immediate on real failure.
 const quicDialTimeout = 8 * time.Second
+
+// quicKeepAlive is the QUIC transport keepalive interval. 15s (was 10s):
+// the hub pings every 25s and answers ours, and with the control plane on
+// its own stream a slightly lazier keepalive no longer risks NAT expiry
+// for the data plane — meanwhile mobile clients spend less radio awake
+// time.
+const quicKeepAlive = 15 * time.Second
 
 // quicTLSClientConfig builds the TLS config for the QUIC host transport.
 //
@@ -1099,8 +1181,29 @@ func (c *Client) quicAddr() (host, port string) {
 	return u, strconv.Itoa(c.cfg.QUICPort)
 }
 
-// runSession runs the shared frame loop over a generic transport.
-func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, send func([]byte) error, recv func() ([]byte, error)) error {
+// frameTransport abstracts the two uplink/downlink planes of a session.
+// Both transports (WS, QUIC) produce it; runSession wires the queues and
+// read loops to it.
+type frameTransport struct {
+	// sendControl carries events / ping / pong / host_status / seq_reset.
+	sendControl func([]byte) error
+	// sendRequest carries type:"respond" (relay answers). May point at the
+	// same function as sendControl (WS, or QUIC hubs that allow only one
+	// stream).
+	sendRequest func([]byte) error
+	// recvControl reads downlink frames from the control plane.
+	recvControl func() ([]byte, error)
+	// recvRequest, when non-nil, reads downlink frames from the request
+	// plane as well (frames are dispatched by type, whichever stream they
+	// arrive on).
+	recvRequest func() ([]byte, error)
+}
+
+// runSession runs the shared frame loop over a generic transport: one
+// control-plane write loop (with the application ping), one request-plane
+// write loop, and read loops for every downlink stream. Any loop failing
+// fails the session.
+func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, tr frameTransport) error {
 	// Drop stale uplink frames left from a previous session before the
 	// write loop starts, so they cannot interleave with hello-driven
 	// replay and double-send.
@@ -1115,9 +1218,15 @@ func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, send func([
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
-	errCh := make(chan error, 3)
-	go func() { errCh <- c.writeLoop(sessCtx, send) }()
-	go func() { errCh <- c.readLoop(sessCtx, recv, bridge) }()
+	errCh := make(chan error, 5)
+	go func() { errCh <- c.writeLoop(sessCtx, tr.sendControl) }()
+	// Request-plane loop always runs; over WS it multiplexes onto the same
+	// connection under the transport's write mutex.
+	go func() { errCh <- c.writeReqLoop(sessCtx, tr.sendRequest) }()
+	go func() { errCh <- c.readLoop(sessCtx, tr.recvControl, bridge) }()
+	if tr.recvRequest != nil {
+		go func() { errCh <- c.readLoop(sessCtx, tr.recvRequest, bridge) }()
+	}
 	go func() { errCh <- c.idleWatchdog(sessCtx) }()
 
 	select {
@@ -1176,6 +1285,24 @@ func (c *Client) writeLoop(ctx context.Context, send func([]byte) error) error {
 		case payload, ok := <-c.sendCh:
 			if !ok {
 				return errors.New("send channel closed")
+			}
+			if err := send(payload); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// writeReqLoop is the request-plane write loop: relay respond frames only,
+// no ping (the control plane keeps the connection alive).
+func (c *Client) writeReqLoop(ctx context.Context, send func([]byte) error) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case payload, ok := <-c.reqCh:
+			if !ok {
+				return errors.New("request send channel closed")
 			}
 			if err := send(payload); err != nil {
 				return err
@@ -1358,7 +1485,25 @@ func (c *Client) respond(reqID string, status int, body json.RawMessage) {
 	if err != nil {
 		return
 	}
-	c.enqueueFrame(payload, true)
+	// Request plane: over QUIC this rides stream B so a large relay answer
+	// (fs/read-file can reach 16MB) never head-of-line blocks the small
+	// control/event frames on stream A.
+	c.enqueueReqFrame(payload)
+}
+
+// enqueueReqFrame queues a respond frame onto the request plane queue.
+// Critical: request answers must not be silently dropped under load (the
+// browser is blocked on them), so block briefly instead of dropping.
+func (c *Client) enqueueReqFrame(payload []byte) {
+	if c.reqCh == nil {
+		c.enqueueFrame(payload, true)
+		return
+	}
+	select {
+	case c.reqCh <- payload:
+	case <-time.After(5 * time.Second):
+		log.Printf("[hub-client] 中转响应帧入队超时（队列满），丢弃 reqId 帧")
+	}
 }
 
 func mustJSON(v any) json.RawMessage {
