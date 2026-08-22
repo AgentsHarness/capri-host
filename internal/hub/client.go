@@ -1761,6 +1761,14 @@ func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path st
 }
 
 func (c *Client) respond(reqID string, status int, body json.RawMessage) {
+	// A body that is not embeddable JSON (JSONL lines, plain text — json
+	// compacts RawMessage and rejects concatenated values) must not
+	// silently strand the hub's pending request: wrap it as a JSON string
+	// so the relay still answers instead of hanging until the browser
+	// gives up.
+	if !json.Valid(body) {
+		body = mustJSON(string(body))
+	}
 	payload, err := json.Marshal(map[string]any{
 		"v":      1,
 		"type":   "respond",
