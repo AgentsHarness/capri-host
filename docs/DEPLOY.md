@@ -98,6 +98,8 @@ HOST_ID=macbook HOST_NAME="办公室 Mac" \
 | `HOST_TOKEN` | — | 已配对 token，优先于配对码 |
 | `XAI_API_KEY` | — | 可选；否则用 `grok login` |
 | `HUB_QUIC_HOST` | — | 强制 QUIC 拨号地址（域名经代理丢 UDP 时用） |
+| `HUB_QUIC_INSECURE` | — | 设为 `1` 跳过 QUIC 证书校验（仅限可信网络上的自签 hub；生产用 `HUB_QUIC_PIN` 代替） |
+| `HUB_QUIC_PIN` | — | 自签 hub 证书的 SPKI 指纹（sha256，hex 或 base64）。设置后跳过系统 CA，改为比对证书公钥指纹，不匹配即握手失败。见下方[自签证书指纹校验](#自签证书指纹校验hub_quic_pin) |
 
 ### capri-hub
 
@@ -105,8 +107,30 @@ HOST_ID=macbook HOST_NAME="办公室 Mac" \
 |------|------|------|
 | `PORT` | `8787` | HTTP 端口 |
 | `QUIC_PORT` | `8788` | Host 传输 QUIC UDP 端口 |
+| `QUIC_CERT` / `QUIC_KEY` | — | QUIC 传输的 TLS 证书/私钥文件（PEM） |
 | `FE_TOKEN` | — | 浏览器访问密钥，生产必设 |
 | `REQUIRE_FE_TOKEN` | — | 设为 `1` 时没配 `FE_TOKEN` 会拒绝启动 |
+
+## 自签证书指纹校验（HUB_QUIC_PIN）
+
+自签证书的 hub 没有系统 CA 可验，`HUB_QUIC_INSECURE=1` 又等于信任该 UDP 端口上的任何应答者（能收走 host token 并驱动中继请求在本机执行）。`HUB_QUIC_PIN` 是两者的替代：host 跳过 CA 链，改为校验 hub 证书**公钥**（SPKI，SubjectPublicKeyInfo）的 sha256 指纹完全一致——hub 换证书/私钥后指纹即失效（这是 pin 的本意），需要在 hub 侧重新生成并更新配置。
+
+hub 侧用自签证书启动（`QUIC_CERT`/`QUIC_KEY`），host 侧取证书文件算一次指纹：
+
+```bash
+openssl x509 -in hub-cert.pem -pubkey -noout \
+  | openssl pkey -pubin -outform DER \
+  | openssl dgst -sha256 | awk '{print $NF}'
+```
+
+输出 64 位 hex（如 `dfd749…7c91`），配置：
+
+```bash
+HUB_URL=https://hub.example.com HUB_QUIC_PIN=dfd749…7c91 \
+  ./capri-host
+```
+
+指纹也接受 base64（std/URL、带不带 padding 均可）和 `sha256//` 前缀写法。配置格式错误时 QUIC 握手直接失败并回退 WebSocket（错误原因见日志），不会静默降级为不校验。证书或私钥更换后需同步更新 pin。
 
 ## 更新内嵌前端
 

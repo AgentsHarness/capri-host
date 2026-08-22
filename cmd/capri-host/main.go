@@ -51,6 +51,11 @@ func main() {
 			// verifies the hub certificate whenever HUB_URL is https
 			// (a failure just falls back to WebSocket over verified TLS).
 			QUICInsecure: os.Getenv("HUB_QUIC_INSECURE") == "1",
+			// Pin the hub's QUIC certificate SPKI (HUB_QUIC_PIN, sha256
+			// hex/base64 — see docs/DEPLOY.md). Replaces CA verification
+			// with an exact fingerprint match; the safe way to run QUIC
+			// against a self-signed hub cert you control.
+			QUICPin: cfg.HubQUICPin,
 		})
 		go hc.Run(ctx, bridge)
 	}

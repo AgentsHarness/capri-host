@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -33,8 +34,9 @@ import (
 // regardless of which stream they arrive on — no stream carries a request's
 // identity.
 type testQUICHub struct {
-	t  *testing.T
-	ln *quic.Listener
+	t       *testing.T
+	ln      *quic.Listener
+	certDER []byte // leaf certificate (tests compute SPKI pins from it)
 
 	eventsCh  chan map[string]any
 	respondCh chan testHubRespond
@@ -83,12 +85,24 @@ func newTestQUICHub(t *testing.T) *testQUICHub {
 	return &testQUICHub{
 		t:          t,
 		ln:         ln,
+		certDER:    der,
 		eventsCh:   make(chan map[string]any, 32),
 		respondCh:  make(chan testHubRespond, 32),
 		errCh:      make(chan error, 4),
 		firstFrame: make(map[quic.StreamID]string),
 		closed:     make(map[quic.StreamID]bool),
 	}
+}
+
+// spkiPin returns the sha256 of the hub certificate's SPKI — a valid
+// HUB_QUIC_PIN value for this hub.
+func (h *testQUICHub) spkiPin() [32]byte {
+	h.t.Helper()
+	cert, err := x509.ParseCertificate(h.certDER)
+	if err != nil {
+		h.t.Fatalf("parse test cert: %v", err)
+	}
+	return sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 }
 
 // port is the hub's UDP port.

@@ -8,8 +8,12 @@ import (
 	"bytes"
 	"compress/flate"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,8 +60,18 @@ type Config struct {
 	// QUICInsecure disables QUIC server-certificate verification
 	// (HUB_QUIC_INSECURE=1). Only for a self-signed hub you control on a
 	// trusted network — see quicTLSClientConfig for why the default
-	// verifies whenever the hub URL is https.
+	// verifies whenever the hub URL is https. Prefer QUICPin, which keeps
+	// verification but pins the exact certificate.
 	QUICInsecure bool
+	// QUICPin pins the hub's QUIC TLS certificate by the sha256 of its
+	// SubjectPublicKeyInfo (HUB_QUIC_PIN, hex or base64 — see
+	// parseSPKIPin). When set, the system CA path is replaced by an exact
+	// SPKI fingerprint match: a self-signed hub cert can be verified
+	// without trusting anyone who happens to answer on its UDP port.
+	// Takes precedence over QUICInsecure and the https policy. A
+	// malformed value fails the QUIC handshake (Run then falls back to
+	// WebSocket).
+	QUICPin string
 }
 
 // Client forwards events to the hub and executes relayed requests against
@@ -1291,15 +1305,37 @@ const quicKeepAlive = 15 * time.Second
 // operations (shell, file writes) on this machine. The WebSocket path has
 // always verified TLS normally via https://, so QUIC was the odd one out.
 //
-// Policy: verify whenever the hub URL is https (production), skip for a
-// plain-http hub (localhost / lab, where there is no certificate to trust
-// anyway), and allow an explicit HUB_QUIC_INSECURE=1 escape hatch. A
-// verification failure is not fatal — Run falls back to WebSocket, which
+// Policy, in order:
+//
+//  1. HUB_QUIC_PIN set: skip the system CA path and require the peer's
+//     leaf certificate SPKI sha256 to match the pin EXACTLY (certificate
+//     pinning — the verifiable form of a self-signed hub). A mismatch (or
+//     a malformed pin) fails the handshake.
+//  2. HUB_QUIC_INSECURE=1 or a plain-http hub URL (localhost / lab, no
+//     certificate to trust anyway): skip verification.
+//  3. Otherwise (https hub): verify against the hub's DNS name.
+//
+// A verification failure is not fatal — Run falls back to WebSocket, which
 // carries the same frames over verified TLS.
 func (c *Client) quicTLSClientConfig(dialHost string) *tls.Config {
 	// Must match capri-hub quicTLSConfig ALPN ("capri-hub"); an empty
 	// client ALPN yields CRYPTO_ERROR "tls: no application protocol".
 	conf := &tls.Config{NextProtos: []string{"capri-hub"}}
+	if c.cfg.QUICPin != "" {
+		conf.InsecureSkipVerify = true // CA path replaced by the pin check
+		pin, err := parseSPKIPin(c.cfg.QUICPin)
+		if err != nil {
+			// Fail closed: a malformed pin must not silently downgrade to
+			// no verification. The error surfaces as a handshake failure
+			// (→ WebSocket fallback) with the reason inline.
+			conf.VerifyPeerCertificate = func(_ [][]byte, _ [][]*x509.Certificate) error {
+				return fmt.Errorf("HUB_QUIC_PIN 无效: %w", err)
+			}
+			return conf
+		}
+		conf.VerifyPeerCertificate = pinSPKIVerify(pin)
+		return conf
+	}
 	if c.cfg.QUICInsecure || !strings.HasPrefix(strings.TrimSpace(c.cfg.URL), "https://") {
 		conf.InsecureSkipVerify = true
 		return conf
@@ -1312,6 +1348,57 @@ func (c *Client) quicTLSClientConfig(dialHost string) *tls.Config {
 		conf.ServerName = dialHost
 	}
 	return conf
+}
+
+// parseSPKIPin decodes an HUB_QUIC_PIN value: the sha256 digest of the hub
+// certificate's DER SubjectPublicKeyInfo, as 64 hex characters or base64
+// (std/URL alphabet, padded or raw — 32 bytes after decoding). A
+// "sha256/" or "sha256//" prefix (RFC 7469 pinning notation) is accepted.
+func parseSPKIPin(v string) ([32]byte, error) {
+	var out [32]byte
+	s := strings.TrimSpace(v)
+	s = strings.TrimPrefix(s, "sha256//")
+	s = strings.TrimPrefix(s, "sha256/")
+	s = strings.TrimSpace(s)
+	if len(s) == 64 {
+		if b, err := hex.DecodeString(s); err == nil {
+			copy(out[:], b)
+			return out, nil
+		}
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil && len(b) == 32 {
+			copy(out[:], b)
+			return out, nil
+		}
+	}
+	return out, fmt.Errorf("无法解析（应为证书 SPKI sha256 的 64 位 hex 或 base64）: %q", v)
+}
+
+// pinSPKIVerify returns a tls.VerifyPeerCertificate callback that requires
+// the peer's LEAF certificate to have exactly the pinned SPKI: it hashes
+// cert.RawSubjectPublicKeyInfo (DER) with sha256 and compares all 32 bytes.
+// Certificate/key rotation invalidates the pin by design — that is the
+// point of pinning.
+func pinSPKIVerify(pin [32]byte) func([][]byte, [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("hub 未提供证书（SPKI pin 校验失败）")
+		}
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("hub 证书解析失败（SPKI pin 校验）: %w", err)
+		}
+		sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+		if sum != pin {
+			return fmt.Errorf("hub 证书 SPKI 指纹不匹配: 实际 sha256:%s ≠ pin sha256:%s（hub 换证书了？更新 HUB_QUIC_PIN）",
+				hex.EncodeToString(sum[:]), hex.EncodeToString(pin[:]))
+		}
+		return nil
+	}
 }
 
 // urlHostname returns the hostname part of the configured hub URL.
