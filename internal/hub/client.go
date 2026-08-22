@@ -151,6 +151,12 @@ type Client struct {
 	// (or with an old hub) every frame goes out as raw JSON — see
 	// PROTOCOL.md for the wire format.
 	deflateOK atomic.Bool
+
+	// quicDial, when non-nil, replaces quic.DialAddr inside quicSession.
+	// Test seam for the connection-migration test (T6): the real session
+	// logic runs unmodified over a caller-controlled UDP socket that can
+	// rebind mid-session. nil in production.
+	quicDial func(ctx context.Context, addr string, tlsConf *tls.Config, cfg *quic.Config) (*quic.Conn, error)
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -1058,7 +1064,13 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	// path wholesale — there is no per-frame (hello/ping only) granularity
 	// — so a replayed auth/events frame could reach the hub twice. Raw
 	// JSON fallback keeps the link correct without it.
-	conn, err := quic.DialAddr(dialCtx, net.JoinHostPort(host, port), c.quicTLSClientConfig(host),
+	dial := quic.DialAddr
+	if c.quicDial != nil {
+		// Test seam (T6 connection migration): run the session over a
+		// caller-controlled UDP socket.
+		dial = c.quicDial
+	}
+	conn, err := dial(dialCtx, net.JoinHostPort(host, port), c.quicTLSClientConfig(host),
 		&quic.Config{KeepAlivePeriod: quicKeepAlive})
 	if err != nil {
 		return fmt.Errorf("hub quic dial %s: %w", host, err)
