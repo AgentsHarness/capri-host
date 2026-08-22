@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -15,6 +16,11 @@ type Config struct {
 	HostToken   string
 	HostID      string
 	HostName    string
+	// HUB_QUIC_PIN: pin the hub's QUIC certificate by SPKI sha256
+	// fingerprint (hex or base64) instead of the system CA path — the
+	// self-signed-hub replacement for disabling verification. See
+	// docs/DEPLOY.md for the openssl one-liner that generates it.
+	HubQUICPin string
 	// Inbound access token for this host's own HTTP API (/api/*, /events).
 	// Set FE_TOKEN (or ACCESS_TOKEN) to require it; empty = open (local
 	// trusted default, matching the pre-token behavior). Same secret
@@ -42,6 +48,7 @@ func Load() Config {
 		HostToken:   os.Getenv("HOST_TOKEN"),
 		HostID:      envOr("HOST_ID", "local"),
 		HostName:    envOr("HOST_NAME", "Local Host"),
+		HubQUICPin:  strings.TrimSpace(os.Getenv("HUB_QUIC_PIN")),
 		AccessToken: envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")),
 	}
 }
