@@ -115,10 +115,18 @@ type Client struct {
 	// (bridge-assigned or fallback). Compared against hello.seq to detect
 	// host process restart: hub may still hold a high LastSeq from the
 	// previous process while this process restarts at 1.
+	// hubAckSeq is the hub's data-plane watermark as last announced this
+	// session (hello.seq, refreshed by every ping's piggy-backed "seq").
+	// It anchors needCatchUp repairs more precisely than lastSentSeq:
+	// lastSentSeq only proves ENQUEUE, hubAckSeq proves DELIVERY. Reset to
+	// 0 per session (a restarted hub counts from zero) and never records
+	// an ack naming a seq this process never produced (stale pre-reset
+	// frame — see noteHubAck).
 	seqMu       sync.Mutex
 	nextSeq     uint64
 	replay      []acp.Event // ring, newest at the end, capped
 	lastSentSeq uint64
+	hubAckSeq   uint64
 
 	// enqueueMu serializes replay and live event enqueues so frames
 	// reach the hub in strictly increasing seq order. Without it, a live
@@ -138,12 +146,14 @@ type Client struct {
 	// session idle watchdog (see sessionIdleTimeout).
 	lastRecvUnixNano atomic.Int64
 
-	// needCatchUp is set when a live events frame was dropped because the
-	// send queue was full. Those seqs never reach the hub, so the FE's
-	// gap-pull (which reads the hub's buffer) can never fill the hole
+	// needCatchUp is set when a live or replay events frame was dropped
+	// before reaching the wire: the send queue was full, a replay held the
+	// ordering lock (enqueueEvents TryLock missed), or a critical enqueue
+	// timed out on a full queue. Those seqs may never reach the hub, so the
+	// FE's gap-pull (which reads the hub's buffer) can never fill the hole
 	// either — its ordered-delivery buffer then waits for a predecessor
-	// that will never arrive. The heartbeat re-sends from lastSentSeq to
-	// close the gap once the pressure passes.
+	// that will never arrive. The heartbeat re-sends from the hub's ack
+	// watermark to close the gap once the pressure passes.
 	needCatchUp atomic.Bool
 
 	// deflateOK is armed by the hub's hello echo ("deflate":true) after we
@@ -157,6 +167,12 @@ type Client struct {
 	// logic runs unmodified over a caller-controlled UDP socket that can
 	// rebind mid-session. nil in production.
 	quicDial func(ctx context.Context, addr string, tlsConf *tls.Config, cfg *quic.Config) (*quic.Conn, error)
+
+	// QUIC negative cache (Run goroutine only — see pickTransport /
+	// noteQuicOutcome): consecutive ESTABLISHMENT failures and the cooldown
+	// deadline after which QUIC is skipped entirely for a while.
+	quicFails         int
+	quicCooldownUntil time.Time
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -250,14 +266,19 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		// QUIC first (loss-resilient, connection-migrating), WS fallback.
+		// The negative cache (pickTransport) skips QUIC while in cooldown
+		// so a UDP-blocked network does not pay the dial timeout on every
+		// reconnect.
 		err := error(nil)
 		sessionStart := time.Now()
-		if c.cfg.DisableQUIC {
+		if c.pickTransport() == "ws" {
 			err = c.wsSession(ctx, bridge)
 		} else {
-			err = c.quicSession(ctx, bridge)
-			if err != nil && !ctxDone(ctx) {
-				log.Printf("[hub-client] QUIC 连接失败: %v，回退 WebSocket", err)
+			established, qerr := c.quicSession(ctx, bridge)
+			err = qerr
+			if qerr != nil && !ctxDone(ctx) {
+				c.noteQuicOutcome(established)
+				log.Printf("[hub-client] QUIC 连接失败: %v，回退 WebSocket", qerr)
 				err = c.wsSession(ctx, bridge)
 			}
 		}
@@ -535,22 +556,37 @@ func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
 			flush()
 		case <-heartbeat.C:
 			flush()
-			// A live frame dropped under send-queue pressure left a hole
-			// the FE cannot repair on its own (the events never reached the
-			// hub's gap-pull buffer). Re-send from the last acknowledged
-			// seq via the critical path now that the burst has passed.
-			if c.needCatchUp.Swap(false) && c.forwardingEnabled() {
-				c.seqMu.Lock()
-				after := c.lastSentSeq
-				c.seqMu.Unlock()
-				if last := c.sendReplayAfter(after); last > 0 {
-					log.Printf("[hub-client] 补发被丢弃的事件 seq %d..%d", after+1, last)
-				}
-			}
+			c.repairDroppedEvents()
 			// Always heartbeat: keeps hub registry ready flag fresh even
 			// with zero browser subscribers. Control frame, not data-plane seq.
 			c.enqueueHostStatus(bridge)
 		}
+	}
+}
+
+// repairDroppedEvents is the heartbeat's catch-up step: a frame dropped
+// before the wire (queue full / replay held the lock / critical timeout)
+// left a hole the FE cannot repair on its own — those events never reached
+// the hub's gap-pull buffer. Re-send from the hub's ack watermark once the
+// burst has passed.
+func (c *Client) repairDroppedEvents() {
+	if !c.needCatchUp.Swap(false) || !c.forwardingEnabled() {
+		return
+	}
+	c.seqMu.Lock()
+	// Anchor at the DELIVERY watermark when this session has one: it covers
+	// anything not provably on the hub, including frames lost between
+	// enqueue and the wire; re-sent in-flight frames are deduped by the
+	// hub's stale-seq gate, and the re-sent window is bounded (queue depth
+	// plus one ping interval of production). Before the first ack (old
+	// hub, hello not yet processed) fall back to the enqueue watermark.
+	after := c.lastSentSeq
+	if c.hubAckSeq > 0 {
+		after = c.hubAckSeq
+	}
+	c.seqMu.Unlock()
+	if last := c.sendReplayAfter(after); last > 0 {
+		log.Printf("[hub-client] 补发被丢弃的事件 seq %d..%d", after+1, last)
 	}
 }
 
@@ -581,7 +617,18 @@ func eventSeq(ev acp.Event) uint64 {
 // in-progress replay so the hub never sees a higher seq first (see
 // enqueueReplay).
 func (c *Client) enqueueEvents(evs []acp.Event) {
-	c.enqueueMu.Lock()
+	// Try-lock, never block: a large replay can hold the ordering lock for
+	// a long time (each frame briefly blocks on a full queue). Blocking
+	// here would stall forwardLoop's flush — the bridge subscriber channel
+	// then fills and Broadcast drops droppable events BEFORE they reach the
+	// replay ring, where no repair path can recover them. The batch is
+	// already in the ring (flush ran seqAndReplay first), so dropping here
+	// is safe: needCatchUp's heartbeat repair re-sends it in order.
+	if !c.enqueueMu.TryLock() {
+		c.needCatchUp.Store(true)
+		log.Printf("[hub-client] 重放占用发送通道，丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(evs))
+		return
+	}
 	defer c.enqueueMu.Unlock()
 	c.enqueueEventsLocked(evs, false)
 }
@@ -610,7 +657,12 @@ func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 		case c.sendCh <- payload:
 			c.noteLastSentSeq(evs)
 		case <-time.After(5 * time.Second):
-			log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留）", len(evs))
+			// lastSentSeq was NOT advanced, so a later repair re-sends this
+			// batch; without the flag nothing retriggered it until the next
+			// reconnect, leaving the hub missing transcript the whole
+			// session.
+			c.needCatchUp.Store(true)
+			log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(evs))
 		}
 		return
 	}
@@ -643,6 +695,23 @@ func (c *Client) noteLastSentSeq(evs []acp.Event) {
 		c.lastSentSeq = max
 	}
 	c.seqMu.Unlock()
+}
+
+// noteHubAck records the hub's data-plane watermark from a ping's
+// piggy-backed "seq" ack (same meaning as hello.seq). An ack naming a seq
+// this process never produced is ignored: after a seq_reset the hub counts
+// from zero again, and a ping already in flight when the reset landed can
+// still carry the previous epoch's high watermark — anchoring a repair
+// there would skip exactly the low seqs the hub now needs.
+func (c *Client) noteHubAck(seq uint64) {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	if seq > c.nextSeq {
+		return
+	}
+	if seq > c.hubAckSeq {
+		c.hubAckSeq = seq
+	}
 }
 
 // marshalEventsFrame builds a type:"events" frame for evs, enforcing the
@@ -813,6 +882,12 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 		c.enqueueSeqResetLocked()
 		last := c.sendReplayAfterLocked(0)
 		c.enqueueMu.Unlock()
+		// The hub's watermark is now 0 (seq_reset cleared it); so is our
+		// view of it. A ping carrying the pre-reset high ack must not
+		// re-anchor repairs past the replay (noteHubAck filters it).
+		c.seqMu.Lock()
+		c.hubAckSeq = 0
+		c.seqMu.Unlock()
 		// Do NOT advance lastSentSeq from the alien hubSeq. Replay
 		// everything this process has buffered (after 0).
 		if last > 0 {
@@ -825,6 +900,8 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 	if last := c.sendReplayAfter(hubSeq); last > 0 {
 		log.Printf("[hub-client] 重连补发事件 seq %d..%d", hubSeq+1, last)
 	}
+	// hello.seq doubles as this session's first delivery ack.
+	c.noteHubAck(hubSeq)
 	// Hub is caught up through hubSeq — raise watermark so a later 0→1
 	// does not re-send what hub already has. Only safe when hubSeq is in
 	// this process's seq space (hubSeq <= localMax).
@@ -1030,7 +1107,10 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 
 // quicSession dials the hub over QUIC (UDP): a control/event stream, a
 // shared request stream, and one dedicated stream per in-flight relay
-// request — all carrying 4-byte length-prefixed JSON frames.
+// request — all carrying 4-byte length-prefixed JSON frames. It returns
+// whether the session was ESTABLISHED (dial + streams + auth send all
+// succeeded — runSession then owns the outcome) so the caller's negative
+// cache can distinguish "UDP path broken" from "session ran and dropped".
 //
 // Stream A (control/event plane), opened first: auth, events, ping/pong,
 // host_status, seq_reset, the hub's hello/subscribers downlink, and the
@@ -1050,10 +1130,10 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 // 16MB relay answer (which saturates its stream's window for seconds) and
 // both the control frames and other requests' small responds. See
 // PROTOCOL.md.
-func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
+func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) (bool, error) {
 	tok, err := c.hostToken()
 	if err != nil {
-		return err
+		return false, err
 	}
 	host, port := c.quicAddr()
 	dialCtx, cancel := context.WithTimeout(ctx, quicDialTimeout)
@@ -1073,7 +1153,7 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	conn, err := dial(dialCtx, net.JoinHostPort(host, port), c.quicTLSClientConfig(host),
 		&quic.Config{KeepAlivePeriod: quicKeepAlive})
 	if err != nil {
-		return fmt.Errorf("hub quic dial %s: %w", host, err)
+		return false, fmt.Errorf("hub quic dial %s: %w", host, err)
 	}
 	defer conn.CloseWithError(0, "")
 
@@ -1088,7 +1168,7 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	}
 	streamA, err := openStream()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer streamA.Close()
 	// Stream B failure is not fatal: an older hub may cap bidirectional
@@ -1107,14 +1187,14 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	// echoing "deflate":true in its hello (see PROTOCOL.md).
 	auth, _ := json.Marshal(map[string]any{"v": 1, "type": "auth", "token": tok, "deflate": true})
 	if err := c.quicSendFrame(streamA, auth); err != nil {
-		return fmt.Errorf("hub quic auth send: %w", err)
+		return false, fmt.Errorf("hub quic auth send: %w", err)
 	}
 	// A QUIC stream only becomes visible to the peer once a frame references
 	// it — OpenStreamSync alone transmits nothing, so the hub's AcceptStream
 	// would block forever and the shared request plane could never attach.
 	// Prime stream B with a no-op pong (ignored by the hub's type dispatch).
 	if err := c.quicSendFrame(streamB, reqStreamPrime); err != nil {
-		return fmt.Errorf("hub quic request-plane prime: %w", err)
+		return false, fmt.Errorf("hub quic request-plane prime: %w", err)
 	}
 	log.Printf("[hub-client] 已连接 hub（quic %s:%s）", host, port)
 
@@ -1135,7 +1215,7 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	if streamB != streamA {
 		tr.recvRequest = quicRecvFrame(streamB)
 	}
-	return c.runSession(ctx, bridge, tr)
+	return true, c.runSession(ctx, bridge, tr)
 }
 
 // reqStreamPrime is the no-op activation frame sent on every freshly opened
@@ -1298,6 +1378,46 @@ func quicRecvFrame(stream *quic.Stream) func() ([]byte, error) {
 // ~1s), so a perfectly usable QUIC path was being abandoned for the
 // slower TCP fallback. WS fallback is still immediate on real failure.
 const quicDialTimeout = 8 * time.Second
+
+// QUIC negative cache: after quicFailMax consecutive ESTABLISHMENT
+// failures (dial / handshake / stream open / auth send — a session that
+// ran and later dropped proves the UDP path works and does NOT count),
+// Run skips QUIC for quicFailCooldown and dials WebSocket directly.
+// Without this, a network that blocks UDP outright (corporate firewall,
+// fake-ip proxy) pays the full quicDialTimeout on EVERY reconnect before
+// the fallback. The cooldown lapses so a network that starts allowing UDP
+// is picked back up; failing quicFailMax more times re-arms it.
+const (
+	quicFailMax      = 3
+	quicFailCooldown = 5 * time.Minute
+)
+
+// pickTransport chooses this reconnect attempt's transport: "quic" unless
+// disabled or inside the negative-cache cooldown, else "ws". Run goroutine
+// only (guards the quicFails / quicCooldownUntil fields).
+func (c *Client) pickTransport() string {
+	if c.cfg.DisableQUIC || time.Now().Before(c.quicCooldownUntil) {
+		return "ws"
+	}
+	return "quic"
+}
+
+// noteQuicOutcome updates the negative cache after a QUIC attempt. An
+// established session resets the failure count (the path works); an
+// establishment failure counts up and arms the cooldown at quicFailMax.
+// Run goroutine only.
+func (c *Client) noteQuicOutcome(established bool) {
+	if established {
+		c.quicFails = 0
+		return
+	}
+	c.quicFails++
+	if c.quicFails == quicFailMax {
+		c.quicCooldownUntil = time.Now().Add(quicFailCooldown)
+		log.Printf("[hub-client] QUIC 连续 %d 次建立失败，%.0f 秒内直接使用 WebSocket（跳过每次重连的握手等待）",
+			c.quicFails, quicFailCooldown.Seconds())
+	}
+}
 
 // quicKeepAlive is the QUIC transport keepalive interval. 15s (was 10s):
 // the hub pings every 25s and answers ours, and with the control plane on
@@ -1487,6 +1607,12 @@ func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, tr frameTra
 	// generation counter restarts low. Clear our high-water mark or every
 	// count from a restarted hub would look stale and be ignored.
 	c.subsGen.Store(0)
+	// The delivery ack is per-session too: a restarted hub counts from
+	// zero, and the previous session's ack says nothing about what THIS
+	// hub process has seen. hello.seq re-arms it.
+	c.seqMu.Lock()
+	c.hubAckSeq = 0
+	c.seqMu.Unlock()
 	c.markRecv()
 	c.enqueueHostStatus(bridge)
 
@@ -1656,6 +1782,12 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 					gen = *msg.SubsGen
 				}
 				c.applySubscribers(*msg.Subscribers, gen, bridge)
+			}
+			// Data-plane delivery ack piggy-backed on the liveness ping
+			// (absent on old hubs): anchors needCatchUp repairs at the
+			// hub's actual watermark instead of the enqueue watermark.
+			if msg.Seq != nil {
+				c.noteHubAck(*msg.Seq)
 			}
 			pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
 			c.enqueueFrame(pong, false)

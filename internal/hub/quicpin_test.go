@@ -139,7 +139,7 @@ func TestQUICTLSPinHandshake(t *testing.T) {
 	defer fwdCancel()
 	go c.forwardLoop(fwdCtx, bridge)
 	done := make(chan error, 1)
-	go func() { done <- c.quicSession(ctx, bridge) }()
+	go func() { _, err := c.quicSession(ctx, bridge); done <- err }()
 	deadline := time.After(5 * time.Second)
 	for !c.forwardingEnabled() {
 		select {
@@ -165,7 +165,7 @@ func TestQUICTLSPinHandshake(t *testing.T) {
 	c2.reqCh = make(chan reqFrame, 16)
 	bctx, bcancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer bcancel()
-	err := c2.quicSession(bctx, bridge)
+	_, err := c2.quicSession(bctx, bridge)
 	if err == nil {
 		t.Fatal("session established against a mismatched SPKI pin")
 	}

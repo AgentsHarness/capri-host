@@ -311,7 +311,7 @@ func TestQUICDualStreamPlaneSeparation(t *testing.T) {
 	defer fwdCancel()
 	go c.forwardLoop(fwdCtx, bridge)
 	done := make(chan error, 1)
-	go func() { done <- c.quicSession(ctx, bridge) }()
+	go func() { _, err := c.quicSession(ctx, bridge); done <- err }()
 
 	// Wait for forwarding enabled (hello.subscribers=1 on the control plane).
 	deadline := time.After(5 * time.Second)
@@ -416,7 +416,7 @@ func TestQUICPerRequestStreams(t *testing.T) {
 	defer fwdCancel()
 	go c.forwardLoop(fwdCtx, bridge)
 	done := make(chan error, 1)
-	go func() { done <- c.quicSession(ctx, bridge) }()
+	go func() { _, err := c.quicSession(ctx, bridge); done <- err }()
 
 	deadline := time.After(5 * time.Second)
 	for !c.forwardingEnabled() {

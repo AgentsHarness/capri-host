@@ -1164,7 +1164,7 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 	go c.forwardLoop(fwdCtx, bridge) // forwardLoop is a private method; test is in-package
 
 	done := make(chan error, 1)
-	go func() { done <- c.quicSession(ctx, bridge) }()
+	go func() { _, err := c.quicSession(ctx, bridge); done <- err }()
 
 	// Wait for forwarding enabled (hello.subscribers=1).
 	deadline := time.After(5 * time.Second)
