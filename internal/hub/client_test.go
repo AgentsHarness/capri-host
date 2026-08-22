@@ -3,18 +3,8 @@ package hub
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math/big"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1133,121 +1123,19 @@ func (f *fakeHub) countPairCalls() int {
 // TestQUICSessionRoundTrip exercises the QUIC transport end to end:
 // auth frame → hello (subscribers+seq) → events uplink → request downlink → respond.
 func TestQUICSessionRoundTrip(t *testing.T) {
-	// Self-signed TLS for the in-test QUIC server.
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "test-hub"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
-	qtls := &tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		NextProtos:   []string{"capri-hub"}, // match production hub ALPN
-	}
-
-	ln, err := quic.ListenAddr("127.0.0.1:0", qtls, &quic.Config{KeepAlivePeriod: 10 * time.Second})
-	if err != nil {
-		t.Fatalf("quic listen: %v", err)
-	}
-	defer ln.Close()
-	quicPort := ln.Addr().(*net.UDPAddr).Port
-
-	eventsCh := make(chan map[string]any, 16)
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept(context.Background())
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		ctx := context.Background()
-		// The host client opens the stream; the server accepts it.
-		stream, err := conn.AcceptStream(ctx)
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		readFrame := func() ([]byte, error) {
-			var lb [4]byte
-			if _, err := io.ReadFull(stream, lb[:]); err != nil {
-				return nil, err
-			}
-			buf := make([]byte, binary.BigEndian.Uint32(lb[:]))
-			_, err := io.ReadFull(stream, buf)
-			return buf, err
-		}
-		writeFrame := func(v any) error {
-			b, _ := json.Marshal(v)
-			var lb [4]byte
-			binary.BigEndian.PutUint32(lb[:], uint32(len(b)))
-			if _, err := stream.Write(lb[:]); err != nil {
-				return err
-			}
-			_, err := stream.Write(b)
-			return err
-		}
-		// Auth frame first.
-		data, err := readFrame()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		var auth struct {
-			Type  string `json:"type"`
-			Token string `json:"token"`
-		}
-		if json.Unmarshal(data, &auth) != nil || auth.Type != "auth" || auth.Token != "tok123" {
-			serverErr <- fmt.Errorf("bad auth: %s", data)
-			return
-		}
-		if err := writeFrame(map[string]any{"v": 1, "type": "hello", "service": "hub", "subscribers": 1, "seq": 0}); err != nil {
-			serverErr <- err
-			return
-		}
-		// Push a relayed request.
-		if err := writeFrame(map[string]any{
+	// Multi-stream in-memory hub (see dualstream_test.go): control plane is
+	// the first accepted stream, responds arrive on per-request streams.
+	th := newTestQUICHub(t)
+	th.serve(func(ctrl *quic.Stream) {
+		// Push a relayed request down the control plane.
+		_ = writeTestFrame(ctrl, map[string]any{
 			"v": 1, "type": "request", "reqId": "qr1",
 			"method": "POST", "path": "/api/prompt",
 			"body": map[string]any{"blocks": []any{map[string]any{"type": "text", "text": "hi"}}},
-		}); err != nil {
-			serverErr <- err
-			return
-		}
-		for {
-			data, err := readFrame()
-			if err != nil {
-				serverErr <- fmt.Errorf("server read: %w", err)
-				return
-			}
-			var frame struct {
-				Type     string           `json:"type"`
-				Events   []map[string]any `json:"events"`
-				ReqID    string           `json:"reqId"`
-				Status   int              `json:"status"`
-				SeqStart float64          `json:"seqStart"`
-			}
-			if json.Unmarshal(data, &frame) != nil {
-				continue
-			}
-			switch frame.Type {
-			case "events":
-				for _, ev := range frame.Events {
-					ev["__seqStart"] = frame.SeqStart
-					eventsCh <- ev
-					if ev["text"] == "over quic" {
-						serverErr <- nil
-						return
-					}
-				}
-			case "respond":
-				// relay answer observed; keep reading until the chunk lands
-			}
-		}
-	}()
+		})
+	})
+
+	eventsCh := th.eventsCh
 
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeTestJSON(w, 200, map[string]any{"ok": true, "stopReason": "end_turn"})
@@ -1256,7 +1144,7 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 
 	// Point the client at the QUIC port itself (URL host:port = QUIC endpoint).
 	c := NewClient(Config{
-		URL:       fmt.Sprintf("https://127.0.0.1:%d", quicPort),
+		URL:       fmt.Sprintf("https://127.0.0.1:%d", th.port()),
 		HostID:    "h1",
 		Token:     "tok123",
 		LocalBase: local.URL,
@@ -1266,6 +1154,7 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 		QUICInsecure: true,
 	})
 	c.sendCh = make(chan []byte, 64)
+	c.reqCh = make(chan reqFrame, 16)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1285,7 +1174,7 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 			select {
 			case err := <-done:
 				t.Fatalf("forwarding never enabled over QUIC (session err: %v)", err)
-			case err := <-serverErr:
+			case err := <-th.errCh:
 				t.Fatalf("forwarding never enabled over QUIC (server err: %v)", err)
 			default:
 				t.Fatal("forwarding never enabled over QUIC")
@@ -1320,11 +1209,14 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 		t.Fatal("no events over QUIC")
 	}
 
-	// Relay round trip: respond arrives for qr1.
+	// Relay round trip: respond for qr1 arrives on its per-request stream.
 	select {
-	case err := <-serverErr:
-		if err != nil {
-			t.Fatalf("server: %v", err)
+	case resp := <-th.respondCh:
+		if resp.ReqID != "qr1" {
+			t.Fatalf("respond reqId = %q, want qr1", resp.ReqID)
+		}
+		if resp.Status != 200 {
+			t.Errorf("respond status = %d, want 200", resp.Status)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no respond for qr1 over QUIC")

@@ -125,7 +125,7 @@ func TestWSUplinkDeflateNegotiated(t *testing.T) {
 
 			c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", DisableQUIC: true})
 			c.sendCh = make(chan []byte, 64)
-			c.reqCh = make(chan []byte, 8)
+			c.reqCh = make(chan reqFrame, 8)
 			bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
 			ctx, cancel := context.WithCancel(context.Background())
