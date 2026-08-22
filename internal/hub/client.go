@@ -82,11 +82,12 @@ type Client struct {
 	sendCh chan []byte
 
 	// reqCh carries relay respond frames (type:"respond") to the request
-	// plane write loop. With the QUIC transport these ride a dedicated
-	// stream (stream B) so a 16MB fs/read-file answer cannot head-of-line
-	// block the small event/ping frames on the control stream; over WS it
-	// multiplexes onto the same connection. Created in Run next to sendCh.
-	reqCh chan []byte
+	// plane write loop. With the QUIC transport each in-flight request gets
+	// a dedicated stream (T1) so a 16MB fs/read-file answer cannot
+	// head-of-line block either the control stream or other requests'
+	// responds; over WS everything multiplexes onto one connection. Created
+	// in Run next to sendCh.
+	reqCh chan reqFrame
 
 	// Reliability: every forwarded event keeps its bridge.Broadcast seq
 	// (dual-path FE dedupes by (hostId,seq)) and is kept in a bounded
@@ -216,7 +217,7 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 	log.Printf("[hub-client] connected to hub %s as %s (%s)", c.cfg.URL, c.cfg.HostID, c.cfg.HostName)
 
 	c.sendCh = make(chan []byte, 256)
-	c.reqCh = make(chan []byte, 64)
+	c.reqCh = make(chan reqFrame, 64)
 
 	// Bridge events → hub (async queue + batch; no text merge — dual-path seq).
 	fwdCtx, fwdCancel := context.WithCancel(ctx)
@@ -843,19 +844,31 @@ func (c *Client) enqueueSeqResetLocked() {
 // cannot double-send after reconnect.
 func (c *Client) drainSendCh() {
 	n := 0
-	for _, ch := range []chan []byte{c.sendCh, c.reqCh} {
-		if ch == nil {
-			continue
-		}
+	drain := func(ch chan []byte) {
 		for {
 			select {
 			case <-ch:
 				n++
 			default:
-				goto next
+				return
 			}
 		}
-	next:
+	}
+	drainReq := func(ch chan reqFrame) {
+		for {
+			select {
+			case <-ch:
+				n++
+			default:
+				return
+			}
+		}
+	}
+	if c.sendCh != nil {
+		drain(c.sendCh)
+	}
+	if c.reqCh != nil {
+		drainReq(c.reqCh)
 	}
 	if n > 0 {
 		log.Printf("[hub-client] 重连前清空发送队列 %d 帧", n)
@@ -985,7 +998,9 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	}
 	return c.runSession(ctx, bridge, frameTransport{
 		sendControl: write,
-		sendRequest: write,
+		// WS is a single connection: both planes multiplex onto it, so the
+		// per-request routing is a no-op (reqId/final ignored).
+		sendRequest: func(_ string, payload []byte, _ bool) error { return write(payload) },
 		recvControl: func() ([]byte, error) {
 			_, data, err := conn.Read(ctx)
 			return data, err
@@ -993,18 +1008,28 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	})
 }
 
-// quicSession dials the hub over QUIC (UDP): two bidirectional streams with
-// 4-byte length-prefixed JSON frames.
+// quicSession dials the hub over QUIC (UDP): a control/event stream, a
+// shared request stream, and one dedicated stream per in-flight relay
+// request — all carrying 4-byte length-prefixed JSON frames.
 //
 // Stream A (control/event plane), opened first: auth, events, ping/pong,
-// host_status, seq_reset, and the hub's hello/subscribers downlink.
-// Stream B (request plane): relayed request downlink + respond uplink.
+// host_status, seq_reset, the hub's hello/subscribers downlink, and the
+// relayed `request` downlink. Stream B (shared request plane) is opened and
+// primed up front purely as the FALLBACK: whenever a per-request stream
+// cannot be opened (peer stream limit, old hub) or the in-flight cap is
+// hit, respond frames ride B — or A when even B failed — which is exactly
+// the WS-equivalent single-stream behavior.
 //
-// Frames are self-describing (JSON "type"), so the hub's stream Accept loop
-// dispatches purely by frame type; keeping the planes on separate streams
-// removes QUIC head-of-line blocking between a 16MB relay answer (which
-// saturates the stream's flow-control window for seconds) and the small,
-// latency-sensitive event/ping frames. See PROTOCOL.md.
+// Per-request streams (T1): the first respond for a relay request opens a
+// dedicated bidirectional stream, primed with a no-op pong, and every
+// respond for that request rides the same stream until its final frame
+// closes it. Frames are self-describing (JSON "type" + "reqId"), so the hub
+// accepts streams in arrival order and dispatches purely by frame type —
+// no stream carries a request's identity. Keeping each request's answer on
+// its own stream removes QUIC flow-control head-of-line blocking between a
+// 16MB relay answer (which saturates its stream's window for seconds) and
+// both the control frames and other requests' small responds. See
+// PROTOCOL.md.
 func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	tok, err := c.hostToken()
 	if err != nil {
@@ -1041,85 +1066,204 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) error {
 	}
 	defer streamA.Close()
 	// Stream B failure is not fatal: an older hub may cap bidirectional
-	// streams at 1. Fall back to sharing stream A (WS-equivalent behavior).
+	// streams at 1. It is only the shared fallback for per-request streams;
+	// without it responds share stream A (WS-equivalent behavior).
 	streamB, err2 := openStream()
 	if err2 != nil {
-		log.Printf("[hub-client] 请求平面独立流创建失败（%v），中转响应与事件共用单流", err2)
+		log.Printf("[hub-client] 共享请求流创建失败（%v），中转响应退回控制流", err2)
 		streamB = streamA
 	} else {
 		defer streamB.Close()
-	}
-
-	quicSend := func(stream *quic.Stream) func([]byte) error {
-		return func(payload []byte) error {
-			// 写超时与 WS 路径对齐（30s）：QUIC stream.Write 在流控/拥塞窗口
-			// 耗尽（对端停止 ACK）时会无限期阻塞。若无 deadline，writeLoop
-			// 会静默卡死且重连永不触发——readLoop 因 hub keepalive 仍能收包
-			// 而"看似正常"，整条上行通道就悄悄死掉。每次发送前设 deadline，
-			// 返回前清除，避免残留影响后续复用。
-			if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
-				return fmt.Errorf("hub quic set write deadline: %w", err)
-			}
-			defer stream.SetWriteDeadline(time.Time{})
-			flag := uint32(0)
-			if c.deflateOK.Load() {
-				if zp, ok := deflatePayload(payload); ok {
-					payload = zp
-					flag = deflateFlagQUIC
-				}
-			}
-			var lenBuf [4]byte
-			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload))|flag)
-			if _, err := stream.Write(lenBuf[:]); err != nil {
-				return err
-			}
-			_, err := stream.Write(payload)
-			return err
-		}
-	}
-	quicRecv := func(stream *quic.Stream) func() ([]byte, error) {
-		return func() ([]byte, error) {
-			var lenBuf [4]byte
-			if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
-				return nil, err
-			}
-			n := binary.BigEndian.Uint32(lenBuf[:]) &^ deflateFlagQUIC
-			if n > 32<<20 {
-				return nil, fmt.Errorf("frame too large: %d", n)
-			}
-			buf := make([]byte, n)
-			_, err := io.ReadFull(stream, buf)
-			return buf, err
-		}
 	}
 
 	// Auth rides stream A, uncompressed (negotiation has not happened yet).
 	// The "deflate":true field offers uplink compression; the hub arms it by
 	// echoing "deflate":true in its hello (see PROTOCOL.md).
 	auth, _ := json.Marshal(map[string]any{"v": 1, "type": "auth", "token": tok, "deflate": true})
-	if err := quicSend(streamA)(auth); err != nil {
+	if err := c.quicSendFrame(streamA, auth); err != nil {
 		return fmt.Errorf("hub quic auth send: %w", err)
 	}
-	// A QUIC stream only becomes visible to the peer once a frame
-	// references it — OpenStreamSync alone transmits nothing, so the hub's
-	// AcceptStream would block forever and its request downlink could never
-	// attach to stream B. Prime the stream with a no-op pong (ignored by
-	// the hub's type dispatch) so the hub can accept and route it.
-	noop, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
-	if err := quicSend(streamB)(noop); err != nil {
+	// A QUIC stream only becomes visible to the peer once a frame references
+	// it — OpenStreamSync alone transmits nothing, so the hub's AcceptStream
+	// would block forever and the shared request plane could never attach.
+	// Prime stream B with a no-op pong (ignored by the hub's type dispatch).
+	if err := c.quicSendFrame(streamB, reqStreamPrime); err != nil {
 		return fmt.Errorf("hub quic request-plane prime: %w", err)
 	}
 	log.Printf("[hub-client] 已连接 hub（quic %s:%s）", host, port)
 
+	plane := &quicReqPlane{
+		conn:    conn,
+		ctx:     ctx,
+		shared:  streamB,
+		writeFn: c.quicSendFrame,
+		streams: make(map[string]*quic.Stream),
+	}
+	defer plane.closeAll()
+
 	tr := frameTransport{
-		sendControl: quicSend(streamA),
-		sendRequest: quicSend(streamB),
-		recvControl: quicRecv(streamA),
+		sendControl: func(payload []byte) error { return c.quicSendFrame(streamA, payload) },
+		sendRequest: plane.send,
+		recvControl: quicRecvFrame(streamA),
 	}
 	if streamB != streamA {
-		tr.recvRequest = quicRecv(streamB)
+		tr.recvRequest = quicRecvFrame(streamB)
 	}
 	return c.runSession(ctx, bridge, tr)
+}
+
+// reqStreamPrime is the no-op activation frame sent on every freshly opened
+// request-plane stream (shared stream B and each per-request stream):
+// OpenStreamSync transmits nothing, so without a first frame the hub's
+// AcceptStream would block forever and could never attach its read loop. A
+// pong is harmless — the hub's type dispatch ignores it.
+var reqStreamPrime = mustJSON(map[string]any{"v": 1, "type": "pong"})
+
+// reqStreamMax caps how many per-request QUIC streams may be open at once.
+// Past the cap (or when OpenStream fails) responds fall back to the shared
+// request stream: correctness first, head-of-line separation best-effort.
+// A var so tests can shrink it.
+var reqStreamMax = 64
+
+// reqOpenTimeout bounds a per-request OpenStreamSync: opening must never
+// wedge the request write loop — the shared fallback is one error away.
+const reqOpenTimeout = 5 * time.Second
+
+// quicReqPlane routes respond frames onto per-request QUIC streams (T1):
+// one dedicated bidirectional stream per in-flight relay request, opened on
+// the request's first respond, primed with a no-op pong, and closed after
+// its final respond. State is scoped to one QUIC session; a plane whose
+// session died simply fails its next write.
+type quicReqPlane struct {
+	conn    *quic.Conn
+	ctx     context.Context // session ctx: open cancellation propagates
+	shared  *quic.Stream    // shared fallback (stream B, or A when B failed)
+	writeFn func(*quic.Stream, []byte) error
+	mu      sync.Mutex
+	streams map[string]*quic.Stream // reqId → dedicated stream
+}
+
+// send writes one respond frame for reqID: it opens (and primes) the
+// request's dedicated stream on first use, writes to it (or to the shared
+// fallback), and closes the dedicated stream after the request's final
+// frame. Any write error fails the session, like every other transport
+// write.
+func (p *quicReqPlane) send(reqID string, payload []byte, final bool) error {
+	s := p.streamFor(reqID)
+	if err := p.writeFn(s, payload); err != nil {
+		return err
+	}
+	if final {
+		p.finish(reqID)
+	}
+	return nil
+}
+
+// streamFor returns the dedicated stream for reqID, opening one when this
+// is the request's first respond. Open failure or a full cap degrades to
+// the shared stream — an old hub or a stream-limit exhaustion must not
+// break relay answers.
+func (p *quicReqPlane) streamFor(reqID string) *quic.Stream {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if s, ok := p.streams[reqID]; ok {
+		return s
+	}
+	if len(p.streams) < reqStreamMax {
+		if s, err := p.openLocked(); err == nil {
+			p.streams[reqID] = s
+			return s
+		} else {
+			log.Printf("[hub-client] 每请求流创建失败（%v），该请求响应走共享请求流", err)
+		}
+	} else {
+		log.Printf("[hub-client] 在途请求流已达上限 %d，该请求响应走共享请求流", reqStreamMax)
+	}
+	return p.shared
+}
+
+// openLocked opens and primes one dedicated request stream; the caller
+// holds p.mu.
+func (p *quicReqPlane) openLocked() (*quic.Stream, error) {
+	octx, cancel := context.WithTimeout(p.ctx, reqOpenTimeout)
+	defer cancel()
+	s, err := p.conn.OpenStreamSync(octx)
+	if err != nil {
+		return nil, fmt.Errorf("hub quic open request stream: %w", err)
+	}
+	if err := p.writeFn(s, reqStreamPrime); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("hub quic request-stream prime: %w", err)
+	}
+	return s, nil
+}
+
+// finish closes reqID's dedicated stream (its final respond was written);
+// the hub's read loop sees EOF and releases its side. Requests riding the
+// shared stream have no entry and no cleanup.
+func (p *quicReqPlane) finish(reqID string) {
+	p.mu.Lock()
+	s := p.streams[reqID]
+	delete(p.streams, reqID)
+	p.mu.Unlock()
+	if s != nil {
+		s.Close()
+	}
+}
+
+// closeAll tears down every still-open dedicated stream (session end).
+func (p *quicReqPlane) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, s := range p.streams {
+		s.Close()
+		delete(p.streams, id)
+	}
+}
+
+// quicSendFrame writes one length-prefixed (optionally deflate-flagged)
+// frame to a QUIC stream.
+func (c *Client) quicSendFrame(stream *quic.Stream, payload []byte) error {
+	// 写超时与 WS 路径对齐（30s）：QUIC stream.Write 在流控/拥塞窗口
+	// 耗尽（对端停止 ACK）时会无限期阻塞。若无 deadline，writeLoop
+	// 会静默卡死且重连永不触发——readLoop 因 hub keepalive 仍能收包
+	// 而"看似正常"，整条上行通道就悄悄死掉。每次发送前设 deadline，
+	// 返回前清除，避免残留影响后续复用。
+	if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return fmt.Errorf("hub quic set write deadline: %w", err)
+	}
+	defer stream.SetWriteDeadline(time.Time{})
+	flag := uint32(0)
+	if c.deflateOK.Load() {
+		if zp, ok := deflatePayload(payload); ok {
+			payload = zp
+			flag = deflateFlagQUIC
+		}
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload))|flag)
+	if _, err := stream.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err := stream.Write(payload)
+	return err
+}
+
+// quicRecvFrame reads one length-prefixed frame from a QUIC stream.
+func quicRecvFrame(stream *quic.Stream) func() ([]byte, error) {
+	return func() ([]byte, error) {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
+			return nil, err
+		}
+		n := binary.BigEndian.Uint32(lenBuf[:]) &^ deflateFlagQUIC
+		if n > 32<<20 {
+			return nil, fmt.Errorf("frame too large: %d", n)
+		}
+		buf := make([]byte, n)
+		_, err := io.ReadFull(stream, buf)
+		return buf, err
+	}
 }
 
 // quicDialTimeout bounds the QUIC handshake before falling back to
@@ -1214,15 +1358,17 @@ func (c *Client) quicAddr() (host, port string) {
 type frameTransport struct {
 	// sendControl carries events / ping / pong / host_status / seq_reset.
 	sendControl func([]byte) error
-	// sendRequest carries type:"respond" (relay answers). May point at the
-	// same function as sendControl (WS, or QUIC hubs that allow only one
-	// stream).
-	sendRequest func([]byte) error
+	// sendRequest carries type:"respond" frames (relay answers), routed by
+	// reqId: over QUIC each in-flight request rides its own stream (T1);
+	// over WS (or a QUIC hub that allows no extra streams) every frame
+	// multiplexes onto the shared connection. final marks a request's last
+	// frame so the transport can release its per-request stream.
+	sendRequest func(reqID string, payload []byte, final bool) error
 	// recvControl reads downlink frames from the control plane.
 	recvControl func() ([]byte, error)
 	// recvRequest, when non-nil, reads downlink frames from the request
-	// plane as well (frames are dispatched by type, whichever stream they
-	// arrive on).
+	// plane's shared stream as well (frames are dispatched by type,
+	// whichever stream they arrive on).
 	recvRequest func() ([]byte, error)
 }
 
@@ -1324,17 +1470,19 @@ func (c *Client) writeLoop(ctx context.Context, send func([]byte) error) error {
 }
 
 // writeReqLoop is the request-plane write loop: relay respond frames only,
-// no ping (the control plane keeps the connection alive).
-func (c *Client) writeReqLoop(ctx context.Context, send func([]byte) error) error {
+// no ping (the control plane keeps the connection alive). Frames carry
+// their reqId so the transport can route each request to its own stream
+// and close it after the request's final frame (T1).
+func (c *Client) writeReqLoop(ctx context.Context, send func(reqID string, payload []byte, final bool) error) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case payload, ok := <-c.reqCh:
+		case f, ok := <-c.reqCh:
 			if !ok {
 				return errors.New("request send channel closed")
 			}
-			if err := send(payload); err != nil {
+			if err := send(f.reqID, f.payload, f.final); err != nil {
 				return err
 			}
 		}
@@ -1524,24 +1672,35 @@ func (c *Client) respond(reqID string, status int, body json.RawMessage) {
 	if err != nil {
 		return
 	}
-	// Request plane: over QUIC this rides stream B so a large relay answer
-	// (fs/read-file can reach 16MB) never head-of-line blocks the small
-	// control/event frames on stream A.
-	c.enqueueReqFrame(payload)
+	// Request plane: over QUIC each request's answer rides its own stream
+	// (T1) so a large relay answer (fs/read-file can reach 16MB) never
+	// head-of-line blocks the control/event frames or other requests.
+	// A relay request gets exactly one respond — its terminal frame, which
+	// also closes the request's stream.
+	c.enqueueReqFrame(reqFrame{reqID: reqID, payload: payload, final: true})
+}
+
+// reqFrame is one queued request-plane frame: the marshaled respond body,
+// the reqId it answers, and whether it is the request's final frame (the
+// transport closes the request's dedicated stream after it).
+type reqFrame struct {
+	reqID   string
+	payload []byte
+	final   bool
 }
 
 // enqueueReqFrame queues a respond frame onto the request plane queue.
 // Critical: request answers must not be silently dropped under load (the
 // browser is blocked on them), so block briefly instead of dropping.
-func (c *Client) enqueueReqFrame(payload []byte) {
+func (c *Client) enqueueReqFrame(f reqFrame) {
 	if c.reqCh == nil {
-		c.enqueueFrame(payload, true)
+		c.enqueueFrame(f.payload, true)
 		return
 	}
 	select {
-	case c.reqCh <- payload:
+	case c.reqCh <- f:
 	case <-time.After(5 * time.Second):
-		log.Printf("[hub-client] 中转响应帧入队超时（队列满），丢弃 reqId 帧")
+		log.Printf("[hub-client] 中转响应帧入队超时（队列满），丢弃 reqId=%s 帧", f.reqID)
 	}
 }
 
