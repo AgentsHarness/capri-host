@@ -1492,3 +1492,33 @@ func TestStalePingSubscribersIgnored(t *testing.T) {
 		t.Fatal("stale ping subsGen=19 disabled forwarding — ordering gate failed")
 	}
 }
+
+// TestRespondWrapsNonJSONBody: a local relay body that is not embeddable
+// JSON (JSONL, plain text) must not silently drop the respond frame —
+// the hub's Dispatch would wait forever. respond wraps it as a JSON
+// string so the relay still answers.
+func TestRespondWrapsNonJSONBody(t *testing.T) {
+	c := NewClient(Config{URL: "http://hub", HostID: "h1", Token: "t", DisableQUIC: true})
+	c.reqCh = make(chan reqFrame, 1)
+
+	c.respond("r1", 200, json.RawMessage("{\"ok\":true}"))
+	f := <-c.reqCh
+	if !json.Valid(f.payload) || !bytes.Contains(f.payload, []byte(`"ok":true`)) {
+		t.Fatalf("valid JSON body must pass through unwrapped: %s", f.payload)
+	}
+	if !f.final {
+		t.Error("relay respond must be the request's final frame")
+	}
+
+	c.respond("r2", 200, json.RawMessage("line one\nline two\n"))
+	f = <-c.reqCh
+	var frame struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(f.payload, &frame); err != nil {
+		t.Fatalf("wrapped respond must be valid JSON: %v (%s)", err, f.payload)
+	}
+	if frame.Body != "line one\nline two\n" {
+		t.Fatalf("wrapped body = %q", frame.Body)
+	}
+}
