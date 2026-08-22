@@ -165,7 +165,7 @@ func TestQUICConnectionMigration(t *testing.T) {
 	defer fwdCancel()
 	go c.forwardLoop(fwdCtx, bridge)
 	done := make(chan error, 1)
-	go func() { done <- c.quicSession(ctx, bridge) }()
+	go func() { _, err := c.quicSession(ctx, bridge); done <- err }()
 	sessionAlive := func() bool {
 		select {
 		case err := <-done:
