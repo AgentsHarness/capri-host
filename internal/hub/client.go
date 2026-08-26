@@ -173,6 +173,36 @@ type Client struct {
 	// deadline after which QUIC is skipped entirely for a while.
 	quicFails         int
 	quicCooldownUntil time.Time
+
+	// ── control surface (see control.go) ──────────────────────────────
+	//
+	// connected / transport / connectedAt are the link's observable state.
+	// Nothing tracked them before: whether a session was up was implicit in
+	// Run being parked inside a blocking wsSession/quicSession call, and the
+	// chosen transport was discarded after the dial. They are set by
+	// noteConnected at each transport's handshake and cleared by
+	// noteDisconnected in runSession, which both transports funnel through.
+	connected   atomic.Bool
+	transport   atomic.Value // string: TransportQUIC | TransportWS
+	connectedAt atomic.Int64 // unix nano, 0 when not connected
+
+	// ctlMu guards sessCancel and lastErr.
+	ctlMu sync.Mutex
+	// sessCancel cancels the CURRENT session's context (a child of Run's
+	// ctx), which is what lets Pair drop a live connection without taking
+	// the whole process down. nil while no session is running.
+	sessCancel context.CancelFunc
+	lastErr    string
+
+	// forceRepair is set by requestRepair and consumed once by Run's
+	// reconnect loop: it means "the token changed, reconnect now" and
+	// distinguishes a deliberate re-pair from the transport failure the
+	// loop's existing auth-retry branch handles.
+	forceRepair atomic.Bool
+	// repairCh wakes Run out of a pairing retry or reconnect backoff sleep.
+	// Created in NewClient, not Run, because Pair may be called before Run
+	// starts. Buffered 1: the signal is a level, not a queue.
+	repairCh chan struct{}
 }
 
 // replayCap bounds the host-side replay buffer (events).
@@ -223,6 +253,10 @@ func NewClient(cfg Config) *Client {
 		cfg: cfg,
 		// Generous timeout: relayed prompts can run up to 30 minutes.
 		httpc: &http.Client{Timeout: 50 * time.Minute},
+		// Created here rather than in Run: Pair is reachable from the tray
+		// and the HTTP API before Run's first iteration, and a nil channel
+		// would make requestRepair's non-blocking send silently vanish.
+		repairCh: make(chan struct{}, 1),
 	}
 }
 
@@ -240,16 +274,26 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 		if err == nil {
 			break
 		}
+		c.setLastErr(err)
 		log.Printf("[hub-client] 配对失败: %v（%.0fs 后重试）", err, pairBackoff.Seconds())
 		select {
 		case <-ctx.Done():
 			return
+		case <-c.repairCh:
+			// Pair() persisted a token while we were waiting — retry at
+			// once. Without this a tray pairing would sit idle for up to
+			// 30 seconds behind a backoff timer that has nothing left to
+			// wait for.
+			c.forceRepair.Store(false)
+			pairBackoff = time.Second
+			continue
 		case <-time.After(pairBackoff):
 		}
 		if pairBackoff < 30*time.Second {
 			pairBackoff *= 2
 		}
 	}
+	c.setLastErr(nil)
 	log.Printf("[hub-client] connected to hub %s as %s (%s)", c.cfg.URL, c.cfg.HostID, c.cfg.HostName)
 
 	c.sendCh = make(chan []byte, 256)
@@ -265,6 +309,15 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 	repaired := false
 	backoff := time.Second
 	for ctx.Err() == nil {
+		// Each session runs on its OWN cancellable context, a child of
+		// Run's. Both transports block for the whole life of a session, so
+		// this is the only handle that can end one early — it is what lets
+		// Pair swap the token on a connected host instead of requiring a
+		// restart. Cancelling it never affects ctx, so the checks below
+		// still distinguish "session ended" from "process shutting down".
+		sessCtx, sessCancel := context.WithCancel(ctx)
+		c.setSessCancel(sessCancel)
+
 		// QUIC first (loss-resilient, connection-migrating), WS fallback.
 		// The negative cache (pickTransport) skips QUIC while in cooldown
 		// so a UDP-blocked network does not pay the dial timeout on every
@@ -272,16 +325,22 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 		err := error(nil)
 		sessionStart := time.Now()
 		if c.pickTransport() == "ws" {
-			err = c.wsSession(ctx, bridge)
+			err = c.wsSession(sessCtx, bridge)
 		} else {
-			established, qerr := c.quicSession(ctx, bridge)
+			established, qerr := c.quicSession(sessCtx, bridge)
 			err = qerr
-			if qerr != nil && !ctxDone(ctx) {
+			// ctxDone(sessCtx), not ctx: a repair-driven cancel must not
+			// be mistaken for a broken UDP path and burn a pointless
+			// WebSocket dial on the way out.
+			if qerr != nil && !ctxDone(sessCtx) {
 				c.noteQuicOutcome(established)
 				log.Printf("[hub-client] QUIC 连接失败: %v，回退 WebSocket", qerr)
-				err = c.wsSession(ctx, bridge)
+				err = c.wsSession(sessCtx, bridge)
 			}
 		}
+		c.setSessCancel(nil)
+		sessCancel()
+
 		if ctx.Err() != nil {
 			break
 		}
@@ -301,6 +360,24 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 		c.forwardEvents = false
 		c.fwdMu.Unlock()
 
+		// A Pair/Unpair replaced the credential: reconnect immediately on
+		// the new one. This is checked before the auth-retry branch below
+		// because the session very likely ended by our own cancel, whose
+		// error says nothing about the hub. Re-arming `repaired` matters
+		// too — the auth one-shot was spent on the OLD token and the new
+		// one deserves its own retry.
+		if c.forceRepair.Swap(false) {
+			select {
+			case <-c.repairCh: // consume the paired wakeup
+			default:
+			}
+			log.Printf("[hub-client] 配对信息已更新，立即重连")
+			repaired = false
+			backoff = time.Second
+			continue
+		}
+
+		c.setLastErr(err)
 		if isAuthErr(err) && c.cfg.PairCode != "" && !repaired {
 			log.Printf("[hub-client] hub 拒绝了旧 token，重新配对…")
 			c.clearState()
@@ -316,10 +393,17 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-c.repairCh:
+			// Paired while we were backing off: skip the remaining wait
+			// and do not escalate the delay — the next attempt uses a
+			// credential we have never tried.
+			c.forceRepair.Store(false)
+			log.Printf("[hub-client] 配对信息已更新，提前重连")
+			backoff = time.Second
 		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 		}
 	}
 }
@@ -1063,6 +1147,7 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	log.Printf("[hub-client] 已连接 hub（ws）")
+	c.noteConnected(TransportWS)
 
 	// coder/websocket forbids concurrent writes; both planes share the
 	// connection under this mutex.
@@ -1197,6 +1282,7 @@ func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) (bool, err
 		return false, fmt.Errorf("hub quic request-plane prime: %w", err)
 	}
 	log.Printf("[hub-client] 已连接 hub（quic %s:%s）", host, port)
+	c.noteConnected(TransportQUIC)
 
 	plane := &quicReqPlane{
 		conn:    conn,
@@ -1596,6 +1682,9 @@ type frameTransport struct {
 // write loop, and read loops for every downlink stream. Any loop failing
 // fails the session.
 func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, tr frameTransport) error {
+	// Both transports call noteConnected at their handshake and funnel here,
+	// so this is the one place that can reliably say the session is over.
+	defer c.noteDisconnected()
 	// Drop stale uplink frames left from a previous session before the
 	// write loop starts, so they cannot interleave with hello-driven
 	// replay and double-send.

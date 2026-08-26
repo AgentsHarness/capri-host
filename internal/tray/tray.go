@@ -1,0 +1,97 @@
+// Package tray runs the host's system tray menu in-process.
+//
+// The previous incarnation of this feature was a PowerShell script that
+// launched the exe, supervised it, and taskkill'd it plus its grok child on
+// exit. Folding it into the binary removes the supervision problem rather than
+// solving it: there is one process, so there is nothing to lose track of, and
+// "quit" is an ordinary shutdown instead of a kill.
+package tray
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/AgentsHarness/capri-host/internal/hub"
+	"github.com/AgentsHarness/capri-host/internal/netinfo"
+)
+
+// Deps is everything the menu needs from the rest of the program. Function
+// fields rather than concrete types keep the tray independent of how the host
+// is wired, and let the non-Windows build ignore all of it.
+type Deps struct {
+	Version    string
+	Port       int
+	HostID     string
+	HostName   string
+	HubURL     string
+	LogPath    string
+	ConfigPath string
+
+	// HubState returns the live hub link. nil in local mode.
+	HubState func() hub.State
+	// Pair exchanges a pairing code for a token on the running client.
+	// nil in local mode.
+	Pair func(ctx context.Context, code string) error
+	// Quit begins an orderly shutdown of the whole host.
+	Quit func()
+}
+
+// LocalURL is the address to open on this machine.
+func (d Deps) LocalURL() string {
+	return fmt.Sprintf("http://localhost:%d/", d.Port)
+}
+
+// LANURL is the address another device on the same network uses — the one you
+// type into a phone. Empty when this machine has no usable LAN address, which
+// the menu shows by disabling the item rather than opening a URL that cannot
+// work.
+func (d Deps) LANURL(ni netinfo.Info) string {
+	ip := lanIP(ni)
+	if ip == "" {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d/", ip, d.Port)
+}
+
+// lanIP picks the address to hand another device: the default route's source
+// address when it belongs to a real interface, else the first candidate.
+//
+// Preferring the default route's address is what fixes the case the old
+// PowerShell tray got wrong — on a machine running a proxy, adapter metrics put
+// a virtual NIC first and it would advertise an address nothing could reach.
+func lanIP(ni netinfo.Info) string {
+	for _, ifc := range ni.Ifaces {
+		if ifc.IP == ni.Outbound {
+			return ifc.IP
+		}
+	}
+	if len(ni.Ifaces) > 0 {
+		return ni.Ifaces[0].IP
+	}
+	return ni.Outbound
+}
+
+// statusText is the one-line link summary shown in the tooltip and menu.
+//
+// The distinction between "未配对" and "连接中…" is the whole reason the hub
+// client grew a State method: previously nothing could tell them apart, so a
+// host that had never been paired looked identical to one whose hub was simply
+// down, and the only remedy offered for either was to restart the process.
+func statusText(st hub.State) string {
+	switch {
+	case !st.Configured:
+		return "本机模式（未配置 hub）"
+	case !st.Paired:
+		return "未配对"
+	case st.Connected:
+		if st.Transport != "" {
+			return "已连接（" + strings.ToUpper(st.Transport) + "）"
+		}
+		return "已连接"
+	case st.LastError != "":
+		return "未连接"
+	default:
+		return "连接中…"
+	}
+}

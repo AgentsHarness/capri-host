@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AgentsHarness/capri-host/internal/procattr"
 )
 
 const (
@@ -1096,6 +1098,10 @@ func (b *Bridge) ensureProcess() error {
 	b.mu.Unlock()
 
 	cmd := exec.Command(b.cfg.Bin, "agent", "stdio")
+	// The agent talks JSON-RPC over the pipes attached below, so it never
+	// needs a console window. Suppressing it is what keeps a double-clicked
+	// GUI host from popping a terminal (see internal/procattr).
+	procattr.HideConsole(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -3807,6 +3813,9 @@ func shortenHome(path string) string {
 func runGit(cwd string, args ...string) string {
 	cmd := exec.Command("git", append([]string{"-C", cwd}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	// Output is captured, so no window is needed — and this runs often enough
+	// that an unsuppressed console would flash repeatedly under the GUI build.
+	procattr.HideConsole(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
