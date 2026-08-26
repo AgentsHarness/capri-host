@@ -186,6 +186,11 @@ Environment=HOST_NAME=我的服务器
 WantedBy=multi-user.target
 ```
 
+Windows 不用写服务：托盘菜单里的 **开机自启** 开关直接写当前用户的
+`HKCU\...\CurrentVersion\Run`，不需要管理员权限，勾上即生效。注册的命令行带
+`--autostart`，所以登录启动时不会弹浏览器。注册表里存的是绝对路径——挪动 exe
+之后手动启动一次会自动修正；挪完直接重启则不会启动。
+
 ## 常见问题
 
 | 现象 | 处理 |

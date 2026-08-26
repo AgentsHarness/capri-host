@@ -89,9 +89,16 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           ext=""
-          [ "$GOOS" = "windows" ] && ext=".exe"
+          gui=""
+          if [ "$GOOS" = "windows" ]; then
+            ext=".exe"
+            # Windows 版是双击运行的：不带 -H=windowsgui 的二进制是 console
+            # 子系统，Explorer 会替它开一个终端窗口，而托盘存在的前提正是
+            # 没有那个窗口。同时它让 stderr 失效，所以日志走 logs/host.log。
+            gui=" -H=windowsgui"
+          fi
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/capri-host-${GOOS}-${GOARCH}${ext}" ./cmd/capri-host
+          go build -trimpath -ldflags "-s -w${gui} -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/capri-host-${GOOS}-${GOARCH}${ext}" ./cmd/capri-host
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
