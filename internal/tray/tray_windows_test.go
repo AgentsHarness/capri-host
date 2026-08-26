@@ -22,7 +22,6 @@ func fakeMenu(st hub.State, ni netinfo.Info) *menu {
 			Port:       8765,
 			HostID:     "pc",
 			HostName:   "家里的 Windows",
-			HubURL:     st.HubURL,
 			LogPath:    `C:\Users\me\.capri-host\logs\host.log`,
 			ConfigPath: `C:\Users\me\.capri-host\config.toml`,
 			HubState:   func() hub.State { return st },

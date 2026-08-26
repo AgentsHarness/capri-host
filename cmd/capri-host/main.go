@@ -104,43 +104,43 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Hub relay mode: pair with capri-hub and serve requests through it.
-	// The browser talks to the hub; this host keeps working locally too.
-	var hubClient *hub.Client
-	if cfg.HubURL != "" {
-		hubClient = hub.NewClient(hub.Config{
-			URL:         cfg.HubURL,
-			HostID:      cfg.HostID,
-			HostName:    cfg.HostName,
-			PairCode:    cfg.HubPairCode,
-			Token:       cfg.HostToken,
-			LocalBase:   fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
-			AccessToken: cfg.AccessToken,
-			// Same reason as LastSessionFile above: keep every piece of
-			// per-install state under one relocatable directory. The
-			// default resolves to ~/.capri-host/hub.json, which is the
-			// path the client would have chosen on its own.
-			StateFile: filepath.Join(config.AppDir(), "hub.json"),
-			// Optional: bypass proxy/fake-ip DNS for the QUIC transport
-			// (e.g. HUB_QUIC_HOST=203.0.113.10).
-			QUICHost: os.Getenv("HUB_QUIC_HOST"),
-			// Escape hatch for a self-signed hub on a trusted network.
-			// Leave unset in production: the QUIC transport otherwise
-			// verifies the hub certificate whenever HUB_URL is https
-			// (a failure just falls back to WebSocket over verified TLS).
-			QUICInsecure: os.Getenv("HUB_QUIC_INSECURE") == "1",
-			// Pin the hub's QUIC certificate SPKI (HUB_QUIC_PIN, sha256
-			// hex/base64 — see docs/DEPLOY.md). Replaces CA verification
-			// with an exact fingerprint match; the safe way to run QUIC
-			// against a self-signed hub cert you control.
-			QUICPin: cfg.HubQUICPin,
-		})
-		// The reference is kept this time. Dropping it is what made the
-		// pairing code a startup-only input and left nothing able to report
-		// whether the relay was actually up.
-		srv.SetHubController(hubClient)
-		go hubClient.Run(ctx, bridge)
-	}
+	// The hub manager is built unconditionally, even with no HUB_URL. That is
+	// what makes the tray's pairing entry work for a fresh install: a user who
+	// has never configured anything can type a hub address into the dialog and
+	// the manager retargets a client at it, with no restart and no hand-edited
+	// config file.
+	hubMgr := hub.NewManager(hub.Config{
+		URL:         cfg.HubURL,
+		HostID:      cfg.HostID,
+		HostName:    cfg.HostName,
+		PairCode:    cfg.HubPairCode,
+		Token:       cfg.HostToken,
+		LocalBase:   fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+		AccessToken: cfg.AccessToken,
+		// Same reason as LastSessionFile above: keep every piece of
+		// per-install state under one relocatable directory. The
+		// default resolves to ~/.capri-host/hub.json, which is the
+		// path the client would have chosen on its own.
+		StateFile: filepath.Join(config.AppDir(), "hub.json"),
+		// Optional: bypass proxy/fake-ip DNS for the QUIC transport
+		// (e.g. HUB_QUIC_HOST=203.0.113.10).
+		QUICHost: os.Getenv("HUB_QUIC_HOST"),
+		// Escape hatch for a self-signed hub on a trusted network.
+		// Leave unset in production: the QUIC transport otherwise
+		// verifies the hub certificate whenever HUB_URL is https
+		// (a failure just falls back to WebSocket over verified TLS).
+		QUICInsecure: os.Getenv("HUB_QUIC_INSECURE") == "1",
+		// Pin the hub's QUIC certificate SPKI (HUB_QUIC_PIN, sha256
+		// hex/base64 — see docs/DEPLOY.md). Replaces CA verification
+		// with an exact fingerprint match; the safe way to run QUIC
+		// against a self-signed hub cert you control.
+		QUICPin: cfg.HubQUICPin,
+	}, persistHubChoice(cfg))
+	// The reference is kept this time. Dropping it is what made the pairing
+	// code a startup-only input and left nothing able to report whether the
+	// relay was actually up.
+	srv.SetHubController(hubMgr)
+	go hubMgr.Run(ctx, bridge)
 
 	// Eager boot in background (non-fatal if grok missing until first prompt).
 	// Boot only warms the agent process — it does NOT create a session, so
@@ -194,14 +194,11 @@ func main() {
 			Port:       cfg.Port,
 			HostID:     cfg.HostID,
 			HostName:   cfg.HostName,
-			HubURL:     cfg.HubURL,
 			LogPath:    logPath(logFile),
 			ConfigPath: config.ConfigPath(),
+			HubState:   hubMgr.State,
+			PairWith:   hubMgr.PairWith,
 			Quit:       stop,
-		}
-		if hubClient != nil {
-			deps.HubState = hubClient.State
-			deps.Pair = hubClient.Pair
 		}
 		// A signal (or any other cancel) must also take the tray down, or
 		// Run would keep blocking main after the rest has shut down.
@@ -222,6 +219,33 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	bridge.Shutdown()
+}
+
+// persistHubChoice returns the callback the hub manager invokes after pairing
+// against a new address, so the choice survives a restart.
+//
+// It also settles the host's identity, which is not incidental: the hub keys
+// its host table by host id, so every unconfigured host arriving as the
+// compiled default would displace the previous one. A user who never edited a
+// config file has no other moment at which an identity could be chosen, and
+// pairing is the first time it starts to matter.
+func persistHubChoice(cfg config.Config) hub.PairPersist {
+	return func(hubURL string) error {
+		s := config.Settings{HubURL: config.String(hubURL)}
+
+		if cfg.HostID == config.DefaultHostID && cfg.HostName == config.DefaultHostName {
+			if id, name, ok := config.MachineHostIdentity(); ok {
+				s.HostID = config.String(id)
+				s.HostName = config.String(name)
+				log.Printf("[capri-host] 本机标识仍是默认值，已按机器名写入 host_id=%s host_name=%q（重启后生效）", id, name)
+			}
+		}
+		if err := config.Save(s); err != nil {
+			return err
+		}
+		log.Printf("[capri-host] hub 地址已写入 %s", config.ConfigPath())
+		return nil
+	}
 }
 
 // waitForListen reports whether the port accepts connections within timeout.

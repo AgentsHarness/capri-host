@@ -24,17 +24,30 @@ type Deps struct {
 	Port       int
 	HostID     string
 	HostName   string
-	HubURL     string
 	LogPath    string
 	ConfigPath string
 
-	// HubState returns the live hub link. nil in local mode.
+	// HubState returns the live hub link. Never nil in practice: the host
+	// always builds a hub manager, so that a machine with no hub configured
+	// still has something for the pairing menu entry to talk to.
+	//
+	// The hub address deliberately is NOT a field here. It can change while
+	// the process runs — that is the point of the pairing dialog — so reading
+	// it from the snapshot is the only way the menu cannot go stale.
 	HubState func() hub.State
-	// Pair exchanges a pairing code for a token on the running client.
-	// nil in local mode.
-	Pair func(ctx context.Context, code string) error
+	// PairWith points the host at hubURL (empty = keep the current one) and
+	// exchanges code for a token, without a restart.
+	PairWith func(ctx context.Context, hubURL, code string) error
 	// Quit begins an orderly shutdown of the whole host.
 	Quit func()
+}
+
+// HubURL is the currently configured hub, empty in local mode.
+func (d Deps) HubURL() string {
+	if d.HubState == nil {
+		return ""
+	}
+	return d.HubState().HubURL
 }
 
 // LocalURL is the address to open on this machine.

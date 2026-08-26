@@ -60,7 +60,9 @@ type menu struct {
 	deps  Deps
 	sleep *power.Inhibitor
 
-	hubMode bool
+	// canPair is true when the host wired up a hub manager, which it always
+	// does — including in local mode, so pairing has an entry point.
+	canPair bool
 
 	mLAN   *systray.MenuItem
 	mHub   *systray.MenuItem
@@ -80,7 +82,11 @@ type menu struct {
 }
 
 func (t *menu) onReady() {
-	t.hubMode = t.deps.HubURL != "" && t.deps.HubState != nil && t.deps.Pair != nil
+	// The pairing entry is unconditional. Gating it on a hub already being
+	// configured is what made the feature unreachable for a new user: with no
+	// hub_url there was no menu item, and the only way to get one was to
+	// hand-author a TOML file they had never been told about.
+	t.canPair = t.deps.PairWith != nil && t.deps.HubState != nil
 
 	if icon, err := assets.ReadFile("assets/capri.ico"); err == nil {
 		systray.SetIcon(icon)
@@ -104,16 +110,15 @@ func (t *menu) onReady() {
 
 	mLocal := systray.AddMenuItem("打开本机地址", t.deps.LocalURL())
 	t.mLAN = systray.AddMenuItem("打开内网地址", "同一局域网内的手机/平板用这个地址")
-	if t.deps.HubURL != "" {
-		t.mHub = systray.AddMenuItem("打开 hub 地址", t.deps.HubURL)
-		// Starts hidden: until the state is read, "paired" is unknown, and
-		// showing it first would flash an item that then disappears.
-		t.mHub.Hide()
-	}
+	// Created unconditionally because the hub address can be set at runtime.
+	// Starts hidden: until the first state read, "paired" is unknown, and
+	// showing it would flash an item that then disappears.
+	t.mHub = systray.AddMenuItem("打开 hub 地址", "配对成功后可用")
+	t.mHub.Hide()
 
 	systray.AddSeparator()
-	if t.hubMode {
-		t.mPair = systray.AddMenuItem("配对 hub…", "输入 hub 上显示的 6 位配对码")
+	if t.canPair {
+		t.mPair = systray.AddMenuItem("配对 hub…", "填写 hub 地址并输入 6 位配对码")
 	}
 	t.mAwake = systray.AddMenuItemCheckbox("阻止电脑休眠", "按住系统电源请求，屏幕仍可正常息屏", false)
 	if !power.Supported() {
@@ -139,9 +144,7 @@ func (t *menu) onReady() {
 	// goroutine would freeze every other menu item behind it.
 	go t.watch(mLocal.ClickedCh, func() { OpenURL(t.deps.LocalURL()) })
 	go t.watch(t.mLAN.ClickedCh, t.onOpenLAN)
-	if t.mHub != nil {
-		go t.watch(t.mHub.ClickedCh, func() { OpenURL(t.deps.HubURL) })
-	}
+	go t.watch(t.mHub.ClickedCh, t.onOpenHub)
 	if t.mPair != nil {
 		go t.watch(t.mPair.ClickedCh, t.onPair)
 	}
@@ -157,8 +160,8 @@ func (t *menu) onReady() {
 	// Logged last, so its presence in the log proves the icon was created and
 	// every handler is attached. Without it the only evidence the tray came up
 	// is that the process failed to exit, which is not evidence at all.
-	log.Printf("[tray] 托盘已就绪（hub 模式=%v，休眠控制=%v，开机自启=%v）",
-		t.hubMode, power.Supported(), autostart.Enabled())
+	log.Printf("[tray] 托盘已就绪（可配对=%v，hub=%q，休眠控制=%v，开机自启=%v）",
+		t.canPair, t.deps.HubURL(), power.Supported(), autostart.Enabled())
 }
 
 // watch runs fn for every click on ch. ClickedCh is closed when the tray shuts
@@ -236,9 +239,15 @@ func (t *menu) refresh() {
 			}
 			t.hubShown = st.Paired
 		}
+		if st.Paired {
+			t.mHub.SetTooltip(st.HubURL)
+		}
 	}
 
 	if t.mPair != nil {
+		// The label carries the state because this one item is both "set up a
+		// hub" and "re-pair an existing one", and which of those it means
+		// depends entirely on the state.
 		t.mPair.SetTitle("配对 hub…（" + statusText(st) + "）")
 	}
 	// Keep the checkbox honest even if Enable/Disable failed underneath us.
@@ -286,36 +295,103 @@ func (t *menu) onOpenLAN() {
 	OpenURL(u)
 }
 
+func (t *menu) onOpenHub() {
+	if u := t.deps.HubURL(); u != "" {
+		OpenURL(u)
+	}
+}
+
 func (t *menu) onPair() {
 	st := t.state()
-	prompt := strings.Join([]string{
-		"输入 hub 上显示的 6 位配对码：",
-		"",
-		"hub 地址：" + st.HubURL,
-		"当前状态：" + statusText(st),
-		"",
-		"配对码在 hub 的启动日志里（docker logs capri-hub），",
-		"也可以直接读 hub 的 GET /api/pairing。15 分钟过期。",
-	}, "\n")
 
-	code, err := zenity.Entry(prompt, zenity.Title("配对 hub"))
-	if err != nil {
-		return // cancelled
+	hubURL, ok := t.askHubURL(st)
+	if !ok {
+		return
 	}
-	if strings.TrimSpace(code) == "" {
+	code, ok := t.askPairCode(hubURL)
+	if !ok {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), pairDialogTimeout)
 	defer cancel()
-	if err := t.deps.Pair(ctx, code); err != nil {
+	if err := t.deps.PairWith(ctx, hubURL, code); err != nil {
 		log.Printf("[tray] 配对失败: %v", err)
 		_ = zenity.Error("配对失败：\n\n"+err.Error(), zenity.Title("配对失败"))
 		return
 	}
-	log.Printf("[tray] 配对成功")
-	_ = zenity.Info("配对成功。正在用新凭证重新连接 hub。", zenity.Title("配对成功"))
+
+	// Read back rather than echoing what was typed: PairWith normalises the
+	// address, so this is where the user finds out that "1.2.3.4" became
+	// "https://1.2.3.4".
+	now := t.state()
+	log.Printf("[tray] 配对成功，hub=%s", now.HubURL)
+	_ = zenity.Info("配对成功。\n\nhub 地址："+now.HubURL+"\n正在用新凭证连接，地址已写入配置文件。",
+		zenity.Title("配对成功"))
 	t.refresh()
+}
+
+// askHubURL prompts for the hub address, pre-filled with the current one so
+// re-pairing the same hub is a matter of pressing Enter.
+func (t *menu) askHubURL(st hub.State) (string, bool) {
+	prompt := strings.Join([]string{
+		"hub 地址：",
+		"",
+		"例如  https://hub.example.com",
+		"或    http://192.168.1.10:8787",
+		"",
+		"不写 http:// 或 https:// 时按 https 处理；",
+		"没有证书的 hub 请显式填 http://。",
+	}, "\n")
+
+	u, err := zenity.Entry(prompt,
+		zenity.Title("配对 hub — 1/2 地址"),
+		zenity.EntryText(st.HubURL))
+	if err != nil {
+		return "", false // cancelled
+	}
+	u = strings.TrimSpace(u)
+	if u == "" {
+		_ = zenity.Error("hub 地址不能为空。", zenity.Title("配对 hub"))
+		return "", false
+	}
+	// Validate before asking for a code: a pairing code expires in 15 minutes,
+	// so making the user fetch one and only then rejecting the address wastes
+	// the code and possibly a trip to the server.
+	norm, err := hub.NormalizeHubURL(u)
+	if err != nil {
+		_ = zenity.Error(err.Error(), zenity.Title("hub 地址无效"))
+		return "", false
+	}
+	return norm, true
+}
+
+// askPairCode prompts for the 6-character code.
+func (t *menu) askPairCode(hubURL string) (string, bool) {
+	prompt := strings.Join([]string{
+		"输入 hub 上显示的 6 位配对码：",
+		"",
+		"hub 地址：" + hubURL,
+		"",
+		"配对码在 hub 的启动日志里（docker logs capri-hub），",
+		"也可以读 hub 的 GET /api/pairing。15 分钟过期。",
+	}, "\n")
+
+	code, err := zenity.Entry(prompt, zenity.Title("配对 hub — 2/2 配对码"))
+	if err != nil {
+		return "", false // cancelled
+	}
+	if strings.TrimSpace(code) == "" {
+		return "", false
+	}
+	// Checked here as well as in the manager so a typo costs one dialog rather
+	// than a round trip against the hub's per-IP pairing rate limit.
+	norm := hub.NormalizePairCode(code)
+	if err := hub.ValidatePairCode(norm); err != nil {
+		_ = zenity.Error(err.Error(), zenity.Title("配对码无效"))
+		return "", false
+	}
+	return norm, true
 }
 
 func (t *menu) onToggleAutostart() {
@@ -376,7 +452,7 @@ func (t *menu) infoText() string {
 
 	st := t.state()
 	if !st.Configured {
-		b.WriteString("hub 地址：未配置（仅本机模式）\n")
+		b.WriteString("hub 地址：未配置（用「配对 hub」填写地址并配对）\n")
 	} else {
 		fmt.Fprintf(&b, "hub 地址：%s\n", st.HubURL)
 	}

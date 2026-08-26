@@ -11,14 +11,15 @@ import (
 )
 
 // HubController is the slice of the hub client this API needs. Declaring it as
-// an interface rather than taking *hub.Client keeps the handlers testable with
-// a stub and documents exactly how much of the client the HTTP layer may
+// an interface rather than taking *hub.Manager keeps the handlers testable with
+// a stub and documents exactly how much of the hub layer the HTTP layer may
 // touch.
 type HubController interface {
 	// State returns a snapshot of the hub link.
 	State() hub.State
-	// Pair exchanges a pairing code for a token and adopts it live.
-	Pair(ctx context.Context, code string) error
+	// PairWith points the host at hubURL (empty = keep the current one) and
+	// exchanges code for a token, adopting it live.
+	PairWith(ctx context.Context, hubURL, code string) error
 }
 
 // SetHubController injects the live hub client after New has returned.
@@ -65,6 +66,10 @@ func (s *Server) handleHubState(w http.ResponseWriter, r *http.Request) {
 
 type hubPairBody struct {
 	Code string `json:"code"`
+	// HubURL is optional. Supplying it points the host at that hub, which is
+	// what lets a browser complete first-time setup on a host that was started
+	// with no hub configured at all — the same thing the tray dialog does.
+	HubURL string `json:"hubUrl"`
 }
 
 // hubPairTimeout bounds one pairing attempt. The client's own http.Client
@@ -82,7 +87,7 @@ func (s *Server) handleHubPair(w http.ResponseWriter, r *http.Request) {
 	ctl := s.hubController()
 	if ctl == nil {
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"ok": false, "error": "本机未配置 hub（需要设置 HUB_URL）",
+			"ok": false, "error": "本机未启用 hub 客户端",
 		})
 		return
 	}
@@ -94,7 +99,7 @@ func (s *Server) handleHubPair(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), hubPairTimeout)
 	defer cancel()
 
-	if err := ctl.Pair(ctx, body.Code); err != nil {
+	if err := ctl.PairWith(ctx, body.HubURL, body.Code); err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, hub.ErrBadPairCode) {
 			status = http.StatusBadRequest

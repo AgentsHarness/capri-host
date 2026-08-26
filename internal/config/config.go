@@ -42,12 +42,22 @@ type Config struct {
 	ConfigError error
 }
 
+// DefaultHostID and DefaultHostName are the compiled-in identity used when
+// nothing else supplies one. Exported so a caller can tell "the user never
+// chose an identity" from "the user chose this one" — the hub keys its host
+// table by id, so leaving every unconfigured host on the same default makes
+// two of them displace each other on the same hub.
+const (
+	DefaultHostID   = "local"
+	DefaultHostName = "Local Host"
+)
+
 func Load() Config {
 	c := Config{
 		Port:        8765,
 		GrokBin:     "grok",
-		HostID:      "local",
-		HostName:    "Local Host",
+		HostID:      DefaultHostID,
+		HostName:    DefaultHostName,
 		OpenBrowser: true,
 		EnableTray:  true,
 	}

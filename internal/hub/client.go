@@ -491,6 +491,13 @@ func (c *Client) stateFileLocked() string {
 	if c.cfg.StateFile != "" {
 		return c.cfg.StateFile
 	}
+	return defaultStateFile()
+}
+
+// defaultStateFile is where the pairing token lives when Config.StateFile is
+// unset. Package-level so the manager resolves the same path rather than
+// keeping its own copy of the rule.
+func defaultStateFile() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -499,7 +506,17 @@ func (c *Client) stateFileLocked() string {
 }
 
 func (c *Client) loadStateLocked() *stateFile {
-	path := c.stateFileLocked()
+	return readStateFile(c.stateFileLocked())
+}
+
+func (c *Client) saveStateLocked(st stateFile) {
+	_ = writeStateFile(c.stateFileLocked(), st)
+}
+
+// readStateFile returns the persisted pairing, or nil when there is none to
+// read. Package-level so the manager can inspect a token without holding some
+// particular client's mutex.
+func readStateFile(path string) *stateFile {
 	if path == "" {
 		return nil
 	}
@@ -514,14 +531,19 @@ func (c *Client) loadStateLocked() *stateFile {
 	return &st
 }
 
-func (c *Client) saveStateLocked(st stateFile) {
-	path := c.stateFileLocked()
+// writeStateFile persists a pairing at 0600 — it holds a hub credential.
+func writeStateFile(path string, st stateFile) error {
 	if path == "" {
-		return
+		return nil
 	}
-	b, _ := json.Marshal(st)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, b, 0o600)
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
 
 // clearState forgets the persisted token so the next Run re-pairs.
