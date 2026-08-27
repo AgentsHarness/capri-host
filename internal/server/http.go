@@ -14,10 +14,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/AgentsHarness/capri-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/procattr"
 )
 
 type Server struct {
@@ -30,6 +32,12 @@ type Server struct {
 	// The handler runs it detached from the client connection so a browser
 	// crash mid-turn does not cancel the turn (the grok agent keeps running).
 	promptFn func(ctx context.Context, sessionID string, blocks []acp.ContentBlock) (string, error)
+
+	// hubCtl is the live hub client, injected by main after New (see
+	// SetHubController). nil in local mode and in every test that does not
+	// care about hub state.
+	hubMu  sync.Mutex
+	hubCtl HubController
 }
 
 func New(cfg config.Config, bridge *acp.Bridge) *Server {
@@ -37,6 +45,10 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /events", s.handleSSE)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
+	// Hub link: read the pairing/connection state, and pair at runtime with
+	// a code read off the hub. See http_hub.go.
+	mux.HandleFunc("GET /api/hub/state", s.handleHubState)
+	mux.HandleFunc("POST /api/hub/pair", s.handleHubPair)
 	mux.HandleFunc("POST /api/prompt", s.handlePrompt)
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
 	mux.HandleFunc("POST /api/agent-restart", s.handleAgentRestart)
@@ -263,6 +275,13 @@ var sensitiveEndpointPaths = []string{
 	"/api/shell",
 	"/api/api-key-get",
 	"/api/api-key-set",
+	// Pairing rewrites this host's persisted hub credential. A remote page
+	// cannot point us at a hub of its own (the URL comes from config, not
+	// the request), so the exposure is narrow — but it is still a
+	// state-changing privileged write, and the local-origin gate costs
+	// nothing here: localhost origins, which is all the dev server and the
+	// relayed tunnel ever present, still pass.
+	"/api/hub/pair",
 }
 
 // isSensitiveEndpoint reports whether r targets a sensitive endpoint.
@@ -1425,6 +1444,9 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "sh", "-c", body.Command)
 		cmd.Dir = cwd
+		// Both streams are captured below, so the child needs no console
+		// window — without this the GUI build flashes a terminal per call.
+		procattr.HideConsole(cmd)
 		// stdout and stderr share the same 16 MiB cap; stderr is folded into
 		// the same truncation accounting, so `truncated` flips when either
 		// stream overflows.
