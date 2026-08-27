@@ -23,7 +23,6 @@
 **Capri**（Capricorn）是 [Grok Build](https://x.ai/cli) 的具体适配项目，我们基于 ACP 协议，搭配 capri-fe、capri-hub 实现远程 Agent 控制。
 
 一个进程、一个端口，同时提供 **Web 界面** 和接口。Windows 上还内置**系统托盘**——
-双击 exe 就能跑，不需要启动脚本，也不弹终端窗口。
 
 ```
 浏览器  ──本机──▶  capri-host :8765  ──▶  grok
@@ -40,13 +39,8 @@
 
 2、从 [Releases](https://github.com/AgentsHarness/capri-host/releases) 选你的平台。
 
-**Windows**：把 `capri-host-windows-amd64.exe` 放到任意目录（`C:\Tools\`、
-`%USERPROFILE%\.capri-host\` 都行，别放在会被自动清理的下载目录或 OneDrive
-按需同步目录里），**双击运行**。它不读自己所在目录的任何文件，所以随时可以挪
-位置。首次运行 SmartScreen 可能拦一次，点「更多信息 → 仍要运行」。
+**Windows**：首次运行 SmartScreen 可能拦一次，点「更多信息 → 仍要运行」。
 
-启动后浏览器会自动打开 <http://localhost:8765>，任务栏通知区域出现托盘图标。
-重复双击不会启动第二个进程，只会再打开一次页面。
 
 **macOS / Linux**：
 
@@ -71,8 +65,6 @@ Windows 上要构建出「双击不弹黑框」的版本，必须带 `-H=windows
 go build -ldflags "-s -w -H=windowsgui" -o capri-host.exe ./cmd/capri-host
 ```
 
-任何平台启动后都会自动打开 <http://localhost:8765>，不想要就设
-`CAPRI_OPEN_BROWSER=0`。
 
 ## 系统托盘（Windows）
 
@@ -131,9 +123,6 @@ hub_url  = 'https://hub.example.com'
 | `open_browser`              | `CAPRI_OPEN_BROWSER`  |
 | `tray`                      | `CAPRI_TRAY`          |
 
-从旧的 PowerShell 启动脚本升级过来时，只要 `config.toml` 还不存在，首次运行会
-自动把同目录 `env.ps1` 里的 `$env:NAME = "value"` 迁移成 `config.toml`；`env.ps1`
-不会被删除。
 
 ### 文件位置
 
@@ -155,7 +144,7 @@ hub_url  = 'https://hub.example.com'
 当前有效的码。
 
 **Windows：托盘 → 配对 hub…**，依次填 hub 地址和配对码，成功后地址自动写回
-`config.toml`，不需要碰任何文件。
+`config.toml`。
 
 **其他平台**（或想用环境变量的话）：
 
