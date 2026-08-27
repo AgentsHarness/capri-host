@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-host/internal/config"
 )
 
 // This file exists so the hub address itself can be chosen at runtime, not
@@ -148,6 +149,51 @@ func (m *Manager) HubURL() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.cfg.URL
+}
+
+// HostName is the display name currently in use (after the boot-time
+// identity adoption), shown in the tray tooltip and the info dialog.
+func (m *Manager) HostName() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.HostName
+}
+
+// Rename updates the host's display name everywhere it appears: the hub
+// registry (so browsers see the new name live), the running bridge (so the
+// local API and grok frames use it), and config.toml (so it survives a
+// restart). An empty or whitespace-only name is refused.
+//
+// The hub update runs through the live client when one is connected; in
+// local mode or before the first pairing it is skipped (there is no hub to
+// tell). A hub-side failure is reported but does not roll back the local
+// change: the name is the user's choice and the hub rename is best-effort
+// (the next event frame carries the new name anyway, and the hub will
+// reconcile when it sees it).
+func (m *Manager) Rename(ctx context.Context, newName string) error {
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return errors.New("本机代号不能为空")
+	}
+
+	m.mu.Lock()
+	m.cfg.HostName = newName
+	cl := m.cur
+	m.mu.Unlock()
+
+	if err := config.Save(config.Settings{HostName: config.String(newName)}); err != nil {
+		log.Printf("[hub-manager] 改名写回配置失败（本次运行仍然生效）: %v", err)
+	}
+	if m.bridge != nil {
+		m.bridge.SetHostName(newName)
+	}
+	if cl != nil {
+		if err := cl.Rename(ctx, newName); err != nil {
+			log.Printf("[hub-manager] 通知 hub 改名失败（本地已更新）: %v", err)
+		}
+	}
+	log.Printf("[hub-manager] 本机代号已改为 %q", newName)
+	return nil
 }
 
 // Pair pairs against the hub already configured. It satisfies the server's

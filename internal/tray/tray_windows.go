@@ -127,6 +127,10 @@ func (t *menu) onReady() {
 
 	systray.AddSeparator()
 	mInfo := systray.AddMenuItem("连接信息…", "本机名称、本机/内网/hub 地址与配对状态")
+	mName := systray.AddMenuItem("本机代号…", "修改本机在网页端和 hub 上的显示名")
+	if t.deps.Rename == nil {
+		mName.Disable()
+	}
 	t.mBoot = systray.AddMenuItemCheckbox("开机自启", "登录 Windows 时自动启动（默认关闭）", autostart.Enabled())
 	if !autostart.Supported() {
 		t.mBoot.Disable()
@@ -150,6 +154,7 @@ func (t *menu) onReady() {
 	}
 	go t.watch(t.mAwake.ClickedCh, t.onToggleAwake)
 	go t.watch(mInfo.ClickedCh, t.onInfo)
+	go t.watch(mName.ClickedCh, t.onRename)
 	go t.watch(t.mBoot.ClickedCh, t.onToggleAutostart)
 	go t.watch(mLog.ClickedCh, func() { openPath(t.deps.LogPath) })
 	go t.watch(mQuit.ClickedCh, t.onQuit)
@@ -211,7 +216,7 @@ func (t *menu) netSnapshot() netinfo.Info {
 
 func (t *menu) refresh() {
 	st := t.state()
-	tip := fmt.Sprintf("Capri Host %s — %s\n%s", t.deps.Version, t.deps.HostName, statusText(st))
+	tip := fmt.Sprintf("Capri Host %s — %s\n%s", t.deps.Version, t.deps.LiveHostName(), statusText(st))
 	systray.SetTooltip(tip)
 
 	// LAN item: the address is only knowable at runtime and can vanish when a
@@ -331,6 +336,42 @@ func (t *menu) onPair() {
 	t.refresh()
 }
 
+// renameDialogTimeout bounds one rename attempt against the hub.
+const renameDialogTimeout = 15 * time.Second
+
+// onRename prompts for a new display name and applies it. The current name is
+// pre-filled so a quick correction is one edit + Enter. The name is applied
+// locally (bridge + config) and pushed to the hub when paired; a hub failure
+// is reported but does not undo the local change — the next event frame
+// carries the new name regardless.
+func (t *menu) onRename() {
+	cur := t.deps.LiveHostName()
+	in, err := zenity.Entry("输入新的本机代号（在网页端和 hub 上的显示名）：",
+		zenity.Title("本机代号"),
+		zenity.EntryText(cur))
+	if err != nil {
+		return // cancelled
+	}
+	name := strings.TrimSpace(in)
+	if name == "" {
+		_ = zenity.Error("本机代号不能为空。", zenity.Title("本机代号"))
+		return
+	}
+	if name == cur {
+		return // nothing to do
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), renameDialogTimeout)
+	defer cancel()
+	if err := t.deps.Rename(ctx, name); err != nil {
+		log.Printf("[tray] 改名失败: %v", err)
+		_ = zenity.Error("改名失败：\n\n"+err.Error(), zenity.Title("本机代号"))
+		return
+	}
+	_ = zenity.Info("本机代号已改为："+name+"\n\n已写入配置文件，下次启动仍然生效。",
+		zenity.Title("本机代号"))
+	t.refresh()
+}
+
 // askHubURL prompts for the hub address, pre-filled with the current one so
 // re-pairing the same hub is a matter of pressing Enter.
 func (t *menu) askHubURL(st hub.State) (string, bool) {
@@ -439,7 +480,7 @@ func (t *menu) infoText() string {
 	ni := t.netSnapshot()
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "本机名称：%s\n", t.deps.HostName)
+	fmt.Fprintf(&b, "本机名称：%s\n", t.deps.LiveHostName())
 	fmt.Fprintf(&b, "Host ID：%s\n", t.deps.HostID)
 	fmt.Fprintf(&b, "版本：%s　端口：%d\n\n", t.deps.Version, t.deps.Port)
 

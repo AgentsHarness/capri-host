@@ -194,6 +194,18 @@ type clientRequest struct {
 	meta map[string]any
 }
 
+// SetHostName updates the display name shown in snapshots and the messages
+// sent to grok. It is called by the tray's rename action so the new name
+// takes effect immediately, not only after a restart. The write happens
+// under b.mu (which Snapshot already holds when reading hostName); the
+// unguarded reads in the stdio loop are benign on amd64 and, worst case,
+// show a stale name for one frame until the next read picks up the new one.
+func (b *Bridge) SetHostName(name string) {
+	b.mu.Lock()
+	b.hostName = name
+	b.mu.Unlock()
+}
+
 func NewBridge(cfg GrokConfig) *Bridge {
 	homeDir, _ := os.UserHomeDir()
 	b := &Bridge{

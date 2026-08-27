@@ -68,6 +68,21 @@ func main() {
 		log.Printf("[capri-host] 已读取配置 %s", cfg.ConfigSource)
 	}
 
+	// Adopt a per-machine identity BEFORE anything that can pair. The hub
+	// keys its host table by host id, so a first pairing against the
+	// compiled default "local" would mint a token bound to "local" and every
+	// unconfigured host on the same hub would displace the previous one.
+	// Deriving the id from the OS hostname is stable across restarts, so a
+	// token minted now still matches after a restart. Nothing is written to
+	// disk here: the derivation reproduces the same id, and persistHubChoice
+	// still stamps it into config.toml on the first successful pairing.
+	if cfg.HostID == config.DefaultHostID && cfg.HostName == config.DefaultHostName {
+		if id, name, ok := config.MachineHostIdentity(); ok {
+			cfg.HostID, cfg.HostName = id, name
+			log.Printf("[capri-host] 采用本机标识 host_id=%s host_name=%q", id, name)
+		}
+	}
+
 	localURL := fmt.Sprintf("http://localhost:%d/", cfg.Port)
 
 	// One host per session. Two copies would race for the port and the loser
@@ -198,6 +213,7 @@ func main() {
 			ConfigPath: config.ConfigPath(),
 			HubState:   hubMgr.State,
 			PairWith:   hubMgr.PairWith,
+			Rename:     hubMgr.Rename,
 			Quit:       stop,
 		}
 		// A signal (or any other cancel) must also take the tray down, or
@@ -224,21 +240,20 @@ func main() {
 // persistHubChoice returns the callback the hub manager invokes after pairing
 // against a new address, so the choice survives a restart.
 //
-// It also settles the host's identity, which is not incidental: the hub keys
-// its host table by host id, so every unconfigured host arriving as the
-// compiled default would displace the previous one. A user who never edited a
-// config file has no other moment at which an identity could be chosen, and
-// pairing is the first time it starts to matter.
+// It also stamps the adopted machine identity into config.toml on the first
+// pairing: the id was already derived in main and used for this pairing, but
+// nothing else writes it down, so a restart without a config file would come
+// up as the default again. The derivation is stable, so writing it here only
+// makes the choice explicit rather than re-derived every launch.
 func persistHubChoice(cfg config.Config) hub.PairPersist {
 	return func(hubURL string) error {
 		s := config.Settings{HubURL: config.String(hubURL)}
-
-		if cfg.HostID == config.DefaultHostID && cfg.HostName == config.DefaultHostName {
-			if id, name, ok := config.MachineHostIdentity(); ok {
-				s.HostID = config.String(id)
-				s.HostName = config.String(name)
-				log.Printf("[capri-host] 本机标识仍是默认值，已按机器名写入 host_id=%s host_name=%q（重启后生效）", id, name)
-			}
+		// Only persist the identity when it is NOT the compiled default: a
+		// host whose hostname could not be derived stays on "local" and
+		// writing that would pin the collision-prone default forever.
+		if cfg.HostID != config.DefaultHostID {
+			s.HostID = config.String(cfg.HostID)
+			s.HostName = config.String(cfg.HostName)
 		}
 		if err := config.Save(s); err != nil {
 			return err

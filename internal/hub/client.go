@@ -322,7 +322,7 @@ func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
 		// The negative cache (pickTransport) skips QUIC while in cooldown
 		// so a UDP-blocked network does not pay the dial timeout on every
 		// reconnect.
-		err := error(nil)
+		var err error
 		sessionStart := time.Now()
 		if c.pickTransport() == "ws" {
 			err = c.wsSession(sessCtx, bridge)

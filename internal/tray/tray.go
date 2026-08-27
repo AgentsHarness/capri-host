@@ -38,6 +38,10 @@ type Deps struct {
 	// PairWith points the host at hubURL (empty = keep the current one) and
 	// exchanges code for a token, without a restart.
 	PairWith func(ctx context.Context, hubURL, code string) error
+	// Rename changes this host's display name (hub registry, bridge,
+	// config.toml) without a restart. The tray dialog calls it with the name
+	// the user typed.
+	Rename func(ctx context.Context, newName string) error
 	// Quit begins an orderly shutdown of the whole host.
 	Quit func()
 }
@@ -48,6 +52,19 @@ func (d Deps) HubURL() string {
 		return ""
 	}
 	return d.HubState().HubURL
+}
+
+// LiveHostName is the display name to show in the tooltip / info dialog. It
+// prefers the live hub state (which reflects a rename the tray itself just
+// performed, since the manager updates cfg.HostName synchronously) and falls
+// back to the compiled-in field before the hub manager is wired.
+func (d Deps) LiveHostName() string {
+	if d.HubState != nil {
+		if n := d.HubState().HostName; n != "" {
+			return n
+		}
+	}
+	return d.HostName
 }
 
 // LocalURL is the address to open on this machine.

@@ -1,10 +1,15 @@
 package hub
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -136,6 +141,46 @@ func (c *Client) Pair(ctx context.Context, code string) error {
 	c.setLastErr(nil)
 	log.Printf("[hub-client] 配对成功，token 已保存到 %s", path)
 	c.requestRepair()
+	return nil
+}
+
+// Rename updates this host's display name on the hub. It hits the admin
+// rename endpoint (FE_TOKEN-gated, not the host pairing token), so a host
+// with no AccessToken cannot rename — the caller reports that. The hub
+// updates its registry live (no reconnection needed): the next event frame
+// this client sends already carries the new name, and browsers refresh via
+// the hub's hosts_changed broadcast. c.cfg.HostName is updated on success so
+// subsequent frames are consistent.
+func (c *Client) Rename(ctx context.Context, newName string) error {
+	if c.cfg.URL == "" {
+		return errors.New("未配置 hub，无法在 hub 上改名")
+	}
+	if c.cfg.AccessToken == "" {
+		return errors.New("hub 未设置 FE_TOKEN，无法通过本机改名（请在 hub 侧管理界面改名）")
+	}
+	body, _ := json.Marshal(map[string]any{"hostName": newName})
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		c.cfg.URL+"/api/hosts/"+url.PathEscape(c.cfg.HostID)+"/rename", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.AccessToken)
+	res, err := c.httpc.Do(req)
+	if err != nil {
+		return fmt.Errorf("无法连接 hub: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		var out struct{ Error string `json:"error"` }
+		_ = json.NewDecoder(io.LimitReader(res.Body, 4<<10)).Decode(&out)
+		if out.Error != "" {
+			return fmt.Errorf("hub 拒绝改名: %s", out.Error)
+		}
+		return fmt.Errorf("hub 拒绝改名 (HTTP %d)", res.StatusCode)
+	}
+	c.cfg.HostName = newName
+	log.Printf("[hub-client] hub 上的显示名已更新为 %q", newName)
 	return nil
 }
 

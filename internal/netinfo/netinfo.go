@@ -53,18 +53,16 @@ func Local() Info {
 // rather than guessing from adapter metrics, which is where the previous
 // PowerShell tray picked wrong on machines running a proxy.
 func OutboundIP() string {
-	for _, probe := range []string{"8.8.8.8:80", "1.1.1.1:80", "223.5.5.5:80"} {
-		conn, err := net.DialTimeout("udp4", probe, 2*time.Second)
-		if err != nil {
-			continue
-		}
-		addr, ok := conn.LocalAddr().(*net.UDPAddr)
-		_ = conn.Close()
-		if ok && addr.IP != nil && !addr.IP.IsUnspecified() {
-			return addr.IP.String()
-		}
+	conn, err := net.DialTimeout("udp4", "8.8.8.8:80", 2*time.Second)
+	if err != nil {
+		return ""
 	}
-	return ""
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil || addr.IP.IsUnspecified() {
+		return ""
+	}
+	return addr.IP.String()
 }
 
 // Interfaces lists up interfaces holding a non-loopback IPv4, skipping virtual

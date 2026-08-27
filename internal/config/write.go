@@ -142,12 +142,9 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := os.Chmod(tmp, perm); err != nil {
 		return err
 	}
-	// Windows refuses to rename onto an existing file, unlike POSIX.
-	if _, err := os.Stat(path); err == nil {
-		if err := os.Remove(path); err != nil {
-			return err
-		}
-	}
+	// os.Rename on Windows uses MoveFileEx with MOVEFILE_REPLACE_EXISTING,
+	// so it atomically overwrites an existing file. The old remove-then-
+	// rename left a window where the file did not exist at all.
 	return os.Rename(tmp, path)
 }
 
