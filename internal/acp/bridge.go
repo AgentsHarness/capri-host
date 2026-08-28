@@ -117,6 +117,11 @@ type Bridge struct {
 	goalStop   chan struct{} // closed to end the goal loop
 	goalLoopOn bool
 
+	// ── 会话历史归一化视图缓存（session_history.go）───────────────────
+	// 按 (size, mtime) 失效；只存行级元数据，不缓存信封内容。
+	historyMu    sync.Mutex
+	historyCache map[string]*historyCacheEntry
+
 	subscribersMu sync.Mutex
 	subscribers   map[chan Event]struct{}
 
@@ -204,6 +209,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		bootDone:    make(chan struct{}),
 		genRate:     newGenRateTracker(),
 		usageLastUsed: make(map[string]int64),
+		historyCache:  make(map[string]*historyCacheEntry),
 	}
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
@@ -1393,6 +1399,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 //     moment and renders fake "Worked for 0.0s" markers.
 //   - agentTimestampMs → ev["agentTimestampMs"]: authoritative send time
 //     (user_chunk echoes fix the optimistic user row's ts with it).
+//   - eventId → ev["eventId"]: agent 事件 id（"{sessionId}-{N}"）提升为
+//     事件顶层，FE 用它做 live↔快照接缝去重（msgSeq 契约）；params._meta
+//     无该键时不带（absent key ≠ off）。
 //   - agentTimestampMs - streamStartMs → ev["elapsedMs"]: real thought
 //     duration (live thought blocks otherwise seal against the local
 //     first-seen timer, understating turns adopted mid-flight).
@@ -1409,6 +1418,9 @@ func attachStreamMeta(ev Event, params map[string]any) Event {
 	}
 	if v, ok := meta["agentTimestampMs"]; ok {
 		ev["agentTimestampMs"] = v
+	}
+	if v, ok := meta["eventId"]; ok {
+		ev["eventId"] = v
 	}
 	if v, ok := meta["streamStartMs"]; ok {
 		ev["streamStartMs"] = v
@@ -3620,29 +3632,48 @@ type SessionUpdatesOpts struct {
 	TurnIndex *int
 }
 
-// SessionUpdates fetches a session's stored updates (message history) via
-// the ACP extension method x.ai/session/updates. Each element of the result
-// is the full storage envelope {timestamp, method, params}.
+// SessionUpdates fetches a session's stored updates (message history). Each
+// element of the result is the full storage envelope {timestamp, method,
+// params}.
+//
+// 本地归一化优先（msgSeq 契约，见 session_history.go）：会话文件可读且
+// 全部信封带 params._meta.agentTimestampMs 时，从归一化视图分页服务——
+// turnIndex/offset/limit 在 msgSeq 空间解释，每条 update 顶层带 msgSeq，
+// promptStarts 由 host 重算，totalCount = 归一化条数。回退路径（文件
+// 不可读 / 任一信封缺 agentTimestampMs）走既有 agent
+// `_x.ai/session/updates` 透传（响应无 msgSeq、promptStarts 原样），
+// 两条路径互斥、按会话内容自动选择。stream=true 路径不改（agent 以
+// chunked 通知推流，本地分页无法替代）。
 func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...SessionUpdatesOpts) (UpdatesPage, error) {
+	o := SessionUpdatesOpts{}
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	if !o.Stream {
+		if page, ok := b.localUpdatesPage(sessionID, cwd, o); ok {
+			log.Printf("[capri-host] session updates served locally (msgSeq total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
+			return page, nil
+		}
+	}
 	if err := b.Boot(ctx); err != nil {
 		return UpdatesPage{}, err
 	}
 	params := map[string]any{"sessionId": sessionID, "cwd": cwd}
-	if len(opts) > 0 {
-		if opts[0].Offset != nil {
-			params["offset"] = *opts[0].Offset
+	{
+		if o.Offset != nil {
+			params["offset"] = *o.Offset
 		}
-		if opts[0].Limit != nil {
-			params["limit"] = *opts[0].Limit
+		if o.Limit != nil {
+			params["limit"] = *o.Limit
 		}
-		if opts[0].Stream {
+		if o.Stream {
 			params["stream"] = true
 		}
-		if opts[0].ChunkSize != nil {
-			params["chunkSize"] = *opts[0].ChunkSize
+		if o.ChunkSize != nil {
+			params["chunkSize"] = *o.ChunkSize
 		}
-		if opts[0].TurnIndex != nil {
-			params["turnIndex"] = *opts[0].TurnIndex
+		if o.TurnIndex != nil {
+			params["turnIndex"] = *o.TurnIndex
 		}
 	}
 	// ACP wire convention: extension methods are sent with an underscore
