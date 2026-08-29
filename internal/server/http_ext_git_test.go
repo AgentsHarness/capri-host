@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +47,47 @@ func TestGitEndpoints(t *testing.T) {
 	rec = postJSON(t, s, "/api/git/commit", `{"cwd":"/ws"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWorktreeCreateSessionSemantics — worktree/create 的 sessionId 语义：
+// 有活动会话时回落活动会话（原行为）；home 空状态无会话时也必须能发出
+// 去——agent 侧 CreateWorktreeRequest.session_id 是 serde 必填字段，占位
+// 非空且唯一，避免 XaiCall 把空串解析成活动会话而 404（该场景创建根本
+// 不需要真实会话）。
+func TestWorktreeCreateSessionSemantics(t *testing.T) {
+	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
+	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
+	s, _ := newFakeAgentServer(t)
+
+	// 无活动会话：200，wire sessionId 是非空占位（前缀 nosession-），
+	// sourcePath 原样透传。
+	params := recordedParams(t, s, recordPath, "/api/git/worktree/create",
+		`{"sourcePath":"/home/repo"}`, "_x.ai/git/worktree/create")
+	sid, _ := params["sessionId"].(string)
+	if !strings.HasPrefix(sid, "nosession-") {
+		t.Errorf("sessionless create sessionId = %q, want nosession-* placeholder", sid)
+	}
+	if params["sourcePath"] != "/home/repo" {
+		t.Errorf("sourcePath = %v, want /home/repo", params["sourcePath"])
+	}
+
+	// 有活动会话：回落活动会话 id（sess-new），不再用占位。
+	createActiveSession(t, s)
+	rec := postJSON(t, s, "/api/git/worktree/create", `{"sourcePath":"/ws"}`)
+	wantOK(t, rec)
+	var last map[string]any
+	for _, m := range readRecordedRequests(t, recordPath) {
+		if m["method"] == "_x.ai/git/worktree/create" {
+			last = m
+		}
+	}
+	if last == nil {
+		t.Fatal("no recorded _x.ai/git/worktree/create request")
+	}
+	params, _ = last["params"].(map[string]any)
+	if params["sessionId"] != "sess-new" {
+		t.Errorf("active-session create sessionId = %v, want sess-new", params["sessionId"])
 	}
 }
 
