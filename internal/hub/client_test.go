@@ -1014,7 +1014,11 @@ func TestEnqueueReplaySurvivesFullQueue(t *testing.T) {
 	}
 	replayDone := make(chan struct{})
 	go func() {
-		c.enqueueReplay(evs)
+		// The production replay path (sendReplayAfter) holds enqueueMu
+		// across enqueueReplayLocked — mirror that here.
+		c.enqueueMu.Lock()
+		c.enqueueReplayLocked(evs)
+		c.enqueueMu.Unlock()
 		close(replayDone)
 	}()
 
@@ -1045,7 +1049,7 @@ func TestEnqueueReplaySurvivesFullQueue(t *testing.T) {
 	select {
 	case <-replayDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("enqueueReplay never returned")
+		t.Fatal("enqueueReplayLocked never returned")
 	}
 }
 

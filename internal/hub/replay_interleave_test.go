@@ -15,7 +15,7 @@ import (
 // ordering hazard:
 //
 // After a disconnect with a large buffered backlog, the hello-driven
-// replay (sendReplayAfter → enqueueReplay) enqueues frames in chunks
+// replay (sendReplayAfter → enqueueReplayLocked) enqueues frames in chunks
 // (replayFrameBudget), while live forwarding (forwardLoop) re-arms at
 // the same moment. If a live frame — whose seqs are HIGHER than the
 // backlog's — lands between replay frames, the hub's stale-seq gate
