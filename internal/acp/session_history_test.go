@@ -452,7 +452,7 @@ func TestSessionUpdatesDegradedToLineOrderOnBrokenEventId(t *testing.T) {
 	const sid = "sess-1"
 	broken := `{"timestamp":300,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}},"_meta":{"agentTimestampMs":300,"eventId":"sess-1-x"}}}`
 	writeSessionFile(t, home, "/ws", sid, []string{
-		broken,                              // 行0：ts=300，eventId 的 N 解析失败
+		broken, // 行0：ts=300，eventId 的 N 解析失败
 		histEnvelope(sid, 8, 100, msgUserChunk("echo")), // 行1：ts=100
 		histEnvelope(sid, 13, 200, msgCancelledTurn()),  // 行2：ts=200
 	})
@@ -486,5 +486,5 @@ func TestSessionUpdatesDegradedToLineOrderOnBrokenEventId(t *testing.T) {
 	}
 }
 
-func intPtr(v int) *int            { return &v }
-func int64Ptr(v int64) *int64      { return &v }
+func intPtr(v int) *int       { return &v }
+func int64Ptr(v int64) *int64 { return &v }

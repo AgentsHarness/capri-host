@@ -48,7 +48,6 @@ import (
 // 时放行发布，避免回拨导致节流永久卡死。
 
 const (
-	genRateBurstGapMs      = 8    // 到达间隔小于此值 → 同一 burst
 	genRateMaxIdleGapMs    = 800  // [仅 host 到达时间回退路径] 空闲超过此值不计入生成时间（防攒包）
 	genRateMinDtMs         = 16   // 有效时长下限（仅 publish 兜底；gap≤0 不逐包加地板）
 	genRateMaxPlausibleCps = 2000 // [仅回退路径] 单包可归因的生成速度上限（字符/s）→ 时长地板
@@ -103,6 +102,17 @@ func (t *genRateTracker) reset(sid string) {
 	if s := t.bySid[sid]; s != nil {
 		s.clearSegment()
 	}
+}
+
+// discard 删除 session 的整个分桶（会话关闭/删除时调用）；与 reset 不同，
+// 不保留空段——防止 bySid 随历史会话 id 无界增长。
+func (t *genRateTracker) discard(sid string) {
+	if sid == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.bySid, sid)
 }
 
 // genRateSeg 是单个 session 的生成速率估算器状态。口径：

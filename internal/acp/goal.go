@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -87,19 +88,19 @@ continue working.`, objective)
 // GoalState is the wire shape of the host-side goal. Field names mirror
 // the TUI's goal_updated payload so the frontend renders it unchanged.
 type GoalState struct {
-	Objective    string `json:"objective"`
-	Status       string `json:"status"` // active|user_paused|blocked|complete|cleared|budget_limited
-	Phase        string `json:"phase"`  // planning|executing
-	Planning     bool   `json:"planning,omitempty"`
-	Verifying    bool   `json:"verifying_completion,omitempty"`
-	TokenBudget  int64  `json:"token_budget,omitempty"`
-	TokensUsed   int64  `json:"tokens_used"`
-	TokenBaseline int64 `json:"token_baseline"`
-	StartedAt    int64  `json:"started_at"` // unix ms
-	ElapsedMs    int64  `json:"elapsed_ms"`
-	TotalDeliverables   int `json:"total_deliverables"`
-	CompletedDeliverables int `json:"completed_deliverables"`
-	Message      string `json:"message,omitempty"`
+	Objective             string `json:"objective"`
+	Status                string `json:"status"` // active|user_paused|blocked|complete|cleared|budget_limited
+	Phase                 string `json:"phase"`  // planning|executing
+	Planning              bool   `json:"planning,omitempty"`
+	Verifying             bool   `json:"verifying_completion,omitempty"`
+	TokenBudget           int64  `json:"token_budget,omitempty"`
+	TokensUsed            int64  `json:"tokens_used"`
+	TokenBaseline         int64  `json:"token_baseline"`
+	StartedAt             int64  `json:"started_at"` // unix ms
+	ElapsedMs             int64  `json:"elapsed_ms"`
+	TotalDeliverables     int    `json:"total_deliverables"`
+	CompletedDeliverables int    `json:"completed_deliverables"`
+	Message               string `json:"message,omitempty"`
 
 	// sessionID is the session the goal runs in (not serialized; used to
 	// tag broadcasts and pick the prompt target).
@@ -126,6 +127,34 @@ const (
 // session is idle before sending the next continuation turn.
 const goalLoopIdlePoll = 2 * time.Second
 
+// ─────────────────────────────────────────────────────────────────────
+// goalEngine — 独立的 goal 组件。原先 15 个 (b *Bridge) 方法与
+// goalMu/goal/goalStop/goalLoopOn 四个字段收敛于此；Bridge 保留
+// Goal{Set,Status,Pause,Resume,Clear} 五个门面方法（server 调用面），
+// 进程死亡清理路径经 Bridge.goal 触达。
+//
+// goalHost 是引擎对 Bridge 的消费者侧窄接口：引擎只订阅事件、查会话
+// 忙闲、发回合、广播——除此之外不触碰 Bridge 任何状态。
+// ─────────────────────────────────────────────────────────────────────
+type goalHost interface {
+	Subscribe() (ch chan Event, unsubscribe func())
+	// resolveSessionID maps "" to the active session (goal control verbs).
+	resolveSessionID(sessionID string) string
+	// sessionBusy reports whether the session currently has turns in flight.
+	sessionBusy(sessionID string) bool
+	PromptWithOpts(ctx context.Context, sessionID string, blocks []ContentBlock, opts PromptOpts) (stopReason string, meta map[string]any, err error)
+	Broadcast(ev Event)
+}
+
+type goalEngine struct {
+	host goalHost
+
+	mu     sync.Mutex
+	g      *GoalState
+	stop   chan struct{} // closed to end the goal loop
+	loopOn bool
+}
+
 // goalLoopTurnDelay is the grace period after a user turn ends before the
 // loop sends its own continuation (lets the user's reply render first).
 const goalLoopTurnDelay = 3 * time.Second
@@ -137,19 +166,19 @@ const goalLoopTurnDelay = 3 * time.Second
 // The goal binds to the resolved session — the loop prompts that session
 // and broadcasts are tagged with it. The first turn is fired by the loop
 // goroutine, which injects the goal instruction.
-func (b *Bridge) GoalSet(ctx context.Context, sessionID, objective string, tokenBudget int64) (map[string]any, error) {
+func (ge *goalEngine) GoalSet(ctx context.Context, sessionID, objective string, tokenBudget int64) (map[string]any, error) {
 	objective = strings.TrimSpace(objective)
 	if objective == "" {
 		return nil, &HTTPError{Code: 400, Msg: "缺少目标描述"}
 	}
-	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+	if sessionID = ge.host.resolveSessionID(sessionID); sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	now := time.Now().UnixMilli()
-	b.goalMu.Lock()
+	ge.mu.Lock()
 	// Stop any previous loop before replacing the state.
-	b.stopGoalLoopLocked()
-	b.goal = &GoalState{
+	ge.stopLoopLocked()
+	ge.g = &GoalState{
 		Objective:   objective,
 		Status:      goalActive,
 		Phase:       "executing",
@@ -158,110 +187,110 @@ func (b *Bridge) GoalSet(ctx context.Context, sessionID, objective string, token
 		ElapsedMs:   0,
 		sessionID:   sessionID,
 	}
-	b.goalLoopOn = true
-	b.goalStop = make(chan struct{})
-	stop := b.goalStop
-	b.goalMu.Unlock()
+	ge.loopOn = true
+	ge.stop = make(chan struct{})
+	stop := ge.stop
+	ge.mu.Unlock()
 
-	b.broadcastGoal()
-	go b.goalLoop(stop)
-	return b.goalSnapshot(), nil
+	ge.broadcastGoal()
+	go ge.goalLoop(stop)
+	return ge.goalSnapshot(), nil
 }
 
 // GoalStatus returns the current goal state of the given session (empty
 // sessionId resolves to the active one). nil state, no error when no goal
 // is set at all; 404 when a goal exists but is bound to another session.
-func (b *Bridge) GoalStatus(sessionID string) (map[string]any, error) {
-	sessionID = b.resolveSessionID(sessionID)
-	b.goalMu.Lock()
-	defer b.goalMu.Unlock()
-	if b.goal == nil {
+func (ge *goalEngine) GoalStatus(sessionID string) (map[string]any, error) {
+	sessionID = ge.host.resolveSessionID(sessionID)
+	ge.mu.Lock()
+	defer ge.mu.Unlock()
+	if ge.g == nil {
 		return nil, nil
 	}
-	if b.goal.sessionID != sessionID {
+	if ge.g.sessionID != sessionID {
 		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
 	}
-	return b.goalSnapshotLocked(), nil
+	return ge.goalSnapshotLocked(), nil
 }
 
 // GoalPause pauses an active goal (user_paused) on the given session. The
 // current in-flight continuation turn finishes; the loop stops scheduling
 // further turns. Empty sessionId resolves to the active one; a goal bound
 // to another session is a 404.
-func (b *Bridge) GoalPause(sessionID string) (map[string]any, error) {
-	sessionID = b.resolveSessionID(sessionID)
-	b.goalMu.Lock()
-	if b.goal == nil {
-		b.goalMu.Unlock()
-		return b.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
+func (ge *goalEngine) GoalPause(sessionID string) (map[string]any, error) {
+	sessionID = ge.host.resolveSessionID(sessionID)
+	ge.mu.Lock()
+	if ge.g == nil {
+		ge.mu.Unlock()
+		return ge.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
 	}
-	if b.goal.sessionID != sessionID {
-		b.goalMu.Unlock()
+	if ge.g.sessionID != sessionID {
+		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
 	}
-	if b.goal.Status != goalActive {
-		b.goalMu.Unlock()
-		return b.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
+	if ge.g.Status != goalActive {
+		ge.mu.Unlock()
+		return ge.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
 	}
-	b.goal.Status = goalUserPaused
-	b.goal.Message = ""
-	b.stopGoalLoopLocked()
-	b.goalMu.Unlock()
-	b.broadcastGoal()
-	return b.goalSnapshot(), nil
+	ge.g.Status = goalUserPaused
+	ge.g.Message = ""
+	ge.stopLoopLocked()
+	ge.mu.Unlock()
+	ge.broadcastGoal()
+	return ge.goalSnapshot(), nil
 }
 
 // GoalResume resumes a paused goal on the given session (empty sessionId
 // resolves to the active one; a goal bound to another session is a 404).
-func (b *Bridge) GoalResume(sessionID string) (map[string]any, error) {
-	sessionID = b.resolveSessionID(sessionID)
-	b.goalMu.Lock()
-	if b.goal == nil {
-		b.goalMu.Unlock()
+func (ge *goalEngine) GoalResume(sessionID string) (map[string]any, error) {
+	sessionID = ge.host.resolveSessionID(sessionID)
+	ge.mu.Lock()
+	if ge.g == nil {
+		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前没有目标"}
 	}
-	if b.goal.sessionID != sessionID {
-		b.goalMu.Unlock()
+	if ge.g.sessionID != sessionID {
+		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
 	}
-	if b.goal.Status != goalUserPaused && b.goal.Status != goalBlocked {
-		b.goalMu.Unlock()
-		return b.goalSnapshot(), &HTTPError{Code: 409, Msg: "目标未处于暂停状态"}
+	if ge.g.Status != goalUserPaused && ge.g.Status != goalBlocked {
+		ge.mu.Unlock()
+		return ge.goalSnapshot(), &HTTPError{Code: 409, Msg: "目标未处于暂停状态"}
 	}
-	b.goal.Status = goalActive
-	b.goal.Verifying = false
-	b.goal.verifyingRound = false
-	b.goal.claimedCompletion = false
-	b.goal.Message = ""
-	b.goalLoopOn = true
-	b.goalStop = make(chan struct{})
-	stop := b.goalStop
-	b.goalMu.Unlock()
-	b.broadcastGoal()
-	go b.goalLoop(stop)
-	return b.goalSnapshot(), nil
+	ge.g.Status = goalActive
+	ge.g.Verifying = false
+	ge.g.verifyingRound = false
+	ge.g.claimedCompletion = false
+	ge.g.Message = ""
+	ge.loopOn = true
+	ge.stop = make(chan struct{})
+	stop := ge.stop
+	ge.mu.Unlock()
+	ge.broadcastGoal()
+	go ge.goalLoop(stop)
+	return ge.goalSnapshot(), nil
 }
 
 // GoalClear clears the goal on the given session (cleared; empty sessionId
 // resolves to the active one; a goal bound to another session is a 404).
 // Stops the loop.
-func (b *Bridge) GoalClear(sessionID string) (map[string]any, error) {
-	sessionID = b.resolveSessionID(sessionID)
-	b.goalMu.Lock()
-	if b.goal == nil {
-		b.goalMu.Unlock()
+func (ge *goalEngine) GoalClear(sessionID string) (map[string]any, error) {
+	sessionID = ge.host.resolveSessionID(sessionID)
+	ge.mu.Lock()
+	if ge.g == nil {
+		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前没有目标"}
 	}
-	if b.goal.sessionID != sessionID {
-		b.goalMu.Unlock()
+	if ge.g.sessionID != sessionID {
+		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
 	}
-	b.goal.Status = goalCleared
-	b.goal.Message = ""
-	b.stopGoalLoopLocked()
-	b.goalMu.Unlock()
-	b.broadcastGoal()
-	return b.goalSnapshot(), nil
+	ge.g.Status = goalCleared
+	ge.g.Message = ""
+	ge.stopLoopLocked()
+	ge.mu.Unlock()
+	ge.broadcastGoal()
+	return ge.goalSnapshot(), nil
 }
 
 // ── loop ─────────────────────────────────────────────────────────────
@@ -270,26 +299,26 @@ func (b *Bridge) GoalClear(sessionID string) (map[string]any, error) {
 // single goroutine per goal (stop channel closes to end it).
 //
 // The loop captures the goal pointer it owns at entry. /goal set may
-// replace b.goal while this loop is blocked (e.g. in a long
+// replace ge.g while this loop is blocked (e.g. in a long
 // PromptWithOpts, up to promptTimeout); every state write below is
 // guarded by goalLoopOwns so a stale loop never pollutes the
 // replacement goal and exits as soon as it notices the swap.
-func (b *Bridge) goalLoop(stop chan struct{}) {
-	b.goalMu.Lock()
-	g := b.goal
-	b.goalMu.Unlock()
+func (ge *goalEngine) goalLoop(stop chan struct{}) {
+	ge.mu.Lock()
+	g := ge.g
+	ge.mu.Unlock()
 	if g == nil {
 		return
 	}
 	for {
 		// 1. State check: only Active goals continue.
-		st := b.goalStruct()
+		st := ge.goalStruct()
 		if st == nil || st.Status != goalActive {
 			return
 		}
 		// 1b. Ownership: the goal was replaced by /goal set while this
 		//     loop was in flight — exit without touching the new goal.
-		if !b.goalLoopOwns(g) {
+		if !ge.goalLoopOwns(g) {
 			return
 		}
 
@@ -297,13 +326,13 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 		//    evidence turns inject their own. The evidence round is
 		//    decided by the previous iteration's analysis.
 		var instruction string
-		b.goalMu.Lock()
-		if !b.goalLoopOwns(g) {
-			b.goalMu.Unlock()
+		ge.mu.Lock()
+		if !ge.goalLoopOwns(g) {
+			ge.mu.Unlock()
 			return
 		}
-		first := b.goal.TokensUsed == 0 && !b.goal.claimedCompletion && !b.goal.verifyingRound
-		if b.goal.verifyingRound {
+		first := ge.g.TokensUsed == 0 && !ge.g.claimedCompletion && !ge.g.verifyingRound
+		if ge.g.verifyingRound {
 			instruction = goalVerifyInstruction(st.Objective)
 		} else if first {
 			instruction = goalInstruction(st.Objective)
@@ -311,20 +340,20 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 			instruction = goalContinueInstruction(st.Objective)
 		}
 		sid := st.sessionID
-		b.goalMu.Unlock()
+		ge.mu.Unlock()
 
 		// 3. Wait until the session is idle (user turns win; the loop
 		//    yields while a user message is in flight).
-		if !b.goalWaitIdle(stop, sid) {
+		if !ge.goalWaitIdle(stop, sid) {
 			return
 		}
 
 		// 4. Re-check state and ownership (pause/clear/set may have
 		//    landed while waiting).
-		b.goalMu.Lock()
-		owned := b.goalLoopOwns(g)
-		active := owned && b.goal.Status == goalActive
-		b.goalMu.Unlock()
+		ge.mu.Lock()
+		owned := ge.goalLoopOwns(g)
+		active := owned && ge.g.Status == goalActive
+		ge.mu.Unlock()
 		if !active {
 			return
 		}
@@ -333,11 +362,11 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 		//    goroutine consumes the subscription during the whole turn, so
 		//    long turns never overflow the 512-slot Subscribe buffer and
 		//    lose update_goal / usage / summary events to Broadcast drops.
-		evCh, unsub := b.Subscribe()
-		drain := b.goalDrainConcurrent(evCh)
-		blocks := []ContentBlock{{"type": "text", "text": instruction}}
+		evCh, unsub := ge.host.Subscribe()
+		drain := ge.goalDrainConcurrent(evCh)
+		blocks := []ContentBlock{{kType: "text", "text": instruction}}
 		ctx, cancel := context.WithTimeout(context.Background(), promptTimeout)
-		stopReason, _, err := b.PromptWithOpts(ctx, sid, blocks, PromptOpts{})
+		stopReason, _, err := ge.host.PromptWithOpts(ctx, sid, blocks, PromptOpts{})
 		cancel()
 		// Stop the drainer and collect the turn's events (in order).
 		collected := drain()
@@ -349,14 +378,14 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 			// user message does not restart the loop). A stale loop
 			// (goal replaced while the prompt was in flight) must not
 			// write its failure into the new goal.
-			b.goalMu.Lock()
-			owned := b.goalLoopOwns(g)
-			if owned && b.goal.Status == goalActive {
-				b.goal.Message = "回合失败: " + err.Error()
+			ge.mu.Lock()
+			owned := ge.goalLoopOwns(g)
+			if owned && ge.g.Status == goalActive {
+				ge.g.Message = "回合失败: " + err.Error()
 			}
-			b.goalMu.Unlock()
+			ge.mu.Unlock()
 			if owned {
-				b.broadcastGoal()
+				ge.broadcastGoal()
 			}
 			return
 		}
@@ -366,14 +395,14 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 		// another turn; the goal stays active and only /goal resume
 		// restarts it.
 		if stopReason == "cancelled" {
-			b.goalMu.Lock()
-			owned := b.goalLoopOwns(g)
-			if owned && b.goal.Status == goalActive {
-				b.goal.Message = "回合已取消（goal 保持活动，可用 /goal resume 继续）"
+			ge.mu.Lock()
+			owned := ge.goalLoopOwns(g)
+			if owned && ge.g.Status == goalActive {
+				ge.g.Message = "回合已取消（goal 保持活动，可用 /goal resume 继续）"
 			}
-			b.goalMu.Unlock()
+			ge.mu.Unlock()
 			if owned {
-				b.broadcastGoal()
+				ge.broadcastGoal()
 			}
 			return
 		}
@@ -383,7 +412,7 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 		//    before every state write and returns true when this loop is
 		//    stale (goal replaced) — the loop then exits without touching
 		//    the new goal.
-		if done := b.goalAnalyze(g, collected); done {
+		if done := ge.goalAnalyze(g, collected); done {
 			return
 		}
 	}
@@ -391,7 +420,7 @@ func (b *Bridge) goalLoop(stop chan struct{}) {
 
 // goalWaitIdle polls the session busy flag until idle, or until the stop
 // channel closes (returns false when stopped).
-func (b *Bridge) goalWaitIdle(stop chan struct{}, sessionID string) bool {
+func (ge *goalEngine) goalWaitIdle(stop chan struct{}, sessionID string) bool {
 	// Grace period so the user's previous turn renders before the loop
 	// fires its continuation.
 	select {
@@ -400,13 +429,7 @@ func (b *Bridge) goalWaitIdle(stop chan struct{}, sessionID string) bool {
 		return false
 	}
 	for {
-		b.mu.Lock()
-		var busy bool
-		if s := b.sessions[sessionID]; s != nil {
-			busy = s.Busy
-		}
-		b.mu.Unlock()
-		if !busy {
+		if !ge.host.sessionBusy(sessionID) {
 			return true
 		}
 		select {
@@ -428,7 +451,7 @@ func (b *Bridge) goalWaitIdle(stop chan struct{}, sessionID string) bool {
 // and returns the collected events in turn order. The drainer only
 // collects events; it never touches goal state, so the goalLoopOwns
 // identity guard in goalAnalyze is unaffected.
-func (b *Bridge) goalDrainConcurrent(evCh chan Event) func() []Event {
+func (ge *goalEngine) goalDrainConcurrent(evCh chan Event) func() []Event {
 	var events []Event
 	stop := make(chan struct{})
 	drained := make(chan struct{})
@@ -461,12 +484,12 @@ func (b *Bridge) goalDrainConcurrent(evCh chan Event) func() []Event {
 
 // goalAnalyze applies the collected turn events to the tracker and
 // decides whether the loop should stop. g is the goal pointer the
-// calling loop captured at entry: before every write to b.goal the
+// calling loop captured at entry: before every write to ge.g the
 // function checks goalLoopOwns(g), so a stale loop whose goal was
 // replaced by /goal set returns true immediately without touching the
 // new goal. Returns true when the loop must exit (complete / blocked /
 // budget limited / cleared / paused mid-loop / loop stale).
-func (b *Bridge) goalAnalyze(g *GoalState, events []Event) bool {
+func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 	var text strings.Builder
 	tokensUsed := int64(0)
 	sawAgentGoalUpdate := false
@@ -475,7 +498,7 @@ func (b *Bridge) goalAnalyze(g *GoalState, events []Event) bool {
 	var toolMessage string
 
 	for _, ev := range events {
-		switch ev["type"] {
+		switch ev[kType] {
 		case "chunk":
 			if t, ok := ev["text"].(string); ok {
 				text.WriteString(t)
@@ -504,94 +527,94 @@ func (b *Bridge) goalAnalyze(g *GoalState, events []Event) bool {
 				}
 			}
 		case "goal_updated":
-			if u, ok := ev["update"].(map[string]any); ok {
+			if u, ok := ev[kUpdate].(map[string]any); ok {
 				sawAgentGoalUpdate = true
 				// The agent session has goal mode on and reports its own
 				// state — mirror it (agent is authoritative for status).
-				b.goalMu.Lock()
-				if !b.goalLoopOwns(g) {
-					b.goalMu.Unlock()
+				ge.mu.Lock()
+				if !ge.goalLoopOwns(g) {
+					ge.mu.Unlock()
 					return true // loop stale: goal replaced
 				}
 				if s, _ := u["status"].(string); s != "" {
-					b.goal.Status = s
+					ge.g.Status = s
 				}
 				if v, _ := u["verifying_completion"].(bool); v {
-					b.goal.Verifying = true
+					ge.g.Verifying = true
 				}
 				if m, _ := u["message"].(string); m != "" {
-					b.goal.Message = m
+					ge.g.Message = m
 				}
 				if n, ok := u["total_deliverables"].(float64); ok {
-					b.goal.TotalDeliverables = int(n)
+					ge.g.TotalDeliverables = int(n)
 				}
 				if n, ok := u["completed_deliverables"].(float64); ok {
-					b.goal.CompletedDeliverables = int(n)
+					ge.g.CompletedDeliverables = int(n)
 				}
-				b.goalMu.Unlock()
+				ge.mu.Unlock()
 			}
 		}
 	}
 
 	// Budget enforcement (best effort — only when a budget was set).
-	b.goalMu.Lock()
-	if !b.goalLoopOwns(g) {
-		b.goalMu.Unlock()
+	ge.mu.Lock()
+	if !ge.goalLoopOwns(g) {
+		ge.mu.Unlock()
 		return true // loop stale: goal replaced
 	}
-	if b.goal != nil && b.goal.TokenBudget > 0 && tokensUsed > 0 {
-		b.goal.TokensUsed = tokensUsed
-		if tokensUsed > b.goal.TokenBudget {
-			b.goal.Status = goalBudgetLimited
-			b.goal.Message = fmt.Sprintf("token 预算 %d 已耗尽", b.goal.TokenBudget)
-			b.stopGoalLoopLocked()
+	if ge.g != nil && ge.g.TokenBudget > 0 && tokensUsed > 0 {
+		ge.g.TokensUsed = tokensUsed
+		if tokensUsed > ge.g.TokenBudget {
+			ge.g.Status = goalBudgetLimited
+			ge.g.Message = fmt.Sprintf("token 预算 %d 已耗尽", ge.g.TokenBudget)
+			ge.stopLoopLocked()
 			done := true
-			b.goalMu.Unlock()
-			b.broadcastGoal()
+			ge.mu.Unlock()
+			ge.broadcastGoal()
 			return done
 		}
 	}
-	b.goalMu.Unlock()
+	ge.mu.Unlock()
 
 	// Agent-driven state (goal mode on the agent side): mirror terminal
 	// states and stop the loop.
 	if sawAgentGoalUpdate {
-		b.goalMu.Lock()
-		if !b.goalLoopOwns(g) {
-			b.goalMu.Unlock()
+		ge.mu.Lock()
+		if !ge.goalLoopOwns(g) {
+			ge.mu.Unlock()
 			return true // loop stale: goal replaced
 		}
-		terminal := b.goal != nil && (b.goal.Status == goalComplete || b.goal.Status == goalCleared ||
-			b.goal.Status == goalBudgetLimited || b.goal.Status == goalUserPaused ||
-			b.goal.Status == goalBlocked)
-		b.goalMu.Unlock()
+		terminal := ge.g != nil && (ge.g.Status == goalComplete || ge.g.Status == goalCleared ||
+			ge.g.Status == goalBudgetLimited || ge.g.Status == goalUserPaused ||
+			ge.g.Status == goalBlocked)
+		ge.mu.Unlock()
 		if terminal {
-			b.broadcastGoal()
+			ge.broadcastGoal()
 			return true
 		}
 	}
 
 	// Tool-driven state (update_goal call with completed/blocked_reason).
 	if sawUpdateGoalCall {
-		b.goalMu.Lock()
-		if !b.goalLoopOwns(g) {
-			b.goalMu.Unlock()
+		ge.mu.Lock()
+		if !ge.goalLoopOwns(g) {
+			ge.mu.Unlock()
 			return true // loop stale: goal replaced
 		}
-		if b.goal != nil {
+		if ge.g != nil {
 			if toolCompleted {
-				b.goal.claimedCompletion = true
-				b.goal.Verifying = true
-				b.goal.verifyingRound = true
+				ge.g.claimedCompletion = true
+				ge.g.Verifying = true
+				ge.g.verifyingRound = true
 			} else if toolBlocked {
-				b.goal.Status = goalBlocked
-				b.goal.Message = toolMessage
+				ge.g.Status = goalBlocked
+				ge.g.Message = toolMessage
 			} else if toolMessage != "" {
-				b.goal.Message = toolMessage
+				ge.g.Message = toolMessage
 			}
 		}
-		b.goalMu.Unlock()
-		b.broadcastGoal()
+		ge.mu.Unlock()
+		ge.broadcastGoal()
 		if toolBlocked {
 			return true
 		}
@@ -603,134 +626,134 @@ func (b *Bridge) goalAnalyze(g *GoalState, events []Event) bool {
 
 	// Text-driven analysis.
 	claim, blocked, evidence := analyzeGoalText(text.String())
-	b.goalMu.Lock()
-	if !b.goalLoopOwns(g) {
-		b.goalMu.Unlock()
+	ge.mu.Lock()
+	if !ge.goalLoopOwns(g) {
+		ge.mu.Unlock()
 		return true // loop stale: goal replaced
 	}
-	if b.goal == nil {
-		b.goalMu.Unlock()
+	if ge.g == nil {
+		ge.mu.Unlock()
 		return true
 	}
-	if b.goal.verifyingRound {
+	if ge.g.verifyingRound {
 		// Evidence round resolution.
-		b.goal.verifyingRound = false
-		b.goal.Verifying = false
+		ge.g.verifyingRound = false
+		ge.g.Verifying = false
 		switch {
 		case claim && evidence:
-			b.goal.Status = goalComplete
-			b.goal.Message = ""
-			b.goal.CompletedDeliverables = b.goal.TotalDeliverables
-			if b.goal.TotalDeliverables == 0 {
-				b.goal.TotalDeliverables = 1
-				b.goal.CompletedDeliverables = 1
+			ge.g.Status = goalComplete
+			ge.g.Message = ""
+			ge.g.CompletedDeliverables = ge.g.TotalDeliverables
+			if ge.g.TotalDeliverables == 0 {
+				ge.g.TotalDeliverables = 1
+				ge.g.CompletedDeliverables = 1
 			}
-			b.goalMu.Unlock()
-			b.broadcastGoal()
+			ge.mu.Unlock()
+			ge.broadcastGoal()
 			return true
 		case claim && !evidence:
-			b.goal.Status = goalBlocked
-			b.goal.Message = "完成声明缺少可验证证据（无变更文件/命令/输出）"
-			b.goalMu.Unlock()
-			b.broadcastGoal()
+			ge.g.Status = goalBlocked
+			ge.g.Message = "完成声明缺少可验证证据（无变更文件/命令/输出）"
+			ge.mu.Unlock()
+			ge.broadcastGoal()
 			return true
 		case blocked:
-			b.goal.Status = goalBlocked
-			b.goal.Message = "模型报告受阻"
-			b.goalMu.Unlock()
-			b.broadcastGoal()
+			ge.g.Status = goalBlocked
+			ge.g.Message = "模型报告受阻"
+			ge.mu.Unlock()
+			ge.broadcastGoal()
 			return true
 		default:
 			// Model kept working instead of defending the claim.
-			b.goal.claimedCompletion = false
-			b.goalMu.Unlock()
+			ge.g.claimedCompletion = false
+			ge.mu.Unlock()
 			return false
 		}
 	}
 	// Normal round: latch a completion claim for the evidence round.
-	if claim && !b.goal.claimedCompletion {
-		b.goal.claimedCompletion = true
-		b.goal.Verifying = true
-		b.goal.verifyingRound = true
-		b.goal.Message = "完成声明待验证…"
-		b.goalMu.Unlock()
-		b.broadcastGoal()
+	if claim && !ge.g.claimedCompletion {
+		ge.g.claimedCompletion = true
+		ge.g.Verifying = true
+		ge.g.verifyingRound = true
+		ge.g.Message = "完成声明待验证…"
+		ge.mu.Unlock()
+		ge.broadcastGoal()
 		return false
 	}
 	if blocked {
-		b.goal.Status = goalBlocked
-		b.goal.Message = "模型报告受阻"
-		b.goalMu.Unlock()
-		b.broadcastGoal()
+		ge.g.Status = goalBlocked
+		ge.g.Message = "模型报告受阻"
+		ge.mu.Unlock()
+		ge.broadcastGoal()
 		return true
 	}
-	b.goalMu.Unlock()
+	ge.mu.Unlock()
 	return false
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-// stopGoalLoopLocked closes the stop channel so an in-flight goalLoop
-// exits at its next checkpoint. Callers must hold b.goalMu.
-func (b *Bridge) stopGoalLoopLocked() {
-	if !b.goalLoopOn {
+// stopLoopLocked closes the stop channel so an in-flight goalLoop
+// exits at its next checkpoint. Callers must hold ge.mu.
+func (ge *goalEngine) stopLoopLocked() {
+	if !ge.loopOn {
 		return
 	}
-	if b.goalStop != nil {
-		close(b.goalStop)
+	if ge.stop != nil {
+		close(ge.stop)
 	}
-	b.goalLoopOn = false
-	b.goalStop = nil
+	ge.loopOn = false
+	ge.stop = nil
 }
 
 // goalLoopOwns reports whether g — the goal pointer a loop captured at
-// entry — is still the current goal. A /goal set that replaced b.goal
+// entry — is still the current goal. A /goal set that replaced ge.g
 // invalidates every older loop: a stale loop must stop writing state so
 // its old turn's events never pollute the new goal. Callers must hold
-// b.goalMu.
-func (b *Bridge) goalLoopOwns(g *GoalState) bool {
-	return g != nil && b.goal == g
+// ge.mu.
+func (ge *goalEngine) goalLoopOwns(g *GoalState) bool {
+	return g != nil && ge.g == g
 }
 
 // goalStruct returns a copy of the goal state as a struct (nil when no
 // goal is set). Loop logic that needs struct fields uses this instead of
 // the wire-shaped snapshot map.
-func (b *Bridge) goalStruct() *GoalState {
-	b.goalMu.Lock()
-	defer b.goalMu.Unlock()
-	if b.goal == nil {
+func (ge *goalEngine) goalStruct() *GoalState {
+	ge.mu.Lock()
+	defer ge.mu.Unlock()
+	if ge.g == nil {
 		return nil
 	}
-	g := *b.goal
+	g := *ge.g
 	return &g
 }
 
 // goalSnapshot returns a serializable copy of the current state (nil when
 // no goal is set). Elapsed is recomputed at snapshot time.
-func (b *Bridge) goalSnapshot() map[string]any {
-	b.goalMu.Lock()
-	defer b.goalMu.Unlock()
-	return b.goalSnapshotLocked()
+func (ge *goalEngine) goalSnapshot() map[string]any {
+	ge.mu.Lock()
+	defer ge.mu.Unlock()
+	return ge.goalSnapshotLocked()
 }
 
-func (b *Bridge) goalSnapshotLocked() map[string]any {
-	if b.goal == nil {
+func (ge *goalEngine) goalSnapshotLocked() map[string]any {
+	if ge.g == nil {
 		return nil
 	}
-	g := *b.goal
+	g := *ge.g
 	g.ElapsedMs = time.Now().UnixMilli() - g.StartedAt
 	if g.ElapsedMs < 0 {
 		g.ElapsedMs = 0
 	}
 	m := map[string]any{
-		"objective":             g.Objective,
-		"status":                g.Status,
-		"phase":                 g.Phase,
-		"tokens_used":           g.TokensUsed,
-		"token_baseline":        g.TokenBaseline,
-		"started_at":            g.StartedAt,
-		"elapsed_ms":            g.ElapsedMs,
-		"total_deliverables":    g.TotalDeliverables,
+		"objective":              g.Objective,
+		"status":                 g.Status,
+		"phase":                  g.Phase,
+		"tokens_used":            g.TokensUsed,
+		"token_baseline":         g.TokenBaseline,
+		"started_at":             g.StartedAt,
+		"elapsed_ms":             g.ElapsedMs,
+		"total_deliverables":     g.TotalDeliverables,
 		"completed_deliverables": g.CompletedDeliverables,
 	}
 	if g.Planning {
@@ -751,22 +774,22 @@ func (b *Bridge) goalSnapshotLocked() map[string]any {
 // broadcastGoal pushes a goal_updated notification carrying the current
 // state — same event shape the agent's own goal_updated uses
 // ({type, update, sessionId}).
-func (b *Bridge) broadcastGoal() {
-	b.goalMu.Lock()
-	st := b.goalSnapshotLocked()
+func (ge *goalEngine) broadcastGoal() {
+	ge.mu.Lock()
+	st := ge.goalSnapshotLocked()
 	var sid string
-	if b.goal != nil {
-		sid = b.goal.sessionID
+	if ge.g != nil {
+		sid = ge.g.sessionID
 	}
-	b.goalMu.Unlock()
+	ge.mu.Unlock()
 	if st == nil {
 		return
 	}
-	ev := Event{"type": "goal_updated", "update": st}
+	ev := Event{kType: "goal_updated", kUpdate: st}
 	if sid != "" {
-		ev["sessionId"] = sid
+		ev[kSessionID] = sid
 	}
-	b.Broadcast(ev)
+	ge.host.Broadcast(ev)
 }
 
 // isUpdateGoalToolCall detects the update_goal tool call on the wire
@@ -841,4 +864,31 @@ func analyzeGoalText(text string) (claimComplete, claimBlocked, hasEvidence bool
 		}
 	}
 	return claimComplete, claimBlocked, hasEvidence
+}
+
+// ── Bridge 门面（server 的调用面；实现全部在 goalEngine）─────────────
+
+// GoalSet starts (or restarts) an autonomous goal on the given session.
+func (b *Bridge) GoalSet(ctx context.Context, sessionID, objective string, tokenBudget int64) (map[string]any, error) {
+	return b.goal.GoalSet(ctx, sessionID, objective, tokenBudget)
+}
+
+// GoalStatus returns the current goal state of the given session.
+func (b *Bridge) GoalStatus(sessionID string) (map[string]any, error) {
+	return b.goal.GoalStatus(sessionID)
+}
+
+// GoalPause pauses an active goal on the given session.
+func (b *Bridge) GoalPause(sessionID string) (map[string]any, error) {
+	return b.goal.GoalPause(sessionID)
+}
+
+// GoalResume resumes a paused goal on the given session.
+func (b *Bridge) GoalResume(sessionID string) (map[string]any, error) {
+	return b.goal.GoalResume(sessionID)
+}
+
+// GoalClear clears the goal on the given session.
+func (b *Bridge) GoalClear(sessionID string) (map[string]any, error) {
+	return b.goal.GoalClear(sessionID)
 }

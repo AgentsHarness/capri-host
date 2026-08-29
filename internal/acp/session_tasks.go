@@ -226,61 +226,6 @@ func extractPromptIndex(line []byte) *int64 {
 	return &idx
 }
 
-// filterRewindLines keeps only live-branch lines (agent's
-// filter_rewind_lines semantics). Returns the input unchanged when no
-// rewind markers are present.
-func filterRewindLines(lines []string) []string {
-	hasRewind := false
-	for _, l := range lines {
-		if strings.Contains(l, tagRewind) {
-			hasRewind = true
-			break
-		}
-	}
-	if !hasRewind {
-		return lines
-	}
-
-	var result []string
-	var promptStarts []int
-	inUser := false
-	var lastIdx *int64
-
-	for _, line := range lines {
-		isRewind, isUser, promptIdx := classifyRewindLine([]byte(line))
-		switch {
-		case isRewind:
-			target := 0
-			if idx := extractRewindTarget([]byte(line)); idx != nil {
-				target = int(*idx)
-			}
-			trunc := len(result)
-			if target < len(promptStarts) {
-				trunc = promptStarts[target]
-			}
-			result = result[:trunc]
-			promptStarts = promptStarts[:min(target, len(promptStarts))]
-			inUser = false
-			continue
-		case isUser:
-			newRun := !inUser
-			if promptIdx != nil && lastIdx != nil && *promptIdx != *lastIdx {
-				newRun = true
-			}
-			if newRun {
-				promptStarts = append(promptStarts, len(result))
-			}
-			result = append(result, line)
-			inUser = true
-			lastIdx = promptIdx
-		default:
-			result = append(result, line)
-			inUser = false
-		}
-	}
-	return result
-}
-
 // extractRewindTarget reads the rewind marker's target_prompt_index.
 func extractRewindTarget(line []byte) *int64 {
 	if !bytes.Contains(line, []byte(`"target_prompt_index"`)) {
@@ -303,13 +248,6 @@ func extractRewindTarget(line []byte) *int64 {
 		return nil
 	}
 	return &idx
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ── event parsing ───────────────────────────────────────────────────────
@@ -342,31 +280,27 @@ func parseTaskEvents(path string) ([]TaskEvent, error) {
 }
 
 // parseTaskEventsReadAll is the whole-file fallback for parseTaskEvents,
-// reached only when a single line exceeds maxUsageLineBytes.
+// reached only when a single line exceeds maxUsageLineBytes. It feeds the
+// same rewindFilter as the streaming path — the truncation semantics live
+// in exactly one place.
 func parseTaskEventsReadAll(path string) ([]TaskEvent, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	lines := filterRewindLines(strings.Split(string(raw), "\n"))
-	events := make([]TaskEvent, 0, 16)
-	for _, line := range lines {
-		ev, ok := parseTaskEventLine([]byte(line))
-		if !ok {
-			continue
-		}
-		events = append(events, ev)
+	var filt rewindFilter
+	for _, line := range strings.Split(string(raw), "\n") {
+		filt.feed([]byte(line))
 	}
-	return events, nil
+	return filt.events, nil
 }
 
-// rewindFilter is the streaming form of filterRewindLines: lines are fed
-// one at a time and the task events of live-branch lines are kept in
-// order; events parsed from dead-branch lines (after a rewind_marker) are
-// dropped. For a file without rewind markers every line's events are
-// kept unchanged, exactly like filterRewindLines. Only the parsed events
-// are retained (never the raw lines), so memory stays proportional to the
-// event count instead of the file size.
+// rewindFilter keeps only the task events of live-branch lines (agent's
+// filter_rewind_lines semantics): lines are fed one at a time and the task
+// events of dead-branch lines (after a rewind_marker) are dropped. For a
+// file without rewind markers every line's events are kept unchanged. Only
+// the parsed events are retained (never the raw lines), so memory stays
+// proportional to the event count instead of the file size.
 type rewindFilter struct {
 	events   []TaskEvent
 	evStarts []int // len(events) at each user-message run start
@@ -385,7 +319,7 @@ func (f *rewindFilter) feed(line []byte) {
 		// Truncate at the target prompt run's start. evStarts holds
 		// event counts (events is 1:1 with the live-branch lines, so the
 		// event index at a run start is exactly the count of events that
-		// preceded it — same truncation semantics as filterRewindLines).
+		// preceded it).
 		trunc := len(f.events)
 		if target < len(f.evStarts) {
 			trunc = f.evStarts[target]
@@ -742,28 +676,6 @@ func applyProbe(sum TaskSummary, orphanPaths []string, open map[string]bool) Tas
 		}
 	}
 	return sum
-}
-
-// scanTaskSummary is the single-session convenience form (probes its own
-// orphans in one lsof call).
-func scanTaskSummary(path string) (TaskSummary, error) {
-	sum, orphanPaths, err := scanTaskCensus(path)
-	if err != nil {
-		return TaskSummary{}, err
-	}
-	if len(orphanPaths) == 0 {
-		return sum, nil
-	}
-	open := probeOpenLogs(orphanPaths)
-	if open == nil {
-		open = make(map[string]bool, len(orphanPaths))
-		for _, p := range orphanPaths {
-			if taskLogFresh(p) {
-				open[p] = true
-			}
-		}
-	}
-	return applyProbe(sum, orphanPaths, open), nil
 }
 
 // SessionRunningTasks returns the session's tasks that are STILL RUNNING:

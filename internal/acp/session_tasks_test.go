@@ -208,60 +208,6 @@ func TestParseTaskEventsRewindDeadBranch(t *testing.T) {
 	}
 }
 
-func TestScanTaskSummaryCounts(t *testing.T) {
-	home := t.TempDir()
-	// Include a message whose TEXT mentions task_backgrounded — escaped
-	// quotes mean the raw tag cannot appear inside a JSON string, so the
-	// count must ignore it.
-	msg, _ := json.Marshal(map[string]any{
-		"timestamp": 1,
-		"method":    "session/update",
-		"params": map[string]any{
-			"sessionId": "sess-1",
-			"update": map[string]any{
-				"sessionUpdate": "agent_message_chunk",
-				"content":       map[string]any{"type": "text", "text": `handle_task_backgrounded says "sessionUpdate":"task_backgrounded"`},
-			},
-		},
-	})
-	// t-1 completed; t-2 orphan whose log is HELD OPEN by this test
-	// process (kernel-level liveness → running); t-3 orphan whose log
-	// exists but no process holds it (dead).
-	freshLog := filepath.Join(home, "held.log")
-	held, err := os.OpenFile(freshLog, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer held.Close()
-	staleLog := filepath.Join(home, "closed.log")
-	if err := os.WriteFile(staleLog, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	lines := []string{
-		envLine(1, bgUpdateWithLog("t-1", "a", freshLog)),
-		envLine(2, bgUpdateWithLog("t-2", "b", freshLog)),
-		envLine(3, doneUpdate("t-1", 0)),
-		envLine(4, bgUpdateWithLog("t-3", "c", staleLog)),
-		envLine(5, schedUpdate("scheduled_task_created", "loop-1", "x")),
-		string(msg),
-	}
-	path := writeSessionFile(t, home, "/tmp/ws", "sess-1", lines)
-
-	sum, err := scanTaskSummary(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sum.HasTasks {
-		t.Error("HasTasks = false, want true")
-	}
-	if sum.BgCount != 3 {
-		t.Errorf("BgCount = %d, want 3", sum.BgCount)
-	}
-	if sum.BgRunning != 1 {
-		t.Errorf("BgRunning = %d, want 1 (only t-2 passes the open-fd probe)", sum.BgRunning)
-	}
-}
-
 func TestRunningTasksLivenessProbe(t *testing.T) {
 	home := t.TempDir()
 	// The liveness signal is the open file handle, NOT log writes: the
