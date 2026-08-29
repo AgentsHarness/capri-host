@@ -4,6 +4,7 @@
 # Binaries
 /capri-host
 /bin/
+/dist/
 /release/
 *.exe
 *.exe~

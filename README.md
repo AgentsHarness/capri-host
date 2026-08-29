@@ -71,7 +71,7 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 
 配对成功后 token 写在 `~/.capri-host/hub.json`，之后只需带 `HUB_URL`、`FE_TOKEN` 重启。浏览器打开独立部署的前端地址，选这台 Host 即可。
 
-更完整的部署说明（后台、开机自启、防火墙）见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+更完整的部署说明（后台、开机自启、防火墙）见 [docs/DEPLOY.md](docs/DEPLOY.md)。事件语义契约（seq / 双路去重 / 分级背压）见 [docs/EVENT-CONTRACTS.md](docs/EVENT-CONTRACTS.md)。
 
 ## 常用变量
 
