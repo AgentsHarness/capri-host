@@ -36,12 +36,15 @@ func main() {
 	// The browser talks to the hub; this host keeps working locally too.
 	if cfg.HubURL != "" {
 		hc := hub.NewClient(hub.Config{
-			URL:         cfg.HubURL,
-			HostID:      cfg.HostID,
-			HostName:    cfg.HostName,
-			PairCode:    cfg.HubPairCode,
-			Token:       cfg.HostToken,
-			LocalBase:   fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+			URL:       cfg.HubURL,
+			HostID:    cfg.HostID,
+			HostName:  cfg.HostName,
+			PairCode:  cfg.HubPairCode,
+			Token:     cfg.HostToken,
+			LocalBase: fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
+			// 进程内直调本 host 的 API 处理链（同一条 withAuth 管线），
+			// 中继不再绕道本机 TCP 回环。LocalBase 仅作回退保留。
+			Local:       srv.Handler(),
 			AccessToken: cfg.AccessToken,
 			// Optional: bypass proxy/fake-ip DNS for the QUIC transport
 			// (e.g. HUB_QUIC_HOST=203.0.113.10).
