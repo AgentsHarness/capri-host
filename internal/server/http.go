@@ -21,9 +21,10 @@ import (
 )
 
 type Server struct {
-	cfg    config.Config
-	bridge *acp.Bridge
-	http   *http.Server
+	cfg     config.Config
+	bridge  bridgeAPI
+	handler http.Handler
+	http    *http.Server
 	// promptFn runs a turn when injected (tests only; signature unchanged).
 	// When nil, handlePrompt uses bridge.PromptWithOpts — the default path —
 	// so the optional messageId/meta fields ride the session/prompt params.
@@ -32,9 +33,49 @@ type Server struct {
 	promptFn func(ctx context.Context, sessionID string, blocks []acp.ContentBlock) (string, error)
 }
 
-func New(cfg config.Config, bridge *acp.Bridge) *Server {
+func New(cfg config.Config, bridge bridgeAPI) *Server {
 	s := &Server{cfg: cfg, bridge: bridge}
+	s.handler = s.routes()
+	s.http = &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           s.handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	return s
+}
+
+// routes 装配完整处理链：核心 API → 模型/goal/统计/用量 → 扩展域（每个
+// register*Routes 与其 handler 同文件，路由与实现同址）→ 嵌入前端兜底。
+// CORS for Vite dev. withAuth sits INSIDE withCORS so preflight OPTIONS
+// (which never carries Authorization) is answered by CORS without tripping
+// the token gate.
+func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
+	s.registerCoreRoutes(mux)
+	s.registerModelRoutes(mux)
+	s.registerGoalRoutes(mux)
+	s.registerStatsRoutes(mux)
+	s.registerUsageRoutes(mux)
+	s.registerExtRoutes(mux)
+	s.registerExtSessionRoutes(mux)
+	s.registerExtQueueRoutes(mux)
+	s.registerExtGitRoutes(mux)
+	s.registerExtCodeRoutes(mux)
+	s.registerExtMCPRoutes(mux)
+	s.registerExtEcosystemRoutes(mux)
+	s.registerExtAuthRoutes(mux)
+	s.registerExtTerminalRoutes(mux)
+	s.registerExtFSRoutes(mux)
+	s.registerExtCloudRoutes(mux)
+	s.registerExtMiscRoutes(mux)
+	// 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
+	// 非 API 路径回退 index.html（实现见 web.go）
+	mux.HandleFunc("GET /", s.handleWeb)
+	return withCORS(withAuth(mux, s.cfg.AccessToken))
+}
+
+// registerCoreRoutes 注册核心 API（回合、会话、权限、任务、终端外的主链路）。
+func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /events", s.handleSSE)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/prompt", s.handlePrompt)
@@ -46,16 +87,10 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/session-load", s.handleSessionLoad)
 	mux.HandleFunc("POST /api/set-mode", s.handleSetMode)
 	mux.HandleFunc("POST /api/set-model", s.handleSetModel)
-	mux.HandleFunc("POST /api/set-default-model", s.handleSetDefaultModel)
-	mux.HandleFunc("POST /api/custom-models", s.handleCustomModels)
-	mux.HandleFunc("POST /api/custom-model", s.handleCustomModelUpsert)
-	mux.HandleFunc("POST /api/custom-model-delete", s.handleCustomModelDelete)
 	mux.HandleFunc("POST /api/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/session-state", s.handleSessionState)
 	mux.HandleFunc("POST /api/session-updates", s.handleSessionUpdates)
 	mux.HandleFunc("POST /api/session-running-tasks", s.handleSessionRunningTasks)
-	mux.HandleFunc("POST /api/usage-report", s.handleUsageReport)
-	mux.HandleFunc("POST /api/session-stats", s.handleSessionStats)
 	mux.HandleFunc("POST /api/git-info", s.handleGitInfo)
 	mux.HandleFunc("POST /api/session-fork", s.handleSessionFork)
 	mux.HandleFunc("POST /api/session-rename", s.handleSessionRename)
@@ -70,12 +105,6 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("POST /api/rewind-points", s.handleRewindPoints)
 	mux.HandleFunc("POST /api/rewind-execute", s.handleRewindExecute)
 	mux.HandleFunc("POST /api/scheduler-delete", s.handleSchedulerDelete)
-	// ── goal engine (TUI /goal parity; host-side, see http_goal.go) ──
-	mux.HandleFunc("POST /api/goal/set", s.handleGoalSet)
-	mux.HandleFunc("POST /api/goal/status", s.handleGoalStatus)
-	mux.HandleFunc("POST /api/goal/pause", s.handleGoalPause)
-	mux.HandleFunc("POST /api/goal/resume", s.handleGoalResume)
-	mux.HandleFunc("POST /api/goal/clear", s.handleGoalClear)
 	mux.HandleFunc("POST /api/shell", s.handleShell)
 	mux.HandleFunc("GET /api/hosts", s.handleHosts)
 	mux.HandleFunc("POST /api/billing", s.handleBilling)
@@ -91,167 +120,12 @@ func New(cfg config.Config, bridge *acp.Bridge) *Server {
 	mux.HandleFunc("GET /api/extensions", s.handleExtensions)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
 	mux.HandleFunc("POST /api/settings", s.handleSettingsUpdate)
-	// ── x.ai 扩展直通（完整对齐；实现见 http_ext.go）──
-	mux.HandleFunc("POST /api/xai-call", s.handleXaiCall)
-	mux.HandleFunc("POST /api/session-resume", s.handleSessionResume)
-	mux.HandleFunc("POST /api/session-close", s.handleSessionClose)
-	mux.HandleFunc("POST /api/session-load-history", s.handleSessionLoadHistory)
-	mux.HandleFunc("POST /api/git/status", s.handleGitStatus)
-	mux.HandleFunc("POST /api/git/diffs", s.handleGitDiffs)
-	mux.HandleFunc("POST /api/git/stage", s.handleGitStage)
-	mux.HandleFunc("POST /api/git/unstage", s.handleGitUnstage)
-	mux.HandleFunc("POST /api/git/discard", s.handleGitDiscard)
-	mux.HandleFunc("POST /api/git/commit", s.handleGitCommit)
-	mux.HandleFunc("POST /api/git/checkout", s.handleGitCheckout)
-	mux.HandleFunc("POST /api/git/checkout-commit", s.handleGitCheckoutCommit)
-	mux.HandleFunc("POST /api/git/stash", s.handleGitStash)
-	mux.HandleFunc("POST /api/git/branches", s.handleGitBranches)
-	mux.HandleFunc("POST /api/git/current-commit", s.handleGitCurrentCommit)
-	mux.HandleFunc("POST /api/git/repo-root", s.handleGitRepoRoot)
-	mux.HandleFunc("POST /api/queue/remove", s.handleQueueRemove)
-	mux.HandleFunc("POST /api/queue/clear", s.handleQueueClear)
-	mux.HandleFunc("POST /api/queue/reorder", s.handleQueueReorder)
-	mux.HandleFunc("POST /api/queue/edit", s.handleQueueEdit)
-	mux.HandleFunc("POST /api/queue/interject", s.handleQueueInterject)
-	mux.HandleFunc("POST /api/queue/hold-edit", s.handleQueueHoldEdit)
-	mux.HandleFunc("POST /api/queue/release-edit", s.handleQueueReleaseEdit)
-	mux.HandleFunc("POST /api/queue/status", s.handleQueueStatus)
-	mux.HandleFunc("POST /api/skills/list", s.handleSkillsList)
-	mux.HandleFunc("POST /api/skills/toggle", s.handleSkillsToggle)
-	mux.HandleFunc("POST /api/skills/add", s.handleSkillsAdd)
-	mux.HandleFunc("POST /api/skills/remove", s.handleSkillsRemove)
-	mux.HandleFunc("POST /api/skills/refresh-baseline", s.handleSkillsRefreshBaseline)
-	mux.HandleFunc("POST /api/plugins/list", s.handlePluginsList)
-	mux.HandleFunc("POST /api/plugins/action", s.handlePluginsAction)
-	mux.HandleFunc("POST /api/plugins/reload", s.handlePluginsReload)
-	mux.HandleFunc("POST /api/hooks/list", s.handleHooksList)
-	mux.HandleFunc("POST /api/hooks/action", s.handleHooksAction)
-	mux.HandleFunc("POST /api/marketplace/list", s.handleMarketplaceList)
-	mux.HandleFunc("POST /api/marketplace/action", s.handleMarketplaceAction)
-	mux.HandleFunc("POST /api/workflows/list", s.handleWorkflowsList)
-	mux.HandleFunc("POST /api/session/info", s.handleSessionInfoExt)
-	mux.HandleFunc("POST /api/session/usage", s.handleSessionUsage)
-	mux.HandleFunc("POST /api/session/search", s.handleSessionSearch)
-	mux.HandleFunc("POST /api/sessions/list", s.handleSessionsList)
-	mux.HandleFunc("POST /api/prompt-history", s.handlePromptHistory)
-	mux.HandleFunc("POST /api/btw", s.handleBtw)
-	mux.HandleFunc("POST /api/interject", s.handleInterject)
-	mux.HandleFunc("POST /api/commands-list", s.handleCommandsList)
-	mux.HandleFunc("POST /api/workspaces/list", s.handleWorkspacesList)
-	mux.HandleFunc("POST /api/subagent/list-running", s.handleSubagentListRunning)
-	mux.HandleFunc("POST /api/session/share", s.handleSessionShare)
-	mux.HandleFunc("POST /api/mcp/read-resource", s.handleMCPReadResource)
-	mux.HandleFunc("POST /api/mcp/auth-status", s.handleMCPAuthStatus)
-	mux.HandleFunc("POST /api/mcp/setup", s.handleMCPSetup)
-	mux.HandleFunc("POST /api/mcp/toggle-tool", s.handleMCPToggleTool)
-	mux.HandleFunc("POST /api/mcp/call", s.handleMCPCall)
-	mux.HandleFunc("POST /api/auth/info", s.handleAuthInfo)
-	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
-	mux.HandleFunc("POST /api/auth/get-url", s.handleAuthGetURL)
-	mux.HandleFunc("POST /api/auth/submit-code", s.handleAuthSubmitCode)
-	mux.HandleFunc("POST /api/fs/list", s.handleFSList)
-	mux.HandleFunc("POST /api/fs/read-file", s.handleFSReadFile)
-	mux.HandleFunc("POST /api/fs/exists", s.handleFSExists)
-	mux.HandleFunc("POST /api/capabilities", s.handleCapabilities)
-	mux.HandleFunc("POST /api/folder-trust-request", s.handleFolderTrustRequest)
-	mux.HandleFunc("POST /api/suggest", s.handleSuggest)
-	mux.HandleFunc("POST /api/suggest-prompt", s.handleSuggestPrompt)
-	mux.HandleFunc("POST /api/pr/status", s.handlePRStatus)
-	mux.HandleFunc("POST /api/hunk-tracker/hunks", s.handleHunkTrackerHunks)
-	mux.HandleFunc("POST /api/bundle/status", s.handleBundleStatus)
-	mux.HandleFunc("POST /api/terminal/list", s.handleTerminalList)
-	mux.HandleFunc("POST /api/search/content", s.handleSearchContent)
-	mux.HandleFunc("POST /api/billing/auto-topup-rule", s.handleAutoTopupRule)
-	mux.HandleFunc("POST /api/feedback", s.handleFeedback)
-	mux.HandleFunc("POST /api/cloud/env/list", s.handleCloudEnvList)
-	// ── x.ai 扩展直通（完整对齐，第二批；实现见 http_ext2.go）──
-	mux.HandleFunc("POST /api/session/state", s.handleSessionStateExt)
-	mux.HandleFunc("POST /api/session-import", s.handleSessionImport)
-	mux.HandleFunc("POST /api/session-repair", s.handleSessionRepair)
-	mux.HandleFunc("POST /api/session-update-mcp-servers", s.handleSessionUpdateMcpServers)
-	mux.HandleFunc("POST /api/session-add-local-workspace", s.handleSessionAddLocalWorkspace)
-	mux.HandleFunc("POST /api/session-resolve-worktree-resume", s.handleSessionResolveWorktreeResume)
-	mux.HandleFunc("POST /api/session-rehydrate", s.handleSessionRehydrate)
-	mux.HandleFunc("POST /api/session-summaries/session-list", s.handleSessionSummariesSessionList)
-	mux.HandleFunc("POST /api/session-summaries/workspace-list", s.handleSessionSummariesWorkspaceList)
-	mux.HandleFunc("POST /api/session-summaries/workspace-list-recent", s.handleSessionSummariesWorkspaceListRecent)
-	mux.HandleFunc("POST /api/cloud/terminate", s.handleCloudTerminate)
-	mux.HandleFunc("POST /api/cloud/env/create", s.handleCloudEnvCreate)
-	mux.HandleFunc("POST /api/cloud/env/update", s.handleCloudEnvUpdate)
-	mux.HandleFunc("POST /api/cloud/env/delete", s.handleCloudEnvDelete)
-	mux.HandleFunc("POST /api/api-key-get", s.handleApiKeyGet)
-	mux.HandleFunc("POST /api/api-key-set", s.handleApiKeySet)
-	mux.HandleFunc("POST /api/auth/get-bearer-token", s.handleAuthGetBearerToken)
-	mux.HandleFunc("POST /api/auth/cancel", s.handleAuthCancel)
-	mux.HandleFunc("POST /api/auth/check-subscription", s.handleAuthCheckSubscription)
-	mux.HandleFunc("POST /api/privacy/set-coding-data-retention", s.handlePrivacySetCodingDataRetention)
-	mux.HandleFunc("POST /api/rollout/survey", s.handleRolloutSurvey)
-	mux.HandleFunc("POST /api/git/files", s.handleGitFiles)
-	mux.HandleFunc("POST /api/git/stage-content", s.handleGitStageContent)
-	mux.HandleFunc("POST /api/git/checkout-session-head", s.handleGitCheckoutSessionHead)
-	mux.HandleFunc("POST /api/git/worktree/create", s.handleWorktreeCreate)
-	mux.HandleFunc("POST /api/git/worktree/remove", s.handleWorktreeRemove)
-	mux.HandleFunc("POST /api/git/worktree/apply", s.handleWorktreeApply)
-	mux.HandleFunc("POST /api/git/worktree/create-from-worktree", s.handleWorktreeCreateFromWorktree)
-	mux.HandleFunc("POST /api/git/worktree/create-from-worktree-sync", s.handleWorktreeCreateFromWorktreeSync)
-	mux.HandleFunc("POST /api/git/worktree/resume-session", s.handleWorktreeResumeSession)
-	mux.HandleFunc("POST /api/git/worktree/list", s.handleWorktreeList)
-	mux.HandleFunc("POST /api/git/worktree/show", s.handleWorktreeShow)
-	mux.HandleFunc("POST /api/git/worktree/gc", s.handleWorktreeGc)
-	mux.HandleFunc("POST /api/git/worktree/db/stats", s.handleWorktreeDbStats)
-	mux.HandleFunc("POST /api/git/worktree/db/rebuild", s.handleWorktreeDbRebuild)
-	mux.HandleFunc("POST /api/git/worktree/db/path", s.handleWorktreeDbPath)
-	mux.HandleFunc("POST /api/hunk-tracker/files", s.handleHunkTrackerFiles)
-	mux.HandleFunc("POST /api/hunk-tracker/file-contents", s.handleHunkTrackerFileContents)
-	mux.HandleFunc("POST /api/hunk-tracker/summary", s.handleHunkTrackerSummary)
-	mux.HandleFunc("POST /api/hunk-tracker/hunk-action", s.handleHunkTrackerHunkAction)
-	mux.HandleFunc("POST /api/hunk-tracker/file-action", s.handleHunkTrackerFileAction)
-	mux.HandleFunc("POST /api/hunk-tracker/turn-action", s.handleHunkTrackerTurnAction)
-	mux.HandleFunc("POST /api/hunk-tracker/all-action", s.handleHunkTrackerAllAction)
-	mux.HandleFunc("POST /api/skills/reset", s.handleSkillsReset)
-	mux.HandleFunc("POST /api/skills/config", s.handleSkillsConfig)
-	mux.HandleFunc("POST /api/plugins/notify-updates", s.handlePluginsNotifyUpdates)
-	mux.HandleFunc("POST /api/subagent/get", s.handleSubagentGet)
-	mux.HandleFunc("POST /api/terminal/create", s.handleTerminalCreate)
-	mux.HandleFunc("POST /api/terminal/kill", s.handleTerminalKill)
-	mux.HandleFunc("POST /api/terminal/output", s.handleTerminalOutput)
-	mux.HandleFunc("POST /api/terminal/wait-for-exit", s.handleTerminalWaitForExit)
-	mux.HandleFunc("POST /api/terminal/release", s.handleTerminalRelease)
-	mux.HandleFunc("POST /api/terminal/background", s.handleTerminalBackground)
-	mux.HandleFunc("POST /api/terminal/pty/create", s.handleTerminalPtyCreate)
-	mux.HandleFunc("POST /api/terminal/pty/load", s.handleTerminalPtyLoad)
-	mux.HandleFunc("POST /api/terminal/pty/resize", s.handleTerminalPtyResize)
-	mux.HandleFunc("POST /api/terminal/pty/input", s.handleTerminalPtyInput)
-	mux.HandleFunc("POST /api/fs/write-file", s.handleFSWriteFile)
-	mux.HandleFunc("POST /api/fs/delete-file", s.handleFSDeleteFile)
-	mux.HandleFunc("POST /api/search/fuzzy/open", s.handleSearchFuzzyOpen)
-	mux.HandleFunc("POST /api/search/fuzzy/change", s.handleSearchFuzzyChange)
-	mux.HandleFunc("POST /api/search/fuzzy/close", s.handleSearchFuzzyClose)
-	mux.HandleFunc("POST /api/bundle/sync", s.handleBundleSync)
-	mux.HandleFunc("POST /api/bundle/entry-get", s.handleBundleEntryGet)
-	mux.HandleFunc("POST /api/code/goto-definition", s.handleCodeGotoDefinition)
-	mux.HandleFunc("POST /api/code/goto-references", s.handleCodeGotoReferences)
-	mux.HandleFunc("POST /api/code/find-definitions", s.handleCodeFindDefinitions)
-	mux.HandleFunc("POST /api/code/find-references", s.handleCodeFindReferences)
-	mux.HandleFunc("POST /api/code/status", s.handleCodeStatus)
-	mux.HandleFunc("POST /api/review/comment", s.handleReviewComment)
-	mux.HandleFunc("POST /api/review/comment-delete", s.handleReviewCommentDelete)
-	mux.HandleFunc("POST /api/debug/trigger-feedback", s.handleDebugTriggerFeedback)
-	mux.HandleFunc("POST /api/debug/arm-auto-compact", s.handleDebugArmAutoCompact)
-	mux.HandleFunc("POST /api/debug/agent", s.handleDebugAgent)
-	// ── 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
-	// 非 API 路径回退 index.html（实现见 web.go）──
-	mux.HandleFunc("GET /", s.handleWeb)
-	// CORS for Vite dev. withAuth sits INSIDE withCORS so preflight
-	// OPTIONS (which never carries Authorization) is answered by CORS
-	// without tripping the token gate.
-	s.http = &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           withCORS(withAuth(mux, cfg.AccessToken)),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	return s
 }
+
+// Handler 暴露完整的本地 API 处理链（CORS + token 鉴权 + 路由）。hub
+// 中继模式用它做进程内直调（见 hub.Config.Local），不再绕道本机
+// TCP 回环——同一条鉴权管线，少一个端口依赖。
+func (s *Server) Handler() http.Handler { return s.handler }
 
 // ── local-origin guard for sensitive endpoints ────────────────────────
 
@@ -1034,10 +908,10 @@ func (s *Server) handleGitInfo(w http.ResponseWriter, r *http.Request) {
 // handleSessionFork forks the given session via x.ai/session/fork
 // ({sessionId?} empty resolves to the active one).
 type forkBody struct {
-	SessionID    string `json:"sessionId,omitempty"`
-	SourceCwd    string `json:"sourceCwd"`
-	NewCwd       string `json:"newCwd"`
-	NewSessionID string `json:"newSessionId"`
+	SessionID     string `json:"sessionId,omitempty"`
+	SourceCwd     string `json:"sourceCwd"`
+	NewCwd        string `json:"newCwd"`
+	NewSessionID  string `json:"newSessionId"`
 	SourceWorkDir string `json:"sourceWorkspaceDir"`
 	// Fork truncation (agent ForkSessionRequest.target_prompt_index):
 	// keep turns 0..=targetPromptIndex (0-based, inclusive). Nil → full copy.

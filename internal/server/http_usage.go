@@ -29,3 +29,8 @@ func (s *Server) handleUsageReport(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": rep})
 }
+
+// registerUsageRoutes 注册本域路由（路由与实现同址）。
+func (s *Server) registerUsageRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/usage-report", s.handleUsageReport)
+}

@@ -28,3 +28,8 @@ func (s *Server) handleSessionStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "stats": stats})
 }
+
+// registerStatsRoutes 注册本域路由（路由与实现同址）。
+func (s *Server) registerStatsRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/session-stats", s.handleSessionStats)
+}
