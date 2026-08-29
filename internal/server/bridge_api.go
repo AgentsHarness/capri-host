@@ -117,6 +117,7 @@ type miscAPI interface {
 	MemoryFlush(ctx context.Context, sessionID string) (map[string]any, error)
 	MemoryRewrite(ctx context.Context, sessionID, rawText, contextSummary string) (map[string]any, error)
 	SetUiSettings(patch map[string]any) error
+	SetToolsetSettings(patch map[string]any) error
 	DismissModelDefaultCampaigns(ctx context.Context) error
 	ConfigTOMLPath() (string, error)
 }
