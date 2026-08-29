@@ -10,6 +10,7 @@ var writableUIKeys = map[string]func(any) (any, error){
 	"page_flip_on_send":       requireBool,
 	"remember_tool_approvals": requireBool,
 	"permission_mode":         requirePermissionMode,
+	"follow_up_behavior":      requireFollowUpBehavior,
 }
 
 func requireBool(v any) (any, error) {
@@ -30,6 +31,22 @@ func requirePermissionMode(v any) (any, error) {
 		return s, nil
 	default:
 		return nil, fmt.Errorf("必须是 ask / auto / always-approve")
+	}
+}
+
+// requireFollowUpBehavior validates [ui].follow_up_behavior — canonical
+// values "queue" (default) / "steer" (mid-turn interjection), matching the
+// TUI FollowUpBehavior enum.
+func requireFollowUpBehavior(v any) (any, error) {
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("必须是字符串")
+	}
+	switch s {
+	case "queue", "steer":
+		return s, nil
+	default:
+		return nil, fmt.Errorf("必须是 queue / steer")
 	}
 }
 

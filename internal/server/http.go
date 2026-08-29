@@ -1746,14 +1746,44 @@ type settingsUpdateBody struct {
 	PageFlipOnSend        *bool   `json:"page_flip_on_send"`
 	RememberToolApprovals *bool   `json:"remember_tool_approvals"`
 	PermissionMode        *string `json:"permission_mode"`
+	FollowUpBehavior      *string `json:"follow_up_behavior"`
+}
+
+// settingsBodyKeyKnown reports whether settingsUpdateBody declares the
+// key. Kept in lockstep with the struct: a key missing here would be
+// silently dropped by the JSON decode and look like a successful no-op.
+func settingsBodyKeyKnown(key string) bool {
+	switch key {
+	case "collapsed_edit_blocks", "page_flip_on_send",
+		"remember_tool_approvals", "permission_mode", "follow_up_behavior":
+		return true
+	}
+	return false
 }
 
 // handleSettingsUpdate — POST /api/settings: patch the FE-consumed [ui]
-// scalars into config.toml. Unknown keys never reach the file (the
-// struct drops them). Response is the same payload as GET.
+// scalars into config.toml. Unknown keys get a 400 up front (the struct
+// decode would otherwise drop them silently). Response is the same
+// payload as GET.
 func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
+	var raw map[string]any
+	if err := readJSON(r, &raw); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效 JSON"})
+		return
+	}
+	for k := range raw {
+		if !settingsBodyKeyKnown(k) {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": "不允许的设置项 " + k})
+			return
+		}
+	}
+	bodyBytes, err := json.Marshal(raw)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效 JSON"})
+		return
+	}
 	var body settingsUpdateBody
-	if err := readJSON(r, &body); err != nil {
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效 JSON"})
 		return
 	}
@@ -1769,6 +1799,9 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.PermissionMode != nil {
 		patch["permission_mode"] = *body.PermissionMode
+	}
+	if body.FollowUpBehavior != nil {
+		patch["follow_up_behavior"] = *body.FollowUpBehavior
 	}
 	if len(patch) == 0 {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要至少一个设置项"})

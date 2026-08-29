@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -291,15 +292,67 @@ func TestSettingsUpdateRejectsUnknownAndEmpty(t *testing.T) {
 		t.Fatalf("empty: status = %d, want 400", rec.Code)
 	}
 
-	// Struct decode drops unknown keys; with nothing left → 400.
+	// Unknown keys get an explicit 400 up front (the struct decode would
+	// silently drop them and look like a successful no-op).
 	rec = postJSON(t, s, "/api/settings", `{"theme":"dark","yolo":true}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown-only: status = %d, want 400", rec.Code)
+	}
+	if m := decodeBody(t, rec); !strings.Contains(fmt.Sprint(m["error"]), "不允许的设置项") {
+		t.Fatalf("unknown-only: error = %v, want 不允许的设置项", m["error"])
 	}
 
 	rec = postJSON(t, s, "/api/settings", `{"permission_mode":"yolo"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad mode: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	rec = postJSON(t, s, "/api/settings", `{"follow_up_behavior":"yolo"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad follow_up_behavior: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// POST follow_up_behavior writes [ui].follow_up_behavior into config.toml,
+// the POST response echoes it back, and a subsequent GET returns it too
+// (the capsule's selected state comes from GET /api/settings).
+func TestSettingsUpdateFollowUpBehavior(t *testing.T) {
+	grok := withFakeGrokHome(t)
+	s := newLocalServer(t)
+	path := filepath.Join(grok, "config.toml")
+	os.WriteFile(path, []byte(`
+[ui]
+yolo = true
+theme = "dark"
+`), 0o644)
+
+	rec := postJSON(t, s, "/api/settings", `{"follow_up_behavior":"steer"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, body=%s", m["ok"], rec.Body.String())
+	}
+	ui, _ := m["ui"].(map[string]any)
+	if ui["follow_up_behavior"] != "steer" || ui["yolo"] != true || ui["theme"] != "dark" {
+		t.Fatalf("ui = %v, want follow_up_behavior steer with other keys preserved", m["ui"])
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `follow_up_behavior = "steer"`) {
+		t.Errorf("config.toml missing [ui].follow_up_behavior:\n%s", raw)
+	}
+
+	// GET回读：胶囊选中态的数据源。
+	rec = getJSON(t, s, "/api/settings")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if ui, _ = decodeBody(t, rec)["ui"].(map[string]any); ui["follow_up_behavior"] != "steer" {
+		t.Fatalf("GET ui = %v, want follow_up_behavior steer", ui)
 	}
 }
 
