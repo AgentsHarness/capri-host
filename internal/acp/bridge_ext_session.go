@@ -26,31 +26,6 @@ func (b *Bridge) xaiCallUnwrapped(ctx context.Context, method string, params map
 	return m, nil
 }
 
-// xaiNotify writes a fire-and-forget `_x.ai/<method>` notification (no
-// JSON-RPC id, so the agent's ext_notification path handles it — a
-// request-style call would get -32601) and returns a bare ok. The session
-// id is resolved from the active session the same way XaiCall does it
-// ("" → active; no active session → HTTPError 404), because the queue
-// handlers route on sessionId and silently drop the command without it.
-func (b *Bridge) xaiNotify(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
-	if err := b.Boot(ctx); err != nil {
-		return nil, err
-	}
-	if sid := b.resolveSessionID(""); sid == "" {
-		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
-	} else {
-		params["sessionId"] = sid
-	}
-	if err := b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "_" + method,
-		"params":  params,
-	}); err != nil {
-		return nil, err
-	}
-	return map[string]any{"ok": true}, nil
-}
-
 // ── session meta / lifecycle ─────────────────────────────────────────
 
 // SessionInfoExt calls x.ai/session/info — live session metadata
@@ -380,60 +355,6 @@ func (b *Bridge) SubagentGet(ctx context.Context, subagentID string, block *bool
 		params["timeoutMs"] = timeoutMs
 	}
 	return b.xaiCallUnwrapped(ctx, "x.ai/subagent/get", params)
-}
-
-// ── prompt queue (fire-and-forget notifications) ─────────────────────
-//
-// The x.ai/queue/* methods have NO request branch in the agent — they are
-// handled only as ext_notifications, so every wrapper writes without a
-// JSON-RPC id (a request-style call would get -32601). The agent routes on
-// sessionId and silently drops the command without it, so each wrapper
-// fills sessionId from the active session and fails fast with 404 when
-// there is none (mirroring TogglePlanMode/PermissionsReset).
-
-// QueueRemove sends x.ai/queue/remove: {id, sessionId, expectedVersion?}
-// (expectedVersion omitted — agent treats it as 0). Removes one queued
-// prompt on an exact version match.
-func (b *Bridge) QueueRemove(ctx context.Context, id string) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/remove", map[string]any{"id": id})
-}
-
-// QueueReorder sends x.ai/queue/reorder: {orderedIds, sessionId} — the
-// full ordered list of queued prompt ids.
-func (b *Bridge) QueueReorder(ctx context.Context, orderedIDs []string) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/reorder", map[string]any{"orderedIds": orderedIDs})
-}
-
-// QueueClear sends x.ai/queue/clear: {sessionId} — clears the requesting
-// client's queued prompts.
-func (b *Bridge) QueueClear(ctx context.Context) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/clear", map[string]any{})
-}
-
-// QueueEdit sends x.ai/queue/edit: {id, newText, sessionId} — in-place
-// text edit of a queued prompt.
-func (b *Bridge) QueueEdit(ctx context.Context, id, newText string) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/edit", map[string]any{"id": id, "newText": newText})
-}
-
-// QueueHoldEdit sends x.ai/queue/hold_edit: {id, sessionId} — pins a
-// queued prompt open for editing (combine-edit mode).
-func (b *Bridge) QueueHoldEdit(ctx context.Context, id string) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/hold_edit", map[string]any{"id": id})
-}
-
-// QueueReleaseEdit sends x.ai/queue/release_edit: {id, sessionId} —
-// releases a held queued prompt.
-func (b *Bridge) QueueReleaseEdit(ctx context.Context, id string) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/release_edit", map[string]any{"id": id})
-}
-
-// QueueInterject sends x.ai/queue/interject: {id, sessionId,
-// expectedVersion?, newText?} — promotes a queued prompt into the running
-// turn; expectedVersion/newText are omitted (agent defaults: version 0,
-// keep stored text).
-func (b *Bridge) QueueInterject(ctx context.Context, id string) (map[string]any, error) {
-	return b.xaiNotify(ctx, "x.ai/queue/interject", map[string]any{"id": id})
 }
 
 // ── sharing ──────────────────────────────────────────────────────────

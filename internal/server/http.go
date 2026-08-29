@@ -1039,6 +1039,9 @@ type forkBody struct {
 	NewCwd       string `json:"newCwd"`
 	NewSessionID string `json:"newSessionId"`
 	SourceWorkDir string `json:"sourceWorkspaceDir"`
+	// Fork truncation (agent ForkSessionRequest.target_prompt_index):
+	// keep turns 0..=targetPromptIndex (0-based, inclusive). Nil → full copy.
+	TargetPromptIndex *uint64 `json:"targetPromptIndex,omitempty"`
 }
 
 func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
@@ -1056,6 +1059,9 @@ func (s *Server) handleSessionFork(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.SourceWorkDir != "" {
 		params["sourceWorkspaceDir"] = body.SourceWorkDir
+	}
+	if body.TargetPromptIndex != nil {
+		params["targetPromptIndex"] = *body.TargetPromptIndex
 	}
 	res, err := s.bridge.ForkSession(r.Context(), body.SessionID, params)
 	if err != nil {

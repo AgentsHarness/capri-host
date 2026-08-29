@@ -382,6 +382,41 @@ func TestExt2WireKeys(t *testing.T) {
 		t.Errorf("session/state params = %v, want %v", params, want)
 	}
 
+	// session/fork：targetPromptIndex 透传（agent 按轮截断，0-based 含端点）；
+	// 缺省时不出现该键 = 完整副本。
+	params = recordedParams(t, s, recordPath, "/api/session-fork", `{"sessionId":"sess-new","targetPromptIndex":3}`, "_x.ai/session/fork")
+	want = map[string]any{
+		"sourceSessionId": "sess-new", "sourceCwd": "/ws", "newCwd": "/ws",
+		"sessionKind": "fork", "targetPromptIndex": float64(3),
+	}
+	if !reflect.DeepEqual(params, want) {
+		t.Errorf("session/fork params = %v, want %v", params, want)
+	}
+
+	// 不带 targetPromptIndex：完整副本（该键不出现）。同一方法录制了两条
+	// 而 findRequest 取第一条，这里手工取最后一条。
+	recFork := postJSON(t, s, "/api/session-fork", `{"sessionId":"sess-new"}`)
+	if recFork.Code != http.StatusOK {
+		t.Fatalf("session-fork status = %d, body=%s", recFork.Code, recFork.Body.String())
+	}
+	var lastFork map[string]any
+	for _, m := range readRecordedRequests(t, recordPath) {
+		if m["method"] == "_x.ai/session/fork" {
+			lastFork = m
+		}
+	}
+	if lastFork == nil {
+		t.Fatalf("no recorded _x.ai/session/fork request")
+	}
+	params, _ = lastFork["params"].(map[string]any)
+	want = map[string]any{
+		"sourceSessionId": "sess-new", "sourceCwd": "/ws", "newCwd": "/ws",
+		"sessionKind": "fork",
+	}
+	if !reflect.DeepEqual(params, want) {
+		t.Errorf("session/fork (full copy) params = %v, want %v", params, want)
+	}
+
 	params = recordedParams(t, s, recordPath, "/api/session-import", `{"cwd":"/ws","state":{"summary":{"title":"t"}},"updates":[{"a":1}]}`, "_x.ai/session/import")
 	want = map[string]any{
 		"sessionId": "sess-new", "cwd": "/ws",
