@@ -31,13 +31,13 @@ type PermissionScope struct {
 
 // Status is a snapshot for GET /api/status and SSE hello.
 type Status struct {
-	Ready     bool           `json:"ready"`
-	Busy      bool           `json:"busy"`
-	Booting   bool           `json:"booting"`
-	SessionID string         `json:"sessionId,omitempty"`
-	Cwd       string         `json:"cwd,omitempty"`
-	HostID   string `json:"hostId"`
-	HostName string `json:"hostName"`
+	Ready     bool   `json:"ready"`
+	Busy      bool   `json:"busy"`
+	Booting   bool   `json:"booting"`
+	SessionID string `json:"sessionId,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	HostID    string `json:"hostId"`
+	HostName  string `json:"hostName"`
 	// Mode 标明部署模式："local"（未配置 HUB_URL，浏览器直连本进程）或
 	// "hub"（配置了 HUB_URL，本进程作为 hub 客户端中继，内嵌前端应跨源
 	// 直连 hub）。由 server 层在 handleStatus 填充，bridge 自身不感知。

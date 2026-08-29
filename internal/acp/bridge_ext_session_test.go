@@ -21,80 +21,6 @@ func TestExtSessionMethodsWirePayloads(t *testing.T) {
 		params map[string]any
 	}{
 		{
-			name:   "session/state fills active sessionId (camelCase)",
-			call:   func(b *Bridge) (map[string]any, error) { return b.SessionState(ctx, "/ws") },
-			method: "_x.ai/session/state",
-			params: map[string]any{"sessionId": "s1", "cwd": "/ws"},
-		},
-		{
-			name:   "share_session snake_case session_id filled",
-			call:   func(b *Bridge) (map[string]any, error) { return b.ShareSession(ctx) },
-			method: "_x.ai/share_session",
-			params: map[string]any{"session_id": "s1"},
-		},
-		{
-			name:   "session/usage fills active sessionId",
-			call:   func(b *Bridge) (map[string]any, error) { return b.SessionUsage(ctx) },
-			method: "_x.ai/session/usage",
-			params: map[string]any{"sessionId": "s1"},
-		},
-		{
-			name:   "session/search sends query and no sessionId",
-			call:   func(b *Bridge) (map[string]any, error) { return b.SessionSearch(ctx, "mcp", "", 0, 0, nil) },
-			method: "_x.ai/session/search",
-			params: map[string]any{"query": "mcp"},
-		},
-		{
-			name: "session/search optional fields omitted when zero",
-			call: func(b *Bridge) (map[string]any, error) {
-				return b.SessionSearch(ctx, "git", "/repo", 20, 5, boolPtr(true))
-			},
-			method: "_x.ai/session/search",
-			params: map[string]any{"query": "git", "cwd": "/repo", "limit": float64(20), "offset": float64(5), "includeContent": true},
-		},
-		{
-			name:   "btw fills sessionId",
-			call:   func(b *Bridge) (map[string]any, error) { return b.Btw(ctx, "what next?") },
-			method: "_x.ai/btw",
-			params: map[string]any{"sessionId": "s1", "question": "what next?"},
-		},
-		{
-			name:   "prompt_history snake_case session_id",
-			call:   func(b *Bridge) (map[string]any, error) { return b.PromptHistory(ctx, "/ws", "s1", "") },
-			method: "_x.ai/prompt_history",
-			params: map[string]any{"cwd": "/ws", "session_id": "s1"},
-		},
-		{
-			name:   "prompt_history omits optional session ids",
-			call:   func(b *Bridge) (map[string]any, error) { return b.PromptHistory(ctx, "/ws", "", "") },
-			method: "_x.ai/prompt_history",
-			params: map[string]any{"cwd": "/ws"},
-		},
-		{
-			name:   "session/close fills active sessionId",
-			call:   func(b *Bridge) (map[string]any, error) { return b.SessionClose(ctx) },
-			method: "_x.ai/session/close",
-			params: map[string]any{"sessionId": "s1"},
-		},
-		{
-			name:   "session/rehydrate fills sessionId",
-			call:   func(b *Bridge) (map[string]any, error) { return b.SessionRehydrate(ctx, "/src", "/repo", "/wt") },
-			method: "_x.ai/session/rehydrate",
-			params: map[string]any{"sessionId": "s1", "sourceCwd": "/src", "repoRoot": "/repo", "worktreePath": "/wt"},
-		},
-		{
-			name:   "interject fills sessionId",
-			call:   func(b *Bridge) (map[string]any, error) { return b.Interject(ctx, "hi", "") },
-			method: "_x.ai/interject",
-			params: map[string]any{"sessionId": "s1", "text": "hi"},
-		},
-		{
-			name:   "session/list omits empty optional fields",
-			call:   func(b *Bridge) (map[string]any, error) { return b.SessionList(ctx, "", "", "", 0) },
-			method: "_x.ai/session/list",
-			params: map[string]any{},
-		},
-		{
 			name:   "session/load_history sends beforeId cursor",
 			call:   func(b *Bridge) (map[string]any, error) { return b.SessionLoadHistory(ctx, "c-42") },
 			method: "_x.ai/session/load_history",
@@ -144,7 +70,7 @@ func TestExtSessionMethodBareResult(t *testing.T) {
 	b, w := readyBridge()
 	done := make(chan callResult, 1)
 	go func() {
-		res, err := b.SessionUsage(context.Background())
+		res, err := b.SessionLoadHistory(context.Background(), "")
 		done <- callResult{res, err}
 	}()
 	resolveNext(t, b, w, map[string]any{"usage": map[string]any{"numTurns": 3}})
@@ -158,18 +84,16 @@ func TestExtSessionMethodBareResult(t *testing.T) {
 }
 
 // A REQUIRED sessionId with no active session must 404 fast — XaiCall's
-// fill rule, exercised through a session-scoped wrapper.
-func TestExtSessionMethodNoActiveSession(t *testing.T) {
+// fill rule, exercised directly on the XaiCall surface.
+func TestExtMethodNoActiveSession(t *testing.T) {
 	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
 	b.mu.Lock()
 	b.ready = true
 	b.stdin = discardWriteCloser{}
 	b.mu.Unlock()
-	_, err := b.SessionUsage(context.Background())
+	_, err := b.XaiCall(context.Background(), "x.ai/session/usage", map[string]any{"sessionId": ""})
 	var he *HTTPError
 	if !errors.As(err, &he) || he.Code != 404 {
 		t.Errorf("err = %v, want HTTPError 404", err)
 	}
 }
-
-func boolPtr(v bool) *bool { return &v }

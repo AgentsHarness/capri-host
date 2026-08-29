@@ -6,8 +6,8 @@ import (
 
 func TestAnalyzeGoalText(t *testing.T) {
 	cases := []struct {
-		name          string
-		text          string
+		name                   string
+		text                   string
 		claim, block, evidence bool
 	}{
 		{

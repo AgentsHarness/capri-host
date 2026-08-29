@@ -39,7 +39,7 @@ import (
 //     钳制 [0,1]；input 为 0 时为 0）；
 //   - 时间：事件信封顶层 timestamp（unix 秒；请求 from/to 兼容毫秒）；
 //   - rewind 死分支照常计入：回退丢弃的回合是真实消耗过的 token（与
-//     task 时间线的 filterRewindLines 语义不同——那是会话视图，这是
+//     task 时间线的 rewind 死分支过滤语义不同——那是会话视图，这是
 //     资源消耗账本），文件全量回合终态事件都统计。
 //
 // 性能（实测：284 个会话 ~1.1GB updates.jsonl，全量聚合 <500ms）：

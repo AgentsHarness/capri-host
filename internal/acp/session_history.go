@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -230,6 +231,32 @@ type historyCacheEntry struct {
 	view    *normalizedHistory
 }
 
+// historyCache 缓存会话 updates.jsonl 的归一化视图。Bridge 持有一个
+// 实例，缓存锁纪律收敛在本类型内。
+type historyCache struct {
+	mu      sync.Mutex
+	entries map[string]*historyCacheEntry
+}
+
+// get 命中返回视图；未命中或 (size, mtime) 已变化返回 false。
+func (hc *historyCache) get(path string, size int64, mod time.Time) (*normalizedHistory, bool) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	if ent, ok := hc.entries[path]; ok && ent.size == size && ent.modTime.Equal(mod) {
+		return ent.view, true
+	}
+	return nil, false
+}
+
+func (hc *historyCache) put(path string, size int64, mod time.Time, view *normalizedHistory) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	if hc.entries == nil {
+		hc.entries = make(map[string]*historyCacheEntry)
+	}
+	hc.entries[path] = &historyCacheEntry{size: size, modTime: mod, view: view}
+}
+
 // normalizedSessionHistory 返回该会话 updates.jsonl 的归一化视图（带
 // (size, mtime) 缓存）。ok=false = 触发回退（文件不可读 / 任一信封缺
 // agentTimestampMs），调用方走 agent RPC 透传。
@@ -240,25 +267,16 @@ func (b *Bridge) normalizedSessionHistory(path string) (*normalizedHistory, bool
 	}
 	size, mod := st.Size(), st.ModTime()
 
-	b.historyMu.Lock()
-	if ent, ok := b.historyCache[path]; ok && ent.size == size && ent.modTime.Equal(mod) {
-		view := ent.view
-		b.historyMu.Unlock()
+	if view, ok := b.hist.get(path, size, mod); ok {
 		return view, true
 	}
-	b.historyMu.Unlock()
 
 	view, err := buildNormalizedHistory(path)
 	if err != nil {
 		return nil, false
 	}
 
-	b.historyMu.Lock()
-	if b.historyCache == nil {
-		b.historyCache = make(map[string]*historyCacheEntry)
-	}
-	b.historyCache[path] = &historyCacheEntry{size: size, modTime: mod, view: view}
-	b.historyMu.Unlock()
+	b.hist.put(path, size, mod, view)
 	return view, true
 }
 

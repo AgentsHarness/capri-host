@@ -44,7 +44,7 @@ func TestCampaignTouchesModelsDefault(t *testing.T) {
 		{
 			name:  "no models at all",
 			entry: map[string]any{"id": "c4", "tips": []any{}},
-			want: false,
+			want:  false,
 		},
 	}
 	for _, c := range cases {
