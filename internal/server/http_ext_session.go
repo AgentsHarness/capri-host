@@ -130,9 +130,13 @@ func (s *Server) handlePromptHistory(w http.ResponseWriter, r *http.Request) {
 	s.xaiCall(w, r, "x.ai/prompt_history", params)
 }
 
+// handleBtw — POST /api/btw {question, sessionId?} → x.ai/btw。
+// sessionId 显式给出时透传（浏览器可能在别的会话上发 /btw——多标签页 /
+// 恢复的历史会话）；缺省沿用 "" → XaiCall 填活动会话（向后兼容）。
 func (s *Server) handleBtw(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Question string `json:"question"`
+		SessionID string `json:"sessionId"`
+		Question  string `json:"question"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -141,7 +145,9 @@ func (s *Server) handleBtw(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 question"})
 		return
 	}
-	s.xaiCall(w, r, "x.ai/btw", map[string]any{"sessionId": "", "question": body.Question})
+	params := sessionKey(acp.WireSessionID, body.SessionID)
+	params["question"] = body.Question
+	s.xaiCall(w, r, "x.ai/btw", params)
 }
 
 func (s *Server) handleInterject(w http.ResponseWriter, r *http.Request) {
