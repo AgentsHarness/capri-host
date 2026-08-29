@@ -33,6 +33,7 @@ default = "grok-4"
 		"page_flip_on_send":       false,
 		"remember_tool_approvals": true,
 		"permission_mode":         "auto",
+		"follow_up_behavior":      "steer",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +51,7 @@ default = "grok-4"
 		ui["page_flip_on_send"] != false ||
 		ui["remember_tool_approvals"] != true ||
 		ui["permission_mode"] != "auto" ||
+		ui["follow_up_behavior"] != "steer" ||
 		ui["theme"] != "dark" ||
 		ui["yolo"] != true {
 		t.Fatalf("ui = %#v", ui)
@@ -67,5 +69,11 @@ default = "grok-4"
 	}
 	if err := b.SetUiSettings(map[string]any{"permission_mode": "yolo"}); err == nil {
 		t.Fatal("bad permission_mode must fail")
+	}
+	if err := b.SetUiSettings(map[string]any{"follow_up_behavior": "yolo"}); err == nil {
+		t.Fatal("bad follow_up_behavior must fail")
+	}
+	if err := b.SetUiSettings(map[string]any{"follow_up_behavior": 7}); err == nil {
+		t.Fatal("non-string follow_up_behavior must fail")
 	}
 }
