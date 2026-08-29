@@ -1742,11 +1742,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 type settingsUpdateBody struct {
-	CollapsedEditBlocks   *bool   `json:"collapsed_edit_blocks"`
-	PageFlipOnSend        *bool   `json:"page_flip_on_send"`
-	RememberToolApprovals *bool   `json:"remember_tool_approvals"`
-	PermissionMode        *string `json:"permission_mode"`
-	FollowUpBehavior      *string `json:"follow_up_behavior"`
+	CollapsedEditBlocks   *bool                `json:"collapsed_edit_blocks"`
+	PageFlipOnSend        *bool                `json:"page_flip_on_send"`
+	RememberToolApprovals *bool                `json:"remember_tool_approvals"`
+	PermissionMode        *string              `json:"permission_mode"`
+	FollowUpBehavior      *string              `json:"follow_up_behavior"`
+	Toolset               *settingsToolsetBody `json:"toolset"`
+}
+
+// settingsToolsetBody is the writable subset of [toolset]: only
+// ask_user_question.timeout_enabled / timeout_secs (validated against
+// writableToolsetKeys). A `toolset` object with an unknown sub-table or
+// key is rejected before any write.
+type settingsToolsetBody struct {
+	AskUserQuestion *map[string]any `json:"ask_user_question"`
 }
 
 // settingsBodyKeyKnown reports whether settingsUpdateBody declares the
@@ -1755,26 +1764,65 @@ type settingsUpdateBody struct {
 func settingsBodyKeyKnown(key string) bool {
 	switch key {
 	case "collapsed_edit_blocks", "page_flip_on_send",
-		"remember_tool_approvals", "permission_mode", "follow_up_behavior":
+		"remember_tool_approvals", "permission_mode", "follow_up_behavior",
+		"toolset":
+		return true
+	}
+	return false
+}
+
+// settingsToolsetKeyKnown reports whether the [toolset.ask_user_question]
+// sub-key is a declared writable key (lockstep with writableToolsetKeys).
+// Kept as a server-side guard so unknown nested keys get an explicit 400
+// instead of being silently dropped by the struct decode.
+func settingsToolsetKeyKnown(key string) bool {
+	switch key {
+	case "timeout_enabled", "timeout_secs":
 		return true
 	}
 	return false
 }
 
 // handleSettingsUpdate — POST /api/settings: patch the FE-consumed [ui]
-// scalars into config.toml. Unknown keys get a 400 up front (the struct
-// decode would otherwise drop them silently). Response is the same
-// payload as GET.
+// scalars and the [toolset.ask_user_question] timeout pair into
+// config.toml. Unknown keys get a 400 up front (the struct decode would
+// otherwise drop them silently). Response is the same payload as GET.
 func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	var raw map[string]any
 	if err := readJSON(r, &raw); err != nil {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效 JSON"})
 		return
 	}
-	for k := range raw {
+	for k, v := range raw {
 		if !settingsBodyKeyKnown(k) {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "不允许的设置项 " + k})
 			return
+		}
+		if k == "toolset" {
+			// Nested allowlist: only ask_user_question.{timeout_enabled,
+			// timeout_secs}; anything else gets an explicit 400.
+			ts, ok := v.(map[string]any)
+			if !ok {
+				writeJSON(w, 400, map[string]any{"ok": false, "error": "toolset 必须是对象"})
+				return
+			}
+			for sk, sv := range ts {
+				if sk != "ask_user_question" {
+					writeJSON(w, 400, map[string]any{"ok": false, "error": "不允许的设置项 " + sk})
+					return
+				}
+				aq, ok := sv.(map[string]any)
+				if !ok {
+					writeJSON(w, 400, map[string]any{"ok": false, "error": "toolset.ask_user_question 必须是对象"})
+					return
+				}
+				for ak := range aq {
+					if !settingsToolsetKeyKnown(ak) {
+						writeJSON(w, 400, map[string]any{"ok": false, "error": "不允许的设置项 " + ak})
+						return
+					}
+				}
+			}
 		}
 	}
 	bodyBytes, err := json.Marshal(raw)
@@ -1803,13 +1851,29 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	if body.FollowUpBehavior != nil {
 		patch["follow_up_behavior"] = *body.FollowUpBehavior
 	}
-	if len(patch) == 0 {
+	toolsetPatch := map[string]any{}
+	if body.Toolset != nil && body.Toolset.AskUserQuestion != nil {
+		for k, v := range *body.Toolset.AskUserQuestion {
+			// Values are re-validated (bool / 1–86400 int) by
+			// acp.SetToolsetSettings before anything touches disk.
+			toolsetPatch[k] = v
+		}
+	}
+	if len(patch) == 0 && len(toolsetPatch) == 0 {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要至少一个设置项"})
 		return
 	}
-	if err := s.bridge.SetUiSettings(patch); err != nil {
-		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
-		return
+	if len(patch) > 0 {
+		if err := s.bridge.SetUiSettings(patch); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	}
+	if len(toolsetPatch) > 0 {
+		if err := s.bridge.SetToolsetSettings(toolsetPatch); err != nil {
+			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 	}
 	out := s.settingsPayload()
 	out["ok"] = true
@@ -1839,6 +1903,21 @@ func (s *Server) settingsPayload() map[string]any {
 	for _, name := range []string{"ui", "session", "models", "cli"} {
 		if kv, ok := sections[name]; ok && len(kv) > 0 {
 			out[name] = kv
+		}
+	}
+	// [toolset.ask_user_question] — exposed under `toolset` with ONLY the
+	// two FE-consumed timeout scalars. The rest of [toolset] (bash / web_search
+	// method tables, runtime-only structs) must not leak the same way other
+	// unknown sections are dropped above.
+	if aq, ok := sections["toolset.ask_user_question"]; ok {
+		filtered := map[string]any{}
+		for _, k := range []string{"timeout_enabled", "timeout_secs"} {
+			if v, has := aq[k]; has {
+				filtered[k] = v
+			}
+		}
+		if len(filtered) > 0 {
+			out["toolset"] = map[string]any{"ask_user_question": filtered}
 		}
 	}
 	return out
