@@ -50,6 +50,34 @@ func TestGitEndpoints(t *testing.T) {
 	}
 }
 
+// TestGitRepoRootWireKey — /api/git/repo-root 的 wire 键必须是 agent 侧
+// GitRepoRequest 的 currentWorkingDirectory（serde 必填）。该端点历史上发的
+// 是其它 git 方法用的 gitRoot，agent 判缺字段直接 -32602 "Invalid params"，
+// FE home 空状态的「在新 worktree 中开始」门控因此恒为置灰。
+func TestGitRepoRootWireKey(t *testing.T) {
+	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
+	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
+	s, _ := newFakeAgentServer(t)
+
+	// 无活动会话也要能发出去（home 场景本来就没有会话）。
+	params := recordedParams(t, s, recordPath, "/api/git/repo-root",
+		`{"cwd":"/ws"}`, "_x.ai/git/git_repo_root")
+	want := map[string]any{"currentWorkingDirectory": "/ws"}
+	if !reflect.DeepEqual(params, want) {
+		t.Errorf("git_repo_root params = %v, want %v", params, want)
+	}
+
+	// 空 cwd → 400，且不下发 wire 请求（该字段没有活动会话兜底）。
+	before := len(readRecordedRequests(t, recordPath))
+	rec := postJSON(t, s, "/api/git/repo-root", `{"cwd":""}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if after := len(readRecordedRequests(t, recordPath)); after != before {
+		t.Errorf("空 cwd 不应发出 wire 请求（%d → %d 条）", before, after)
+	}
+}
+
 // TestWorktreeCreateSessionSemantics — worktree/create 的 sessionId 语义：
 // 有活动会话时回落活动会话（原行为）；home 空状态无会话时也必须能发出
 // 去——agent 侧 CreateWorktreeRequest.session_id 是 serde 必填字段，占位

@@ -1,6 +1,9 @@
 package acp
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestStreamGenWindow(t *testing.T) {
 	// 单包：末包 − streamStart。
@@ -26,5 +29,51 @@ func TestStreamGenWindow(t *testing.T) {
 	// 全缺：0。
 	if g := streamGenWindow(0, 0, 1000); g != 0 {
 		t.Errorf("empty = %d, want 0", g)
+	}
+}
+
+func TestSessionStatsTurnsFollowTracker(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunk("A")),
+		histEnvelope(sid, 1, 20, msgUserChunk("B")), // 连续无 PI → 同一 run
+		histEnvelope(sid, 2, 30, msgAgentChunk("a1")),
+		histEnvelope(sid, 3, 40, msgUserChunkMeta("inj", map[string]any{"hostTurn": true})),
+		histEnvelope(sid, 4, 50, msgUserChunk("C")),
+		histEnvelope(sid, 5, 60, msgAgentChunk("c1")),
+	})
+	b, _ := historyBridge(t, home)
+	st, err := b.SessionStats(context.Background(), "/ws", sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Turns != 2 {
+		t.Errorf("turns = %d, want 2（连续 user 合并、hostTurn 不计）", st.Turns)
+	}
+}
+
+func TestSessionStatsTurnsDropRewindBranch(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunkMeta("A", map[string]any{"promptIndex": 0})),
+		histEnvelope(sid, 1, 20, msgAgentChunk("a1")),
+		histEnvelope(sid, 2, 30, msgUserChunkMeta("B", map[string]any{"promptIndex": 1})),
+		histEnvelope(sid, 3, 40, map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t-dead"}),
+		histEnvelope(sid, 4, 50, msgRewindMarker(1)),
+		histEnvelope(sid, 5, 60, msgUserChunkMeta("C", map[string]any{"promptIndex": 1})),
+		histEnvelope(sid, 6, 70, map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t-live"}),
+	})
+	b, _ := historyBridge(t, home)
+	st, err := b.SessionStats(context.Background(), "/ws", sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Turns != 2 {
+		t.Errorf("turns = %d, want 2（A + C，B 支截掉）", st.Turns)
+	}
+	if st.Steps != 1 {
+		t.Errorf("steps = %d, want 1（死分支 tool_call 不计）", st.Steps)
 	}
 }

@@ -50,6 +50,7 @@ func envLine(ts int64, update any) string {
 		"params": map[string]any{
 			"sessionId": "sess-1",
 			"update":    update,
+			"_meta":     map[string]any{"agentTimestampMs": ts},
 		},
 	})
 	return string(raw)
@@ -119,16 +120,17 @@ func userChunk(ts int64, promptIdx int) string {
 			"update": map[string]any{
 				"sessionUpdate": "user_message_chunk",
 				"content":       map[string]any{"type": "text", "text": "hi"},
+				"_meta":         map[string]any{"promptIndex": promptIdx},
 			},
-			"_meta": map[string]any{"promptIndex": promptIdx},
+			"_meta": map[string]any{"agentTimestampMs": ts},
 		},
 	})
 	return string(raw)
 }
 
-func rewindMarkerLine(target int) string {
+func rewindMarkerLine(ts int64, target int) string {
 	raw, _ := json.Marshal(map[string]any{
-		"timestamp": 1,
+		"timestamp": ts,
 		"method":    "session/update",
 		"params": map[string]any{
 			"sessionId": "sess-1",
@@ -136,6 +138,7 @@ func rewindMarkerLine(target int) string {
 				"sessionUpdate":       "rewind_marker",
 				"target_prompt_index": target,
 			},
+			"_meta": map[string]any{"agentTimestampMs": ts},
 		},
 	})
 	return string(raw)
@@ -189,9 +192,9 @@ func TestParseTaskEventsRewindDeadBranch(t *testing.T) {
 		envLine(2, bgUpdate("t-1", "keep me")),
 		userChunk(3, 1),
 		envLine(4, bgUpdate("t-2", "dead branch")),
-		rewindMarkerLine(1),
-		userChunk(5, 2),
-		envLine(6, bgUpdate("t-3", "keep me too")),
+		rewindMarkerLine(5, 1),
+		userChunk(6, 2),
+		envLine(7, bgUpdate("t-3", "keep me too")),
 	}
 	path := writeSessionFile(t, home, "/tmp/ws", "sess-1", lines)
 	events, err := parseTaskEvents(path)
