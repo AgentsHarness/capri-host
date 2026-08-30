@@ -55,7 +55,7 @@ type Bridge struct {
 	// createSession / LoadSession / session/resume succeeds — between those
 	// two moments a waiter must not mistake "booted, no session yet" for a
 	// boot failure. Cleared on boot start, boot failure and process death.
-	bootOK bool
+	bootOK    bool
 	agentInfo map[string]any
 	// authMeta: the `_meta` from the authenticate response (AuthMeta:
 	// email/auth_mode/team_id/team_name/is_zdr/team_role/
@@ -113,20 +113,15 @@ type Bridge struct {
 	nextClientReqID atomic.Int64
 	clientReqs      sync.Map // requestId string -> *clientRequest
 
-	// ── goal engine (host-side /goal, see goal.go) ────────────────────
-	goalMu     sync.Mutex
-	goal       *GoalState
-	goalStop   chan struct{} // closed to end the goal loop
-	goalLoopOn bool
+	// ── goal engine（host-side /goal，独立组件见 goal.go）──────────────
+	goal goalEngine
 
-	subscribersMu sync.Mutex
-	subscribers   map[chan Event]struct{}
+	// ── 会话历史归一化视图缓存（session_history.go）───────────────────
+	// 按 (size, mtime) 失效；只存行级元数据，不缓存信封内容。
+	hist historyCache
 
-	// eventSeq 是广播事件的全局单调序号（Broadcast 附加到每个事件）。
-	// 本地 SSE 与 hub 中继（/ws/fe 推回）携带同一 seq，前端选中本机
-	// host 时双路（本地 SSE + hub WS）收到同一事件可按 (hostId, seq)
-	// 去重；hub-client 转发时保留该 seq（不再自行分配）。
-	eventSeq uint64
+	// bus 是事件发布/订阅内核（event_bus.go）：订阅者集合 + 全局 seq。
+	bus eventBus
 
 	hostID   string
 	hostName string
@@ -209,18 +204,19 @@ func (b *Bridge) SetHostName(name string) {
 func NewBridge(cfg GrokConfig) *Bridge {
 	homeDir, _ := os.UserHomeDir()
 	b := &Bridge{
-		cfg:         cfg,
-		hostID:      cfg.HostID,
-		hostName:    cfg.HostName,
-		homeDir:     homeDir,
-		sessions:    make(map[string]*SessionState),
-		subscribers: make(map[chan Event]struct{}),
-		bootDone:    make(chan struct{}),
-		genRate:     newGenRateTracker(),
+		cfg:           cfg,
+		hostID:        cfg.HostID,
+		hostName:      cfg.HostName,
+		homeDir:       homeDir,
+		sessions:      make(map[string]*SessionState),
+		bootDone:      make(chan struct{}),
+		genRate:       newGenRateTracker(),
 		usageLastUsed: make(map[string]int64),
 	}
+	b.bus.init()
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
+	b.goal.host = b
 	if id, cwd := b.loadLastSessionFile(); id != "" {
 		b.lastSessionID = id
 		b.lastSessionCwd = cwd
@@ -338,84 +334,11 @@ func normCwd(cwd string) string {
 
 // Subscribe returns a buffered event channel; call unsubscribe to remove.
 func (b *Bridge) Subscribe() (ch chan Event, unsubscribe func()) {
-	ch = make(chan Event, 512)
-	b.subscribersMu.Lock()
-	b.subscribers[ch] = struct{}{}
-	b.subscribersMu.Unlock()
-	return ch, func() {
-		b.subscribersMu.Lock()
-		delete(b.subscribers, ch)
-		b.subscribersMu.Unlock()
-		// drain
-		for {
-			select {
-			case <-ch:
-			default:
-				return
-			}
-		}
-	}
+	return b.bus.subscribe()
 }
 
 func (b *Bridge) Broadcast(ev Event) {
-	if ev == nil {
-		return
-	}
-	b.subscribersMu.Lock()
-	defer b.subscribersMu.Unlock()
-	// 全局事件序号：所有订阅者（本地 SSE、hub-client 转发）看到同一
-	// 事件同一 seq。注意 hub-client 转发时必须保留该 seq（见其
-	// seqAndReplay），否则双路去重失效。
-	b.eventSeq++
-	ev["seq"] = b.eventSeq
-	critical := !droppableEventType(ev["type"])
-	for ch := range b.subscribers {
-		if !critical {
-			// 慢消费者：可丢事件（chunk/thought 等流式噪声）直接丢弃，
-			// seq 照常前进，落后方靠 FE gap-pull 补。不要为了填洞而合并
-			// chunk——会破坏与 hub 上行一致的双路 seq。
-			select {
-			case ch <- ev:
-			default:
-			}
-			continue
-		}
-		// 关键事件（终态 done/turn_completed、error、client_request、
-		// roster 变更等）永不主动丢弃：丢掉它们会让 FE 永远等不到终态。
-		// 改为有界阻塞等待慢消费者腾出位置；仅在极端超时（消费者已死
-		// 而未注销）时兜底丢弃并大声告警。阻塞期间持有 subscribersMu，
-		// 后续 Broadcast 排队——全局 seq 顺序因此得以保持。
-		select {
-		case ch <- ev:
-		case <-time.After(broadcastCriticalTimeout):
-			log.Printf("[bridge] 关键事件 %v 投递超时（订阅者阻塞 %s），被迫丢弃 seq=%v",
-				ev["type"], broadcastCriticalTimeout, ev["seq"])
-		}
-	}
-}
-
-// broadcastCriticalTimeout bounds how long Broadcast blocks on a full
-// subscriber channel for a critical (non-droppable) event before giving up.
-// SSE 消费者循环读取，正常情况下远不会触及该上限；到达即说明消费者已经
-// 死亡（连接半开、进程卡死）而未注销。
-const broadcastCriticalTimeout = 5 * time.Second
-
-// droppableEventType reports whether an event type is lossy-tolerable stream
-// noise: dropping one (or several) of these under backpressure costs at most
-// transient UI jitter that FE gap-pull can repair or ignore. Everything else
-// (terminal states like done/turn_completed, errors, client_request, roster
-// and permission changes) is critical and is never dropped voluntarily.
-func droppableEventType(t any) bool {
-	s, ok := t.(string)
-	if !ok {
-		return false
-	}
-	switch s {
-	case "chunk", "user_chunk", "thought", "gen_rate", "log",
-		"session_updates_chunk", "search_fuzzy_status", "search_content_status":
-		return true
-	}
-	return false
+	b.bus.publish(ev)
 }
 
 // ── roster helpers ────────────────────────────────────────────────
@@ -432,7 +355,7 @@ func (b *Bridge) activeSessionLocked() *SessionState {
 // broadcastRosterChange pushes sessions_changed so clients refresh the
 // dashboard list whenever the roster or a session's live state changed.
 func (b *Bridge) broadcastRosterChange() {
-	b.Broadcast(Event{"type": "sessions_changed", "params": map[string]any{}})
+	b.Broadcast(Event{kType: "sessions_changed", kParams: map[string]any{}})
 }
 
 // releaseBusy drops one in-flight prompt's claim on a session and, when
@@ -484,10 +407,10 @@ func (b *Bridge) setSessionAwaiting(id string, awaiting bool) {
 // to the host's active session there would mis-tag events in multi-client
 // setups.
 func sessionIdExplicit(params map[string]any) string {
-	if sid, ok := params["sessionId"].(string); ok && sid != "" {
+	if sid, ok := params[kSessionID].(string); ok && sid != "" {
 		return sid
 	}
-	if sid, ok := params["session_id"].(string); ok && sid != "" {
+	if sid, ok := params[kSessionIDS].(string); ok && sid != "" {
 		return sid
 	}
 	return ""
@@ -710,7 +633,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 
 	if err := b.ensureProcess(); err != nil {
 		b.setBootError(err.Error())
-		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		b.Broadcast(Event{kType: kError, "message": err.Error()})
 		return err
 	}
 
@@ -728,11 +651,11 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 			// it as plain text), git head changes are notified, hunk tracking
 			// stays agent-side. codeNavigation / folderTrust / fs_notify are
 			// env-opt-in (absent = off, same as the TUI).
-			"meta": initCapabilitiesMeta(),
+			kMetaOut: initCapabilitiesMeta(),
 		},
 		"clientInfo": map[string]any{
 			"name":    "capri-host",
-			"title":   "ACP Host",
+			kTitle:    "ACP Host",
 			"version": Version,
 		},
 		// `_meta` mirrors the Grok Build TUI's build_initialize_meta
@@ -740,13 +663,13 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		// pager's PAGER_CLIENT_TYPE and clientVersion to its build-time
 		// version; the remaining seeds are env-driven and omitted when the
 		// env var is absent (matching the TUI's default omit).
-		"_meta": initMetaSeeds(),
+		kMeta: initMetaSeeds(),
 	}, bootTimeout)
 	if err != nil {
 		// 假设 agent 可靠：初始化失败直接报错，不杀进程、不自愈。
 		// 进程要不要重启由用户通过重启接口决定。
 		b.setBootError(err.Error())
-		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		b.Broadcast(Event{kType: kError, "message": err.Error()})
 		return err
 	}
 
@@ -767,7 +690,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	if err := b.authenticate(ctx, initRes); err != nil {
 		// 同 initialize：只报错，不杀进程。
 		b.setBootError(err.Error())
-		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		b.Broadcast(Event{kType: kError, "message": err.Error()})
 		return err
 	}
 
@@ -786,7 +709,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 	b.mu.Unlock()
 	if noSession {
 		ev := Event{
-			"type":      "ready",
+			kType:       "ready",
 			"agentInfo": agentInfo,
 			"hostId":    hostID,
 			"hostName":  hostName,
@@ -934,24 +857,24 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	// params `_meta`, exactly like the TUI's SessionFlags.to_meta() —
 	// absent key ≠ off, so only send when the client provided seeds.
 	if len(sc.Meta) > 0 {
-		params["_meta"] = sc.Meta
+		params[kMeta] = sc.Meta
 	}
 
 	sessRes, err := b.request(ctx, "session/new", params, bootTimeout)
 	if err != nil {
 		// 假设 agent 可靠：创建失败直接报错，不杀进程、不自愈。
 		b.setBootError(err.Error())
-		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		b.Broadcast(Event{kType: kError, "message": err.Error()})
 		return err
 	}
 
-	sid, _ := sessRes["sessionId"].(string)
+	sid, _ := sessRes[kSessionID].(string)
 	if sid == "" {
 		// 协议级异常：agent 应答了但没给 sessionId —— 报错返回，不杀
 		// 进程；是否需要重启由用户决定。
 		err := errors.New("session/new 未返回 sessionId")
 		b.setBootError(err.Error())
-		b.Broadcast(Event{"type": "error", "message": err.Error()})
+		b.Broadcast(Event{kType: kError, "message": err.Error()})
 		return err
 	}
 
@@ -964,11 +887,11 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	}
 	s.Cwd = cwd
 	s.modes = sessRes["modes"]
-	s.configOpts = sessRes["configOptions"]
+	s.configOpts = sessRes[kConfigOptions]
 	s.models = sessRes["models"]
 	// session/new 响应 `_meta`（agent 下发）原样存下，ready 事件 / Status
 	// 透传；缺省为 nil（absent key ≠ off）。
-	s.sessionMeta = sessRes["_meta"]
+	s.sessionMeta = sessRes[kMeta]
 	b.activeSessionID = sid
 	b.rememberSessionLocked(sid, cwd)
 	b.ready = true
@@ -985,15 +908,15 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	b.mu.Unlock()
 
 	ev := Event{
-		"type":          "ready",
-		"sessionId":     sid,
-		"cwd":           sessCwd,
-		"agentInfo":     agentInfo,
-		"modes":         modes,
-		"configOptions": configOpts,
-		"models":        models,
-		"hostId":        hostID,
-		"hostName":      hostName,
+		kType:          "ready",
+		kSessionID:     sid,
+		"cwd":          sessCwd,
+		"agentInfo":    agentInfo,
+		"modes":        modes,
+		kConfigOptions: configOpts,
+		"models":       models,
+		"hostId":       hostID,
+		"hostName":     hostName,
 	}
 	if sessionMeta != nil {
 		ev["sessionMeta"] = sessionMeta
@@ -1011,7 +934,7 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	var methodIDs []string
 	for _, m := range methodsRaw {
 		mm, _ := m.(map[string]any)
-		if id, _ := mm["id"].(string); id != "" {
+		if id, _ := mm[kID].(string); id != "" {
 			methodIDs = append(methodIDs, id)
 		}
 	}
@@ -1026,7 +949,7 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	// 一致）；读 `meta` 会永远落空而回退到第一个方法（xai.api_key），
 	// 导致 session 认证（OIDC/cached_token）失效、模型请求 401。
 	var methodID string
-	if meta, ok := init["_meta"].(map[string]any); ok {
+	if meta, ok := init[kMeta].(map[string]any); ok {
 		if id, _ := meta["defaultAuthMethodId"].(string); id != "" {
 			for _, m := range methodIDs {
 				if m == id {
@@ -1061,7 +984,7 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	}
 	res, err := b.request(ctx, "authenticate", map[string]any{
 		"methodId": methodID,
-		"_meta":    meta,
+		kMeta:      meta,
 	}, bootTimeout)
 	if err != nil {
 		return err
@@ -1073,7 +996,7 @@ func (b *Bridge) authenticate(ctx context.Context, init map[string]any) error {
 	// map，直接存入 any 字段会让 omitempty 失效。
 	b.mu.Lock()
 	b.authMeta = nil
-	if m, ok := res["_meta"].(map[string]any); ok {
+	if m, ok := res[kMeta].(map[string]any); ok {
 		b.authMeta = m
 	}
 	b.mu.Unlock()
@@ -1171,8 +1094,8 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 	lastID, _ := b.resetRoster("process-exit")
 	log.Printf("[capri-host] grok process exited (code=%d), lastSession=%s", code, lastID)
 	b.Broadcast(Event{
-		"type":   "status",
-		"text":   "连接HOST异常，请检查后重试",
+		kType:    "status",
+		kText:    "连接HOST异常，请检查后重试",
 		"action": "restart-agent", // 进程已死：唯一恢复动作是用户重启
 	})
 }
@@ -1183,7 +1106,7 @@ func (b *Bridge) readStderr(r io.Reader) {
 	for sc.Scan() {
 		t := sc.Text()
 		if t != "" {
-			b.Broadcast(Event{"type": "log", "text": t})
+			b.Broadcast(Event{kType: "log", kText: t})
 		}
 	}
 }
@@ -1207,8 +1130,8 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 			log.Printf("[capri-host] stdout 单行超过 %dMB 上限（%d 字节），agent 输出通道已损坏", maxLineBytes>>20, len(line))
 			b.failAllPending(fmt.Errorf("agent 输出通道已损坏: 单行 %d 字节超上限", len(line)))
 			b.Broadcast(Event{
-				"type":   "status",
-				"text":   "agent 输出通道异常，请重启 agent",
+				kType:    "status",
+				kText:    "agent 输出通道异常，请重启 agent",
 				"action": "restart-agent",
 			})
 			return
@@ -1223,8 +1146,8 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 				log.Printf("[capri-host] stdout 扫描错误: %v — agent 输出通道已损坏", err)
 				b.failAllPending(fmt.Errorf("agent 输出通道已损坏: %v", err))
 				b.Broadcast(Event{
-					"type":   "status",
-					"text":   "agent 输出通道异常，请重启 agent",
+					kType:    "status",
+					kText:    "agent 输出通道异常，请重启 agent",
 					"action": "restart-agent",
 				})
 			}
@@ -1247,30 +1170,30 @@ func (b *Bridge) handleStdoutLine(line []byte) {
 }
 
 func (b *Bridge) onAgentMessage(msg map[string]any) {
-	if method, _ := msg["method"].(string); method == "session/update" {
-		params, _ := msg["params"].(map[string]any)
+	if method, _ := msg[kMethod].(string); method == "session/update" {
+		params, _ := msg[kParams].(map[string]any)
 		b.handleSessionUpdate(params)
 		return
 	}
 
 	// x.ai/* extension notifications (no id). Also accept the wrapped
 	// leader form {"method":"_x.ai/foo","params":{"method":"x.ai/foo",...}}.
-	if method, _ := msg["method"].(string); strings.HasPrefix(method, "x.ai/") || strings.HasPrefix(method, "_x.ai/") {
-		params, _ := msg["params"].(map[string]any)
+	if method, _ := msg[kMethod].(string); strings.HasPrefix(method, "x.ai/") || strings.HasPrefix(method, "_x.ai/") {
+		params, _ := msg[kParams].(map[string]any)
 		if params == nil {
 			params = map[string]any{}
 		}
 		realMethod, realParams := unwrapExtMethod(method, params)
-		if msg["id"] == nil {
+		if msg[kID] == nil {
 			b.handleXaiNotification(realMethod, realParams)
 			return
 		}
 		// Agent → client extension request: forward for browser interaction.
-		b.forwardXaiRequest(msg["id"], realMethod, realParams)
+		b.forwardXaiRequest(msg[kID], realMethod, realParams)
 		return
 	}
 
-	id := msg["id"]
+	id := msg[kID]
 	if id == nil {
 		return
 	}
@@ -1278,7 +1201,7 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 	// Response to our request?
 	if ch, ok := b.pending.LoadAndDelete(idKey(id)); ok {
 		c := ch.(chan rpcResult)
-		if errObj, has := msg["error"]; has && errObj != nil {
+		if errObj, has := msg[kError]; has && errObj != nil {
 			em := "agent error"
 			code := 0
 			if m, ok := errObj.(map[string]any); ok {
@@ -1293,20 +1216,20 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 			// healthy — callers distinguish this from transport failures
 			// (timeout etc.) and skip the kill+restore self-heal.
 			c <- rpcResult{err: &RPCError{Code: code, Msg: em}}
-		} else if m, ok := msg["result"].(map[string]any); ok {
+		} else if m, ok := msg[kResult].(map[string]any); ok {
 			c <- rpcResult{result: m}
 		} else {
 			// Non-object result (a bare array, e.g. workspace_list_recent's
 			// payload): keep it verbatim instead of coercing to {}, which
 			// swallowed the data. requestRaw() surfaces it as-is.
-			c <- rpcResult{raw: msg["result"]}
+			c <- rpcResult{raw: msg[kResult]}
 		}
 		return
 	}
 
 	// Agent → client request
-	if method, _ := msg["method"].(string); method != "" {
-		params, _ := msg["params"].(map[string]any)
+	if method, _ := msg[kMethod].(string); method != "" {
+		params, _ := msg[kParams].(map[string]any)
 		if params == nil {
 			params = map[string]any{}
 		}
@@ -1333,7 +1256,7 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 下回落会误标到宿主的活动会话）。
 	sid := sessionIdExplicit(params)
 
-	update, _ := params["update"].(map[string]any)
+	update, _ := params[kUpdate].(map[string]any)
 	// Every standard session/update carries the session-accumulated
 	// context token count in `_meta.totalTokens` (the TUI's ⇣ counter
 	// source, "Accumulated token count across the session"). Surface it
@@ -1344,8 +1267,8 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 严格重复。其余 kind 值去重：实测流水期 _meta.totalTokens 在一段
 	// 输出内恒定（同一 used 连续 70+ 条），只广播值变化——上下文计数
 	// 器无需逐条刷新。
-	if k, _ := update["sessionUpdate"].(string); k != "turn_completed" && k != "response_completed" {
-		if meta, ok := params["_meta"].(map[string]any); ok {
+	if k, _ := update[kSessionUpdate].(string); k != "turn_completed" && k != "response_completed" {
+		if meta, ok := params[kMeta].(map[string]any); ok {
 			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
 				b.mu.Lock()
 				last := b.usageLastUsed[sid]
@@ -1353,7 +1276,7 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 				b.mu.Unlock()
 				if used != last {
 					b.trackUsage(sid, used, 0)
-					b.Broadcast(Event{"type": "usage", "used": used, "size": nil, "sessionId": sid})
+					b.Broadcast(Event{kType: "usage", kUsed: used, kSize: nil, kSessionID: sid})
 				}
 			}
 		}
@@ -1366,14 +1289,14 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// （未建模 kind）时 generic session_notification 作为前向兼容载体
 	// 发出，形状保持现状。
 	if !b.dispatchSessionUpdateKind(sid, params, func(ev Event) Event {
-		ev["sessionId"] = sid
+		ev[kSessionID] = sid
 		return ev
 	}) {
 		b.Broadcast(Event{
-			"type":      "session_notification",
-			"method":    "session/update",
-			"params":    map[string]any{"update": update},
-			"sessionId": sid,
+			kType:      "session_notification",
+			kMethod:    "session/update",
+			kParams:    map[string]any{kUpdate: update},
+			kSessionID: sid,
 		})
 	}
 
@@ -1385,11 +1308,11 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 账本对象是死字段——不再透传。typed 事件（dispatch 已发）是 FE
 	// 回合封口语义；usage 提取保留在此（官方载体带 size:nil；x.ai 载体
 	// 不带 —— 保持原状，不统一）。
-	if kind, _ := update["sessionUpdate"].(string); kind == "turn_completed" || kind == "response_completed" {
-		ev := Event{"type": "usage"}
-		if meta, ok := params["_meta"].(map[string]any); ok {
+	if kind, _ := update[kSessionUpdate].(string); kind == "turn_completed" || kind == "response_completed" {
+		ev := Event{kType: "usage"}
+		if meta, ok := params[kMeta].(map[string]any); ok {
 			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
-				ev["used"] = used
+				ev[kUsed] = used
 				b.trackUsage(sid, used, 0)
 			}
 		}
@@ -1397,8 +1320,8 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 		// usage event (no _meta.totalTokens) would otherwise null the
 		// client's `used`.
 		if len(ev) > 1 {
-			ev["size"] = nil
-			ev["sessionId"] = sid
+			ev[kSize] = nil
+			ev[kSessionID] = sid
 			b.Broadcast(ev)
 		}
 	}
@@ -1411,6 +1334,9 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 //     moment and renders fake "Worked for 0.0s" markers.
 //   - agentTimestampMs → ev["agentTimestampMs"]: authoritative send time
 //     (user_chunk echoes fix the optimistic user row's ts with it).
+//   - eventId → ev["eventId"]: agent 事件 id（"{sessionId}-{N}"）提升为
+//     事件顶层，FE 用它做 live↔快照接缝去重（msgSeq 契约）；params._meta
+//     无该键时不带（absent key ≠ off）。
 //   - agentTimestampMs - streamStartMs → ev["elapsedMs"]: real thought
 //     duration (live thought blocks otherwise seal against the local
 //     first-seen timer, understating turns adopted mid-flight).
@@ -1418,7 +1344,7 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 // turn_completed already carries params._meta as `meta`; only the
 // high-frequency stream events need this.
 func attachStreamMeta(ev Event, params map[string]any) Event {
-	meta, ok := params["_meta"].(map[string]any)
+	meta, ok := params[kMeta].(map[string]any)
 	if !ok || len(meta) == 0 {
 		return ev
 	}
@@ -1427,6 +1353,9 @@ func attachStreamMeta(ev Event, params map[string]any) Event {
 	}
 	if v, ok := meta["agentTimestampMs"]; ok {
 		ev["agentTimestampMs"] = v
+	}
+	if v, ok := meta["eventId"]; ok {
+		ev["eventId"] = v
 	}
 	if v, ok := meta["streamStartMs"]; ok {
 		ev["streamStartMs"] = v
@@ -1457,20 +1386,20 @@ func attachStreamMeta(ev Event, params map[string]any) Event {
 // params._meta 非空时携带 `meta`（官方与 x.ai 载体统一，两个载体都可能有
 // _meta——eventId 等）；仅非空才带（absent key ≠ off）。
 func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, tag func(Event) Event) bool {
-	update, _ := params["update"].(map[string]any)
+	update, _ := params[kUpdate].(map[string]any)
 	if update == nil {
 		return false
 	}
-	kind, _ := update["sessionUpdate"].(string)
+	kind, _ := update[kSessionUpdate].(string)
 	// meta 保全：params._meta 非空时随 typed kind 事件携带。
 	var kindMeta any
-	if m, ok := params["_meta"].(map[string]any); ok && len(m) > 0 {
+	if m, ok := params[kMeta].(map[string]any); ok && len(m) > 0 {
 		kindMeta = m
 	}
 	switch kind {
 	case "agent_message_chunk":
-		if text := contentText(update["content"]); text != "" {
-			ev := attachStreamMeta(Event{"type": "chunk", "text": text}, params)
+		if text := contentText(update[kContent]); text != "" {
+			ev := attachStreamMeta(Event{kType: "chunk", kText: text}, params)
 			if mid, ok := update["messageId"]; ok {
 				ev["messageId"] = mid
 			}
@@ -1479,13 +1408,13 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			// hideFromScrollback; update.content._meta = TextContent.meta →
 			// displayText / displayAsCron) so live rendering classifies
 			// system-injected prompts exactly like the replay path does.
-			if meta, ok := update["_meta"].(map[string]any); ok {
+			if meta, ok := update[kMeta].(map[string]any); ok {
 				if v, ok := meta["hideFromScrollback"]; ok {
 					ev["hideFromScrollback"] = v
 				}
 			}
-			if content, ok := update["content"].(map[string]any); ok {
-				if meta, ok := content["_meta"].(map[string]any); ok {
+			if content, ok := update[kContent].(map[string]any); ok {
+				if meta, ok := content[kMeta].(map[string]any); ok {
 					for _, k := range []string{"displayText", "displayAsCron"} {
 						if v, ok := meta[k]; ok {
 							ev[k] = v
@@ -1502,12 +1431,12 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			// 速率 = 流起点之后的全部字符 / 墙钟，含首包）。
 			now, streamStartMs, agentClock := metaAgentTs(params)
 			if rate, ok := b.genRate.observe(sid, text, now, agentClock, streamStartMs); ok {
-				b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": true}))
+				b.Broadcast(tag(Event{kType: "gen_rate", kRate: rate, kActive: true}))
 			}
 		}
 		// Image blocks ride the same chunk carrier: emit one typed image
 		// event per block (text parts still go through the chunk event).
-		for _, img := range contentImages(update["content"]) {
+		for _, img := range contentImages(update[kContent]) {
 			if ev, ok := imageEvent(sid, img); ok {
 				b.Broadcast(ev)
 			}
@@ -1517,20 +1446,20 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 用户输入打断生成段：静默复位速率估算器（不发任何事件，
 		// 客户端显示值在下一段 live 更新前保留）。
 		b.genRate.reset(sid)
-		if text := contentText(update["content"]); text != "" {
-			ev := attachStreamMeta(Event{"type": "user_chunk", "text": text}, params)
+		if text := contentText(update[kContent]); text != "" {
+			ev := attachStreamMeta(Event{kType: "user_chunk", kText: text}, params)
 			// Forward the chunk + content-block meta (wire shape:
 			// update._meta = ContentChunk.meta → hideFromScrollback;
 			// update.content._meta = TextContent.meta → displayText /
 			// displayAsCron) so live rendering classifies system-injected
 			// prompts exactly like the replay path does.
-			if meta, ok := update["_meta"].(map[string]any); ok {
+			if meta, ok := update[kMeta].(map[string]any); ok {
 				if v, ok := meta["hideFromScrollback"]; ok {
 					ev["hideFromScrollback"] = v
 				}
 			}
-			if content, ok := update["content"].(map[string]any); ok {
-				if meta, ok := content["_meta"].(map[string]any); ok {
+			if content, ok := update[kContent].(map[string]any); ok {
+				if meta, ok := content[kMeta].(map[string]any); ok {
 					for _, k := range []string{"displayText", "displayAsCron"} {
 						if v, ok := meta[k]; ok {
 							ev[k] = v
@@ -1541,7 +1470,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			// 同 agent_message_chunk：不携带 fullUpdate（typed 字段即 wire 契约）。
 			b.Broadcast(tag(ev))
 		}
-		for _, img := range contentImages(update["content"]) {
+		for _, img := range contentImages(update[kContent]) {
 			if ev, ok := imageEvent(sid, img); ok {
 				b.Broadcast(ev)
 			}
@@ -1549,18 +1478,18 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		return true
 	case "agent_thought_chunk":
 		// content is typically { "type":"text", "text":"..." }; accept a few shapes
-		if text := contentText(update["content"]); text != "" {
-			ev := attachStreamMeta(Event{"type": "thought", "text": text}, params)
+		if text := contentText(update[kContent]); text != "" {
+			ev := attachStreamMeta(Event{kType: "thought", kText: text}, params)
 			// Forward the chunk meta verbatim (hideFromScrollback etc.)
 			// so live rendering treats it like the replay path does.
-			if meta, ok := update["_meta"].(map[string]any); ok {
-				ev["meta"] = meta
+			if meta, ok := update[kMeta].(map[string]any); ok {
+				ev[kMetaOut] = meta
 			}
 			b.Broadcast(tag(ev))
 			// 思考文本同样更新生成速率（见 genrate.go）。
 			now, streamStartMs, agentClock := metaAgentTs(params)
 			if rate, ok := b.genRate.observe(sid, text, now, agentClock, streamStartMs); ok {
-				b.Broadcast(tag(Event{"type": "gen_rate", "rate": rate, "active": true}))
+				b.Broadcast(tag(Event{kType: "gen_rate", kRate: rate, kActive: true}))
 			}
 		}
 		return true
@@ -1569,27 +1498,27 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// active:false（不带 rate）——前端收到后清除速率显示（只在输
 		// 出过程中显示）。
 		b.genRate.reset(sid)
-		b.Broadcast(tag(Event{"type": "gen_rate", "active": false}))
-		b.Broadcast(tag(Event{"type": "tool_call", "toolCall": update}))
+		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
+		b.Broadcast(tag(Event{kType: "tool_call", kToolCall: update}))
 		return true
 	case "tool_call_update":
-		b.Broadcast(tag(Event{"type": "tool_call_update", "toolCallUpdate": update}))
+		b.Broadcast(tag(Event{kType: "tool_call_update", kToolCallUpdate: update}))
 		return true
 	case "plan":
-		b.Broadcast(tag(Event{"type": "plan", "entries": update["entries"]}))
+		b.Broadcast(tag(Event{kType: "plan", kEntries: update[kEntries]}))
 		return true
 	case "usage_update":
-		b.trackUsage(sid, toInt64(update["used"]), toInt64(update["size"]))
+		b.trackUsage(sid, toInt64(update[kUsed]), toInt64(update[kSize]))
 		b.Broadcast(tag(Event{
-			"type": "usage",
-			"used": update["used"],
-			"size": update["size"],
-			"cost": update["cost"],
+			kType: "usage",
+			kUsed: update[kUsed],
+			kSize: update[kSize],
+			kCost: update[kCost],
 		}))
 		return true
 	case "current_mode_update":
 		b.mu.Lock()
-		if ms := update["modeState"]; ms != nil {
+		if ms := update[kModeState]; ms != nil {
 			if s := b.sessions[sid]; s != nil {
 				s.modes = ms
 			}
@@ -1599,11 +1528,11 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			modes = s.modes
 		}
 		b.mu.Unlock()
-		b.Broadcast(tag(Event{"type": "modes_update", "modes": modes}))
+		b.Broadcast(tag(Event{kType: "modes_update", "modes": modes}))
 		return true
 	case "config_option_update":
 		b.mu.Lock()
-		if co := update["configOptions"]; co != nil {
+		if co := update[kConfigOptions]; co != nil {
 			if s := b.sessions[sid]; s != nil {
 				s.configOpts = co
 			}
@@ -1613,10 +1542,10 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			co = s.configOpts
 		}
 		b.mu.Unlock()
-		b.Broadcast(tag(Event{"type": "config_options_update", "configOptions": co}))
+		b.Broadcast(tag(Event{kType: "config_options_update", kConfigOptions: co}))
 		return true
 	case "available_commands_update":
-		b.Broadcast(tag(Event{"type": "commands_update", "commands": update["commands"]}))
+		b.Broadcast(tag(Event{kType: "commands_update", kCommands: update[kCommands]}))
 		return true
 	case "session_info_update", "session_info":
 		// session_info_update 是官方 ACP SessionUpdate 的 kind（serde tag
@@ -1625,18 +1554,18 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// title/updatedAt roster 跟踪两个载体都要有。
 		b.mu.Lock()
 		if s := b.sessions[sid]; s != nil {
-			if t, ok := update["title"].(string); ok && t != "" {
+			if t, ok := update[kTitle].(string); ok && t != "" {
 				s.Title = t
 			}
-			if u, ok := update["updatedAt"].(string); ok && u != "" {
+			if u, ok := update[kUpdatedAt].(string); ok && u != "" {
 				s.UpdatedAt = u
 			}
 		}
 		b.mu.Unlock()
 		b.Broadcast(tag(Event{
-			"type":      "session_info",
-			"title":     update["title"],
-			"updatedAt": update["updatedAt"],
+			kType:      "session_info",
+			kTitle:     update[kTitle],
+			kUpdatedAt: update[kUpdatedAt],
 		}))
 		return true
 	case "scheduled_task_created":
@@ -1653,9 +1582,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// （x.ai/task_backgrounded / x.ai/task_completed /
 		// x.ai/monitor_event 方法）保持 {type, params, sessionId} 不动
 		// —— 不同载体，形状跟随 wire（见 handleXaiNotification）。
-		ev := Event{"type": kind, "update": update}
+		ev := Event{kType: kind, kUpdate: update}
 		if kindMeta != nil {
-			ev["meta"] = kindMeta
+			ev[kMetaOut] = kindMeta
 		}
 		b.Broadcast(tag(ev))
 		return true
@@ -1669,7 +1598,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 回合终态：复位段状态并广播 active:false（不带 rate）——前端
 		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
 		b.genRate.reset(sid)
-		b.Broadcast(tag(Event{"type": "gen_rate", "active": false}))
+		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
 		// response_completed 不广播 typed 事件：agent 实测从不发该
 		// kind（updates.jsonl 3383/3383 回合终态均为 turn_completed），
 		// FE 对 typed response_completed 无消费（turnEnd.ts 无 case，
@@ -1681,9 +1610,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
 		// prompt_id / usage 等字段）；usage 提取保留在两个载体
 		// （handleSessionUpdate / handleXaiNotification）。
-		ev := Event{"type": kind, "update": update}
+		ev := Event{kType: kind, kUpdate: update}
 		if kindMeta != nil {
-			ev["meta"] = kindMeta
+			ev[kMetaOut] = kindMeta
 		}
 		b.Broadcast(tag(ev))
 		return true
@@ -1711,9 +1640,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// meta），字段原样透传不归一化。载荷形状以 grok 源码
 		// extensions/notification.rs 的 SessionUpdate 枚举（tag =
 		// "sessionUpdate"，snake_case）为准。modeled → 无 generic。
-		ev := Event{"type": kind, "update": update}
+		ev := Event{kType: kind, kUpdate: update}
 		if kindMeta != nil {
-			ev["meta"] = kindMeta
+			ev[kMetaOut] = kindMeta
 		}
 		b.Broadcast(tag(ev))
 		return true
@@ -1737,9 +1666,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 // and the sessionUpdate kind dispatch.
 func (b *Bridge) broadcastScheduledTaskCreated(sid string, params map[string]any, tag func(Event) Event) {
 	task, _ := params["task"].(map[string]any)
-	update, _ := params["update"].(map[string]any)
+	update, _ := params[kUpdate].(map[string]any)
 	ev := Event{
-		"type": "scheduled_task_created",
+		kType: "scheduled_task_created",
 		"task": map[string]any{
 			"taskId":     pick([]map[string]any{task, update, params}, "taskId", "task_id"),
 			"prompt":     pick([]map[string]any{task, update, params}, "prompt"),
@@ -1752,8 +1681,8 @@ func (b *Bridge) broadcastScheduledTaskCreated(sid string, params map[string]any
 	if len(update) > 0 {
 		ev["rawTask"] = update
 	}
-	if meta, ok := params["_meta"].(map[string]any); ok {
-		ev["meta"] = meta
+	if meta, ok := params[kMeta].(map[string]any); ok {
+		ev[kMetaOut] = meta
 	}
 	b.Broadcast(tag(ev))
 }
@@ -1766,9 +1695,9 @@ func (b *Bridge) broadcastScheduledTaskCreated(sid string, params map[string]any
 // sessionUpdate kind dispatch.
 func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any, tag func(Event) Event) {
 	task, _ := params["task"].(map[string]any)
-	update, _ := params["update"].(map[string]any)
+	update, _ := params[kUpdate].(map[string]any)
 	ev := Event{
-		"type":   "scheduled_task_deleted",
+		kType:    "scheduled_task_deleted",
 		"taskId": pick([]map[string]any{task, update, params}, "taskId", "task_id"),
 	}
 	// reason 归一化（1.0.4 起 SessionUpdate::ScheduledTaskDeleted 带
@@ -1782,8 +1711,8 @@ func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any
 	// rawParams preserves the full original params (e.g. session_id +
 	// _meta.eventId / scheduler generation-revision stamps).
 	ev["rawParams"] = params
-	if meta, ok := params["_meta"].(map[string]any); ok {
-		ev["meta"] = meta
+	if meta, ok := params[kMeta].(map[string]any); ok {
+		ev[kMetaOut] = meta
 	}
 	b.Broadcast(tag(ev))
 }
@@ -1830,9 +1759,9 @@ func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag fu
 	}
 	b.mu.Unlock()
 	if models != nil {
-		b.Broadcast(tag(Event{"type": "models_update", "params": models}))
+		b.Broadcast(tag(Event{kType: "models_update", kParams: models}))
 	}
-	ev := Event{"type": "model", "modelId": id}
+	ev := Event{kType: "model", "modelId": id}
 	if name := modelDisplayName(models, id); name != "" {
 		ev["modelName"] = name
 	}
@@ -1854,15 +1783,15 @@ func unwrapExtMethod(method string, params map[string]any) (string, map[string]a
 	if !strings.HasPrefix(method, "_x.ai/") {
 		return method, params
 	}
-	if inner, ok := params["method"].(string); ok && strings.HasPrefix(inner, "x.ai/") {
-		if innerParams, ok := params["params"].(map[string]any); ok {
-			_, hasCamel := innerParams["sessionId"]
-			_, hasSnake := innerParams["session_id"]
+	if inner, ok := params[kMethod].(string); ok && strings.HasPrefix(inner, "x.ai/") {
+		if innerParams, ok := params[kParams].(map[string]any); ok {
+			_, hasCamel := innerParams[kSessionID]
+			_, hasSnake := innerParams[kSessionIDS]
 			if !hasCamel && !hasSnake {
-				if sid, ok := params["sessionId"].(string); ok && sid != "" {
-					innerParams["sessionId"] = sid
-				} else if sid, ok := params["session_id"].(string); ok && sid != "" {
-					innerParams["session_id"] = sid
+				if sid, ok := params[kSessionID].(string); ok && sid != "" {
+					innerParams[kSessionID] = sid
+				} else if sid, ok := params[kSessionIDS].(string); ok && sid != "" {
+					innerParams[kSessionIDS] = sid
 				}
 			}
 			return inner, innerParams
@@ -1881,7 +1810,7 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 	sid := b.sessionIdFrom(params)
 	withSid := func(ev Event) Event {
 		if sid != "" {
-			ev["sessionId"] = sid
+			ev[kSessionID] = sid
 		}
 		return ev
 	}
@@ -1893,7 +1822,7 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		// generic 照发，携带完整 params 使 `_meta`（eventId 等）保全
 		// 方式保持现状。
 		if !b.dispatchSessionUpdateKind(sid, params, withSid) {
-			b.Broadcast(withSid(Event{"type": "session_notification", "method": method, "params": params}))
+			b.Broadcast(withSid(Event{kType: "session_notification", kMethod: method, kParams: params}))
 		}
 		// grok ships usage inside response_completed / turn_completed
 		// notifications instead of the standard usage_update carrier —
@@ -1904,12 +1833,12 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		// 是死字段——不再透传。typed 事件（dispatch 已发）是 FE 回合
 		// 封口语义；usage 提取保留在此（x.ai 载体不带 size:nil，官方
 		// 载体带 —— 保持原状，不统一）。
-		if up, ok := params["update"].(map[string]any); ok {
-			if kind, _ := up["sessionUpdate"].(string); kind == "response_completed" || kind == "turn_completed" {
-				ev := Event{"type": "usage"}
-				if meta, ok := params["_meta"].(map[string]any); ok {
+		if up, ok := params[kUpdate].(map[string]any); ok {
+			if kind, _ := up[kSessionUpdate].(string); kind == "response_completed" || kind == "turn_completed" {
+				ev := Event{kType: "usage"}
+				if meta, ok := params[kMeta].(map[string]any); ok {
 					if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
-						ev["used"] = used
+						ev[kUsed] = used
 						b.trackUsage(sid, used, 0)
 					}
 				}
@@ -1922,11 +1851,11 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 			}
 		}
 	case "x.ai/task_backgrounded":
-		b.Broadcast(withSid(Event{"type": "task_backgrounded", "params": params}))
+		b.Broadcast(withSid(Event{kType: "task_backgrounded", kParams: params}))
 	case "x.ai/task_completed":
-		b.Broadcast(withSid(Event{"type": "task_completed", "params": params}))
+		b.Broadcast(withSid(Event{kType: "task_completed", kParams: params}))
 	case "x.ai/monitor_event":
-		b.Broadcast(withSid(Event{"type": "monitor_event", "params": params}))
+		b.Broadcast(withSid(Event{kType: "monitor_event", kParams: params}))
 	case "x.ai/git_head_changed":
 		// Stash the head into the roster so /api/session-info can serve it.
 		b.mu.Lock()
@@ -1942,7 +1871,7 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 			}
 		}
 		b.mu.Unlock()
-		b.Broadcast(withSid(Event{"type": "git_head_changed", "params": params}))
+		b.Broadcast(withSid(Event{kType: "git_head_changed", kParams: params}))
 	case "x.ai/yolo_mode_changed":
 		// Permission-mode change: CLIENT-SCOPED on the agent side (applies
 		// to every resident session of the sending client), so the broadcast
@@ -1952,15 +1881,15 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		// Also mirror the agent's (echoed) mode into the host record so
 		// later hello snapshots carry the agent's real state.
 		b.recordPermissionMode(permissionModeFromParams(params))
-		b.Broadcast(Event{"type": "yolo_mode_changed", "params": params})
+		b.Broadcast(Event{kType: "yolo_mode_changed", kParams: params})
 	case "x.ai/mcp/server_status":
-		b.Broadcast(withSid(Event{"type": "mcp_server_status", "params": params}))
+		b.Broadcast(withSid(Event{kType: "mcp_server_status", kParams: params}))
 	case "x.ai/mcp/tools_changed", "x.ai/mcp_initialized":
-		b.Broadcast(withSid(Event{"type": "mcp_tools_changed", "params": params}))
+		b.Broadcast(withSid(Event{kType: "mcp_tools_changed", kParams: params}))
 	case "x.ai/mcp/servers_updated":
-		b.Broadcast(withSid(Event{"type": "mcp_servers_updated", "params": params}))
+		b.Broadcast(withSid(Event{kType: "mcp_servers_updated", kParams: params}))
 	case "x.ai/sessions/changed":
-		b.Broadcast(Event{"type": "sessions_changed", "params": params})
+		b.Broadcast(Event{kType: "sessions_changed", kParams: params})
 	case "x.ai/models/update":
 		// Machine-wide catalog refresh (config.toml changed) — update the
 		// active session's catalog while preserving its current selection
@@ -1973,7 +1902,7 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 			models := act.models
 			b.mu.Unlock()
 			if models != nil {
-				ev := Event{"type": "models_update", "params": models}
+				ev := Event{kType: "models_update", kParams: models}
 				// raw carries the ORIGINAL notification params so no field
 				// of the machine-wide broadcast is lost to the merge.
 				ev["raw"] = params
@@ -1983,11 +1912,11 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 			b.mu.Unlock()
 		}
 	case "x.ai/announcements/update":
-		b.Broadcast(Event{"type": "announcements_update", "params": params})
+		b.Broadcast(Event{kType: "announcements_update", kParams: params})
 	case "x.ai/scheduled_task_fired":
-		b.Broadcast(withSid(Event{"type": "scheduled_task_fired", "params": params}))
+		b.Broadcast(withSid(Event{kType: "scheduled_task_fired", kParams: params}))
 	case "x.ai/scheduled_task_inject_prompt":
-		b.Broadcast(withSid(Event{"type": "scheduled_task_inject_prompt", "params": params}))
+		b.Broadcast(withSid(Event{kType: "scheduled_task_inject_prompt", kParams: params}))
 	case "x.ai/scheduled_task_created":
 		// 归一化逻辑抽到 broadcastScheduledTaskCreated（与 sessionUpdate
 		// kind 分发共享）：task/rawTask/rawParams/meta 保全，见该 helper。
@@ -1995,12 +1924,12 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 	case "x.ai/scheduled_task_deleted":
 		b.broadcastScheduledTaskDeleted(sid, params, withSid)
 	case "x.ai/session/prompt_complete":
-		b.Broadcast(withSid(Event{"type": "prompt_complete", "params": params}))
+		b.Broadcast(withSid(Event{kType: "prompt_complete", kParams: params}))
 	case "x.ai/session/updates/chunk":
 		// 分块拉取会话更新（extensions/session_updates.rs:290-330
 		// send_streamed_chunks）：{sessionId, index, updates: [原始
 		// updates.jsonl 行], done}，可选 routing meta。原样透传。
-		b.Broadcast(withSid(Event{"type": "session_updates_chunk", "params": params}))
+		b.Broadcast(withSid(Event{kType: "session_updates_chunk", kParams: params}))
 	case "x.ai/queue/changed":
 		// prompt 队列变更（session/prompt_queue.rs QUEUE_CHANGED_METHOD）。
 		// 队列状态不落盘、load 不回放 —— 缓存最近一次快照，供
@@ -2017,57 +1946,57 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 			}
 			b.mu.Unlock()
 		}
-		b.Broadcast(withSid(Event{"type": "queue_changed", "params": params}))
+		b.Broadcast(withSid(Event{kType: "queue_changed", kParams: params}))
 	case "x.ai/config_changed":
 		// 配置变更（MCP 初始化取消 / agent/app.rs leader 广播）。
-		b.Broadcast(withSid(Event{"type": "config_changed", "params": params}))
+		b.Broadcast(withSid(Event{kType: "config_changed", kParams: params}))
 	case "x.ai/settings/update":
 		// 设置热更新推送（agent/mvp_agent/mod.rs:2042）。
-		b.Broadcast(withSid(Event{"type": "settings_update", "params": params}))
+		b.Broadcast(withSid(Event{kType: "settings_update", kParams: params}))
 	case "x.ai/fs_notify":
 		// 文件系统变更（session/fs_watch.rs:342）：{sessionId,
 		// event:{kind, paths}}。
-		b.Broadcast(withSid(Event{"type": "fs_notify", "params": params}))
+		b.Broadcast(withSid(Event{kType: "fs_notify", kParams: params}))
 	case "x.ai/fs/index":
 		// 全量文件索引（session/fs_watch.rs:428）。
-		b.Broadcast(withSid(Event{"type": "fs_index", "params": params}))
+		b.Broadcast(withSid(Event{kType: "fs_index", kParams: params}))
 	case "x.ai/fs/index/delta":
 		// 增量文件索引（session/fs_watch.rs:368）。
-		b.Broadcast(withSid(Event{"type": "fs_index_delta", "params": params}))
+		b.Broadcast(withSid(Event{kType: "fs_index_delta", kParams: params}))
 	case "x.ai/search/fuzzy/status":
 		// 模糊搜索进度（extensions/search.rs:158）。
-		b.Broadcast(withSid(Event{"type": "search_fuzzy_status", "params": params}))
+		b.Broadcast(withSid(Event{kType: "search_fuzzy_status", kParams: params}))
 	case "x.ai/search/content/status":
 		// 内容搜索进度（extensions/search.rs:222）。
-		b.Broadcast(withSid(Event{"type": "search_content_status", "params": params}))
+		b.Broadcast(withSid(Event{kType: "search_content_status", kParams: params}))
 	case "x.ai/git/worktree/status":
 		// worktree 创建进度（extensions/worktree.rs:37）。
-		b.Broadcast(withSid(Event{"type": "git_worktree_status", "params": params}))
+		b.Broadcast(withSid(Event{kType: "git_worktree_status", kParams: params}))
 	case "x.ai/mcp/init_progress":
 		// MCP 初始化进度（extensions/mcp.rs INIT_PROGRESS）。
-		b.Broadcast(withSid(Event{"type": "mcp_init_progress", "params": params}))
+		b.Broadcast(withSid(Event{kType: "mcp_init_progress", kParams: params}))
 	case "x.ai/terminal/pty/notification":
 		// PTY 输出通知（terminal/pty_session.rs:23 NOTIFICATION_METHOD）。
-		b.Broadcast(withSid(Event{"type": "pty_notification", "params": params}))
+		b.Broadcast(withSid(Event{kType: "pty_notification", kParams: params}))
 	case "x.ai/session/interjection":
 		// 回合中插话（session/acp_session_impl/interjection.rs:171）：
 		// {sessionId, text, interjectionId?}。
-		b.Broadcast(withSid(Event{"type": "session_interjection", "params": params}))
+		b.Broadcast(withSid(Event{kType: "session_interjection", kParams: params}))
 	case "x.ai/follow_ups":
 		// 回合结束后的建议 chips（TUI app/acp_handler/follow_ups.rs 渲染；
 		// params 含 response_id / follow_ups 列表，原样透传）。
-		b.Broadcast(withSid(Event{"type": "follow_ups", "params": params}))
+		b.Broadcast(withSid(Event{kType: "follow_ups", kParams: params}))
 	case "x.ai/leader/version_mismatch":
 		// leader 与 client 版本不一致横幅（TUI xai-grok-pager/src/acp/
 		// version_mismatch.rs 渲染；wire params 为 {clientVersion,
 		// leaderVersion, message}——message 被 TUI 忽略，原样透传）。
-		b.Broadcast(withSid(Event{"type": "leader_version_mismatch", "params": params}))
+		b.Broadcast(withSid(Event{kType: "leader_version_mismatch", kParams: params}))
 	case "x.ai/leader_reconnected":
 		// leader 重连信号（xai-grok-pager-bin/src/main.rs:1354 等，
 		// params 可为空）。
-		b.Broadcast(withSid(Event{"type": "leader_reconnected", "params": params}))
+		b.Broadcast(withSid(Event{kType: "leader_reconnected", kParams: params}))
 	default:
-		b.Broadcast(withSid(Event{"type": "ext_notification", "method": method, "params": params}))
+		b.Broadcast(withSid(Event{kType: "ext_notification", kMethod: method, kParams: params}))
 	}
 }
 
@@ -2153,11 +2082,11 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 	b.clientReqs.Store(reqID, cr)
 	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
-		"type":      "client_request",
+		kType:       "client_request",
 		"requestId": reqID,
-		"method":    method,
-		"params":    params,
-		"sessionId": cr.SessionID,
+		kMethod:     method,
+		kParams:     params,
+		kSessionID:  cr.SessionID,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -2179,11 +2108,11 @@ func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any)
 	b.clientReqs.Store(reqID, cr)
 	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
-		"type":      "client_request",
+		kType:       "client_request",
 		"requestId": reqID,
-		"method":    method,
-		"params":    params,
-		"sessionId": cr.SessionID,
+		kMethod:     method,
+		kParams:     params,
+		kSessionID:  cr.SessionID,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -2239,11 +2168,11 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 // pending. Clients remove matching pending / xaiRequests rows by requestId.
 func (b *Bridge) broadcastClientRequestResolved(reqID, sessionID string) {
 	ev := Event{
-		"type":      "client_request_resolved",
+		kType:       "client_request_resolved",
 		"requestId": reqID,
 	}
 	if sessionID != "" {
-		ev["sessionId"] = sessionID
+		ev[kSessionID] = sessionID
 	}
 	b.Broadcast(ev)
 }
@@ -2284,14 +2213,8 @@ func permissionResult(outcome map[string]any, meta map[string]any) map[string]an
 	}
 	return map[string]any{
 		"outcome": outcome,
-		"_meta":   meta,
+		kMeta:     meta,
 	}
-}
-
-// RespondPermission resolves a pending session/request_permission without
-// response meta (legacy signature — no scope / followup to attach).
-func (b *Bridge) RespondPermission(requestID, optionID string, cancelled bool) error {
-	return b.RespondPermissionWithMeta(requestID, optionID, cancelled, nil, "")
 }
 
 // RespondPermissionWithMeta resolves a pending session/request_permission,
@@ -2306,8 +2229,7 @@ func (b *Bridge) RespondPermission(requestID, optionID string, cancelled bool) e
 //     followup text off the RejectOnce branch. Without a RejectOnce option
 //     it falls back to a plain Cancelled outcome (TUI does the same).
 //
-// Both fields are optional; with none set the wire response is byte-identical
-// to the legacy RespondPermission.
+// Both fields are optional; with none set the response carries no `_meta`.
 func (b *Bridge) RespondPermissionWithMeta(requestID, optionID string, cancelled bool, scope *PermissionScope, followupMessage string) error {
 	v, ok := b.clientReqs.LoadAndDelete(requestID)
 	if !ok {
@@ -2400,17 +2322,17 @@ func (b *Bridge) write(msg map[string]any) error {
 
 func (b *Bridge) respond(id any, result map[string]any) {
 	_ = b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"result":  result,
+		kJSONRPC: "2.0",
+		kID:      id,
+		kResult:  result,
 	})
 }
 
 func (b *Bridge) respondError(id any, message string, code int) {
 	_ = b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"error": map[string]any{
+		kJSONRPC: "2.0",
+		kID:      id,
+		kError: map[string]any{
 			"code":    code,
 			"message": message,
 		},
@@ -2444,10 +2366,10 @@ func (b *Bridge) requestRaw(ctx context.Context, method string, params map[strin
 	b.pending.Store(key, ch)
 
 	msg := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
+		kJSONRPC: "2.0",
+		kID:      id,
+		kMethod:  method,
+		kParams:  params,
 	}
 	if err := b.write(msg); err != nil {
 		b.pending.Delete(key)
@@ -2495,26 +2417,21 @@ type PromptOpts struct {
 	Meta      map[string]any // wire: _meta (非空才发)
 }
 
-// Prompt sends session/prompt to the given session (default: active) and
-// blocks until the turn finishes. When no session exists yet (the host
-// never auto-creates one at boot), the first prompt restores the last
-// known session if one was remembered; only a machine with no last-session
-// pointer starts a brand-new conversation. A failed restore is an error —
-// never silently open a blank chat. Busy is per-session: other sessions
-// can keep running turns in parallel (the agent process is multi-session),
-// and a busy session is NOT rejected — the agent accepts mid-turn
-// session/prompt and queues it in its own authoritative pending_inputs, so
-// the host forwards and the turns run in submission order.
-func (b *Bridge) Prompt(ctx context.Context, sessionID string, blocks []ContentBlock) (stopReason string, err error) {
-	sr, _, err := b.PromptWithOpts(ctx, sessionID, blocks, PromptOpts{})
-	return sr, err
-}
-
-// PromptWithOpts is Prompt with the official optional fields (messageId /
-// _meta) forwarded on the session/prompt params when set; empty opts keep
-// the wire byte-identical to Prompt. Returns the turn's stopReason plus
-// the response `_meta` (the agent's prompt-result meta, nil when absent)
-// so the HTTP layer can pass it through to the browser.
+// PromptWithOpts sends session/prompt to the given session (default:
+// active) and blocks until the turn finishes. When no session exists yet
+// (the host never auto-creates one at boot), the first prompt restores the
+// last known session if one was remembered; only a machine with no
+// last-session pointer starts a brand-new conversation. A failed restore is
+// an error — never silently open a blank chat. Busy is per-session: other
+// sessions can keep running turns in parallel (the agent process is
+// multi-session), and a busy session is NOT rejected — the agent accepts
+// mid-turn session/prompt and queues it in its own authoritative
+// pending_inputs, so the host forwards and the turns run in submission
+// order. The optional fields (messageId / _meta) are forwarded on the
+// session/prompt params when set; empty opts omit them from the wire
+// entirely. Returns the turn's stopReason plus the response `_meta` (the
+// agent's prompt-result meta, nil when absent) so the HTTP layer can pass
+// it through to the browser.
 func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []ContentBlock, opts PromptOpts) (stopReason string, meta map[string]any, err error) {
 	b.mu.Lock()
 	if sessionID == "" {
@@ -2570,7 +2487,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// 0→1 transition: announce the busy turn exactly once. A second
 		// in-flight prompt must not re-announce — the session never left
 		// busy between the two.
-		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
+		b.Broadcast(Event{kType: "busy", kSessionID: sessionID})
 	}
 
 	defer func() {
@@ -2588,14 +2505,14 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 
 	params := map[string]any{
-		"sessionId": sessionID,
-		"prompt":    prompt,
+		kSessionID: sessionID,
+		"prompt":   prompt,
 	}
 	if opts.MessageID != "" {
 		params["messageId"] = opts.MessageID
 	}
 	if len(opts.Meta) > 0 {
-		params["_meta"] = opts.Meta
+		params[kMeta] = opts.Meta
 	}
 	res, err := b.request(ctx, "session/prompt", params, promptTimeout)
 	if err != nil {
@@ -2608,7 +2525,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// simply resend.
 		if errors.Is(err, context.Canceled) {
 			b.Cancel(sessionID)
-			b.Broadcast(Event{"type": "status", "text": "连接已断开，本次回复已取消，请重新发送", "sessionId": sessionID})
+			b.Broadcast(Event{kType: "status", kText: "连接已断开，本次回复已取消，请重新发送", kSessionID: sessionID})
 			return "", nil, err
 		}
 		// A plain JSON-RPC error is the AGENT rejecting the turn (e.g. the
@@ -2632,10 +2549,10 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	// 响应 `_meta`（agent 下发的 prompt-result meta）原样透传：done 事件
 	// 带 `meta`、返回值给 HTTP 层；仅非空才带（absent key ≠ off）。
-	meta, _ = res["_meta"].(map[string]any)
-	ev := Event{"type": "done", "stopReason": sr, "sessionId": sessionID}
+	meta, _ = res[kMeta].(map[string]any)
+	ev := Event{kType: "done", "stopReason": sr, kSessionID: sessionID}
 	if len(meta) > 0 {
-		ev["meta"] = meta
+		ev[kMetaOut] = meta
 	}
 	b.Broadcast(ev)
 	return sr, meta, nil
@@ -2654,9 +2571,9 @@ func (b *Bridge) broadcastPromptError(sessionID string, err error) {
 	if errors.As(err, &rpcErr) {
 		source = "agent"
 	}
-	ev := Event{"type": "error", "message": err.Error(), "source": source}
+	ev := Event{kType: kError, "message": err.Error(), "source": source}
 	if sessionID != "" {
-		ev["sessionId"] = sessionID
+		ev[kSessionID] = sessionID
 	}
 	b.Broadcast(ev)
 }
@@ -2695,14 +2612,14 @@ func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 	}
 	b.mu.Unlock()
 	if sid != "" {
-		params := map[string]any{"sessionId": sid}
+		params := map[string]any{kSessionID: sid}
 		if len(meta) > 0 {
-			params["_meta"] = meta
+			params[kMeta] = meta
 		}
 		_ = b.write(map[string]any{
-			"jsonrpc": "2.0",
-			"method":  "session/cancel",
-			"params":  params,
+			kJSONRPC: "2.0",
+			kMethod:  "session/cancel",
+			kParams:  params,
 		})
 	}
 	b.clientReqs.Range(func(key, value any) bool {
@@ -2719,7 +2636,7 @@ func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 		}
 		return true
 	})
-	b.Broadcast(Event{"type": "cancelled", "sessionId": sid})
+	b.Broadcast(Event{kType: "cancelled", kSessionID: sid})
 }
 
 // resetRoster 清理 agent 进程死亡后的 in-memory 状态：清空 roster 与
@@ -2794,8 +2711,8 @@ func (b *Bridge) SetMode(ctx context.Context, sessionID, modeID string) (map[str
 		return nil, errors.New("没有活跃会话")
 	}
 	return b.request(ctx, "session/set_mode", map[string]any{
-		"sessionId": sessionID,
-		"modeId":    modeID,
+		kSessionID: sessionID,
+		"modeId":   modeID,
 	}, 30*time.Second)
 }
 
@@ -2812,11 +2729,11 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		return errors.New("没有活跃会话")
 	}
 	params := map[string]any{
-		"sessionId": sessionID,
-		"modelId":   modelID,
+		kSessionID: sessionID,
+		"modelId":  modelID,
 	}
 	if reasoningEffort != "" {
-		params["_meta"] = map[string]any{"reasoningEffort": reasoningEffort}
+		params[kMeta] = map[string]any{"reasoningEffort": reasoningEffort}
 	}
 	if _, err := b.request(ctx, "session/set_model", params, 30*time.Second); err != nil {
 		return err
@@ -2835,14 +2752,14 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 	}
 	b.mu.Unlock()
 	if models != nil {
-		b.Broadcast(Event{"type": "models_update", "params": models, "sessionId": sessionID})
+		b.Broadcast(Event{kType: "models_update", kParams: models, kSessionID: sessionID})
 	}
 	b.Broadcast(Event{
-		"type":            "model",
+		kType:             "model",
 		"modelId":         modelID,
 		"modelName":       name,
 		"reasoningEffort": reasoningEffort,
-		"sessionId":       sessionID,
+		kSessionID:        sessionID,
 	})
 	return nil
 }
@@ -2867,7 +2784,7 @@ func (b *Bridge) patchSessionModels(s *SessionState, modelID, effort string) {
 				continue
 			}
 			if id, _ := mm["modelId"].(string); id == modelID {
-				if meta, ok := mm["_meta"].(map[string]any); ok && effort != "" {
+				if meta, ok := mm[kMeta].(map[string]any); ok && effort != "" {
 					meta["reasoningEffort"] = effort
 				}
 			}
@@ -2969,7 +2886,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 			params["cursor"] = opts[0].Cursor
 		}
 		if len(opts[0].Meta) > 0 {
-			params["_meta"] = opts[0].Meta
+			params[kMeta] = opts[0].Meta
 		}
 	}
 	res, err := b.request(ctx, "session/list", params, 30*time.Second)
@@ -2984,7 +2901,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		nextCursor, _ = res["next_cursor"].(string)
 	}
 	// 响应 `_meta` 原样透传（仅非空才发，absent key ≠ off）。
-	meta, _ = res["_meta"].(map[string]any)
+	meta, _ = res[kMeta].(map[string]any)
 
 	// Snapshot the live per-session state under the lock (cheap), then run
 	// the census file reads and the lsof probe OUTSIDE it: sessionTaskCensus
@@ -3007,7 +2924,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		if !ok {
 			continue
 		}
-		sid, _ := m["sessionId"].(string)
+		sid, _ := m[kSessionID].(string)
 		st := &liveState{state: "idle"}
 		if s := b.sessions[sid]; s != nil {
 			st.live = true
@@ -3036,7 +2953,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		if !ok {
 			continue
 		}
-		sid, _ := m["sessionId"].(string)
+		sid, _ := m[kSessionID].(string)
 		cwd, _ := m["cwd"].(string)
 		if sid == "" || cwd == "" {
 			continue
@@ -3052,7 +2969,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		if !ok {
 			continue
 		}
-		sid, _ := m["sessionId"].(string)
+		sid, _ := m[kSessionID].(string)
 		if st := states[sid]; st != nil && st.live {
 			m["status"] = map[string]any{
 				"state":         st.state,
@@ -3061,10 +2978,10 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 				"lastActiveAt":  st.lastActiveAt,
 			}
 			if st.title != "" {
-				m["title"] = st.title
+				m[kTitle] = st.title
 			}
 			if st.updatedAt != "" {
-				m["updatedAt"] = st.updatedAt
+				m[kUpdatedAt] = st.updatedAt
 			}
 		} else {
 			m["status"] = map[string]any{"state": "idle", "busy": false, "awaitingInput": false}
@@ -3159,7 +3076,7 @@ func (b *Bridge) SessionInfo(sessionID string) *SessionInfoDetail {
 			if id, _ := mm["modelId"].(string); id != cur {
 				continue
 			}
-			if meta, ok := mm["_meta"].(map[string]any); ok {
+			if meta, ok := mm[kMeta].(map[string]any); ok {
 				if eff, ok := meta["reasoningEffort"].(string); ok && eff != "" && mi.ReasoningEffort == "" {
 					mi.ReasoningEffort = eff
 				}
@@ -3208,7 +3125,7 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 			sessRes["modes"] = s.modes
 		}
 		if s.configOpts != nil {
-			sessRes["configOptions"] = s.configOpts
+			sessRes[kConfigOptions] = s.configOpts
 		}
 		agentInfo := b.agentInfo
 		modes := s.modes
@@ -3222,15 +3139,15 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		b.mu.Unlock()
 
 		ev := Event{
-			"type":          "ready",
-			"sessionId":     sessionID,
-			"cwd":           sessCwd,
-			"agentInfo":     agentInfo,
-			"modes":         modes,
-			"configOptions": configOpts,
-			"models":        models,
-			"hostId":        hostID,
-			"hostName":      hostName,
+			kType:          "ready",
+			kSessionID:     sessionID,
+			"cwd":          sessCwd,
+			"agentInfo":    agentInfo,
+			"modes":        modes,
+			kConfigOptions: configOpts,
+			"models":       models,
+			"hostId":       hostID,
+			"hostName":     hostName,
 		}
 		// 已存 roster 的 sessionMeta / authenticate 的 authMeta 原样透传，
 		// 仅非空才带。
@@ -3242,7 +3159,7 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		}
 		b.Broadcast(ev)
 		// Re-announce busy so the client can attach the spinner after history load.
-		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
+		b.Broadcast(Event{kType: "busy", kSessionID: sessionID})
 		b.broadcastRosterChange()
 		return sessRes, nil
 	}
@@ -3271,12 +3188,12 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		return nil, err
 	}
 	params := map[string]any{
-		"sessionId":  sessionID,
+		kSessionID:   sessionID,
 		"cwd":        cwd,
 		"mcpServers": []any{},
 	}
 	if len(meta) > 0 && len(meta[0]) > 0 {
-		params["_meta"] = meta[0]
+		params[kMeta] = meta[0]
 	}
 	// Multi-tab: agent session/load REPLAYS the full conversation as
 	// session/update over the shared SSE bus. The tab that called
@@ -3285,18 +3202,18 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	// APPEND the replay onto its existing scrollback (doubled timeline).
 	// Announce before the agent call so peers arm the drop gate first.
 	b.Broadcast(Event{
-		"type":      "session_load_started",
-		"sessionId": sessionID,
-		"cwd":       cwd,
+		kType:      "session_load_started",
+		kSessionID: sessionID,
+		"cwd":      cwd,
 	})
 	sessRes, err := b.request(ctx, "session/load", params, bootTimeout)
 	if err != nil {
 		// Peers that armed on started must unstick (reload or clear gate).
 		b.Broadcast(Event{
-			"type":      "session_load_finished",
-			"sessionId": sessionID,
-			"cwd":       cwd,
-			"ok":        false,
+			kType:      "session_load_finished",
+			kSessionID: sessionID,
+			"cwd":      cwd,
+			"ok":       false,
 		})
 		return nil, err
 	}
@@ -3329,12 +3246,12 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	if modes, ok := sessRes["modes"]; ok && modes != nil {
 		act.modes = modes
 	}
-	if co, ok := sessRes["configOptions"]; ok && co != nil {
+	if co, ok := sessRes[kConfigOptions]; ok && co != nil {
 		act.configOpts = co
 	}
 	// session/load 响应 `_meta` 原样存下（缺省保留 roster 旧值，与
 	// models/modes 的处理一致），ready 事件 / Status 透传。
-	if m, ok := sessRes["_meta"]; ok && m != nil {
+	if m, ok := sessRes[kMeta]; ok && m != nil {
 		act.sessionMeta = m
 	}
 	b.activeSessionID = sessionID
@@ -3357,15 +3274,15 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	sessRes["busy"] = false
 
 	ev := Event{
-		"type":          "ready",
-		"sessionId":     sessionID,
-		"cwd":           sessCwd,
-		"agentInfo":     agentInfo,
-		"modes":         modes,
-		"configOptions": configOpts,
-		"models":        models,
-		"hostId":        hostID,
-		"hostName":      hostName,
+		kType:          "ready",
+		kSessionID:     sessionID,
+		"cwd":          sessCwd,
+		"agentInfo":    agentInfo,
+		"modes":        modes,
+		kConfigOptions: configOpts,
+		"models":       models,
+		"hostId":       hostID,
+		"hostName":     hostName,
 	}
 	if sessionMeta != nil {
 		ev["sessionMeta"] = sessionMeta
@@ -3378,10 +3295,10 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	// rebuild from HTTP history now (initiator already does via its own
 	// loadHistory; this flag is for multi-tab viewers of the same sid).
 	b.Broadcast(Event{
-		"type":      "session_load_finished",
-		"sessionId": sessionID,
-		"cwd":       sessCwd,
-		"ok":        true,
+		kType:      "session_load_finished",
+		kSessionID: sessionID,
+		"cwd":      sessCwd,
+		"ok":       true,
 	})
 	b.broadcastRosterChange()
 	return sessRes, nil
@@ -3417,7 +3334,7 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 			sessRes["modes"] = s.modes
 		}
 		if s.configOpts != nil {
-			sessRes["configOptions"] = s.configOpts
+			sessRes[kConfigOptions] = s.configOpts
 		}
 		agentInfo := b.agentInfo
 		modes := s.modes
@@ -3431,15 +3348,15 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		b.mu.Unlock()
 
 		ev := Event{
-			"type":          "ready",
-			"sessionId":     sessionID,
-			"cwd":           sessCwd,
-			"agentInfo":     agentInfo,
-			"modes":         modes,
-			"configOptions": configOpts,
-			"models":        models,
-			"hostId":        hostID,
-			"hostName":      hostName,
+			kType:          "ready",
+			kSessionID:     sessionID,
+			"cwd":          sessCwd,
+			"agentInfo":    agentInfo,
+			"modes":        modes,
+			kConfigOptions: configOpts,
+			"models":       models,
+			"hostId":       hostID,
+			"hostName":     hostName,
 		}
 		if sessionMeta != nil {
 			ev["sessionMeta"] = sessionMeta
@@ -3449,7 +3366,7 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		}
 		b.Broadcast(ev)
 		// Re-announce busy so the client can attach the spinner after history load.
-		b.Broadcast(Event{"type": "busy", "sessionId": sessionID})
+		b.Broadcast(Event{kType: "busy", kSessionID: sessionID})
 		b.broadcastRosterChange()
 		return sessRes, nil
 	}
@@ -3474,13 +3391,13 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		return nil, err
 	}
 	params := map[string]any{
-		"sessionId":             sessionID,
+		kSessionID:              sessionID,
 		"cwd":                   cwd,
 		"mcpServers":            []any{},
 		"additionalDirectories": []any{},
 	}
 	if len(meta) > 0 && len(meta[0]) > 0 {
-		params["_meta"] = meta[0]
+		params[kMeta] = meta[0]
 	}
 	sessRes, err := b.request(ctx, "session/resume", params, bootTimeout)
 	if err != nil {
@@ -3513,12 +3430,12 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	if modes, ok := sessRes["modes"]; ok && modes != nil {
 		act.modes = modes
 	}
-	if co, ok := sessRes["configOptions"]; ok && co != nil {
+	if co, ok := sessRes[kConfigOptions]; ok && co != nil {
 		act.configOpts = co
 	}
 	// session/resume 响应 `_meta` 原样存下（缺省保留 roster 旧值），
 	// ready 事件 / Status 透传。
-	if m, ok := sessRes["_meta"]; ok && m != nil {
+	if m, ok := sessRes[kMeta]; ok && m != nil {
 		act.sessionMeta = m
 	}
 	b.activeSessionID = sessionID
@@ -3541,15 +3458,15 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	sessRes["busy"] = false
 
 	ev := Event{
-		"type":          "ready",
-		"sessionId":     sessionID,
-		"cwd":           sessCwd,
-		"agentInfo":     agentInfo,
-		"modes":         modes,
-		"configOptions": configOpts,
-		"models":        models,
-		"hostId":        hostID,
-		"hostName":      hostName,
+		kType:          "ready",
+		kSessionID:     sessionID,
+		"cwd":          sessCwd,
+		"agentInfo":    agentInfo,
+		"modes":        modes,
+		kConfigOptions: configOpts,
+		"models":       models,
+		"hostId":       hostID,
+		"hostName":     hostName,
 	}
 	if sessionMeta != nil {
 		ev["sessionMeta"] = sessionMeta
@@ -3582,17 +3499,34 @@ func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	sessRes, err := b.request(ctx, "session/close", map[string]any{
-		"sessionId": sessionID,
+		kSessionID: sessionID,
 	}, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
 	b.mu.Lock()
+	// 与 SessionDelete 同一套 per-session 清理：名册、队列快照、用量
+	// 去重缓存、生成速率分桶与 last-session 指针。
+	b.forgetSessionLocked(sessionID)
+	b.mu.Unlock()
+	b.broadcastRosterChange()
+	return sessRes, nil
+}
+
+// forgetSessionLocked drops every per-session index entry for sid: the
+// roster row, queue snapshot, usage dedup cache and gen-rate bucket, plus
+// the active-session / last-session pointers when they pointed at it. The
+// caller holds b.mu.
+func (b *Bridge) forgetSessionLocked(sessionID string) {
 	delete(b.sessions, sessionID)
 	if b.queueSnapshots != nil {
 		delete(b.queueSnapshots, sessionID)
 	}
+	if b.usageLastUsed != nil {
+		delete(b.usageLastUsed, sessionID)
+	}
+	b.genRate.discard(sessionID)
 	if b.activeSessionID == sessionID {
 		b.activeSessionID = ""
 	}
@@ -3600,9 +3534,6 @@ func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string
 		b.lastSessionID = ""
 		b.lastSessionCwd = ""
 	}
-	b.mu.Unlock()
-	b.broadcastRosterChange()
-	return sessRes, nil
 }
 
 // ── session history (x.ai/session/updates) ───────────────────────
@@ -3638,29 +3569,48 @@ type SessionUpdatesOpts struct {
 	TurnIndex *int
 }
 
-// SessionUpdates fetches a session's stored updates (message history) via
-// the ACP extension method x.ai/session/updates. Each element of the result
-// is the full storage envelope {timestamp, method, params}.
+// SessionUpdates fetches a session's stored updates (message history). Each
+// element of the result is the full storage envelope {timestamp, method,
+// params}.
+//
+// 本地归一化优先（msgSeq 契约，见 session_history.go）：会话文件可读且
+// 全部信封带 params._meta.agentTimestampMs 时，从归一化视图分页服务——
+// turnIndex/offset/limit 在 msgSeq 空间解释，每条 update 顶层带 msgSeq，
+// promptStarts 由 host 重算，totalCount = 归一化条数。回退路径（文件
+// 不可读 / 任一信封缺 agentTimestampMs）走既有 agent
+// `_x.ai/session/updates` 透传（响应无 msgSeq、promptStarts 原样），
+// 两条路径互斥、按会话内容自动选择。stream=true 路径不改（agent 以
+// chunked 通知推流，本地分页无法替代）。
 func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...SessionUpdatesOpts) (UpdatesPage, error) {
+	o := SessionUpdatesOpts{}
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	if !o.Stream {
+		if page, ok := b.localUpdatesPage(sessionID, cwd, o); ok {
+			log.Printf("[capri-host] session updates served locally (msgSeq total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
+			return page, nil
+		}
+	}
 	if err := b.Boot(ctx); err != nil {
 		return UpdatesPage{}, err
 	}
-	params := map[string]any{"sessionId": sessionID, "cwd": cwd}
-	if len(opts) > 0 {
-		if opts[0].Offset != nil {
-			params["offset"] = *opts[0].Offset
+	params := map[string]any{kSessionID: sessionID, "cwd": cwd}
+	{
+		if o.Offset != nil {
+			params["offset"] = *o.Offset
 		}
-		if opts[0].Limit != nil {
-			params["limit"] = *opts[0].Limit
+		if o.Limit != nil {
+			params["limit"] = *o.Limit
 		}
-		if opts[0].Stream {
+		if o.Stream {
 			params["stream"] = true
 		}
-		if opts[0].ChunkSize != nil {
-			params["chunkSize"] = *opts[0].ChunkSize
+		if o.ChunkSize != nil {
+			params["chunkSize"] = *o.ChunkSize
 		}
-		if opts[0].TurnIndex != nil {
-			params["turnIndex"] = *opts[0].TurnIndex
+		if o.TurnIndex != nil {
+			params["turnIndex"] = *o.TurnIndex
 		}
 	}
 	// ACP wire convention: extension methods are sent with an underscore
@@ -3720,7 +3670,7 @@ func (b *Bridge) GitInfo(ctx context.Context, sessionID, cwd string) (map[string
 	res, err := b.request(ctx, "_x.ai/git/info", map[string]any{"gitRoot": cwd}, 15*time.Second)
 	if err == nil {
 		payload := res
-		if inner, ok := res["result"].(map[string]any); ok {
+		if inner, ok := res[kResult].(map[string]any); ok {
 			payload = inner
 		}
 		if br, ok := payload["currentBranch"].(string); ok {
@@ -3859,7 +3809,7 @@ func (b *Bridge) XaiCall(ctx context.Context, method string, params map[string]a
 	if params == nil {
 		params = map[string]any{}
 	}
-	for _, k := range []string{"sessionId", "session_id"} {
+	for _, k := range []string{kSessionID, kSessionIDS} {
 		if v, ok := params[k].(string); ok && v == "" {
 			sid := b.resolveSessionID("")
 			if sid == "" {
@@ -3893,7 +3843,7 @@ func (b *Bridge) XaiNotify(ctx context.Context, method string, params map[string
 	if params == nil {
 		params = map[string]any{}
 	}
-	for _, k := range []string{"sessionId", "session_id"} {
+	for _, k := range []string{kSessionID, kSessionIDS} {
 		if v, ok := params[k].(string); ok && v == "" {
 			sid := b.resolveSessionID("")
 			if sid == "" {
@@ -3903,9 +3853,9 @@ func (b *Bridge) XaiNotify(ctx context.Context, method string, params map[string
 		}
 	}
 	if err := b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "_" + method,
-		"params":  params,
+		kJSONRPC: "2.0",
+		kMethod:  "_" + method,
+		kParams:  params,
 	}); err != nil {
 		return nil, err
 	}
@@ -3979,8 +3929,8 @@ func (b *Bridge) RenameSession(ctx context.Context, sessionID, title string) (ma
 		return nil, err
 	}
 	return b.request(ctx, "_x.ai/session/rename", map[string]any{
-		"sessionId": b.resolveSessionID(sessionID),
-		"title":     title,
+		kSessionID: b.resolveSessionID(sessionID),
+		kTitle:     title,
 	}, 30*time.Second)
 }
 
@@ -3996,8 +3946,8 @@ func (b *Bridge) Recap(ctx context.Context, sessionID string, auto bool) (map[st
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/recap", map[string]any{
-		"sessionId": sessionID,
-		"auto":      auto,
+		kSessionID: sessionID,
+		"auto":     auto,
 	}, 30*time.Second)
 }
 
@@ -4008,7 +3958,7 @@ func (b *Bridge) SubagentCancel(ctx context.Context, sessionID, subagentID strin
 		return nil, err
 	}
 	return b.request(ctx, "_x.ai/subagent/cancel", map[string]any{
-		"sessionId":  b.resolveSessionID(sessionID),
+		kSessionID:   b.resolveSessionID(sessionID),
 		"subagentId": subagentID,
 	}, 30*time.Second)
 }
@@ -4020,8 +3970,8 @@ func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID string) (map[st
 		return nil, err
 	}
 	return b.request(ctx, "_x.ai/task/kill", map[string]any{
-		"sessionId": b.resolveSessionID(sessionID),
-		"taskId":    taskID,
+		kSessionID: b.resolveSessionID(sessionID),
+		"taskId":   taskID,
 	}, 30*time.Second)
 }
 
@@ -4043,7 +3993,7 @@ func (b *Bridge) TaskList(ctx context.Context) (map[string]any, error) {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/task/list", map[string]any{
-		"sessionId": sid,
+		kSessionID: sid,
 	}, 30*time.Second)
 }
 
@@ -4064,28 +4014,19 @@ func (b *Bridge) SessionDelete(ctx context.Context, sessionID string) (map[strin
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	sessRes, err := b.request(ctx, "_x.ai/session/delete", map[string]any{
-		"sessionId": sessionID,
+		kSessionID: sessionID,
 	}, 60*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	// Deleting the ACTIVE session drops the frontend into the EMPTY state
-	// (no auto-new). Clear the roster entry, the active-session pointer and
-	// any last-session hint pointing at the deleted session, so the next
-	// prompt without a sessionId creates a fresh session instead of trying
-	// to restore the deleted one (same cleanup as CloseSession).
+	// (no auto-new). forgetSessionLocked clears the roster entry, the
+	// active-session pointer and any last-session hint pointing at the
+	// deleted session, so the next prompt without a sessionId creates a
+	// fresh session instead of trying to restore the deleted one (same
+	// cleanup as CloseSession).
 	b.mu.Lock()
-	delete(b.sessions, sessionID)
-	if b.queueSnapshots != nil {
-		delete(b.queueSnapshots, sessionID)
-	}
-	if b.activeSessionID == sessionID {
-		b.activeSessionID = ""
-	}
-	if b.lastSessionID == sessionID {
-		b.lastSessionID = ""
-		b.lastSessionCwd = ""
-	}
+	b.forgetSessionLocked(sessionID)
 	b.mu.Unlock()
 	b.broadcastRosterChange()
 	return sessRes, nil
@@ -4108,7 +4049,7 @@ func (b *Bridge) CompactConversation(ctx context.Context, sessionID, note string
 	if sessionID == "" {
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
-	params := map[string]any{"sessionId": sessionID}
+	params := map[string]any{kSessionID: sessionID}
 	if note != "" {
 		params["userContext"] = note
 	}
@@ -4132,7 +4073,7 @@ func (b *Bridge) RewindPoints(ctx context.Context, sessionID string) (map[string
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/rewind/points", map[string]any{
-		"sessionId": sessionID,
+		kSessionID: sessionID,
 	}, 60*time.Second)
 }
 
@@ -4162,7 +4103,7 @@ func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetInde
 		mode = "conversation_only"
 	}
 	return b.request(ctx, "_x.ai/rewind/execute", map[string]any{
-		"sessionId":         sessionID,
+		kSessionID:          sessionID,
 		"targetPromptIndex": targetIndex,
 		"force":             true,
 		"mode":              mode,
@@ -4185,8 +4126,8 @@ func (b *Bridge) SchedulerDelete(ctx context.Context, sessionID, taskID string) 
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/scheduler/delete", map[string]any{
-		"sessionId": sessionID,
-		"taskId":    taskID,
+		kSessionID: sessionID,
+		"taskId":   taskID,
 	}, 30*time.Second)
 }
 
@@ -4214,7 +4155,7 @@ func (b *Bridge) Billing(ctx context.Context, sessionID string) (map[string]any,
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/billing", map[string]any{
-		"sessionId": sessionID,
+		kSessionID: sessionID,
 	}, 30*time.Second)
 }
 
@@ -4230,7 +4171,7 @@ func (b *Bridge) MemoryFlush(ctx context.Context, sessionID string) (map[string]
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/memory/flush", map[string]any{
-		"session_id": sessionID,
+		kSessionIDS: sessionID,
 	}, 30*time.Second)
 }
 
@@ -4246,7 +4187,7 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/memory/rewrite", map[string]any{
-		"sessionId":      sessionID,
+		kSessionID:       sessionID,
 		"rawText":        rawText,
 		"contextSummary": contextSummary,
 	}, 30*time.Second)
@@ -4259,7 +4200,7 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 // JSON-RPC id and returns a bare ok — the frontend applies its local
 // desired state. SessionId defaults to the active session.
 func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error) {
-	return b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{"sessionId": sessionID})
+	return b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{kSessionID: sessionID})
 }
 
 // PermissionsReset sends x.ai/permissions/reset: {sessionId} — clears the
@@ -4269,7 +4210,7 @@ func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[stri
 // with no client/session scoping), so the host writes it without a
 // JSON-RPC id. Frontends should treat it as process-global.
 func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
-	return b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{"sessionId": sessionID})
+	return b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{kSessionID: sessionID})
 }
 
 // SetPermissionMode sends x.ai/yolo_mode_changed as a fire-and-forget
@@ -4306,9 +4247,9 @@ func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string
 	// what hello carries to clients that connect later.
 	b.recordPermissionMode(permissionModeFromParams(params))
 	if err := b.write(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "_x.ai/yolo_mode_changed",
-		"params":  params,
+		kJSONRPC: "2.0",
+		kMethod:  "_x.ai/yolo_mode_changed",
+		kParams:  params,
 	}); err != nil {
 		return nil, err
 	}
@@ -4350,14 +4291,6 @@ func (b *Bridge) recordPermissionMode(mode string) {
 	b.mu.Unlock()
 }
 
-// PermissionMode returns the last-known canonical permission mode
-// (ask / auto / always-approve). "ask" is the agent's default.
-func (b *Bridge) PermissionMode() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.permMode
-}
-
 // MCPList calls x.ai/mcp/list: {sessionId?} → the agent's MCP server
 // registry. The active session's id is injected when one exists so the
 // agent can attach per-session state (enabled/status) to each entry; the
@@ -4369,7 +4302,7 @@ func (b *Bridge) MCPList(ctx context.Context) (map[string]any, error) {
 	}
 	params := map[string]any{}
 	if sid := b.resolveSessionID(""); sid != "" {
-		params["sessionId"] = sid
+		params[kSessionID] = sid
 	}
 	return b.request(ctx, "_x.ai/mcp/list", params, 30*time.Second)
 }
@@ -4387,7 +4320,7 @@ func (b *Bridge) MCPToggle(ctx context.Context, name string, enabled bool) (map[
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/mcp/toggle", map[string]any{
-		"session_id":  sid,
+		kSessionIDS:   sid,
 		"server_name": name,
 		"enabled":     enabled,
 	}, 30*time.Second)
@@ -4408,7 +4341,7 @@ func (b *Bridge) MCPUpsert(ctx context.Context, server map[string]any) (map[stri
 	}
 	serverName, _ := server["name"].(string)
 	params := make(map[string]any, len(server)+1)
-	params["session_id"] = sid
+	params[kSessionIDS] = sid
 	params["server_name"] = serverName
 	for k, v := range server {
 		if k == "name" {
@@ -4430,7 +4363,7 @@ func (b *Bridge) MCPDelete(ctx context.Context, name string) (map[string]any, er
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/mcp/delete", map[string]any{
-		"session_id":  sid,
+		kSessionIDS:   sid,
 		"server_name": name,
 	}, 30*time.Second)
 }
@@ -4446,7 +4379,7 @@ func (b *Bridge) MCPAuthTrigger(ctx context.Context, name string) (map[string]an
 		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
 	}
 	return b.request(ctx, "_x.ai/mcp/auth_trigger", map[string]any{
-		"session_id":  sid,
+		kSessionIDS:   sid,
 		"server_name": name,
 	}, 30*time.Second)
 }
@@ -4465,13 +4398,25 @@ func (b *Bridge) Shutdown() {
 	// Stop the goal loop: a continuation turn can be blocked on a
 	// 30-minute prompt or waiting for the session to go idle, and must
 	// not outlive shutdown. Same mechanism as GoalClear — close the stop
-	// channel so the loop exits at its next checkpoint. stopGoalLoopLocked
-	// guards against double-close (goalLoopOn / goalStop nil checks);
+	// channel so the loop exits at its next checkpoint. stopLoopLocked
+	// guards against double-close (loopOn / stop nil checks);
 	// the process kill above fails the in-flight RPC, so the turn unwinds
 	// promptly instead of holding the loop open.
-	b.goalMu.Lock()
-	b.stopGoalLoopLocked()
-	b.goalMu.Unlock()
+	b.goal.mu.Lock()
+	b.goal.stopLoopLocked()
+	b.goal.mu.Unlock()
+}
+
+// sessionBusy reports whether the session currently has turns in flight.
+// The goal engine polls this while waiting to fire its next continuation
+// turn (see goalEngine.goalWaitIdle).
+func (b *Bridge) sessionBusy(sessionID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s := b.sessions[sessionID]; s != nil {
+		return s.Busy
+	}
+	return false
 }
 
 // HTTPError carries an HTTP status.
@@ -4488,11 +4433,11 @@ func contentText(v any) string {
 	case string:
 		return c
 	case map[string]any:
-		if t, ok := c["text"].(string); ok {
+		if t, ok := c[kText].(string); ok {
 			return t
 		}
 		// nested content
-		if inner, ok := c["content"]; ok {
+		if inner, ok := c[kContent]; ok {
 			return contentText(inner)
 		}
 	case []any:
@@ -4515,11 +4460,11 @@ func contentImages(v any) []map[string]any {
 	walk = func(v any) {
 		switch c := v.(type) {
 		case map[string]any:
-			if t, _ := c["type"].(string); t == "image" {
+			if t, _ := c[kType].(string); t == "image" {
 				out = append(out, c)
 				return
 			}
-			if inner, ok := c["content"]; ok {
+			if inner, ok := c[kContent]; ok {
 				walk(inner)
 			}
 		case []any:
@@ -4548,5 +4493,5 @@ func imageEvent(sid string, block map[string]any) (Event, bool) {
 	if mime == "" {
 		mime = "image/png"
 	}
-	return Event{"type": "image", "sessionId": sid, "data": data, "mimeType": mime}, true
+	return Event{kType: "image", kSessionID: sid, "data": data, "mimeType": mime}, true
 }

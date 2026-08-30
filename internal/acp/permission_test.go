@@ -166,14 +166,14 @@ func TestRespondPermissionFollowupFallsBackToCancelled(t *testing.T) {
 	}
 }
 
-// Plain cancelled without a followup message must not gain meta, and the
-// legacy RespondPermission signature must keep producing the old wire shape.
-func TestRespondPermissionLegacyWireShape(t *testing.T) {
+// Plain cancelled without a followup message, and Selected without a scope,
+// must not gain meta — no scope / followup means the old wire shape.
+func TestRespondPermissionNoMetaWireShape(t *testing.T) {
 	b, w := readyBridge()
 	reqID := pushPermission(t, b, w, permissionParams(allowAlwaysOption()), 7)
 
-	if err := b.RespondPermission(reqID, "", true); err != nil {
-		t.Fatalf("RespondPermission = %v", err)
+	if err := b.RespondPermissionWithMeta(reqID, "", true, nil, ""); err != nil {
+		t.Fatalf("RespondPermissionWithMeta = %v", err)
 	}
 	res := waitForWireResponse(t, b, w, 7)
 	outcome, _ := res["outcome"].(map[string]any)
@@ -184,10 +184,10 @@ func TestRespondPermissionLegacyWireShape(t *testing.T) {
 		t.Errorf("result = %v, want no _meta", res)
 	}
 
-	// Selected without scope: same legacy shape, no meta.
+	// Selected without scope: same shape, no meta.
 	reqID = pushPermission(t, b, w, permissionParams(allowAlwaysOption()), 8)
-	if err := b.RespondPermission(reqID, "allow-always-command", false); err != nil {
-		t.Fatalf("RespondPermission = %v", err)
+	if err := b.RespondPermissionWithMeta(reqID, "allow-always-command", false, nil, ""); err != nil {
+		t.Fatalf("RespondPermissionWithMeta = %v", err)
 	}
 	res = waitForWireResponse(t, b, w, 8)
 	outcome, _ = res["outcome"].(map[string]any)

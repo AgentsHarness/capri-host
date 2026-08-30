@@ -69,7 +69,7 @@ func TestPromptClientDisconnectDoesNotKillProcess(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := b.Prompt(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}})
+	_, _, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Prompt err = %v, want context.Canceled", err)
 	}

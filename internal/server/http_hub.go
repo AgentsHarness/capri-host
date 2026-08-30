@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AgentsHarness/capri-host/internal/hub"
+	"github.com/AgentsHarness/capri-host/internal/hubstate"
 )
 
 // HubController is the slice of the hub client this API needs. Declaring it as
@@ -16,7 +16,7 @@ import (
 // touch.
 type HubController interface {
 	// State returns a snapshot of the hub link.
-	State() hub.State
+	State() hubstate.State
 	// PairWith points the host at hubURL (empty = keep the current one) and
 	// exchanges code for a token, adopting it live.
 	PairWith(ctx context.Context, hubURL, code string) error
@@ -47,11 +47,11 @@ func (s *Server) hubController() HubController {
 // case: it is also the brief window during startup after the server is
 // listening but before main has injected the client, and answering "configured
 // but not yet paired" there is truthful where an error would not be.
-func (s *Server) hubSnapshot() hub.State {
+func (s *Server) hubSnapshot() hubstate.State {
 	if ctl := s.hubController(); ctl != nil {
 		return ctl.State()
 	}
-	return hub.State{
+	return hubstate.State{
 		Configured: s.cfg.HubURL != "",
 		HubURL:     s.cfg.HubURL,
 		HostID:     s.cfg.HostID,
@@ -101,7 +101,7 @@ func (s *Server) handleHubPair(w http.ResponseWriter, r *http.Request) {
 
 	if err := ctl.PairWith(ctx, body.HubURL, body.Code); err != nil {
 		status := http.StatusBadGateway
-		if errors.Is(err, hub.ErrBadPairCode) {
+		if errors.Is(err, hubstate.ErrBadPairCode) {
 			status = http.StatusBadRequest
 		}
 		writeJSON(w, status, map[string]any{"ok": false, "error": err.Error()})

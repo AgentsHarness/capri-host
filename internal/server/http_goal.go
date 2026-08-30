@@ -99,3 +99,13 @@ func (s *Server) handleGoalClear(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "goal": state})
 }
+
+// registerGoalRoutes 注册本域路由（路由与实现同址）。
+func (s *Server) registerGoalRoutes(mux *http.ServeMux) {
+	// ── goal engine (TUI /goal parity; host-side, see http_goal.go) ──
+	mux.HandleFunc("POST /api/goal/set", s.handleGoalSet)
+	mux.HandleFunc("POST /api/goal/status", s.handleGoalStatus)
+	mux.HandleFunc("POST /api/goal/pause", s.handleGoalPause)
+	mux.HandleFunc("POST /api/goal/resume", s.handleGoalResume)
+	mux.HandleFunc("POST /api/goal/clear", s.handleGoalClear)
+}

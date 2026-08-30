@@ -42,6 +42,12 @@ type Config struct {
 	PairCode  string // one-time pairing code; ignored when a token exists
 	Token     string // existing token (HOST_TOKEN); takes precedence
 	LocalBase string // this host's local HTTP base, e.g. http://127.0.0.1:8765
+	// Local 是本 host 的进程内 API 处理链（server.Handler()）。设置后
+	// 中继请求直接调用，不再绕道 LocalBase 的 TCP 回环——少一个端口/
+	// 监听依赖，鉴权与超时语义不变（Authorization 头照常注入，走同一
+	// 条 withAuth 管线）。为 nil 时回退 LocalBase HTTP 直调（兼容旧测试
+	// 与外部装配方）。
+	Local http.Handler
 	// AccessToken is this host's inbound API token (FE_TOKEN). Relayed
 	// requests execute against LocalBase, which now gates /api/* — the
 	// client re-attaches the token so hub-mode traffic passes its own
@@ -79,6 +85,9 @@ type Config struct {
 type Client struct {
 	cfg   Config
 	httpc *http.Client
+
+	// local 非空时中继请求进程内直调（server.Handler()）；nil 回退 LocalBase。
+	local http.Handler
 
 	stateMu sync.Mutex
 	token   string
@@ -250,7 +259,8 @@ func NewClient(cfg Config) *Client {
 		cfg.QUICPort = 8788
 	}
 	return &Client{
-		cfg: cfg,
+		cfg:   cfg,
+		local: cfg.Local,
 		// Generous timeout: relayed prompts can run up to 30 minutes.
 		httpc: &http.Client{Timeout: 50 * time.Minute},
 		// Created here rather than in Run: Pair is reachable from the tray
@@ -264,7 +274,7 @@ func NewClient(cfg Config) *Client {
 // bridge events over WebSocket, and serves relayed requests. It reconnects
 // with backoff and blocks until ctx is done. Pairing failures (hub down at
 // startup) retry with backoff instead of exiting permanently.
-func (c *Client) Run(ctx context.Context, bridge *acp.Bridge) {
+func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 	// ensureToken failure must not be terminal: the hub may be briefly
 	// unreachable at boot (network flap). Retry with the same backoff the
 	// session loop uses.
@@ -614,7 +624,7 @@ func (c *Client) seqAndReplay(evs []acp.Event) {
 	}
 }
 
-func (c *Client) forwardLoop(ctx context.Context, bridge *acp.Bridge) {
+func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 	ch, unsub := bridge.Subscribe()
 	defer unsub()
 	batch := make([]acp.Event, 0, 32)
@@ -721,7 +731,7 @@ func eventSeq(ev acp.Event) uint64 {
 // rather than stall the bridge subscriber (replay buffer still holds it).
 // The enqueueMu ordering lock keeps live frames strictly after any
 // in-progress replay so the hub never sees a higher seq first (see
-// enqueueReplay).
+// enqueueReplayLocked).
 func (c *Client) enqueueEvents(evs []acp.Event) {
 	// Try-lock, never block: a large replay can hold the ordering lock for
 	// a long time (each frame briefly blocks on a full queue). Blocking
@@ -739,17 +749,10 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 	c.enqueueEventsLocked(evs, false)
 }
 
-// enqueueEventsCritical is the critical variant of enqueueEvents: it
-// blocks up to 5s for a send slot (enqueueFrame's critical discipline)
-// instead of dropping, so replay frames survive send-queue pressure.
-func (c *Client) enqueueEventsCritical(evs []acp.Event) {
-	c.enqueueMu.Lock()
-	defer c.enqueueMu.Unlock()
-	c.enqueueEventsLocked(evs, true)
-}
-
-// enqueueEventsLocked is the shared body of enqueueEvents /
-// enqueueEventsCritical; the caller must hold enqueueMu.
+// enqueueEventsLocked is the shared body of enqueueEvents (critical=false,
+// drops under pressure) and the replay path (critical=true, blocks up to 5s
+// for a send slot — enqueueFrame's critical discipline); the caller must
+// hold enqueueMu.
 func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 	if len(evs) == 0 || c.sendCh == nil {
 		return
@@ -845,14 +848,14 @@ func (c *Client) marshalEventsFrame(evs []acp.Event) []byte {
 
 // sendReplayAfter re-sends buffered events with seq > after, in order,
 // so a reconnect does not lose transcript. The backlog is packed into
-// frames of at most replayFrameBudget bytes (see enqueueReplay), so a
+// frames of at most replayFrameBudget bytes (see enqueueReplayLocked), so a
 // large resume cannot build one multi-MB frame that would exceed the
 // hub's read limit. Returns the seq of the last re-sent event (0 when
 // nothing was sent).
 func (c *Client) sendReplayAfter(after uint64) uint64 {
 	// Ordering lock first (enqueueMu → seqMu, matching enqueueEvents):
 	// held across the whole replay so no live frame can land before the
-	// replay frames — see enqueueReplay for why that would lose events.
+	// replay frames — see enqueueReplayLocked for why that would lose events.
 	c.enqueueMu.Lock()
 	defer c.enqueueMu.Unlock()
 	return c.sendReplayAfterLocked(after)
@@ -883,23 +886,16 @@ func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 	return last
 }
 
-// enqueueReplay packs replay events into frames of at most
+// enqueueReplayLocked packs replay events into frames of at most
 // replayFrameBudget bytes (marshaling each event once for sizing) and
 // enqueues them in order via the CRITICAL path — replay is reconnect
 // catch-up, so frames must not be dropped when the send queue happens to
 // be full (enqueueEvents would silently lose them; the hub would then
 // still be missing transcript after the resume). A single event larger
 // than the budget is sent alone; marshalEventsFrame drops it (with a
-// log) if it exceeds maxFrameBytes.
-func (c *Client) enqueueReplay(evs []acp.Event) {
-	c.enqueueMu.Lock()
-	defer c.enqueueMu.Unlock()
-	c.enqueueReplayLocked(evs)
-}
-
-// enqueueReplayLocked packs replay events into frames and enqueues them
-// in order; the caller must hold enqueueMu. The lock spans the whole
-// marshal + flush so no live frame can land before the replay frames:
+// log) if it exceeds maxFrameBytes. The caller must hold enqueueMu, and
+// the lock spans the whole marshal + flush so no live frame can land
+// before the replay frames:
 // the hub's stale-seq gate would otherwise drop the replay events that
 // arrive after higher live seqs — and they are absent from the hub's
 // gap-pull buffer too, so the transcript would be permanently lost.
@@ -944,7 +940,7 @@ func (c *Client) enqueueReplayLocked(evs []acp.Event) {
 //
 // No seq, not stored in the replay buffer. critical=false: under pressure
 // the next heartbeat will refresh the hub registry flag.
-func (c *Client) enqueueHostStatus(bridge *acp.Bridge) {
+func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 	snap := bridge.Snapshot()
 	payload, err := json.Marshal(map[string]any{
 		"v":     1,
@@ -1018,19 +1014,13 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 	c.seqMu.Unlock()
 }
 
-// enqueueSeqReset asks the hub to clear per-host LastSeq + event buffer
-// so a restarted host can uplink from seq 1 again. Critical: must land
-// before any subsequent events frame on the same connection.
+// enqueueSeqResetLocked asks the hub to clear per-host LastSeq + event
+// buffer so a restarted host can uplink from seq 1 again. Critical: must
+// land before any subsequent events frame on the same connection. The
+// caller must hold enqueueMu (handleHelloSeq keeps it across the reset +
+// the replay).
 //
 //	{"v":1,"type":"seq_reset"}
-func (c *Client) enqueueSeqReset() {
-	c.enqueueMu.Lock()
-	defer c.enqueueMu.Unlock()
-	c.enqueueSeqResetLocked()
-}
-
-// enqueueSeqResetLocked is enqueueSeqReset's body; the caller must hold
-// enqueueMu (handleHelloSeq keeps it across the reset + the replay).
 func (c *Client) enqueueSeqResetLocked() {
 	payload, err := json.Marshal(map[string]any{
 		"v":    1,
@@ -1143,7 +1133,7 @@ func (c *Client) hostToken() (string, error) {
 // wsSession dials the hub WebSocket and runs the shared frame loop. Over WS
 // there is a single connection, so both planes multiplex onto it (the
 // request-plane writer shares the connection under a write mutex).
-func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
+func (c *Client) wsSession(ctx context.Context, bridge bridgeSource) error {
 	tok, err := c.hostToken()
 	if err != nil {
 		return err
@@ -1237,7 +1227,7 @@ func (c *Client) wsSession(ctx context.Context, bridge *acp.Bridge) error {
 // 16MB relay answer (which saturates its stream's window for seconds) and
 // both the control frames and other requests' small responds. See
 // PROTOCOL.md.
-func (c *Client) quicSession(ctx context.Context, bridge *acp.Bridge) (bool, error) {
+func (c *Client) quicSession(ctx context.Context, bridge bridgeSource) (bool, error) {
 	tok, err := c.hostToken()
 	if err != nil {
 		return false, err
@@ -1703,7 +1693,7 @@ type frameTransport struct {
 // control-plane write loop (with the application ping), one request-plane
 // write loop, and read loops for every downlink stream. Any loop failing
 // fails the session.
-func (c *Client) runSession(ctx context.Context, bridge *acp.Bridge, tr frameTransport) error {
+func (c *Client) runSession(ctx context.Context, bridge bridgeSource, tr frameTransport) error {
 	// Both transports call noteConnected at their handshake and funnel here,
 	// so this is the one place that can reliably say the session is over.
 	defer c.noteDisconnected()
@@ -1825,7 +1815,7 @@ func (c *Client) writeReqLoop(ctx context.Context, send func(reqID string, paylo
 	}
 }
 
-func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), bridge *acp.Bridge) error {
+func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), bridge bridgeSource) error {
 	for {
 		data, err := recv()
 		if err != nil {
@@ -1920,7 +1910,7 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 // monotonic stamp; gen==0 means a hub too old to send one (apply as
 // before). On a 0→1 transition we also replay what was buffered while
 // paused.
-func (c *Client) applySubscribers(count int, gen uint64, bridge *acp.Bridge) {
+func (c *Client) applySubscribers(count int, gen uint64, bridge bridgeSource) {
 	if gen > 0 {
 		for {
 			prev := c.subsGen.Load()
@@ -1954,6 +1944,10 @@ func (c *Client) applySubscribers(count int, gen uint64, bridge *acp.Bridge) {
 // instead of executing locally. Empty hostId (pre-hostId hubs) is
 // tolerated for rolling upgrades — the hub is the trust boundary either
 // way, so the check is defense-in-depth, not auth.
+//
+// Execution path: in-process via c.local (server.Handler()) when wired —
+// 同一条 withAuth/withCORS 管线，无本机端口依赖；否则回退 LocalBase 的
+// TCP 回环 HTTP 直调（外部装配方与旧测试）。
 func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path string, body json.RawMessage) {
 	if hostID != "" && hostID != c.cfg.HostID {
 		log.Printf("[hub-client] 拒绝非本机中转请求: target=%s self=%s %s %s", hostID, c.cfg.HostID, method, path)
@@ -1962,6 +1956,11 @@ func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path st
 	}
 	ctx, cancel := context.WithTimeout(ctx, 50*time.Minute)
 	defer cancel()
+
+	if c.local != nil {
+		c.relayInProcess(ctx, reqID, method, path, body)
+		return
+	}
 
 	var rd io.Reader
 	if len(body) > 0 {
@@ -2001,6 +2000,74 @@ func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path st
 		return
 	}
 	c.respond(reqID, res.StatusCode, json.RawMessage(rb))
+}
+
+// relayResponseWriter 是进程内中继的响应记录器：缓存状态码与响应体
+// （超过 16MB 即截断并标记——respond 帧走 host↔hub 传输，16MB+ 的帧会
+// 触发 hub 的 WS 读上限并杀掉整条连接，与回环路径语义一致）。Flush 按
+// no-op 处理：中继应答是单帧全量回传，流式 flush 无处可去。
+type relayResponseWriter struct {
+	hdr       http.Header
+	buf       bytes.Buffer
+	code      int
+	truncated bool
+}
+
+func (w *relayResponseWriter) Header() http.Header { return w.hdr }
+
+func (w *relayResponseWriter) Write(p []byte) (int, error) {
+	if w.truncated {
+		return len(p), nil // 继续吞掉写入，让 handler 正常走完
+	}
+	if w.buf.Len()+len(p) > 16<<20+1 {
+		w.truncated = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
+func (w *relayResponseWriter) WriteHeader(code int) { w.code = code }
+
+func (w *relayResponseWriter) Flush() {}
+
+// relayInProcess 直接调用本 host 的 API 处理链并回帧。net/http 的服务器
+// 通常会 recover handler panic；进程内直调没有这层防护，这里补齐——
+// panic 必须变成 500 响应帧，而不是击穿 hub client 的会话 goroutine。
+func (c *Client) relayInProcess(ctx context.Context, reqID, method, path string, body json.RawMessage) {
+	var rd io.Reader
+	if len(body) > 0 {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://capri-local"+path, rd)
+	if err != nil {
+		c.respond(reqID, 500, mustJSON(map[string]any{"ok": false, "error": "invalid relay request"}))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.cfg.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.AccessToken)
+	}
+	rec := &relayResponseWriter{hdr: http.Header{}}
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Printf("[hub-client] 中继处理 panic（%s %s）: %v", method, path, p)
+				rec.code = http.StatusInternalServerError
+				rec.truncated = false
+				rec.buf.Reset()
+				rec.buf.Write(mustJSON(map[string]any{"ok": false, "error": "host 内部错误"}))
+			}
+		}()
+		c.local.ServeHTTP(rec, req)
+	}()
+	if rec.truncated {
+		c.respond(reqID, 502, mustJSON(map[string]any{"ok": false, "error": "本地响应过大（>16MB），无法中继"}))
+		return
+	}
+	if rec.code == 0 {
+		rec.code = http.StatusOK
+	}
+	c.respond(reqID, rec.code, json.RawMessage(rec.buf.Bytes()))
 }
 
 func (c *Client) respond(reqID string, status int, body json.RawMessage) {

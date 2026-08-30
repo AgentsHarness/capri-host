@@ -132,6 +132,10 @@ func main() {
 		Token:       cfg.HostToken,
 		LocalBase:   fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
 		AccessToken: cfg.AccessToken,
+		// 进程内直调本 host 的 API 处理链（同一条 withAuth 管线），中继
+		// 不再绕道本机 TCP 回环。LocalBase 仅作回退保留。重定向到新 hub
+		// 地址时 Manager 用同一份 cfg 重建 client，Local 随之带上。
+		Local: srv.Handler(),
 		// Same reason as LastSessionFile above: keep every piece of
 		// per-install state under one relocatable directory. The
 		// default resolves to ~/.capri-host/hub.json, which is the

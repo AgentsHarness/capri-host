@@ -170,7 +170,7 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | `GET /api/hub/state`  | 是否配置 / 是否配对 / 是否连上 / 传输是 QUIC 还是 WS / 最近错误 |
 | `POST /api/hub/pair`  | `{"code":"XXXXXX","hubUrl":"https://…"}`，`hubUrl` 可省略      |
 
-更完整的部署说明（后台、开机自启、防火墙）见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+更完整的部署说明（后台、开机自启、防火墙）见 [docs/DEPLOY.md](docs/DEPLOY.md)。事件语义契约（seq / 双路去重 / 分级背压）见 [docs/EVENT-CONTRACTS.md](docs/EVENT-CONTRACTS.md)。
 
 ## 常用变量
 

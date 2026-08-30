@@ -472,14 +472,14 @@ func TestPromptWithOptsWire(t *testing.T) {
 	}
 }
 
-// Plain Prompt (thin wrapper) must not emit messageId/_meta — the wire
+// PromptWithOpts with empty opts must not emit messageId/_meta — the wire
 // stays byte-identical to the pre-opts shape.
 func TestPromptOmitsOptsWhenEmpty(t *testing.T) {
 	b, w := metaReadyBridge(t)
 	ctx := context.Background()
 	done := make(chan callResult, 1)
 	go func() {
-		sr, err := b.Prompt(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}})
+		sr, _, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{})
 		done <- callResult{map[string]any{"stopReason": sr}, err}
 	}()
 	resolveNext(t, b, w, map[string]any{"stopReason": "end_turn"})

@@ -110,3 +110,11 @@ func (s *Server) reloadModels(r *http.Request) bool {
 	}
 	return true
 }
+
+// registerModelRoutes 注册本域路由（路由与实现同址）。
+func (s *Server) registerModelRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/set-default-model", s.handleSetDefaultModel)
+	mux.HandleFunc("POST /api/custom-models", s.handleCustomModels)
+	mux.HandleFunc("POST /api/custom-model", s.handleCustomModelUpsert)
+	mux.HandleFunc("POST /api/custom-model-delete", s.handleCustomModelDelete)
+}
