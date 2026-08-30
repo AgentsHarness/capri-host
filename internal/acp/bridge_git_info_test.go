@@ -143,6 +143,14 @@ func TestProbeWorktreeLinkedGitWorktree(t *testing.T) {
 	if isWt, _ := probeWorktree(main); isWt {
 		t.Fatal("main checkout reported as worktree")
 	}
+	// A subdirectory of the linked worktree still IS one.
+	sub := filepath.Join(wt, "inner")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isWt, _ := probeWorktree(sub); !isWt {
+		t.Fatal("linked worktree 的子目录未被识别为 worktree")
+	}
 }
 
 func TestProbeWorktreePlainRepo(t *testing.T) {
@@ -154,6 +162,17 @@ func TestProbeWorktreePlainRepo(t *testing.T) {
 	runGit(repo, "init", "-q", "-b", "main")
 	if isWt, main := probeWorktree(repo); isWt || main != "" {
 		t.Fatalf("plain repo = (%v, %q), want (false, \"\")", isWt, main)
+	}
+	// 子目录才是真实场景（会话 cwd 常常在仓库深处）：git 从子目录查询时
+	// --git-dir 给绝对路径、--git-common-dir 给相对路径，两者字面不等，
+	// 早先的字符串比较会把主仓库的子目录误报成 worktree（TopBar 平白多
+	// 出一个 wt 徽标）。
+	deep := filepath.Join(repo, "cmd", "sub")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isWt, main := probeWorktree(deep); isWt || main != "" {
+		t.Fatalf("plain repo 子目录 = (%v, %q), want (false, \"\")", isWt, main)
 	}
 }
 

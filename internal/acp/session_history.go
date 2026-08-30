@@ -5,9 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,60 +17,69 @@ import (
 // ── 会话历史归一化（msgSeq，契约 tmp/msgseq/CONTRACT.md）──────────────
 //
 // agent 按落盘顺序写 updates.jsonl，落盘顺序可能与真实顺序不一致（如被
-// 取消回合的用户回声在 turn_completed 之后才落盘）。实测存储信封自带的
-// params._meta.agentTimestampMs + eventId 足以在 host 侧重建真实顺序，
-// 无需改 agent。
+// 取消回合的用户回声在 turn_completed 之后才落盘）。host 读盘后按自己的
+// 规则给出会话内密集序号，不借助 eventId：
 //
 // 排序键（升序）：
 //  1. agentTimestampMs（params._meta，事件真实时刻，epoch ms）；
-//  2. N（eventId 去掉 "{sessionId}-" 前缀后的整数——agent 进程级全局
-//     计数，跨会话共享、重启归零，只能做同世代内的顺序细化）；
-//  3. 文件行号（稳定 tiebreak）。
+//  2. 文件行号（同毫秒 tiebreak = 落盘行序）。
 //
-// msgSeq = 归一化后的名次，0 起、会话内密集；归一化只重排、不增减信封。
-// 前置条件：该会话全部信封携带 agentTimestampMs——任一缺失（含行解析
-// 失败）→ 调用方整体退回 agent RPC 透传（wire 契约回退路径）。全部携带
-// 但任一 N 解析失败/缺失 → 整会话退化为文件行号序（msgSeq = 行号名次），
-// 不做混合排序。
+// msgSeq = 归一化后的名次，0 起、会话内密集。eventId 的 N 会跨进程归零、
+// 会话内也会撞车，既不当排序键也不当去重键。
+//
+// 行解析：JSON 失败的行跳过（agent 正在追加时末行半截是常态）；缺
+// agentTimestampMs 的信封同样跳过。跳过之后若没有任何带时间戳的信封 →
+// 调用方退回 agent RPC 透传。只要还能给出本地视图，就不换坐标空间。
 
-// errMissingAgentMeta 标记「有信封缺 params._meta.agentTimestampMs」，
-// 触发调用方的 agent `_x.ai/session/updates` 透传回退（响应无 msgSeq、
-// promptStarts 原样）。
+// errMissingAgentMeta 标记「没有任何带 params._meta.agentTimestampMs 的
+// 存储信封」，触发调用方的 agent `_x.ai/session/updates` 透传回退（响应
+// 无 msgSeq、promptStarts 原样）。
 var errMissingAgentMeta = errors.New("存在缺失 _meta.agentTimestampMs 的存储信封")
 
 // updateLineMeta 是一行存储信封的行级元数据。缓存只存它，不缓存信封内容。
 type updateLineMeta struct {
-	line        int   // 信封在文件中的名次（0 起，按非空行计）
-	agentTsMs   int64 // params._meta.agentTimestampMs；缺失为 0
-	eventN      int64 // eventId 去掉 "{sessionId}-" 前缀后的整数
-	hasEventN   bool  // eventId 存在且 N 可解析
-	isUserChunk bool  // update.sessionUpdate == "user_message_chunk"
+	line        int   // 信封在文件中的名次（0 起，按非空行计，含被跳过的坏行）
+	agentTsMs   int64 // params._meta.agentTimestampMs
+	isUserChunk bool  // update.sessionUpdate == "user_message_chunk" 且非 hostTurn
+	// 回退标记（update.sessionUpdate == "rewind_marker"）：agent 侧
+	// updates.jsonl 是只追加的，/rewind 只落一条标记，被回退掉的那支
+	// 「死分支」仍留在文件里。回放前必须按标记截断，否则 FE 会把用户
+	// 已经回退掉的回合（含被取消的回合）重新画出来。
+	isRewind        bool // update.sessionUpdate == "rewind_marker"
+	rewindTarget    int  // update.target_prompt_index
+	hasRewindTarget bool // target_prompt_index 存在且可解析
+	// 用户 chunk 的 update._meta.promptIndex（agent 回合编号）。缺省时
+	// hasPromptIndex=false，走 UserRunTurnTracker 的无标记规则。
+	promptIndex    int
+	hasPromptIndex bool
 }
 
 // normalizedHistory 是一个会话 updates.jsonl 的归一化视图（行级元数据）。
 type normalizedHistory struct {
-	// lines 为文件行序的元数据；order 为 msgSeq → lines 下标（归一化序）。
+	// lines 为文件行序的元数据（仅含解析成功且带时间戳的行）；order 为
+	// msgSeq → lines 下标（归一化序）。
 	lines []updateLineMeta
 	order []int
 	// promptStarts：每个「新用户 prompt」首条 chunk 的 msgSeq（host 重算，
-	// 规则见 promptStartsOf）。
+	// 规则见 promptStartsOf / userRunTurnTracker）。
 	promptStarts []int
-	// degraded：true = 有 N 缺失/解析失败 → 行号序（msgSeq = 行号名次）。
-	degraded bool
 }
 
 // parseUpdateLineMeta 解析一行存储信封的元数据；行不是合法 JSON →
-// ok=false（按缺失 agentTimestampMs 处理，走透传回退）。
+// ok=false（跳过该行，不拖垮整会话）。
 func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 	var env struct {
 		Params struct {
-			SessionID string `json:"sessionId"`
-			Update    struct {
-				SessionUpdate string `json:"sessionUpdate"`
+			Update struct {
+				SessionUpdate     string `json:"sessionUpdate"`
+				TargetPromptIndex *int64 `json:"target_prompt_index"`
+				Meta              *struct {
+					PromptIndex *int64 `json:"promptIndex"`
+					HostTurn    bool   `json:"hostTurn"`
+				} `json:"_meta"`
 			} `json:"update"`
 			Meta struct {
-				AgentTimestampMs int64  `json:"agentTimestampMs"`
-				EventID          string `json:"eventId"`
+				AgentTimestampMs int64 `json:"agentTimestampMs"`
 			} `json:"_meta"`
 		} `json:"params"`
 	}
@@ -78,32 +88,24 @@ func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 		return m, false
 	}
 	m.agentTsMs = env.Params.Meta.AgentTimestampMs
-	m.isUserChunk = env.Params.Update.SessionUpdate == "user_message_chunk"
-	if n, ok := eventIDNumber(env.Params.Meta.EventID, env.Params.SessionID); ok {
-		m.eventN, m.hasEventN = n, true
+	hostTurn := env.Params.Update.Meta != nil && env.Params.Update.Meta.HostTurn
+	m.isUserChunk = env.Params.Update.SessionUpdate == "user_message_chunk" && !hostTurn
+	if m.isUserChunk && env.Params.Update.Meta != nil && env.Params.Update.Meta.PromptIndex != nil {
+		m.promptIndex = int(*env.Params.Update.Meta.PromptIndex)
+		m.hasPromptIndex = true
+	}
+	m.isRewind = env.Params.Update.SessionUpdate == "rewind_marker"
+	if m.isRewind && env.Params.Update.TargetPromptIndex != nil {
+		m.rewindTarget = int(*env.Params.Update.TargetPromptIndex)
+		m.hasRewindTarget = true
 	}
 	return m, true
 }
 
-// eventIDNumber 从 "{sessionId}-{N}" 提取 N；前缀不匹配时按最后一个 '-'
-// 兜底，解析失败 ok=false（契约：按缺失 → 退化行号序）。
-func eventIDNumber(eventID, sessionID string) (int64, bool) {
-	s := strings.TrimPrefix(eventID, sessionID+"-")
-	if s == eventID {
-		if i := strings.LastIndex(eventID, "-"); i >= 0 {
-			s = eventID[i+1:]
-		}
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
 // scanUpdateLineMeta 逐行扫描 updates.jsonl 提取行级元数据（bufio.Scanner
 // 流式，与 parseTaskEvents 同款；单行超过 maxUsageLineBytes 降级 ReadFile
-// 全扫）。空行不计入行名次。
+// 全扫）。空行不计入行名次。JSON 解析失败的行跳过（保留行名次，供
+// readEnvelopesByRank 对账），末行半截因此不会把整会话打去透传。
 func scanUpdateLineMeta(path string) ([]updateLineMeta, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -113,6 +115,9 @@ func scanUpdateLineMeta(path string) ([]updateLineMeta, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
 	var meta []updateLineMeta
+	rank := 0
+	skipped := 0
+	lastSkipped := false
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -120,10 +125,15 @@ func scanUpdateLineMeta(path string) ([]updateLineMeta, error) {
 		}
 		m, ok := parseUpdateLineMeta(line)
 		if !ok {
-			return nil, errMissingAgentMeta
+			skipped++
+			lastSkipped = true
+			rank++
+			continue
 		}
-		m.line = len(meta)
+		lastSkipped = false
+		m.line = rank
 		meta = append(meta, m)
+		rank++
 	}
 	if err := sc.Err(); err != nil {
 		if !errors.Is(err, bufio.ErrTooLong) {
@@ -131,7 +141,19 @@ func scanUpdateLineMeta(path string) ([]updateLineMeta, error) {
 		}
 		return scanUpdateLineMetaReadAll(path)
 	}
+	logSkippedJSONL(path, skipped, lastSkipped)
 	return meta, nil
+}
+
+func logSkippedJSONL(path string, skipped int, lastSkipped bool) {
+	if skipped == 0 {
+		return
+	}
+	if lastSkipped && skipped == 1 {
+		// 典型：agent 正在追加，末行半截。不打日志。
+		return
+	}
+	log.Printf("[capri-host] session history skipped %d unparseable jsonl line(s) in %s (tailIncomplete=%v)", skipped, path, lastSkipped)
 }
 
 // scanUpdateLineMetaReadAll 是 scanUpdateLineMeta 的整文件兜底（仅当单行
@@ -142,17 +164,26 @@ func scanUpdateLineMetaReadAll(path string) ([]updateLineMeta, error) {
 		return nil, err
 	}
 	var meta []updateLineMeta
+	rank := 0
+	skipped := 0
+	lastSkipped := false
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		m, ok := parseUpdateLineMeta([]byte(line))
 		if !ok {
-			return nil, errMissingAgentMeta
+			skipped++
+			lastSkipped = true
+			rank++
+			continue
 		}
-		m.line = len(meta)
+		lastSkipped = false
+		m.line = rank
 		meta = append(meta, m)
+		rank++
 	}
+	logSkippedJSONL(path, skipped, lastSkipped)
 	return meta, nil
 }
 
@@ -163,62 +194,202 @@ func buildNormalizedHistory(path string) (*normalizedHistory, error) {
 	if err != nil {
 		return nil, err
 	}
+	kept := meta[:0]
+	for _, m := range meta {
+		if m.agentTsMs > 0 {
+			kept = append(kept, m)
+		}
+	}
+	if len(kept) == 0 {
+		if len(meta) == 0 {
+			// 空文件 / 只有半行：给空本地视图，不换空间。
+			return &normalizedHistory{}, nil
+		}
+		return nil, errMissingAgentMeta
+	}
+	if nskip := len(meta) - len(kept); nskip > 0 {
+		log.Printf("[capri-host] session history skipped %d envelope(s) missing agentTimestampMs in %s", nskip, path)
+	}
+	meta = kept
 	view := &normalizedHistory{lines: meta}
 	view.order = make([]int, len(meta))
 	for i := range view.order {
 		view.order[i] = i
 	}
-	for i := range meta {
-		if meta[i].agentTsMs <= 0 {
-			return nil, errMissingAgentMeta
+	sort.SliceStable(view.order, func(a, b int) bool {
+		x, y := &meta[view.order[a]], &meta[view.order[b]]
+		if x.agentTsMs != y.agentTsMs {
+			return x.agentTsMs < y.agentTsMs
 		}
-	}
-	allN := true
-	for i := range meta {
-		if !meta[i].hasEventN {
-			allN = false
-			break
-		}
-	}
-	if !allN {
-		// 退化：行号序（msgSeq = 行号名次），不做混合排序。
-		view.degraded = true
-	} else {
-		// 升序：agentTimestampMs → N → 文件行号（order 初值即行号序，
-		// SliceStable 的稳定性即行号 tiebreak，显式比较仅为可读）。
-		sort.SliceStable(view.order, func(a, b int) bool {
-			x, y := &meta[view.order[a]], &meta[view.order[b]]
-			if x.agentTsMs != y.agentTsMs {
-				return x.agentTsMs < y.agentTsMs
-			}
-			if x.eventN != y.eventN {
-				return x.eventN < y.eventN
-			}
-			return x.line < y.line
-		})
+		return x.line < y.line
+	})
+	// 回退死分支截断（在归一化序上做，msgSeq 因此是「存活序列」的名次）。
+	if filtered, hadRewind := filterRewindBranch(view.order, meta); hadRewind {
+		view.order = filtered
 	}
 	view.promptStarts = promptStartsOf(view)
 	return view, nil
 }
 
+// userRunTurnTracker 是 agent UserRunTurnTracker 的 Go 等价实现（
+// xai-grok-shell session/storage/mod.rs）。连续 user_message_chunk 算同一
+// run；非 user 结束 run；promptIndex 变化（含有标记 ↔ 无标记）开新 run；
+// 见过第一个 promptIndex 之后，无标记 run 不计回合。hostTurn 注入在解析
+// 阶段就不当 isUserChunk，走到 onNonUser。
+type userRunTurnTracker struct {
+	seenMarker   bool
+	inUser       bool
+	currentRunPI int
+	hasCurrentPI bool
+}
+
+// onUserChunk 报告本 chunk 是否打开新 user run，以及该 run 是否计入回合。
+// newRun&&counts → 新的计数回合；newRun&&!counts → 见过标记后的幽灵 run
+// （不计 promptStarts，FE 也不画用户行）；!newRun → 同一 run 的后续 chunk。
+func (t *userRunTurnTracker) onUserChunk(hasPI bool, pi int) (newRun, counts bool) {
+	if hasPI {
+		t.seenMarker = true
+	}
+	counts = !t.seenMarker || hasPI
+	newRun = !t.inUser
+	if t.inUser && (t.seenMarker || hasPI) {
+		newRun = hasPI != t.hasCurrentPI || (hasPI && pi != t.currentRunPI)
+	}
+	if newRun {
+		t.hasCurrentPI = hasPI
+		t.currentRunPI = pi
+	}
+	t.inUser = true
+	return newRun, counts
+}
+
+func (t *userRunTurnTracker) onNonUser() {
+	t.inUser = false
+	t.hasCurrentPI = false
+}
+
+// filterRewindBranch 按 rewind_marker 截断归一化序上的「死分支」，是 agent
+// 侧 session::storage::filter_rewind_by 的 Go 等价实现（agent 1.0.13 的
+// x.ai/session/updates 服务路径不做这层过滤，host 本地服务必须补上，否则
+// 回放会把已回退的回合重新画出来）。
+//
+// 规则与 agent 一致：顺序扫描存活序列，记录每个「新用户 prompt」在结果里的
+// 起点（userRunTurnTracker）；遇到 rewind_marker{target} 就把结果截回到第
+// target 个 prompt 的起点（即丢掉 target 及其后的全部内容），prompt 起点表
+// 同步截断；标记本身不进结果。target 越界（多分支历史里文件序 prompt 与
+// 逻辑 prompt 不再一一对应）时不截断——与 agent 的 fold-to-len(result) 兜底
+// 一致，宁多留不误删。
+//
+// 判定 rewind_marker 只认严格解析出的 sessionUpdate 字段，不靠子串匹配
+// （工具输出正文里出现 "rewind_marker" 不得当成标记）。
+func filterRewindBranch(order []int, lines []updateLineMeta) ([]int, bool) {
+	hasRewind := false
+	for i := range lines {
+		if lines[i].isRewind {
+			hasRewind = true
+			break
+		}
+	}
+	if !hasRewind {
+		return order, false
+	}
+	out := make([]int, 0, len(order))
+	var promptStarts []int
+	var tracker userRunTurnTracker
+	for _, idx := range order {
+		m := &lines[idx]
+		if m.isRewind {
+			if m.hasRewindTarget && m.rewindTarget < len(promptStarts) {
+				out = out[:promptStarts[m.rewindTarget]]
+				promptStarts = promptStarts[:m.rewindTarget]
+			}
+			tracker.onNonUser()
+			continue
+		}
+		if m.isUserChunk {
+			if newRun, counts := tracker.onUserChunk(m.hasPromptIndex, m.promptIndex); newRun && counts {
+				promptStarts = append(promptStarts, len(out))
+			}
+		} else {
+			tracker.onNonUser()
+		}
+		out = append(out, idx)
+	}
+	return out, true
+}
+
 // promptStartsOf 重算「新用户 prompt」起点（契约：host 重算，不再透传
-// agent 的文件行号）：归一化序上 user_message_chunk 且其 agentTimestampMs
-// ≠ 前一条 user_message_chunk 的 agentTimestampMs（与 bridge_ext_stats.go
-// 的回合计数规则一致；多条 chunk 同一瞬间属同一条消息）。值为 msgSeq。
+// agent 的文件行号）。规则与 filterRewindBranch / agent UserRunTurnTracker
+// 相同：连续 user run + promptIndex 优先；值为 msgSeq。
 func promptStartsOf(v *normalizedHistory) []int {
 	var ps []int
-	var lastUserTs int64
+	var tracker userRunTurnTracker
 	for seq, idx := range v.order {
 		m := &v.lines[idx]
 		if !m.isUserChunk {
+			tracker.onNonUser()
 			continue
 		}
-		if len(ps) == 0 || m.agentTsMs != lastUserTs {
+		if newRun, counts := tracker.onUserChunk(m.hasPromptIndex, m.promptIndex); newRun && counts {
 			ps = append(ps, seq)
 		}
-		lastUserTs = m.agentTsMs
 	}
 	return ps
+}
+
+// sessionLineView 返回 rewind 截断后的行视图。优先走时间戳归一化（与
+// msgSeq 同一套）；全部信封缺时间戳时退回文件序，让旧日志的任务时间线
+// / 状态条仍能按 tracker 截死分支。
+func sessionLineView(path string) (*normalizedHistory, error) {
+	view, err := buildNormalizedHistory(path)
+	if err == nil {
+		return view, nil
+	}
+	if !errors.Is(err, errMissingAgentMeta) {
+		return nil, err
+	}
+	meta, err := scanUpdateLineMeta(path)
+	if err != nil {
+		return nil, err
+	}
+	order := make([]int, len(meta))
+	for i := range order {
+		order[i] = i
+	}
+	if filtered, had := filterRewindBranch(order, meta); had {
+		order = filtered
+	}
+	view = &normalizedHistory{lines: meta, order: order}
+	view.promptStarts = promptStartsOf(view)
+	return view, nil
+}
+
+func survivingFileRanks(view *normalizedHistory) map[int]bool {
+	want := make(map[int]bool, len(view.order))
+	for _, idx := range view.order {
+		want[view.lines[idx].line] = true
+	}
+	return want
+}
+
+// rewindFilteredFileOrder 保留缺时间戳的信封（如无 _meta 的 turn_completed
+// usage），按文件序做 rewind 截断。状态条的 token/工具耗时走这一套，避免
+// 把「有 ts 的 chunk + 无 ts 的终态」拆丢；回合数仍用 sessionLineView。
+func rewindFilteredFileOrder(path string) (*normalizedHistory, error) {
+	meta, err := scanUpdateLineMeta(path)
+	if err != nil {
+		return nil, err
+	}
+	order := make([]int, len(meta))
+	for i := range order {
+		order[i] = i
+	}
+	if filtered, had := filterRewindBranch(order, meta); had {
+		order = filtered
+	}
+	view := &normalizedHistory{lines: meta, order: order}
+	view.promptStarts = promptStartsOf(view)
+	return view, nil
 }
 
 // ── 归一化视图缓存 ──────────────────────────────────────────────────────
@@ -258,8 +429,8 @@ func (hc *historyCache) put(path string, size int64, mod time.Time, view *normal
 }
 
 // normalizedSessionHistory 返回该会话 updates.jsonl 的归一化视图（带
-// (size, mtime) 缓存）。ok=false = 触发回退（文件不可读 / 任一信封缺
-// agentTimestampMs），调用方走 agent RPC 透传。
+// (size, mtime) 缓存）。ok=false = 触发回退（文件不可读 / 没有任何带
+// agentTimestampMs 的信封），调用方走 agent RPC 透传。
 func (b *Bridge) normalizedSessionHistory(path string) (*normalizedHistory, bool) {
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
@@ -282,22 +453,32 @@ func (b *Bridge) normalizedSessionHistory(path string) (*normalizedHistory, bool
 
 // ── 本地分页服务（msgSeq 空间）─────────────────────────────────────────
 
-// localUpdatesPage 在本地归一化可用时从 msgSeq 空间分页服务，ok=false
-// 时调用方退回 agent RPC 透传。分页语义（契约）：turnIndex/offset/limit/
-// promptStarts 一律在 msgSeq 空间解释——turnIndex:N = 归一化序列的最后
-// N 个 prompt 轮；offset/limit 直接切 [offset, offset+limit) 窗口
-// （turnIndex 与 offset/limit 同给时 turnIndex 优先）。每条 update 顶层
-// 带 msgSeq；promptStarts 由 host 重算；totalCount = 归一化条数。
-func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts) (UpdatesPage, bool) {
+// errLocalHistoryUnavailable：本地归一化不可用（无文件 / 无时间戳），
+// 调用方走 agent RPC 透传。errLocalHistoryRead：已经在 msgSeq 空间里，
+// 窗口读失败——返回错误，不得透传换空间。
+var (
+	errLocalHistoryUnavailable = errors.New("local session history unavailable")
+	errLocalHistoryRead        = errors.New("local session history window read failed")
+)
+
+// localUpdatesPage 在本地归一化可用时从 msgSeq 空间分页服务。分页语义
+// （契约）：turnIndex/offset/limit/promptStarts 一律在 msgSeq 空间解释——
+// turnIndex:N = 归一化序列的最后 N 个 prompt 轮；offset/limit 切
+// [offset, offset+limit) 窗口，负 offset 按 agent 的 wire 语义解释为尾部
+// 起点（-N = 倒数第 N 条起）（turnIndex 与 offset/limit 同给时 turnIndex
+// 优先）。msgSeq 空间即「回退死分支被截断后的存活序列」（见
+// filterRewindBranch），totalCount / promptStarts 同处该空间。每条 update
+// 顶层带 msgSeq；promptStarts 由 host 重算；totalCount = 存活条数。
+func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts) (UpdatesPage, error) {
 	path := sessionUpdatesFile(b.grokHome(), cwd, sessionID)
 	if path == "" {
-		return UpdatesPage{}, false
+		return UpdatesPage{}, errLocalHistoryUnavailable
 	}
 	view, ok := b.normalizedSessionHistory(path)
 	if !ok {
-		return UpdatesPage{}, false
+		return UpdatesPage{}, errLocalHistoryUnavailable
 	}
-	total := len(view.lines)
+	total := len(view.order)
 	start, end := 0, total
 	switch {
 	case opts.TurnIndex != nil:
@@ -313,11 +494,22 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 			start = ps[len(ps)-n]
 		}
 	case opts.Offset != nil || opts.Limit != nil:
-		if opts.Offset != nil && *opts.Offset > 0 {
-			start = int(*opts.Offset) // wire offset 是 int64，msgSeq 空间为 int
-		}
-		if start > total {
-			start = total
+		if opts.Offset != nil {
+			// agent 的 wire 语义：负 offset = 尾部窗口起点（offset=-N 表示
+			// 「从倒数第 N 条开始」），正 offset = 从头数。FE 的子代理时间线
+			// 分页只认这一套（先 -100 取最新一页，再 -(已加载+100) 往前翻）；
+			// 把负值当 0 会让每一页都返回同一份最早的内容 → 时间线重复显示。
+			if *opts.Offset < 0 {
+				start = total + int(*opts.Offset)
+				if start < 0 {
+					start = 0
+				}
+			} else {
+				start = int(*opts.Offset) // wire offset 是 int64，msgSeq 空间为 int
+				if start > total {
+					start = total
+				}
+			}
 		}
 		end = total
 		if opts.Limit != nil {
@@ -338,16 +530,16 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 	}
 	envs, err := readEnvelopesByRank(path, want)
 	if err != nil {
-		return UpdatesPage{}, false
+		return UpdatesPage{}, fmt.Errorf("%w: %v", errLocalHistoryRead, err)
 	}
 	updates := make([]any, 0, end-start)
 	for seq := start; seq < end; seq++ {
 		env := envs[view.lines[view.order[seq]].line]
 		obj, ok := env.(map[string]any)
 		if !ok {
-			// 窗口内有行读不出来（文件在 stat 与读取之间被截断等）→
-			// 回退透传，绝不吐半页。
-			return UpdatesPage{}, false
+			// 窗口内有行读不出来（文件在 stat 与读取之间被截断等）。
+			// 已经在 msgSeq 空间：报错，绝不透传换空间。
+			return UpdatesPage{}, fmt.Errorf("%w: missing envelope at msgSeq %d", errLocalHistoryRead, seq)
 		}
 		obj["msgSeq"] = seq
 		updates = append(updates, obj)
@@ -357,7 +549,7 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 		TotalCount:   total,
 		HasMore:      end < total,
 		PromptStarts: view.promptStarts,
-	}, true
+	}, nil
 }
 
 // readEnvelopesByRank 读出文件里行名次命中 want 的存储信封（JSON 对象），

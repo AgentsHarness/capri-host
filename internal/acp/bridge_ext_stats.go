@@ -14,8 +14,8 @@ import (
 // POST /api/session-stats {cwd, sessionId} → 扫描该会话的 updates.jsonl
 // 聚合出状态条需要的全部指标：
 //
-//   - turns  回合数：user_message_chunk 事件数（按 agentTimestampMs 去重，
-//     agent 可能把一条用户消息拆成多个 chunk）；
+//   - turns  回合数：与历史分页 promptStarts 同一套 UserRunTurnTracker
+//     （连续 user run + promptIndex；hostTurn 不计；rewind 死分支截掉）；
 //   - steps  步数：tool_call 事件数（工具调用次数）；
 //   - llmDurationMs    LLM API 总耗时：Σ usage.apiDurationMs（含等待 +
 //     生成，agent 权威值）；
@@ -56,10 +56,8 @@ type SessionStats struct {
 type sessionStatsAccumulator struct {
 	stats SessionStats
 
-	// 回合起点（epoch ms）：首个 user_message_chunk 的 agentTimestampMs。
+	// 回合起点（epoch ms）：首个 counted user_message_chunk 的 agentTimestampMs。
 	turnStartMs int64
-	// 已计数的用户 chunk 时间戳（去重）。
-	lastUserTsMs int64
 	// tool_call 开始时间（epoch ms），按 toolCallId。
 	toolStarts map[string]int64
 	// 最近一个 LLM 流的起点（去重新流）。
@@ -93,6 +91,16 @@ func (b *Bridge) SessionStats(ctx context.Context, cwd, sessionID string) (*Sess
 	if _, err := os.Stat(p); err != nil {
 		return &SessionStats{}, nil
 	}
+	turnView, err := sessionLineView(p)
+	if err != nil {
+		return nil, err
+	}
+	scanView, err := rewindFilteredFileOrder(p)
+	if err != nil {
+		return nil, err
+	}
+	want := survivingFileRanks(scanView)
+
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
@@ -102,18 +110,27 @@ func (b *Bridge) SessionStats(ctx context.Context, cwd, sessionID string) (*Sess
 	acc := &sessionStatsAccumulator{toolStarts: make(map[string]int64)}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
+	rank := 0
 	for sc.Scan() {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
-		acc.line(sc.Bytes())
+		line := sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if want[rank] {
+			acc.line(line)
+		}
+		rank++
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	acc.finish()
+	acc.stats.Turns = int64(len(turnView.promptStarts))
 	return &acc.stats, nil
 }
 
@@ -166,21 +183,19 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 	case "user_message_chunk":
 		a.closeStream()
 		a.pendingGenMs = 0
-		// 一条用户消息可能拆成多个 chunk：按 agentTimestampMs 去重。
-		// 老数据无 _meta（agentTsMs=0）→ 按 chunk 行数计（无去重键）。
+		if hostTurnUpdate(upd) {
+			return
+		}
+		// 回合数由 sessionLineView.promptStarts 在扫描结束后覆盖；这里
+		// 只维护 firstToken 用的回合起点。
 		if agentTsMs > 0 {
-			if agentTsMs != a.lastUserTsMs {
-				a.stats.Turns++
-				a.lastUserTsMs = agentTsMs
-				a.turnFirstChunkSeen = false
-			}
 			if turnStartMs > 0 {
 				a.turnStartMs = turnStartMs
 			} else {
 				a.turnStartMs = agentTsMs
 			}
+			a.turnFirstChunkSeen = false
 		} else {
-			a.stats.Turns++
 			a.turnFirstChunkSeen = false
 		}
 	case "tool_call":
@@ -316,6 +331,20 @@ func (a *sessionStatsAccumulator) finish() {
 	if a.firstTokenCount > 0 {
 		s.FirstTokenAvgMs = a.firstTokenSumMs / a.firstTokenCount
 	}
+}
+
+func hostTurnUpdate(upd map[string]json.RawMessage) bool {
+	raw, ok := upd["_meta"]
+	if !ok || len(raw) == 0 {
+		return false
+	}
+	var meta struct {
+		HostTurn bool `json:"hostTurn"`
+	}
+	if json.Unmarshal(raw, &meta) != nil {
+		return false
+	}
+	return meta.HostTurn
 }
 
 // jsonStr / jsonInt 提取 RawMessage 字段值（缺失/非目标类型 → 零值）。

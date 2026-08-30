@@ -208,6 +208,12 @@ func (s *Server) handleGitCurrentCommit(w http.ResponseWriter, r *http.Request) 
 	s.xaiCall(w, r, "x.ai/git/current_commit", gitRootParams(body.Cwd))
 }
 
+// handleGitRepoRoot — POST /api/git/repo-root {cwd} → x.ai/git/git_repo_root。
+// wire 键注意：agent 侧 GitRepoRequest 只有必填的 currentWorkingDirectory
+// （不是其它 git 方法用的 gitRoot）——发 gitRoot 会被 serde 判成缺字段，
+// home 空状态的「在新 worktree 中开始」门控于是永远拿到 -32602
+// "Invalid params"，入口恒为置灰。响应是 GitRepoResponse：仓库根
+// {"GitRepo":{"gitRoot":…}}，非仓库 "NotGitRepo"。
 func (s *Server) handleGitRepoRoot(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Cwd string `json:"cwd"`
@@ -215,7 +221,11 @@ func (s *Server) handleGitRepoRoot(w http.ResponseWriter, r *http.Request) {
 	if !readBody(w, r, &body) {
 		return
 	}
-	s.xaiCall(w, r, "x.ai/git/git_repo_root", gitRootParams(body.Cwd))
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	s.xaiCall(w, r, "x.ai/git/git_repo_root", map[string]any{"currentWorkingDirectory": body.Cwd})
 }
 
 func (s *Server) handlePRStatus(w http.ResponseWriter, r *http.Request) {

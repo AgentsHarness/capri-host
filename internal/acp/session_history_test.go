@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,8 +14,9 @@ import (
 )
 
 // session_history_test.go — msgSeq 契约（tmp/msgseq/CONTRACT.md）验收用例：
-// 真实错序形态归一化、promptStarts 重算、turnIndex 与 offset/limit 分页、
-// 缺 _meta 回退透传、eventId 透传、归一化缓存 (size, mtime) 失效。
+// 真实错序形态归一化（不读 eventId N）、promptStarts 按 UserRunTurnTracker
+// 重算、turnIndex 与 offset/limit 分页、缺 _meta 回退透传、末行半截仍走
+// 本地、eventId 透传、归一化缓存 (size, mtime) 失效。
 
 // histEnvelope 生成一条带 _meta（eventId + agentTimestampMs）的存储信封
 // （agent 落盘形态：{timestamp, method, params:{sessionId, update, _meta}}）。
@@ -39,6 +41,12 @@ func msgUserChunk(text string) map[string]any {
 		"sessionUpdate": "user_message_chunk",
 		"content":       map[string]any{"type": "text", "text": text},
 	}
+}
+
+func msgUserChunkMeta(text string, chunkMeta map[string]any) map[string]any {
+	m := msgUserChunk(text)
+	m["_meta"] = chunkMeta
+	return m
 }
 
 func msgAgentChunk(text string) map[string]any {
@@ -143,13 +151,13 @@ func TestSessionUpdatesNormalizedOrderContractFixture(t *testing.T) {
 	}
 }
 
-// 验收 2：promptStarts 重算——同瞬间多 chunk 合并为一个 prompt 起点，
-// 且只与前一条 user_message_chunk 的时间戳比较（回合计数规则）。
+// 验收 2：promptStarts 重算——连续 user run 合并为一个 prompt 起点
+// （UserRunTurnTracker：非 user 事件才结束 run）。
 func TestSessionUpdatesPromptStartsRecomputed(t *testing.T) {
 	home := t.TempDir()
 	const sid = "sess-1"
-	// 落盘序故意打乱；归一化序（ts,N）：A1(100,1)=0, A2(100,2)=1,
-	// c1(105,3)=2, C1(150,6)=3, c2(160,7)=4, B1(200,4)=5, c3(210,8)=6。
+	// 落盘序故意打乱；归一化序（ts, 行号）：A1(100)=0, A2(100)=1,
+	// c1(105)=2, C1(150)=3, c2(160)=4, B1(200)=5, c3(210)=6。
 	writeSessionFile(t, home, "/ws", sid, []string{
 		histEnvelope(sid, 4, 200, msgUserChunk("B1")),
 		histEnvelope(sid, 1, 100, msgUserChunk("A1")),
@@ -171,9 +179,7 @@ func TestSessionUpdatesPromptStartsRecomputed(t *testing.T) {
 	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1, 2, 3, 4, 5, 6}) {
 		t.Errorf("归一化 msgSeq = %v, want [0 1 2 3 4 5 6]", got)
 	}
-	// A2 与 A1 同瞬间 → 并入；C1(150)≠前一条 user A1(100) → 新起点；
-	// B1(200)≠前一条 user C1(150) → 新起点（比的是前一条 user chunk，
-	// 不是前一条任意事件）。
+	// A1+A2 连续 user → 同一 run；c1 结束 run；C1 新 run；c2 结束；B1 新 run。
 	if !reflect.DeepEqual(page.PromptStarts, []int{0, 3, 5}) {
 		t.Errorf("promptStarts = %v, want [0 3 5]", page.PromptStarts)
 	}
@@ -278,14 +284,14 @@ func TestSessionUpdatesTurnIndexAndOffsetPaging(t *testing.T) {
 	}
 }
 
-// 验收 4：任一信封缺 _meta（含文件不存在）→ 走既有 agent RPC 透传：
+// 验收 4：全部信封缺 _meta（或文件不存在）→ 走既有 agent RPC 透传：
 // 响应无 msgSeq、promptStarts 原样透传（行号空间）、分页参数照旧下发。
+// 夹杂缺时间戳的行则跳过该行、其余仍走本地（不换空间）。
 func TestSessionUpdatesMissingMetaFallsBackToRPC(t *testing.T) {
 	home := t.TempDir()
 	writeSessionFile(t, home, "/ws", "sess-1", []string{
-		histEnvelope("sess-1", 1, 100, msgUserChunk("a")),
-		// 第二行无 _meta → 整会话触发回退。
-		`{"timestamp":1,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"b"}}}}`,
+		`{"timestamp":1,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"a"}}}}`,
+		`{"timestamp":2,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"b"}}}}`,
 	})
 	b, w := historyBridge(t, home)
 	ctx := context.Background()
@@ -305,7 +311,7 @@ func TestSessionUpdatesMissingMetaFallsBackToRPC(t *testing.T) {
 	})
 	method, params := lastRequestParams(t, w)
 	if method != "_x.ai/session/updates" {
-		t.Fatalf("缺 _meta 应回退 agent RPC，method = %q", method)
+		t.Fatalf("全部缺 _meta 应回退 agent RPC，method = %q", method)
 	}
 	if params["offset"] != float64(0) || params["limit"] != float64(10) {
 		t.Errorf("回退路径分页参数须照旧透传：offset=%v limit=%v", params["offset"], params["limit"])
@@ -336,6 +342,33 @@ func TestSessionUpdatesMissingMetaFallsBackToRPC(t *testing.T) {
 	})
 	if method, _ := lastRequestParams(t, w2); method != "_x.ai/session/updates" {
 		t.Fatalf("文件不存在应回退 agent RPC，method = %q", method)
+	}
+}
+
+func TestSessionUpdatesSkipsEnvelopeMissingTimestamp(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 1, 100, msgUserChunk("a")),
+		`{"timestamp":1,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"b"}}}}`,
+		histEnvelope(sid, 3, 200, msgAgentChunk("c")),
+	})
+	b, w := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.lines) != 0 {
+		t.Fatalf("夹杂缺时间戳不得换空间透传（写了 %d 条请求）", len(w.lines))
+	}
+	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Errorf("跳过无 ts 行后 msgSeq = %v, want [0 1]", got)
+	}
+	if got := pageKinds(t, page); !reflect.DeepEqual(got, []string{"user_message_chunk", "agent_message_chunk"}) {
+		t.Errorf("跳过无 ts 行后 kinds = %v", got)
+	}
+	if page.TotalCount != 2 {
+		t.Errorf("totalCount = %d, want 2", page.TotalCount)
 	}
 }
 
@@ -445,9 +478,8 @@ func TestNormalizedHistoryCacheInvalidation(t *testing.T) {
 	}
 }
 
-// 契约退化路径：全部信封带 agentTimestampMs 但任一 N 解析失败 → 整会话
-// 退化为文件行号序（msgSeq = 行号名次），仍走本地（带 msgSeq）。
-func TestSessionUpdatesDegradedToLineOrderOnBrokenEventId(t *testing.T) {
+// eventId N 解析失败不得影响排序：仍按 (ts, 行号)，不退回行号序。
+func TestSessionUpdatesIgnoresBrokenEventId(t *testing.T) {
 	home := t.TempDir()
 	const sid = "sess-1"
 	broken := `{"timestamp":300,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}},"_meta":{"agentTimestampMs":300,"eventId":"sess-1-x"}}}`
@@ -457,13 +489,309 @@ func TestSessionUpdatesDegradedToLineOrderOnBrokenEventId(t *testing.T) {
 		histEnvelope(sid, 13, 200, msgCancelledTurn()),  // 行2：ts=200
 	})
 
-	view, ok := (&Bridge{cfg: GrokConfig{GrokHome: home}}).normalizedSessionHistory(
-		sessionUpdatesFile(home, "/ws", sid))
-	if !ok {
-		t.Fatal("归一化不应回退（agentTimestampMs 全在）")
+	b, w := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !view.degraded {
-		t.Error("N 解析失败应标记退化行号序")
+	if len(w.lines) != 0 {
+		t.Fatalf("N 解析失败仍是本地服务，不得请求 agent（写了 %d 条）", len(w.lines))
+	}
+	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1, 2}) {
+		t.Errorf("msgSeq = %v, want [0 1 2]", got)
+	}
+	if got := pageKinds(t, page); !reflect.DeepEqual(got, []string{"user_message_chunk", "turn_completed", "agent_message_chunk"}) {
+		t.Errorf("kinds = %v, want ts 升序（echo/terminal/broken）", got)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0}) {
+		t.Errorf("promptStarts = %v, want [0]", page.PromptStarts)
+	}
+}
+
+func intPtr(v int) *int       { return &v }
+func int64Ptr(v int64) *int64 { return &v }
+
+// msgRewindMarker 生成一条 /rewind 落盘的标记信封（死分支截断锚点）。
+func msgRewindMarker(target int) map[string]any {
+	return map[string]any{
+		"sessionUpdate":       "rewind_marker",
+		"target_prompt_index": target,
+	}
+}
+
+// 验收：/rewind 之后的「死分支」不得再服务出去。agent 1.0.13 的
+// x.ai/session/updates 不做这层过滤（updates.jsonl 只追加，rewind_marker
+// 之后的回放原样吐回被回退的回合），FE 直接把整轮已回退/已取消的对话重新
+// 画出来——host 本地服务必须按标记截断（agent filter_rewind_by 等价）。
+func TestSessionUpdatesRewindBranchTruncation(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunk("A")),   // msgSeq 0（prompt 0 起点）
+		histEnvelope(sid, 1, 20, msgAgentChunk("a1")), // msgSeq 1
+		histEnvelope(sid, 2, 30, msgUserChunk("B")),   // 死分支：prompt 1
+		histEnvelope(sid, 3, 40, msgAgentChunk("b1")), // 死分支
+		histEnvelope(sid, 4, 50, msgRewindMarker(1)),  // 回退到 prompt 1 → 截掉 1 及以后
+		histEnvelope(sid, 5, 60, msgAgentChunk("c1")), // 回退后新分支的内容
+	})
+	b, w := historyBridge(t, home)
+
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.lines) != 0 {
+		t.Errorf("本地命中时不得请求 agent RPC（写了 %d 条）", len(w.lines))
+	}
+	// 存活序列 = A / a1 / c1，msgSeq 密集重排，标记本身不进结果。
+	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1, 2}) {
+		t.Errorf("截断后 msgSeq = %v, want [0 1 2]", got)
+	}
+	if got := pageKinds(t, page); !reflect.DeepEqual(got,
+		[]string{"user_message_chunk", "agent_message_chunk", "agent_message_chunk"}) {
+		t.Errorf("截断后 sessionUpdate = %v, want user/agent/agent（无 rewind_marker）", got)
+	}
+	if page.TotalCount != 3 {
+		t.Errorf("totalCount = %d, want 3（死分支与标记不计入）", page.TotalCount)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0}) {
+		t.Errorf("promptStarts = %v, want [0]", page.PromptStarts)
+	}
+
+	// turnIndex:1 取最后一轮：存活序列里只有 A 那一轮 → 全量。
+	page, err = b.SessionUpdates(context.Background(), sid, "/ws", SessionUpdatesOpts{TurnIndex: intPtr(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1, 2}) {
+		t.Errorf("turnIndex:1 msgSeq = %v, want [0 1 2]", got)
+	}
+}
+
+// 验收：target 越界（多分支历史里文件序 prompt 与逻辑 prompt 对不上）时
+// 宁多留不误删——与 agent 的 fold-to-len(result) 兜底一致，但标记本身仍被丢弃。
+func TestSessionUpdatesRewindCutsAtPromptIndexBoundary(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunkMeta("A", map[string]any{"promptIndex": 0})),
+		histEnvelope(sid, 1, 20, msgUserChunkMeta("B", map[string]any{"promptIndex": 1})),
+		histEnvelope(sid, 2, 25, msgAgentChunk("b1")),
+		histEnvelope(sid, 3, 30, msgRewindMarker(1)),
+		histEnvelope(sid, 4, 40, msgUserChunkMeta("C", map[string]any{"promptIndex": 1})),
+		histEnvelope(sid, 5, 50, msgAgentChunk("c1")),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pageKinds(t, page); !reflect.DeepEqual(got,
+		[]string{"user_message_chunk", "user_message_chunk", "agent_message_chunk"}) {
+		t.Errorf("截断后 kinds = %v, want A / C / c1（B 支被剪掉）", got)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0, 1}) {
+		t.Errorf("promptStarts = %v, want [0 1]", page.PromptStarts)
+	}
+	if page.TotalCount != 3 {
+		t.Errorf("totalCount = %d, want 3", page.TotalCount)
+	}
+}
+
+func TestSessionUpdatesRewindOutOfRangeKeepsBranch(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunk("A")),
+		histEnvelope(sid, 1, 20, msgUserChunk("B")),
+		histEnvelope(sid, 2, 30, msgRewindMarker(7)),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Errorf("越界 target msgSeq = %v, want [0 1]（保留两支，仅丢标记）", got)
+	}
+	// A、B 连续无 promptIndex → 同一 run，只有一个起点。
+	if !reflect.DeepEqual(page.PromptStarts, []int{0}) {
+		t.Errorf("promptStarts = %v, want [0]", page.PromptStarts)
+	}
+}
+
+// 验收：负 offset = agent 的尾部窗口语义（offset=-N 从倒数第 N 条起，limit
+// 在该起点上开窗）。FE 的子代理时间线只会用这一套：先 offset=-100 取最新
+// 一页，再 offset=-(已加载+100) 往前翻——把负值当 0 会让每页都返回最早的
+// 同一份内容，时间线于是重复显示。
+func TestSessionUpdatesNegativeOffsetPaging(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunk("A")),
+		histEnvelope(sid, 1, 20, msgAgentChunk("a1")),
+		histEnvelope(sid, 2, 30, msgAgentChunk("a2")),
+		histEnvelope(sid, 3, 40, msgUserChunk("B")),
+		histEnvelope(sid, 4, 50, msgAgentChunk("b1")),
+		histEnvelope(sid, 5, 60, msgAgentChunk("b2")),
+	})
+	b, _ := historyBridge(t, home)
+	ctx := context.Background()
+
+	cases := []struct {
+		name        string
+		offset      int64
+		limit       int
+		want        []int
+		wantHasMore bool
+	}{
+		// hasMore 沿用 agent 的语义：end < total（窗口之后还有更新的），
+		// 最新一页因此是 false。
+		{"最新一页", -2, 2, []int{4, 5}, false},
+		{"往前一页", -4, 2, []int{2, 3}, true},
+		{"再往前", -6, 2, []int{0, 1}, true},
+		{"窗口大于总量", -100, 100, []int{0, 1, 2, 3, 4, 5}, false},
+		{"负 offset 无 limit", -3, 0, []int{3, 4, 5}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := SessionUpdatesOpts{Offset: int64Ptr(tc.offset)}
+			if tc.limit > 0 {
+				opts.Limit = intPtr(tc.limit)
+			}
+			page, err := b.SessionUpdates(ctx, sid, "/ws", opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := pageSeqs(t, page); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("offset:%d limit:%d msgSeq = %v, want %v",
+					tc.offset, tc.limit, got, tc.want)
+			}
+			if page.HasMore != tc.wantHasMore {
+				t.Errorf("offset:%d limit:%d hasMore = %v, want %v",
+					tc.offset, tc.limit, page.HasMore, tc.wantHasMore)
+			}
+		})
+	}
+}
+
+// 同毫秒 tiebreak 走文件行号，不读 eventId N（N 更小的后写行不得排到前面）。
+func TestSessionUpdatesSameMsOrderByFileLine(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 9, 100, msgAgentChunk("a")),
+		histEnvelope(sid, 1, 100, msgUserChunk("u")),
+	})
+	b, w := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.lines) != 0 {
+		t.Fatalf("本地命中时不得请求 agent（写了 %d 条）", len(w.lines))
+	}
+	if got := pageKinds(t, page); !reflect.DeepEqual(got, []string{"agent_message_chunk", "user_message_chunk"}) {
+		t.Errorf("同毫秒 kinds = %v, want 文件行序 agent/user（不是 N 升序）", got)
+	}
+}
+
+func TestSessionUpdatesConsecutiveUsersOneRunWithoutPromptIndex(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 100, msgUserChunk("A")),
+		histEnvelope(sid, 1, 200, msgUserChunk("B")),
+		histEnvelope(sid, 2, 300, msgAgentChunk("a1")),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0}) {
+		t.Errorf("无 promptIndex 的连续 user 应合并为 1 个 run，got %v", page.PromptStarts)
+	}
+}
+
+func TestSessionUpdatesPromptIndexOpensNewRun(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 100, msgUserChunkMeta("A", map[string]any{"promptIndex": 0})),
+		histEnvelope(sid, 1, 200, msgUserChunkMeta("B", map[string]any{"promptIndex": 1})),
+		histEnvelope(sid, 2, 300, msgAgentChunk("a1")),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0, 1}) {
+		t.Errorf("promptIndex 变化应开新 run，got %v", page.PromptStarts)
+	}
+}
+
+func TestSessionUpdatesHostTurnNotAPromptStart(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 100, msgUserChunk("A")),
+		histEnvelope(sid, 1, 150, msgUserChunkMeta("injected", map[string]any{"hostTurn": true})),
+		histEnvelope(sid, 2, 200, msgAgentChunk("a1")),
+		histEnvelope(sid, 3, 300, msgUserChunk("B")),
+		histEnvelope(sid, 4, 400, msgAgentChunk("b1")),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0, 3}) {
+		t.Errorf("hostTurn 不得记为 prompt 起点，got %v", page.PromptStarts)
+	}
+	if page.TotalCount != 5 {
+		t.Errorf("hostTurn 行仍在存活序列里，totalCount = %d, want 5", page.TotalCount)
+	}
+}
+
+func TestSessionUpdatesUnmarkedPhantomAfterPromptIndex(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 100, msgUserChunkMeta("A", map[string]any{"promptIndex": 0})),
+		histEnvelope(sid, 1, 200, msgAgentChunk("a1")),
+		histEnvelope(sid, 2, 300, msgUserChunk("phantom")),
+		histEnvelope(sid, 3, 400, msgAgentChunk("p1")),
+		histEnvelope(sid, 4, 500, msgUserChunkMeta("B", map[string]any{"promptIndex": 1})),
+		histEnvelope(sid, 5, 600, msgAgentChunk("b1")),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0, 4}) {
+		t.Errorf("见过 promptIndex 后的无标记 run 不计回合，got %v", page.PromptStarts)
+	}
+}
+
+func TestSessionUpdatesIncompleteLastLineStillLocal(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	path := writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 100, msgUserChunk("A")),
+		histEnvelope(sid, 1, 200, msgAgentChunk("a1")),
+	})
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"timestamp":300,"method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk"`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	b, w := historyBridge(t, home)
@@ -472,19 +800,62 @@ func TestSessionUpdatesDegradedToLineOrderOnBrokenEventId(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(w.lines) != 0 {
-		t.Fatalf("退化行号序仍是本地服务，不得请求 agent（写了 %d 条）", len(w.lines))
+		t.Fatalf("末行半截不得换空间透传（写了 %d 条请求）", len(w.lines))
 	}
-	// 行号序：不按 ts 排，msgSeq = 行名次 0,1,2。
-	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1, 2}) {
-		t.Errorf("退化序 msgSeq = %v, want [0 1 2]", got)
+	if got := pageSeqs(t, page); !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Errorf("半截末行跳过后 msgSeq = %v, want [0 1]", got)
 	}
-	if got := pageKinds(t, page); !reflect.DeepEqual(got, []string{"agent_message_chunk", "user_message_chunk", "turn_completed"}) {
-		t.Errorf("退化序 kinds = %v, want 文件行序", got)
-	}
-	if !reflect.DeepEqual(page.PromptStarts, []int{1}) {
-		t.Errorf("promptStarts = %v, want [1]（user chunk 在 msgSeq 1）", page.PromptStarts)
+	if page.TotalCount != 2 {
+		t.Errorf("totalCount = %d, want 2", page.TotalCount)
 	}
 }
 
-func intPtr(v int) *int       { return &v }
-func int64Ptr(v int64) *int64 { return &v }
+func TestSessionUpdatesRewindMarkerInToolOutputIgnored(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunk("A")),
+		histEnvelope(sid, 1, 20, msgAgentChunk(`see rewind_marker in docs`)),
+		histEnvelope(sid, 2, 30, msgUserChunk("B")),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.TotalCount != 3 {
+		t.Errorf("正文里的 rewind_marker 不得当标记截断，totalCount = %d, want 3", page.TotalCount)
+	}
+	if !reflect.DeepEqual(page.PromptStarts, []int{0, 2}) {
+		t.Errorf("promptStarts = %v, want [0 2]", page.PromptStarts)
+	}
+}
+
+func TestSessionUpdatesWindowReadFailureDoesNotPassthrough(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	path := writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, 10, msgUserChunk("A")),
+	})
+	b, w := historyBridge(t, home)
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 缓存一份指向不存在行名次的视图：读窗口必然缺信封。
+	b.hist.put(path, st.Size(), st.ModTime(), &normalizedHistory{
+		lines:        []updateLineMeta{{line: 99, agentTsMs: 10, isUserChunk: true}},
+		order:        []int{0},
+		promptStarts: []int{0},
+	})
+	_, err = b.SessionUpdates(context.Background(), sid, "/ws")
+	if err == nil {
+		t.Fatal("窗口缺行应返回错误，不得静默成功")
+	}
+	if !errors.Is(err, errLocalHistoryRead) {
+		t.Fatalf("err = %v, want errLocalHistoryRead", err)
+	}
+	if len(w.lines) != 0 {
+		t.Fatalf("已在 msgSeq 空间时不得透传 agent RPC（写了 %d 条）", len(w.lines))
+	}
+}
