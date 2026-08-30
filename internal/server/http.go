@@ -96,6 +96,7 @@ func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/session-rename", s.handleSessionRename)
 	mux.HandleFunc("POST /api/recap", s.handleRecap)
 	mux.HandleFunc("POST /api/session-info", s.handleSessionInfo)
+	mux.HandleFunc("POST /api/session-plan", s.handleSessionPlan)
 	mux.HandleFunc("POST /api/subagent-cancel", s.handleSubagentCancel)
 	mux.HandleFunc("POST /api/task-kill", s.handleTaskKill)
 	mux.HandleFunc("POST /api/task-list", s.handleTaskList)
@@ -998,6 +999,25 @@ func (s *Server) handleSessionInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "session": info})
+}
+
+// handleSessionPlan serves the session's plan.md body (plan 模式正文) —
+// the file the TUI's /view-plan reads. {sessionId, cwd} → {ok, content};
+// 没有 plan 文件时 content 为空串（FE 显示空态），不是错误。
+func (s *Server) handleSessionPlan(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	content, ok := s.bridge.SessionPlan(body.SessionID, body.Cwd)
+	if !ok {
+		content = ""
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "content": content})
 }
 
 // handleSubagentCancel cancels a subagent via x.ai/subagent/cancel
