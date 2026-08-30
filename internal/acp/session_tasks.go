@@ -177,6 +177,26 @@ func sessionUpdatesFile(grokHome, cwd, sessionID string) string {
 	return filepath.Join(dir, sessionID, "updates.jsonl")
 }
 
+// SessionPlan 读取会话的 plan.md 正文（plan 模式产物，与 updates.jsonl 同
+// 目录；TUI 的 /view-plan 读的就是盘上这个文件）。ok=false = 还没有 plan
+// （文件不存在 / 目录定位不到 / sessionId 形状可疑）——不是错误，FE 据此
+// 显示空态。sessionId 参与路径拼接，这里挡掉分隔符与 .. 防越界。
+func (b *Bridge) SessionPlan(sessionID, cwd string) (string, bool) {
+	if sessionID == "" || cwd == "" ||
+		strings.ContainsAny(sessionID, `/\`) || strings.Contains(sessionID, "..") {
+		return "", false
+	}
+	dir := sessionsCwdDir(b.grokHome(), cwd)
+	if dir == "" {
+		return "", false
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, sessionID, "plan.md"))
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
 // ── rewind dead-branch filtering ────────────────────────────────────────
 //
 // Mirrors the agent's filter_rewind_lines: lines after a rewind_marker

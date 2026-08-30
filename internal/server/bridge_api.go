@@ -47,6 +47,7 @@ type sessionAPI interface {
 	RenameSession(ctx context.Context, sessionID, title string) (map[string]any, error)
 	ForkSession(ctx context.Context, sessionID string, params map[string]any) (map[string]any, error)
 	SessionInfo(sessionID string) *acp.SessionInfoDetail
+	SessionPlan(sessionID, cwd string) (string, bool)
 	SessionLoadHistory(ctx context.Context, beforeID string) (map[string]any, error)
 	SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...acp.SessionUpdatesOpts) (acp.UpdatesPage, error)
 	SessionRunningTasks(sessionID, cwd string) ([]acp.TaskEvent, error)
