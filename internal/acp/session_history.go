@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -461,6 +462,93 @@ var (
 	errLocalHistoryRead        = errors.New("local session history window read failed")
 )
 
+// sessionBtwFile 返回会话的 btw_history.jsonl 路径（/btw 侧问日志，agent
+// 的 storage::append_btw 写在 updates.jsonl 同目录）。
+func sessionBtwFile(grokHome, cwd, sessionID string) string {
+	dir := sessionsCwdDir(grokHome, cwd)
+	if dir == "" || sessionID == "" {
+		return ""
+	}
+	return filepath.Join(dir, sessionID, "btw_history.jsonl")
+}
+
+// btwHistoryRecord 是 btw_history.jsonl 的一行（BtwEntry，camelCase）。
+type btwHistoryRecord struct {
+	BtwSessionId string `json:"btwSessionId"`
+	Question     string `json:"question"`
+	Answer       string `json:"answer"`
+	Model        string `json:"model"`
+	Success      bool   `json:"success"`
+	Error        string `json:"error"`
+	AskedAt      string `json:"askedAt"`
+}
+
+// btwAnchorSeq 返回 askedMs 之前最近一条归一化信封的 msgSeq（排序键
+// agentTimestampMs ≤ askedMs 的最大序号）；早于全部信封 → -1。view.order
+// 按 (agentTsMs, 行号) 升序，直接二分。
+func btwAnchorSeq(view *normalizedHistory, askedMs int64) int {
+	return sort.Search(len(view.order), func(i int) bool {
+		return view.lines[view.order[i]].agentTsMs > askedMs
+	}) - 1
+}
+
+// btwWindowRecords 读出本地 btw 侧问记录并换算锚点，按分页窗口 [start, end)
+// 切片（窗口互斥划分，锚点落在哪个窗口就由哪页携带；置顶锚点归最老已
+// 加载页）。文件不存在/解析失败 → 无记录（不报错；agent 透传路径本就
+// 无该文件）。
+func btwWindowRecords(grokHome, cwd, sessionID string, view *normalizedHistory, start, end int) []SessionBtw {
+	path := sessionBtwFile(grokHome, cwd, sessionID)
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []SessionBtw
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var rec btwHistoryRecord
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		if rec.AskedAt == "" {
+			continue
+		}
+		asked, err := time.Parse(time.RFC3339Nano, rec.AskedAt)
+		if err != nil {
+			continue
+		}
+		askedMs := asked.UnixMilli()
+		anchor := btwAnchorSeq(view, askedMs)
+		// 窗口归属：锚点落在 [start, end) 内；早于一切信封的记录只在
+		// 最老已加载页（start=0）携带。窗口互斥 → 跨页加载恰出现一次。
+		if !(anchor >= start && anchor < end) && !(anchor < 0 && start == 0) {
+			continue
+		}
+		out = append(out, SessionBtw{
+			BtwSessionId: rec.BtwSessionId,
+			AskedAt:      askedMs,
+			Question:     rec.Question,
+			Answer:       rec.Answer,
+			Err:          rec.Error,
+			Success:      rec.Success,
+			Model:        rec.Model,
+			AfterMsgSeq:  anchor,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].AfterMsgSeq != out[j].AfterMsgSeq {
+			return out[i].AfterMsgSeq < out[j].AfterMsgSeq
+		}
+		return out[i].AskedAt < out[j].AskedAt
+	})
+	return out
+}
+
 // localUpdatesPage 在本地归一化可用时从 msgSeq 空间分页服务。分页语义
 // （契约）：turnIndex/offset/limit/promptStarts 一律在 msgSeq 空间解释——
 // turnIndex:N = 归一化序列的最后 N 个 prompt 轮；offset/limit 切
@@ -549,6 +637,7 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 		TotalCount:   total,
 		HasMore:      end < total,
 		PromptStarts: view.promptStarts,
+		Btw:          btwWindowRecords(b.grokHome(), cwd, sessionID, view, start, end),
 	}, nil
 }
 

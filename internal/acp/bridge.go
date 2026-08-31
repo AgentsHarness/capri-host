@@ -3534,6 +3534,24 @@ type UpdatesPage struct {
 	TotalCount   int   `json:"totalCount"`
 	HasMore      bool  `json:"hasMore"`
 	PromptStarts []int `json:"promptStarts,omitempty"`
+	// Btw：/btw 侧问回放记录（btw_history.jsonl；只在本地归一化路径可用，
+	// agent 透传路径不带）。不占 msgSeq 空间，分页游标不受影响。
+	Btw []SessionBtw `json:"btw,omitempty"`
+}
+
+// SessionBtw 是一条 /btw 侧问的回放记录，由 host 从 agent 落盘的
+// btw_history.jsonl（xai-grok-shell persistence::BtwEntry，camelCase）读出。
+// AfterMsgSeq 是时间线插入锚点：askedAt 之前最近一条信封的 msgSeq；-1 =
+// 早于全部信封（置顶）。FE 按「msgSeq ≤ 锚点的最后一条之后」拼接。
+type SessionBtw struct {
+	BtwSessionId string `json:"btwSessionId"`
+	AskedAt      int64  `json:"askedAt"` // epoch ms
+	Question     string `json:"question"`
+	Answer       string `json:"answer,omitempty"`
+	Err          string `json:"error,omitempty"`
+	Success      bool   `json:"success"`
+	Model        string `json:"model,omitempty"`
+	AfterMsgSeq  int    `json:"afterMsgSeq"`
 }
 
 // SessionUpdatesOpts carries the optional x.ai/session/updates request
