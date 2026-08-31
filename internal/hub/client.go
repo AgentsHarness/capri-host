@@ -100,6 +100,14 @@ type Client struct {
 	forwardEvents bool
 	fwdKnown      bool // false until the hub tells us a count
 
+	// statusMu guards lastStatus — the host_status registry fields
+	// (ready/busy/booting/pendingCount) most recently sent to the hub.
+	// maybeNotifyHostStatus diffs against it so a thinking/pending/idle
+	// transition reaches the hub immediately instead of on the next
+	// heartbeat.
+	statusMu   sync.Mutex
+	lastStatus *hostStatusFields
+
 	// sendCh carries pre-marshaled frames to the active write loop.
 	// Created in Run; closed only when Run exits (not per reconnect).
 	sendCh chan []byte
@@ -558,6 +566,14 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 			// Always buffer (paused or not) so replay stays complete.
 			ev = cloneEvent(ev)
 			stripFullUpdate(ev)
+			// Host registry fields only change on these transitions —
+			// mirror them to the hub right away (control frame, works
+			// even while event upload is paused) instead of waiting for
+			// the 15s heartbeat.
+			switch t, _ := ev["type"].(string); t {
+			case "busy", "sessions_changed", "client_request", "error":
+				c.maybeNotifyHostStatus(bridge)
+			}
 			batch = append(batch, ev)
 			if len(batch) >= 32 {
 				flush()
@@ -830,21 +846,69 @@ func (c *Client) enqueueReplayLocked(evs []acp.Event) {
 // does not consume the data-plane seq space shared with bridge.Broadcast
 // (dual-path FE dedupes by (hostId,seq)). Shape:
 //
-//	{"v":1,"type":"host_status","ready":true}
+//	{"v":1,"type":"host_status","ready":true,"busy":false,"booting":false,"pendingCount":0}
 //
 // No seq, not stored in the replay buffer. critical=false: under pressure
-// the next heartbeat will refresh the hub registry flag.
+// the next heartbeat will refresh the hub registry flags. Records the sent
+// fields so maybeNotifyHostStatus can diff — the 15s heartbeat keeps
+// sending unconditionally for liveness, while a status change mid-window
+// is pushed via maybeNotifyHostStatus.
 func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 	snap := bridge.Snapshot()
+	fields := hostStatusFieldsOf(snap)
 	payload, err := json.Marshal(map[string]any{
-		"v":     1,
-		"type":  "host_status",
-		"ready": snap.Ready,
+		"v":            1,
+		"type":         "host_status",
+		"ready":        fields.Ready,
+		"busy":         fields.Busy,
+		"booting":      fields.Booting,
+		"pendingCount": fields.PendingCount,
 	})
 	if err != nil {
 		return
 	}
 	c.enqueueFrame(payload, false)
+	c.statusMu.Lock()
+	c.lastStatus = &fields
+	c.statusMu.Unlock()
+}
+
+// hostStatusFields is the subset of the bridge Status snapshot the hub
+// registry mirrors (ready/busy/booting/pendingCount). pendingCount is the
+// number of pending client requests (permissions / x.ai questions); busy
+// means at least one session has a turn in flight; booting means the agent
+// process has not finished booting.
+type hostStatusFields struct {
+	Ready        bool
+	Busy         bool
+	Booting      bool
+	PendingCount int
+}
+
+func hostStatusFieldsOf(s acp.Status) hostStatusFields {
+	return hostStatusFields{
+		Ready:        s.Ready,
+		Busy:         s.Busy,
+		Booting:      s.Booting,
+		PendingCount: len(s.PendingRequests),
+	}
+}
+
+// maybeNotifyHostStatus immediately re-sends host_status when the bridge
+// snapshot's registry fields changed since the last frame, so thinking /
+// pending / idle transitions reach the hub without waiting for the 15s
+// heartbeat. The diff is against the last SENT fields (the heartbeat's
+// unconditional frame refreshes it too), so a quiet host sends nothing.
+// Must run on state transitions only — the caller gates it on event
+// types, not per event, to avoid Snapshot() churn on chunk streams.
+func (c *Client) maybeNotifyHostStatus(bridge bridgeSource) {
+	cur := hostStatusFieldsOf(bridge.Snapshot())
+	c.statusMu.Lock()
+	last := c.lastStatus
+	c.statusMu.Unlock()
+	if last == nil || cur != *last {
+		c.enqueueHostStatus(bridge)
+	}
 }
 
 // handleHelloSeq resumes after hub hello.seq, or resets the seq epoch when
