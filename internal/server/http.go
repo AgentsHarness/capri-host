@@ -833,6 +833,10 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 	if len(page.PromptStarts) > 0 {
 		out["promptStarts"] = page.PromptStarts
 	}
+	// btw：/btw 侧问回放记录（本地归一化路径才有；见 SessionBtw）。
+	if len(page.Btw) > 0 {
+		out["btw"] = page.Btw
+	}
 	if body.Stream {
 		// stream=true: the agent does not return the updates in this
 		// response — the real data arrives as session_updates_chunk SSE
