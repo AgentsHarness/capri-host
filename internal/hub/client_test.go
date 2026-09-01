@@ -550,7 +550,7 @@ func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
 // — no seq, not an events frame, not in the replay buffer — so it cannot
 // collide with bridge.Broadcast seq.
 func TestHostStatusIsControlFrame(t *testing.T) {
-	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", Port: 8765, DisableQUIC: true})
 	c.sendCh = make(chan []byte, 4)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
@@ -570,10 +570,13 @@ func TestHostStatusIsControlFrame(t *testing.T) {
 		if _, ok := f["events"]; ok {
 			t.Errorf("host_status must not be an events frame, payload=%s", payload)
 		}
-		for _, k := range []string{"ready", "busy", "booting", "pendingCount"} {
+		for _, k := range []string{"ready", "busy", "booting", "pendingCount", "port"} {
 			if _, ok := f[k]; !ok {
 				t.Errorf("host_status missing %s: %s", k, payload)
 			}
+		}
+		if int(f["port"].(float64)) != 8765 {
+			t.Errorf("port = %v, want 8765", f["port"])
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no host_status frame")

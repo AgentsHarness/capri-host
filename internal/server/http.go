@@ -71,7 +71,7 @@ func (s *Server) routes() http.Handler {
 	// 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
 	// 非 API 路径回退 index.html（实现见 web.go）
 	mux.HandleFunc("GET /", s.handleWeb)
-	return withCORS(withAuth(mux, s.cfg.AccessToken))
+	return s.withCORS(withAuth(mux, s.cfg.AccessToken))
 }
 
 // registerCoreRoutes 注册核心 API（回合、会话、权限、任务、终端外的主链路）。
@@ -175,18 +175,45 @@ func isLocalOrigin(r *http.Request) bool {
 	return strings.EqualFold(u.Host, r.Host)
 }
 
-func withCORS(next http.Handler) http.Handler {
+// allowSensitiveOrigin reports whether r may hit a sensitive endpoint:
+// local origins (Vite / same-host), or the configured HubURL's origin
+// (deployed FE on the hub talking straight to this host's 127.0.0.1 port).
+func (s *Server) allowSensitiveOrigin(r *http.Request) bool {
+	if isLocalOrigin(r) {
+		return true
+	}
+	return s.isTrustedHubOrigin(r.Header.Get("Origin"))
+}
+
+// isTrustedHubOrigin is true when origin matches cfg.HubURL's scheme+host
+// (path ignored). Empty HubURL → nothing trusted beyond local origins.
+func (s *Server) isTrustedHubOrigin(origin string) bool {
+	if origin == "" || s.cfg.HubURL == "" {
+		return false
+	}
+	ou, err := url.Parse(origin)
+	if err != nil || ou.Scheme == "" || ou.Host == "" {
+		return false
+	}
+	hu, err := url.Parse(s.cfg.HubURL)
+	if err != nil || hu.Scheme == "" || hu.Host == "" {
+		return false
+	}
+	return strings.EqualFold(ou.Scheme, hu.Scheme) && strings.EqualFold(ou.Host, hu.Host)
+}
+
+func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sensitive := isSensitiveEndpoint(r)
+		allowed := !sensitive || s.allowSensitiveOrigin(r)
 		if sensitive {
 			// Sensitive endpoints never answer `*`: echo the request Origin
-			// back only when it is a local origin, so a cross-origin web
-			// page can neither read nor invoke them.
-			if origin := r.Header.Get("Origin"); origin != "" && isLocalOrigin(r) {
+			// only when it is local or the trusted hub FE origin.
+			if origin := r.Header.Get("Origin"); origin != "" && allowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Add("Vary", "Origin")
 			}
-			if !isLocalOrigin(r) {
+			if !allowed {
 				writeJSON(w, http.StatusForbidden, map[string]any{
 					"ok": false, "error": "cross-origin request to sensitive endpoint denied",
 				})
@@ -194,7 +221,8 @@ func withCORS(next http.Handler) http.Handler {
 			}
 		} else {
 			// CORS for Vite dev: the FE runs on another localhost port and
-			// must reach every non-sensitive endpoint.
+			// must reach every non-sensitive endpoint. Hub FE on a public
+			// origin also probes /api/hosts + /api/status this way.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -202,6 +230,12 @@ func withCORS(next http.Handler) http.Handler {
 		// preflight must admit it or cross-origin direct host calls (hub
 		// mode 双连接) would be blocked by the browser.
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// Chrome Private Network Access: public HTTPS pages probing
+		// 127.0.0.1 send Access-Control-Request-Private-Network on
+		// preflight; without the matching Allow header the probe fails.
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" && allowed {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
