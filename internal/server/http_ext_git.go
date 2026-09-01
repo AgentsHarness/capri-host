@@ -1,7 +1,9 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
+	"time"
 )
 
 // http_ext_git.go — git 与 worktree 端点（状态/暂存/提交/stash、worktree CRUD、PR 状态）。
@@ -206,6 +208,12 @@ func (s *Server) handleGitCurrentCommit(w http.ResponseWriter, r *http.Request) 
 	s.xaiCall(w, r, "x.ai/git/current_commit", gitRootParams(body.Cwd))
 }
 
+// handleGitRepoRoot — POST /api/git/repo-root {cwd} → x.ai/git/git_repo_root。
+// wire 键注意：agent 侧 GitRepoRequest 只有必填的 currentWorkingDirectory
+// （不是其它 git 方法用的 gitRoot）——发 gitRoot 会被 serde 判成缺字段，
+// home 空状态的「在新 worktree 中开始」门控于是永远拿到 -32602
+// "Invalid params"，入口恒为置灰。响应是 GitRepoResponse：仓库根
+// {"GitRepo":{"gitRoot":…}}，非仓库 "NotGitRepo"。
 func (s *Server) handleGitRepoRoot(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Cwd string `json:"cwd"`
@@ -213,7 +221,11 @@ func (s *Server) handleGitRepoRoot(w http.ResponseWriter, r *http.Request) {
 	if !readBody(w, r, &body) {
 		return
 	}
-	s.xaiCall(w, r, "x.ai/git/git_repo_root", gitRootParams(body.Cwd))
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	s.xaiCall(w, r, "x.ai/git/git_repo_root", map[string]any{"currentWorkingDirectory": body.Cwd})
 }
 
 func (s *Server) handlePRStatus(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +313,11 @@ func (s *Server) handleGitCheckoutSessionHead(w http.ResponseWriter, r *http.Req
 // handleWorktreeCreate — POST /api/git/worktree/create {sourcePath,
 // worktreePath?, copyMode?, gitRef?, copyIgnoredInBackground?,
 // ignoredSkipPatterns?, worktreeType?, label?} → 同名 wire 方法
-// （sessionId 必填 → 填活动会话；sourcePath 必填）。
+// （sourcePath 必填）。sessionId：有活动会话时回落活动会话；home 空状态
+// 场景没有会话，而 agent 侧 CreateWorktreeRequest.session_id 是 serde
+// 必填字段——给它一个唯一占位，避免 XaiCall 把空串解析成活动会话而
+// 404（该创建不需要真实会话：session_id 在 agent 侧只用于日志与进行中
+// 注册表）。
 func (s *Server) handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SourcePath              string   `json:"sourcePath"`
@@ -320,7 +336,15 @@ func (s *Server) handleWorktreeCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sourcePath"})
 		return
 	}
-	params := map[string]any{"sessionId": "", "sourcePath": body.SourcePath}
+	params := map[string]any{"sourcePath": body.SourcePath}
+	sid := ""
+	if info := s.bridge.SessionInfo(""); info != nil {
+		sid = info.SessionID
+	}
+	if sid == "" {
+		sid = fmt.Sprintf("nosession-%d", time.Now().UnixNano())
+	}
+	params["sessionId"] = sid
 	if body.WorktreePath != "" {
 		params["worktreePath"] = body.WorktreePath
 	}

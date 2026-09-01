@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -291,15 +292,202 @@ func TestSettingsUpdateRejectsUnknownAndEmpty(t *testing.T) {
 		t.Fatalf("empty: status = %d, want 400", rec.Code)
 	}
 
-	// Struct decode drops unknown keys; with nothing left → 400.
+	// Unknown keys get an explicit 400 up front (the struct decode would
+	// silently drop them and look like a successful no-op).
 	rec = postJSON(t, s, "/api/settings", `{"theme":"dark","yolo":true}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown-only: status = %d, want 400", rec.Code)
+	}
+	if m := decodeBody(t, rec); !strings.Contains(fmt.Sprint(m["error"]), "不允许的设置项") {
+		t.Fatalf("unknown-only: error = %v, want 不允许的设置项", m["error"])
 	}
 
 	rec = postJSON(t, s, "/api/settings", `{"permission_mode":"yolo"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad mode: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	rec = postJSON(t, s, "/api/settings", `{"follow_up_behavior":"yolo"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad follow_up_behavior: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// POST follow_up_behavior writes [ui].follow_up_behavior into config.toml,
+// the POST response echoes it back, and a subsequent GET returns it too
+// (the capsule's selected state comes from GET /api/settings).
+func TestSettingsUpdateFollowUpBehavior(t *testing.T) {
+	grok := withFakeGrokHome(t)
+	s := newLocalServer(t)
+	path := filepath.Join(grok, "config.toml")
+	os.WriteFile(path, []byte(`
+[ui]
+yolo = true
+theme = "dark"
+`), 0o644)
+
+	rec := postJSON(t, s, "/api/settings", `{"follow_up_behavior":"steer"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, body=%s", m["ok"], rec.Body.String())
+	}
+	ui, _ := m["ui"].(map[string]any)
+	if ui["follow_up_behavior"] != "steer" || ui["yolo"] != true || ui["theme"] != "dark" {
+		t.Fatalf("ui = %v, want follow_up_behavior steer with other keys preserved", m["ui"])
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `follow_up_behavior = "steer"`) {
+		t.Errorf("config.toml missing [ui].follow_up_behavior:\n%s", raw)
+	}
+
+	// GET回读：胶囊选中态的数据源。
+	rec = getJSON(t, s, "/api/settings")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if ui, _ = decodeBody(t, rec)["ui"].(map[string]any); ui["follow_up_behavior"] != "steer" {
+		t.Fatalf("GET ui = %v, want follow_up_behavior steer", ui)
+	}
+}
+
+// GET /api/settings exposes [toolset.ask_user_question] as the `toolset`
+// section but only the two timeout scalars — [toolset.bash] and the rest
+// of the subtree must not leak.
+func TestSettingsToolsetRead(t *testing.T) {
+	grok := withFakeGrokHome(t)
+	s := newLocalServer(t)
+	os.WriteFile(filepath.Join(grok, "config.toml"), []byte(`
+[ui]
+theme = "dark"
+
+[toolset.ask_user_question]
+timeout_enabled = true
+timeout_secs = 45
+secret_key = "nope"
+
+[toolset.bash]
+find_bfs = true
+`), 0o644)
+
+	rec := getJSON(t, s, "/api/settings")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	ts, _ := m["toolset"].(map[string]any)
+	aq, _ := ts["ask_user_question"].(map[string]any)
+	if aq["timeout_enabled"] != true || aq["timeout_secs"] != float64(45) {
+		t.Fatalf("toolset = %v, want only the two timeout scalars", m["toolset"])
+	}
+	if _, has := aq["secret_key"]; has {
+		t.Fatalf("toolset = %v, secret_key must be filtered", m["toolset"])
+	}
+	if _, has := ts["bash"]; has {
+		t.Fatalf("toolset = %v, [toolset.bash] must not leak", m["toolset"])
+	}
+	ui, _ := m["ui"].(map[string]any)
+	if ui["theme"] != "dark" {
+		t.Fatalf("ui = %v, want preserved", m["ui"])
+	}
+}
+
+// POST /api/settings writes [toolset.ask_user_question] timeout keys; the
+// POST response echoes the section and a subsequent GET reads it back.
+// Ill-typed / out-of-range / unknown values get a 400 before any write.
+func TestSettingsToolsetUpdate(t *testing.T) {
+	grok := withFakeGrokHome(t)
+	s := newLocalServer(t)
+	path := filepath.Join(grok, "config.toml")
+	os.WriteFile(path, []byte(`
+[ui]
+yolo = true
+theme = "dark"
+
+[toolset.bash]
+find_bfs = true
+`), 0o644)
+
+	rec := postJSON(t, s, "/api/settings", `{
+		"toolset": {
+			"ask_user_question": {
+				"timeout_enabled": true,
+				"timeout_secs": 45
+			}
+		}
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, body=%s", m["ok"], rec.Body.String())
+	}
+	aq, _ := m["toolset"].(map[string]any)["ask_user_question"].(map[string]any)
+	if aq["timeout_enabled"] != true || aq["timeout_secs"] != float64(45) {
+		t.Fatalf("response toolset = %v", m["toolset"])
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"timeout_enabled", "timeout_secs = 45", "find_bfs"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("config.toml missing %q:\n%s", want, raw)
+		}
+	}
+
+	rec = getJSON(t, s, "/api/settings")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", rec.Code)
+	}
+	aq, _ = decodeBody(t, rec)["toolset"].(map[string]any)["ask_user_question"].(map[string]any)
+	if aq["timeout_enabled"] != true || aq["timeout_secs"] != float64(45) {
+		t.Fatalf("GET toolset = %v", aq)
+	}
+
+	// Bad secs: negative / zero / over the 86400 ceiling / non-numeric.
+	for _, body := range []string{
+		`{"toolset":{"ask_user_question":{"timeout_secs":-5}}}`,
+		`{"toolset":{"ask_user_question":{"timeout_secs":0}}}`,
+		`{"toolset":{"ask_user_question":{"timeout_secs":86401}}}`,
+		`{"toolset":{"ask_user_question":{"timeout_secs":"30"}}}`,
+		`{"toolset":{"ask_user_question":{"timeout_secs":3.5}}}`,
+		`{"toolset":{"ask_user_question":{"timeout_enabled":"yes"}}}`,
+	} {
+		rec = postJSON(t, s, "/api/settings", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", body, rec.Code)
+		}
+		if m := decodeBody(t, rec); !strings.Contains(fmt.Sprint(m["error"]), "必须") {
+			t.Fatalf("%s: error = %v, want a Chinese rejection", body, m["error"])
+		}
+	}
+	// Unknown nested keys / sub-tables are rejected up front.
+	for _, body := range []string{
+		`{"toolset":{"ask_user_question":{"timeout":30}}}`,
+		`{"toolset":{"bash":{"find_bfs":false}}}`,
+		`{"toolset":42}`,
+		`{"toolset":{"ask_user_question":[]}}`,
+	} {
+		rec = postJSON(t, s, "/api/settings", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", body, rec.Code)
+		}
+	}
+	// Nothing was written by the failed attempts.
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "timeout = 30") {
+		t.Fatalf("config.toml must not contain rejected keys:\n%s", raw)
 	}
 }
 

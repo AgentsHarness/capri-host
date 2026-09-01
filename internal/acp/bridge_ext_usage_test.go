@@ -157,7 +157,7 @@ func TestUsageReportCountsRewindBranch(t *testing.T) {
 		envLine(100, usageTurnUpdate(1000, 100, 1100, 800, 0, 0, nil)),
 		userChunk(150, 1),
 		envLine(200, usageTurnUpdate(2000, 200, 2200, 1500, 0, 0, nil)), // 死分支
-		rewindMarkerLine(1),
+		rewindMarkerLine(225, 1),
 		userChunk(250, 2),
 		envLine(300, usageTurnUpdate(3000, 300, 3300, 2500, 0, 0, nil)),
 	}

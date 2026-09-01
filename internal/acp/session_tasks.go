@@ -41,8 +41,6 @@ const (
 	tagSchedCreated = `"sessionUpdate":"scheduled_task_created"`
 	tagSchedDeleted = `"sessionUpdate":"scheduled_task_deleted"`
 	tagSchedFired   = `"sessionUpdate":"scheduled_task_fired"`
-	tagRewind       = `"sessionUpdate":"rewind_marker"`
-	tagUserChunk    = `"sessionUpdate":"user_message_chunk"`
 )
 
 // Byte forms of the raw-tag pre-filters for the streaming scanner paths
@@ -54,11 +52,10 @@ var (
 	tagSchedCreatedB = []byte(tagSchedCreated)
 	tagSchedDeletedB = []byte(tagSchedDeleted)
 	tagSchedFiredB   = []byte(tagSchedFired)
-	tagRewindB       = []byte(tagRewind)
-	tagUserChunkB    = []byte(tagUserChunk)
 )
 
-// TaskEvent is one persisted task-lifecycle event, in file order. The
+// TaskEvent is one persisted task-lifecycle event, in rewind-surviving
+// sequence order (same view as msgSeq). The
 // fields mirror the wire update so the frontend can reuse its live
 // handlers (handleTaskBackgrounded / handleTaskCompleted) for replay.
 type TaskEvent struct {
@@ -177,88 +174,51 @@ func sessionUpdatesFile(grokHome, cwd, sessionID string) string {
 	return filepath.Join(dir, sessionID, "updates.jsonl")
 }
 
-// ── rewind dead-branch filtering ────────────────────────────────────────
-//
-// Mirrors the agent's filter_rewind_lines: lines after a rewind_marker
-// belong to a dead branch and are dropped until the target prompt run.
-// Skipped entirely (zero cost) when the file has no rewind markers.
-
-type rewindLine struct {
-	line        string
-	promptIndex *int64
-}
-
-func classifyRewindLine(line []byte) (isRewind bool, isUser bool, promptIdx *int64) {
-	switch {
-	case bytes.Contains(line, tagRewindB):
-		return true, false, nil
-	case bytes.Contains(line, tagUserChunkB):
-		idx := extractPromptIndex(line)
-		return false, true, idx
-	default:
-		return false, false, nil
+// SessionPlan 读取会话的 plan.md 正文（plan 模式产物，与 updates.jsonl 同
+// 目录；TUI 的 /view-plan 读的就是盘上这个文件）。ok=false = 还没有 plan
+// （文件不存在 / 目录定位不到 / sessionId 形状可疑）——不是错误，FE 据此
+// 显示空态。sessionId 参与路径拼接，这里挡掉分隔符与 .. 防越界。
+func (b *Bridge) SessionPlan(sessionID, cwd string) (string, bool) {
+	if sessionID == "" || cwd == "" ||
+		strings.ContainsAny(sessionID, `/\`) || strings.Contains(sessionID, "..") {
+		return "", false
 	}
-}
-
-// extractPromptIndex reads params._meta.promptIndex from a user chunk
-// envelope (best-effort).
-func extractPromptIndex(line []byte) *int64 {
-	// Fast path: the tag is absent — nothing to extract.
-	if !bytes.Contains(line, []byte(`"promptIndex"`)) {
-		return nil
+	dir := sessionsCwdDir(b.grokHome(), cwd)
+	if dir == "" {
+		return "", false
 	}
-	var env struct {
-		Params struct {
-			Meta map[string]json.RawMessage `json:"_meta"`
-		} `json:"params"`
+	raw, err := os.ReadFile(filepath.Join(dir, sessionID, "plan.md"))
+	if err != nil {
+		return "", false
 	}
-	if json.Unmarshal(line, &env) != nil {
-		return nil
-	}
-	raw, ok := env.Params.Meta["promptIndex"]
-	if !ok {
-		return nil
-	}
-	var idx int64
-	if json.Unmarshal(raw, &idx) != nil {
-		return nil
-	}
-	return &idx
-}
-
-// extractRewindTarget reads the rewind marker's target_prompt_index.
-func extractRewindTarget(line []byte) *int64 {
-	if !bytes.Contains(line, []byte(`"target_prompt_index"`)) {
-		return nil
-	}
-	var env struct {
-		Params struct {
-			Update map[string]json.RawMessage `json:"update"`
-		} `json:"params"`
-	}
-	if json.Unmarshal(line, &env) != nil {
-		return nil
-	}
-	raw, ok := env.Params.Update["target_prompt_index"]
-	if !ok {
-		return nil
-	}
-	var idx int64
-	if json.Unmarshal(raw, &idx) != nil {
-		return nil
-	}
-	return &idx
+	return string(raw), true
 }
 
 // ── event parsing ───────────────────────────────────────────────────────
 
 // parseTaskEvents scans a session's updates.jsonl and returns its
-// task-lifecycle events in file order (rewind dead branches filtered).
-// Streamed line-by-line with bufio.Scanner — no ReadFile + Split
-// double-copy of multi-hundred-MB files (the scanUsageFile pattern).
-// A line longer than maxUsageLineBytes falls back to the whole-file
-// path, which has no line-length limit.
+// task-lifecycle events on the rewind-surviving sequence (same
+// sessionLineView as msgSeq / 状态条回合数)。超长行走整文件兜底。
 func parseTaskEvents(path string) ([]TaskEvent, error) {
+	view, err := sessionLineView(path)
+	if err != nil {
+		return nil, err
+	}
+	want := survivingFileRanks(view)
+	byRank, err := collectTaskEventsByRank(path, want)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TaskEvent, 0, len(byRank))
+	for _, idx := range view.order {
+		if ev, ok := byRank[view.lines[idx].line]; ok {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
+func collectTaskEventsByRank(path string, want map[int]bool) (map[int]TaskEvent, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -266,86 +226,48 @@ func parseTaskEvents(path string) ([]TaskEvent, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
-	var filt rewindFilter
+	out := make(map[int]TaskEvent)
+	rank := 0
 	for sc.Scan() {
-		filt.feed(sc.Bytes())
+		line := sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if want[rank] {
+			if ev, ok := parseTaskEventLine(line); ok {
+				out[rank] = ev
+			}
+		}
+		rank++
 	}
 	if err := sc.Err(); err != nil {
 		if !errors.Is(err, bufio.ErrTooLong) {
 			return nil, err
 		}
-		return parseTaskEventsReadAll(path)
+		return collectTaskEventsByRankReadAll(path, want)
 	}
-	return filt.events, nil
+	return out, nil
 }
 
-// parseTaskEventsReadAll is the whole-file fallback for parseTaskEvents,
-// reached only when a single line exceeds maxUsageLineBytes. It feeds the
-// same rewindFilter as the streaming path — the truncation semantics live
-// in exactly one place.
-func parseTaskEventsReadAll(path string) ([]TaskEvent, error) {
+func collectTaskEventsByRankReadAll(path string, want map[int]bool) (map[int]TaskEvent, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var filt rewindFilter
+	out := make(map[int]TaskEvent)
+	rank := 0
 	for _, line := range strings.Split(string(raw), "\n") {
-		filt.feed([]byte(line))
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if want[rank] {
+			if ev, ok := parseTaskEventLine([]byte(line)); ok {
+				out[rank] = ev
+			}
+		}
+		rank++
 	}
-	return filt.events, nil
-}
-
-// rewindFilter keeps only the task events of live-branch lines (agent's
-// filter_rewind_lines semantics): lines are fed one at a time and the task
-// events of dead-branch lines (after a rewind_marker) are dropped. For a
-// file without rewind markers every line's events are kept unchanged. Only
-// the parsed events are retained (never the raw lines), so memory stays
-// proportional to the event count instead of the file size.
-type rewindFilter struct {
-	events   []TaskEvent
-	evStarts []int // len(events) at each user-message run start
-	inUser   bool
-	lastIdx  *int64
-}
-
-func (f *rewindFilter) feed(line []byte) {
-	isRewind, isUser, promptIdx := classifyRewindLine(line)
-	switch {
-	case isRewind:
-		target := 0
-		if idx := extractRewindTarget(line); idx != nil {
-			target = int(*idx)
-		}
-		// Truncate at the target prompt run's start. evStarts holds
-		// event counts (events is 1:1 with the live-branch lines, so the
-		// event index at a run start is exactly the count of events that
-		// preceded it).
-		trunc := len(f.events)
-		if target < len(f.evStarts) {
-			trunc = f.evStarts[target]
-		}
-		f.events = f.events[:trunc]
-		f.evStarts = f.evStarts[:min(target, len(f.evStarts))]
-		f.inUser = false
-	case isUser:
-		newRun := !f.inUser
-		if promptIdx != nil && f.lastIdx != nil && *promptIdx != *f.lastIdx {
-			newRun = true
-		}
-		if newRun {
-			f.evStarts = append(f.evStarts, len(f.events))
-		}
-		if ev, ok := parseTaskEventLine(line); ok {
-			f.events = append(f.events, ev)
-		}
-		f.inUser = true
-		f.lastIdx = promptIdx
-	default:
-		if ev, ok := parseTaskEventLine(line); ok {
-			f.events = append(f.events, ev)
-		}
-		f.inUser = false
-	}
+	return out, nil
 }
 
 // parseTaskEventLine parses one storage envelope if it carries a

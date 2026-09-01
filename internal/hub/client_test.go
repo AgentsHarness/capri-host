@@ -546,8 +546,9 @@ func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
 }
 
 // TestHostStatusIsControlFrame: host_status must be a control frame
-// {"v":1,"type":"host_status","ready":…} — no seq, not an events frame,
-// not in the replay buffer — so it cannot collide with bridge.Broadcast seq.
+// {"v":1,"type":"host_status","ready":…,"busy":…,"booting":…,"pendingCount":…}
+// — no seq, not an events frame, not in the replay buffer — so it cannot
+// collide with bridge.Broadcast seq.
 func TestHostStatusIsControlFrame(t *testing.T) {
 	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
 	c.sendCh = make(chan []byte, 4)
@@ -569,8 +570,10 @@ func TestHostStatusIsControlFrame(t *testing.T) {
 		if _, ok := f["events"]; ok {
 			t.Errorf("host_status must not be an events frame, payload=%s", payload)
 		}
-		if _, ok := f["ready"]; !ok {
-			t.Errorf("host_status missing ready: %s", payload)
+		for _, k := range []string{"ready", "busy", "booting", "pendingCount"} {
+			if _, ok := f[k]; !ok {
+				t.Errorf("host_status missing %s: %s", k, payload)
+			}
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no host_status frame")
@@ -642,6 +645,188 @@ func TestHostStatusIsControlFrame(t *testing.T) {
 			return
 		}
 	}
+}
+
+// statusBridge is a minimal bridgeSource for host_status tests: Snapshot
+// returns a Status the test mutates, and Subscribe hands back a channel
+// the test pushes events into.
+type statusBridge struct {
+	mu sync.Mutex
+	st acp.Status
+	ch chan acp.Event
+}
+
+func newStatusBridge() *statusBridge {
+	return &statusBridge{
+		st: acp.Status{Ready: true},
+		ch: make(chan acp.Event, 64),
+	}
+}
+
+func (b *statusBridge) Subscribe() (chan acp.Event, func()) {
+	return b.ch, func() {}
+}
+
+func (b *statusBridge) Snapshot() acp.Status {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.st
+}
+
+func (b *statusBridge) setBusy(v bool) {
+	b.mu.Lock()
+	b.st.Busy = v
+	b.mu.Unlock()
+}
+
+func (b *statusBridge) setPending(n int) {
+	b.mu.Lock()
+	b.st.PendingRequests = make([]acp.PendingReq, n)
+	b.mu.Unlock()
+}
+
+// TestMaybeNotifyHostStatus: a status change pushes a host_status frame
+// immediately (control plane — no seq, no browser-subscriber gate);
+// an unchanged status sends nothing.
+func TestMaybeNotifyHostStatus(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 4)
+	bridge := newStatusBridge()
+
+	// Baseline frame records the sent fields.
+	c.enqueueHostStatus(bridge)
+	select {
+	case <-c.sendCh:
+	case <-time.After(time.Second):
+		t.Fatal("no baseline host_status")
+	}
+
+	// Unchanged → silent.
+	c.maybeNotifyHostStatus(bridge)
+	select {
+	case payload := <-c.sendCh:
+		t.Fatalf("unchanged status must not resend, got %s", payload)
+	default:
+	}
+
+	// Busy flips → immediate frame with busy=true.
+	bridge.setBusy(true)
+	c.maybeNotifyHostStatus(bridge)
+	select {
+	case payload := <-c.sendCh:
+		var f map[string]any
+		if json.Unmarshal(payload, &f) != nil {
+			t.Fatalf("bad frame: %s", payload)
+		}
+		if f["type"] != "host_status" || f["busy"] != true {
+			t.Errorf("frame = %v, want host_status busy=true", f)
+		}
+		if _, ok := f["seq"]; ok {
+			t.Errorf("host_status must not carry seq: %s", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no host_status on busy flip")
+	}
+
+	// Busy → idle again → another immediate frame.
+	bridge.setBusy(false)
+	c.maybeNotifyHostStatus(bridge)
+	select {
+	case payload := <-c.sendCh:
+		var f map[string]any
+		if json.Unmarshal(payload, &f) != nil {
+			t.Fatalf("bad frame: %s", payload)
+		}
+		if f["busy"] != false {
+			t.Errorf("frame = %v, want busy=false", f)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no host_status on idle flip")
+	}
+
+	// Unchanged again → silent.
+	c.maybeNotifyHostStatus(bridge)
+	select {
+	case payload := <-c.sendCh:
+		t.Fatalf("unchanged status must not resend, got %s", payload)
+	default:
+	}
+}
+
+// TestMaybeNotifyHostStatusPendingCount: pendingCount flips also push an
+// immediate host_status frame.
+func TestMaybeNotifyHostStatusPendingCount(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 4)
+	bridge := newStatusBridge()
+
+	c.enqueueHostStatus(bridge)
+	select {
+	case <-c.sendCh:
+	case <-time.After(time.Second):
+		t.Fatal("no baseline host_status")
+	}
+
+	bridge.setPending(2)
+	c.maybeNotifyHostStatus(bridge)
+	select {
+	case payload := <-c.sendCh:
+		var f map[string]any
+		if json.Unmarshal(payload, &f) != nil {
+			t.Fatalf("bad frame: %s", payload)
+		}
+		if got, ok := f["pendingCount"].(float64); !ok || int(got) != 2 {
+			t.Errorf("frame = %v, want pendingCount=2", f)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no host_status on pendingCount flip")
+	}
+}
+
+// TestForwardLoopNotifiesHostStatus: a busy event in the forward loop
+// pushes an immediate host_status frame even while event upload is paused
+// (control frames are not gated on browser subscribers); a chunk event
+// does not.
+func TestForwardLoopNotifiesHostStatus(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 8)
+	c.setBrowserSubscribers(0) // paused upload — control frames must still flow
+	bridge := newStatusBridge()
+	evCh, _ := bridge.Subscribe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.forwardLoop(ctx, bridge)
+
+	// Chunk traffic must not trigger a status frame.
+	evCh <- acp.Event{"type": "chunk", "text": "x", "sessionId": "s1"}
+	select {
+	case payload := <-c.sendCh:
+		t.Fatalf("chunk must not push host_status, got %s", payload)
+	case <-time.After(120 * time.Millisecond):
+		// expected (flush window passed)
+	}
+
+	// Busy transition → immediate host_status with busy=true.
+	bridge.setBusy(true)
+	evCh <- acp.Event{"type": "busy", "sessionId": "s1"}
+	select {
+	case payload := <-c.sendCh:
+		var f map[string]any
+		if json.Unmarshal(payload, &f) != nil {
+			t.Fatalf("bad frame: %s", payload)
+		}
+		if f["type"] != "host_status" || f["busy"] != true {
+			t.Errorf("frame = %v, want host_status busy=true", f)
+		}
+		if _, ok := f["seq"]; ok {
+			t.Errorf("host_status must not carry seq: %s", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no host_status on busy event")
+	}
+
+	cancel()
 }
 
 // TestPausedStillReplaysOnResume: while browser subscribers are 0, bridge

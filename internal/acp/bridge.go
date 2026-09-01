@@ -1335,7 +1335,7 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 //   - agentTimestampMs → ev["agentTimestampMs"]: authoritative send time
 //     (user_chunk echoes fix the optimistic user row's ts with it).
 //   - eventId → ev["eventId"]: agent 事件 id（"{sessionId}-{N}"）提升为
-//     事件顶层，FE 用它做 live↔快照接缝去重（msgSeq 契约）；params._meta
+//     事件顶层（透传，不当 live↔快照主键；N 会撞车）。params._meta
 //     无该键时不带（absent key ≠ off）。
 //   - agentTimestampMs - streamStartMs → ev["elapsedMs"]: real thought
 //     duration (live thought blocks otherwise seal against the local
@@ -3552,6 +3552,24 @@ type UpdatesPage struct {
 	TotalCount   int   `json:"totalCount"`
 	HasMore      bool  `json:"hasMore"`
 	PromptStarts []int `json:"promptStarts,omitempty"`
+	// Btw：/btw 侧问回放记录（btw_history.jsonl；只在本地归一化路径可用，
+	// agent 透传路径不带）。不占 msgSeq 空间，分页游标不受影响。
+	Btw []SessionBtw `json:"btw,omitempty"`
+}
+
+// SessionBtw 是一条 /btw 侧问的回放记录，由 host 从 agent 落盘的
+// btw_history.jsonl（xai-grok-shell persistence::BtwEntry，camelCase）读出。
+// AfterMsgSeq 是时间线插入锚点：askedAt 之前最近一条信封的 msgSeq；-1 =
+// 早于全部信封（置顶）。FE 按「msgSeq ≤ 锚点的最后一条之后」拼接。
+type SessionBtw struct {
+	BtwSessionId string `json:"btwSessionId"`
+	AskedAt      int64  `json:"askedAt"` // epoch ms
+	Question     string `json:"question"`
+	Answer       string `json:"answer,omitempty"`
+	Err          string `json:"error,omitempty"`
+	Success      bool   `json:"success"`
+	Model        string `json:"model,omitempty"`
+	AfterMsgSeq  int    `json:"afterMsgSeq"`
 }
 
 // SessionUpdatesOpts carries the optional x.ai/session/updates request
@@ -3574,10 +3592,11 @@ type SessionUpdatesOpts struct {
 // params}.
 //
 // 本地归一化优先（msgSeq 契约，见 session_history.go）：会话文件可读且
-// 全部信封带 params._meta.agentTimestampMs 时，从归一化视图分页服务——
-// turnIndex/offset/limit 在 msgSeq 空间解释，每条 update 顶层带 msgSeq，
-// promptStarts 由 host 重算，totalCount = 归一化条数。回退路径（文件
-// 不可读 / 任一信封缺 agentTimestampMs）走既有 agent
+// 至少一条信封带 params._meta.agentTimestampMs 时，从归一化视图分页
+// 服务——排序键 (agentTimestampMs, 文件行号)，不读 eventId；turnIndex/
+// offset/limit 在 msgSeq 空间解释，每条 update 顶层带 msgSeq，promptStarts
+// 由 host 按 UserRunTurnTracker 重算，totalCount = 归一化条数。回退路径
+// （文件不可读 / 没有任何带时间戳的信封）走既有 agent
 // `_x.ai/session/updates` 透传（响应无 msgSeq、promptStarts 原样），
 // 两条路径互斥、按会话内容自动选择。stream=true 路径不改（agent 以
 // chunked 通知推流，本地分页无法替代）。
@@ -3587,9 +3606,13 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 		o = opts[0]
 	}
 	if !o.Stream {
-		if page, ok := b.localUpdatesPage(sessionID, cwd, o); ok {
+		page, err := b.localUpdatesPage(sessionID, cwd, o)
+		if err == nil {
 			log.Printf("[capri-host] session updates served locally (msgSeq total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
 			return page, nil
+		}
+		if !errors.Is(err, errLocalHistoryUnavailable) {
+			return UpdatesPage{}, err
 		}
 	}
 	if err := b.Boot(ctx); err != nil {
@@ -3718,17 +3741,33 @@ func probeWorktree(cwd string) (bool, string) {
 	if main, ok := grokMarkerMainRepo(cwd); ok {
 		return true, shortenHome(main)
 	}
-	gitDir := runGit(cwd, "rev-parse", "--git-dir")
-	commonDir := runGit(cwd, "rev-parse", "--git-common-dir")
+	// rev-parse 的这两个输出可能一个是绝对路径、一个是相对 cwd 的（在主仓库的
+	// 子目录里查询时 git 就是这么给的），直接比字符串会把「主仓库的子目录」误判
+	// 成 linked worktree——先各自规范化成绝对路径再比。
+	gitDir := absFromCwd(cwd, runGit(cwd, "rev-parse", "--git-dir"))
+	commonDir := absFromCwd(cwd, runGit(cwd, "rev-parse", "--git-common-dir"))
 	if gitDir == "" || commonDir == "" || gitDir == commonDir {
 		return false, ""
 	}
-	abs := commonDir
-	if !filepath.IsAbs(abs) {
-		abs = filepath.Join(cwd, commonDir)
+	return true, shortenHome(filepath.Dir(commonDir))
+}
+
+// absFromCwd normalizes a path printed by git (which may be relative to the
+// query cwd) into an absolute, symlink-resolved path so two of them can be
+// compared. macOS resolves /var → /private/var, so without EvalSymlinks the
+// absolute form and the cwd-relative form of the same `.git` still differ.
+func absFromCwd(cwd, p string) string {
+	if p == "" {
+		return ""
 	}
-	abs = filepath.Clean(abs)
-	return true, shortenHome(filepath.Dir(abs))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(cwd, p)
+	}
+	p = filepath.Clean(p)
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
 }
 
 // grokMarkerMainRepo walks up from cwd looking for a `.git` directory that

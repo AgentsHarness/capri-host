@@ -47,6 +47,7 @@ type sessionAPI interface {
 	RenameSession(ctx context.Context, sessionID, title string) (map[string]any, error)
 	ForkSession(ctx context.Context, sessionID string, params map[string]any) (map[string]any, error)
 	SessionInfo(sessionID string) *acp.SessionInfoDetail
+	SessionPlan(sessionID, cwd string) (string, bool)
 	SessionLoadHistory(ctx context.Context, beforeID string) (map[string]any, error)
 	SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...acp.SessionUpdatesOpts) (acp.UpdatesPage, error)
 	SessionRunningTasks(sessionID, cwd string) ([]acp.TaskEvent, error)
@@ -117,6 +118,7 @@ type miscAPI interface {
 	MemoryFlush(ctx context.Context, sessionID string) (map[string]any, error)
 	MemoryRewrite(ctx context.Context, sessionID, rawText, contextSummary string) (map[string]any, error)
 	SetUiSettings(patch map[string]any) error
+	SetToolsetSettings(patch map[string]any) error
 	DismissModelDefaultCampaigns(ctx context.Context) error
 	ConfigTOMLPath() (string, error)
 }
