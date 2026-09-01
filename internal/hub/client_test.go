@@ -1238,10 +1238,10 @@ func TestEnqueueReplaySurvivesFullQueue(t *testing.T) {
 	}
 }
 
-// TestRelayRejectsOversizedLocalResponse: a local API response over 16MB
-// must be answered with an explicit error instead of being silently
-// truncated (a 16MB+ respond frame would exceed the hub read limit and
-// kill the whole connection).
+// TestRelayRejectsOversizedLocalResponse: a local API response over
+// maxRelayResponseBytes must be answered with an explicit error instead of
+// being silently truncated (an over-limit respond frame would exceed the
+// hub's read limit and kill the whole connection).
 func TestRelayRejectsOversizedLocalResponse(t *testing.T) {
 	fh := newFakeHub(t)
 	fh.streamFrames = []string{
@@ -1251,7 +1251,7 @@ func TestRelayRejectsOversizedLocalResponse(t *testing.T) {
 	ts := httptest.NewServer(fh.handler())
 	defer ts.Close()
 
-	big := strings.Repeat("z", 16<<20+10)
+	big := strings.Repeat("z", maxRelayResponseBytes+10)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeTestJSON(w, 200, map[string]any{"ok": true, "data": big})
 	}))
@@ -1279,6 +1279,37 @@ func TestRelayRejectsOversizedLocalResponse(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no respond for oversized relay")
+	}
+}
+
+// TestRelayResponseWriterSharesCeiling: the in-process relay (the production
+// path — LocalBase is empty, so the hub request is served by c.local) must
+// use the SAME ceiling as the loopback fallback below it. A second literal
+// here is how it drifted to 16MB while the fallback moved to 28MB, which
+// turned every 16–28MB detail=full history page into a 502 on a real hub.
+func TestRelayResponseWriterSharesCeiling(t *testing.T) {
+	chunk := bytes.Repeat([]byte("y"), 1<<20)
+	w := &relayResponseWriter{hdr: http.Header{}}
+	for i := 0; i < maxRelayResponseBytes>>20; i++ {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if w.truncated {
+			t.Fatalf("truncated at %d MiB, want the full %d MiB through", i+1, maxRelayResponseBytes>>20)
+		}
+	}
+	if w.buf.Len() != maxRelayResponseBytes {
+		t.Fatalf("buffered %d bytes, want %d", w.buf.Len(), maxRelayResponseBytes)
+	}
+	if _, err := w.Write(chunk); err != nil {
+		t.Fatalf("oversized write: %v", err)
+	}
+	if !w.truncated {
+		t.Fatal("no truncation one MiB past the ceiling")
+	}
+	// Once truncated, the handler must still be able to finish writing.
+	if n, err := w.Write(chunk); err != nil || n != len(chunk) {
+		t.Fatalf("post-truncate write = (%d, %v), want swallowed", n, err)
 	}
 }
 
