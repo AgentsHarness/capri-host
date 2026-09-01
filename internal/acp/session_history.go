@@ -557,6 +557,7 @@ func btwWindowRecords(grokHome, cwd, sessionID string, view *normalizedHistory, 
 // 优先）。msgSeq 空间即「回退死分支被截断后的存活序列」（见
 // filterRewindBranch），totalCount / promptStarts 同处该空间。每条 update
 // 顶层带 msgSeq；promptStarts 由 host 重算；totalCount = 存活条数。
+// opts.Detail == meta 时只算窗口与锚点、不读信封（见 lite.go）。
 func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts) (UpdatesPage, error) {
 	path := sessionUpdatesFile(b.grokHome(), cwd, sessionID)
 	if path == "" {
@@ -612,25 +613,30 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 	}
 
 	// 只从文件现读窗口内的信封行（缓存只存元数据）：msgSeq → 行名次。
-	want := make(map[int]bool, end-start)
-	for seq := start; seq < end; seq++ {
-		want[view.lines[view.order[seq]].line] = true
-	}
-	envs, err := readEnvelopesByRank(path, want)
-	if err != nil {
-		return UpdatesPage{}, fmt.Errorf("%w: %v", errLocalHistoryRead, err)
-	}
-	updates := make([]any, 0, end-start)
-	for seq := start; seq < end; seq++ {
-		env := envs[view.lines[view.order[seq]].line]
-		obj, ok := env.(map[string]any)
-		if !ok {
-			// 窗口内有行读不出来（文件在 stat 与读取之间被截断等）。
-			// 已经在 msgSeq 空间：报错，绝不透传换空间。
-			return UpdatesPage{}, fmt.Errorf("%w: missing envelope at msgSeq %d", errLocalHistoryRead, seq)
+	// meta 档（契约 [A]）只要锚点，窗口与计数已在 msgSeq 空间算出，一行
+	// 信封都不必读盘。
+	var updates []any
+	if opts.Detail != DetailMeta {
+		want := make(map[int]bool, end-start)
+		for seq := start; seq < end; seq++ {
+			want[view.lines[view.order[seq]].line] = true
 		}
-		obj["msgSeq"] = seq
-		updates = append(updates, obj)
+		envs, err := readEnvelopesByRank(path, want)
+		if err != nil {
+			return UpdatesPage{}, fmt.Errorf("%w: %v", errLocalHistoryRead, err)
+		}
+		updates = make([]any, 0, end-start)
+		for seq := start; seq < end; seq++ {
+			env := envs[view.lines[view.order[seq]].line]
+			obj, ok := env.(map[string]any)
+			if !ok {
+				// 窗口内有行读不出来（文件在 stat 与读取之间被截断等）。
+				// 已经在 msgSeq 空间：报错，绝不透传换空间。
+				return UpdatesPage{}, fmt.Errorf("%w: missing envelope at msgSeq %d", errLocalHistoryRead, seq)
+			}
+			obj["msgSeq"] = seq
+			updates = append(updates, obj)
+		}
 	}
 	return UpdatesPage{
 		Updates:      updates,

@@ -793,6 +793,10 @@ type sessionUpdatesBody struct {
 	Stream    bool `json:"stream,omitempty"`
 	ChunkSize *int `json:"chunkSize,omitempty"`
 	TurnIndex *int `json:"turnIndex,omitempty"`
+	// detail 是历史页的响应投影档位（契约 lite-replay [A]，见
+	// acp/lite.go）："lite" 只裁工具正文，"meta" 只回分页锚点，
+	// "full"/缺省/未知值 = 信封逐字节原样。
+	Detail string `json:"detail,omitempty"`
 }
 
 // handleSessionUpdates fetches a session's stored updates (message history)
@@ -808,7 +812,7 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
 		return
 	}
-	opts := acp.SessionUpdatesOpts{Offset: body.Offset, Limit: body.Limit, Stream: body.Stream}
+	opts := acp.SessionUpdatesOpts{Offset: body.Offset, Limit: body.Limit, Stream: body.Stream, Detail: body.Detail}
 	if body.ChunkSize != nil {
 		opts.ChunkSize = body.ChunkSize
 	}
@@ -825,7 +829,17 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		"sessionId":  body.SessionID,
 		"totalCount": page.TotalCount,
 		"hasMore":    page.HasMore,
-		"updates":    page.Updates,
+	}
+	// 能力回显（契约 [B]）：projected/omittedBytes 只在投影真正生效时带，
+	// 旧 host 不带该键 → FE 判定不支持 lite。meta 档省略 updates 键本身
+	// （而不是回空数组）——FE 要能区分「没回信封」与「会话没有历史」。
+	// detail 为 full/缺省/未知值时这两条分支都不进，响应与今天逐字节一致。
+	if page.Projected != acp.DetailMeta {
+		out["updates"] = page.Updates
+	}
+	if page.Projected != "" {
+		out["projected"] = page.Projected
+		out["omittedBytes"] = page.OmittedBytes
 	}
 	// promptStarts: pass through so FE can page history one user-turn at a
 	// time (see chat.ts previousTurnWindow). Omit when empty — older agents
