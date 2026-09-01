@@ -25,6 +25,21 @@ const (
 	bootTimeout     = 2 * time.Minute
 	approvalTimeout = 15 * time.Minute
 	protocolVersion = 1
+	// turnStaleAfter bounds how long an agent-observed turn may stay open
+	// with no update at all for that session. Only the observed leg of Busy
+	// is subject to it: a session/prompt this host sent stays busy for the
+	// whole promptTimeout regardless. Silent-but-alive gaps longer than this
+	// (a single 40-minute tool call with no updates) are indistinguishable
+	// from a turn whose terminal update was lost, so the observed turn is
+	// dropped and the session re-opens on the next update it emits.
+	turnStaleAfter = 30 * time.Minute
+	// turnLivenessWindow is how recently an update must have arrived for the
+	// host to treat "the agent is still working" as proven. The prompt
+	// budget (promptTimeout) expiring on a session inside this window says
+	// nothing about the turn, so the failure is kept out of the event stream
+	// (see reportPromptFailure); outside it, a wedged agent must still
+	// surface as an error.
+	turnLivenessWindow = 5 * time.Minute
 )
 
 // Bridge owns one grok agent stdio process and manages multiple ACP
@@ -88,6 +103,17 @@ type Bridge struct {
 	// sessionId, with host-side live state (busy / awaiting input).
 	sessions        map[string]*SessionState
 	activeSessionID string
+
+	// turns is the agent-observed turn state per session, keyed by
+	// sessionId: the update stream says "a turn is in flight for this
+	// session" until turn_completed / response_completed says otherwise.
+	// It is the second leg of SessionState.Busy — busyCount alone only
+	// counts session/prompt calls this host process made and stops
+	// counting when that RPC dies (the 30-minute promptTimeout among
+	// them), which left sessions that were still working reported as idle.
+	// It also covers sessions the agent lists but this process never
+	// created/loaded, and turns started by another client. b.mu protects it.
+	turns map[string]*observedTurn
 
 	// queueSnapshots caches the most recent x.ai/queue/changed params per
 	// session (sessionId → params). The agent's prompt queue is in-memory
@@ -195,6 +221,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		hostName:      cfg.HostName,
 		homeDir:       homeDir,
 		sessions:      make(map[string]*SessionState),
+		turns:         make(map[string]*observedTurn),
 		bootDone:      make(chan struct{}),
 		genRate:       newGenRateTracker(),
 		usageLastUsed: make(map[string]int64),
@@ -329,6 +356,187 @@ func (b *Bridge) Broadcast(ev Event) {
 
 // ── roster helpers ────────────────────────────────────────────────
 
+// openTurnLocked arms the agent-observed turn for sid at now (unix ms).
+// Callers hold b.mu.
+func (b *Bridge) openTurnLocked(sid string, now int64) {
+	if sid == "" {
+		return
+	}
+	if b.turns == nil {
+		b.turns = make(map[string]*observedTurn)
+	}
+	w := b.turns[sid]
+	if w == nil {
+		w = &observedTurn{}
+		b.turns[sid] = w
+	}
+	w.open = true
+	w.seenAt = now
+}
+
+// closeTurnLocked disarms the agent-observed turn for sid, keeping the
+// last-activity stamp for the session-list report. Callers hold b.mu.
+func (b *Bridge) closeTurnLocked(sid string) {
+	if w := b.turns[sid]; w != nil {
+		w.open = false
+	}
+}
+
+// syncBusyLocked re-projects a roster session's Busy from the two legs the
+// host can observe — its own in-flight session/prompt count and the
+// agent-observed turn — and reports whether the flag flipped (the caller
+// announces the change). Callers hold b.mu.
+func (b *Bridge) syncBusyLocked(s *SessionState) bool {
+	w := b.turns[s.SessionID]
+	busy := s.busyCount > 0 || (w != nil && w.open)
+	if s.Busy == busy {
+		return false
+	}
+	s.Busy = busy
+	return true
+}
+
+// noteTurnActivity records that the agent is working on a turn for sid: it
+// opens the observed turn, refreshes LastActiveAt and re-projects Busy.
+//
+// Called from the event stream on every turn-scoped update, so it must stay
+// lock-cheap and broadcast only on the idle→busy / busy→idle flip (a flip
+// happens at most once per turn; the update itself is never re-broadcast).
+// No `busy` event is synthesized here: that event means "this frontend's
+// turn started" (it arms the Waiting-for-response window), and a turn the
+// host did not drive is already rendered from its own chunk/tool updates.
+// Clients learn the new badge from sessions_changed + the next list fetch.
+func (b *Bridge) noteTurnActivity(sid string) {
+	if sid == "" {
+		return
+	}
+	now := time.Now().UnixMilli()
+	b.mu.Lock()
+	b.openTurnLocked(sid, now)
+	flipped := false
+	if s := b.sessions[sid]; s != nil {
+		if now > s.LastActiveAt {
+			s.LastActiveAt = now
+		}
+		flipped = b.syncBusyLocked(s)
+	}
+	b.mu.Unlock()
+	if flipped {
+		b.broadcastRosterChange()
+	}
+}
+
+// noteTurnEnd clears the agent-observed turn for sid (the agent reported
+// turn_completed / response_completed, or a turn the host drove came to a
+// definitive end) and re-projects Busy. See noteTurnActivity for the
+// broadcast discipline.
+func (b *Bridge) noteTurnEnd(sid string) {
+	if sid == "" {
+		return
+	}
+	b.mu.Lock()
+	b.closeTurnLocked(sid)
+	flipped := false
+	if s := b.sessions[sid]; s != nil {
+		flipped = b.syncBusyLocked(s)
+	}
+	b.mu.Unlock()
+	if flipped {
+		b.broadcastRosterChange()
+	}
+}
+
+// settleTurnsLocked drops observed turns that have gone silent for longer
+// than turnStaleAfter without ever reporting a terminal update, so a lost
+// update cannot pin a finished session to "active" forever (turns the host
+// drives with a prompt in flight are never touched by the observed leg's
+// expiry — busyCount keeps them busy on its own). Awaiting-input turns are
+// exempt: the agent is legitimately silent while it waits for the user.
+// Stale closed entries are pruned to keep the map bounded. Reports whether
+// any session's Busy flipped; the caller broadcasts once. Callers hold b.mu.
+func (b *Bridge) settleTurnsLocked(now int64) bool {
+	changed := false
+	for sid, w := range b.turns {
+		age := now - w.seenAt
+		if !w.open {
+			if age > turnStaleAfter.Milliseconds() {
+				delete(b.turns, sid)
+			}
+			continue
+		}
+		if age <= turnStaleAfter.Milliseconds() {
+			continue
+		}
+		s := b.sessions[sid]
+		if s != nil && s.AwaitingInput {
+			continue
+		}
+		w.open = false
+		if s != nil && b.syncBusyLocked(s) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// turnEvidenceKinds are the sessionUpdate kinds that prove the agent is
+// executing a turn: they arm the observed leg of Busy, which
+// turn_completed / response_completed then clears.
+//
+// Deliberately a whitelist rather than "everything except the terminal
+// kinds": a false "active" is sticky (only a terminal update or the
+// turnStaleAfter expiry clears it) while a false "idle" self-heals on the
+// next update, so only kinds that cannot arrive outside a running turn are
+// admitted. Excluded on purpose: session metadata (title / modes / config /
+// commands / model switches — those fire while a session sits idle),
+// usage_update (it also rides along at turn end), the background-task and
+// monitor rails (a backgrounded shell can finish long after its turn did),
+// and subagent_finished (a detached subagent can report after its parent
+// turn ended).
+var turnEvidenceKinds = map[string]bool{
+	"agent_message_chunk":     true,
+	"agent_thought_chunk":     true,
+	"user_message_chunk":      true,
+	"tool_call":               true,
+	"tool_call_update":        true,
+	"tool_call_delta_chunk":   true,
+	"plan":                    true,
+	"plan_update":             true,
+	"diff_review":             true,
+	"retry_state":             true,
+	"response_started":        true,
+	"reasoning_completed":     true,
+	"pending_interaction":     true,
+	"interaction_resolved":    true,
+	"subagent_spawned":        true,
+	"subagent_progress":       true,
+	"workflow_updated":        true,
+	"goal_updated":            true,
+	"scheduled_task_fired":    true,
+	"auto_compact_started":    true,
+	"auto_compact_completed":  true,
+	"auto_compact_failed":     true,
+	"auto_compact_cancelled":  true,
+	"auto_continue_completed": true,
+	"memory_flush_started":    true,
+	"memory_flush_completed":  true,
+}
+
+// observeUpdateKind maintains the observed turn from one sessionUpdate kind:
+// execution evidence opens it, a terminal kind closes it. Unknown/unmodelled
+// kinds are ignored — a future kind does not get to decide session state
+// until it is classified here.
+func (b *Bridge) observeUpdateKind(sid, kind string) {
+	switch kind {
+	case "turn_completed", "response_completed":
+		b.noteTurnEnd(sid)
+	default:
+		if turnEvidenceKinds[kind] {
+			b.noteTurnActivity(sid)
+		}
+	}
+}
+
 // activeSession returns the current active session (nil if none).
 // Callers must hold b.mu.
 func (b *Bridge) activeSessionLocked() *SessionState {
@@ -344,8 +552,8 @@ func (b *Bridge) broadcastRosterChange() {
 	b.Broadcast(Event{kType: "sessions_changed", kParams: map[string]any{}})
 }
 
-// releaseBusy drops one in-flight prompt's claim on a session and, when
-// the LAST in-flight turn finished, flips the session idle and notifies
+// releaseBusy drops one in-flight prompt's claim on a session and, when that
+// leaves the session with nothing in flight, flips it idle and notifies
 // clients (busy → idle transition only — a turn that resolves while a
 // sibling is still running must not report an idle the session never
 // had). It only releases when the roster still holds the SAME session
@@ -353,31 +561,56 @@ func (b *Bridge) broadcastRosterChange() {
 // (and a user-requested restart may restore the session), so a stale
 // turn must not clear the busy flag of a newer turn on the restored
 // session.
-func (b *Bridge) releaseBusy(s *SessionState, sessionID string) {
+//
+// turnEnded says whether the agent actually finished the turn: a prompt that
+// was answered (with a result or with an agent-side JSON-RPC error — the
+// agent answers session/prompt at turn end) did, as did one the host itself
+// aborted (client disconnect → session/cancel) or never delivered. A plain
+// transport failure did not — on the 30-minute promptTimeout of a long turn
+// the agent is usually still working, so the observed turn stays armed and
+// Busy keeps following the update stream instead of falsely reporting idle
+// for the rest of that turn.
+func (b *Bridge) releaseBusy(s *SessionState, sessionID string, turnEnded bool) {
 	b.mu.Lock()
-	last := false
+	changed := false
 	if cur := b.sessions[sessionID]; cur == s && s.busyCount > 0 {
 		s.busyCount--
-		if s.busyCount == 0 {
-			s.Busy = false
-			last = true
+		if turnEnded {
+			b.closeTurnLocked(sessionID)
 		}
+		changed = b.syncBusyLocked(s)
 	}
 	b.mu.Unlock()
-	if last {
+	if changed {
 		b.broadcastRosterChange()
 	}
 }
 
 // setSessionAwaiting flips a session's awaiting-input state (pending
-// permission / x.ai question) and notifies clients on transition.
+// permission / x.ai question) and notifies clients on transition. A pending
+// interaction is itself proof that a turn is in flight — and State() only
+// reports "awaiting" while the session is busy — so flipping to true also
+// arms the observed turn and refreshes LastActiveAt, which a turn the host
+// no longer tracks with a prompt would otherwise lose.
 func (b *Bridge) setSessionAwaiting(id string, awaiting bool) {
+	now := time.Now().UnixMilli()
 	b.mu.Lock()
 	s := b.sessions[id]
 	changed := false
 	if s != nil && s.AwaitingInput != awaiting {
 		s.AwaitingInput = awaiting
 		changed = true
+	}
+	if awaiting {
+		b.openTurnLocked(id, now)
+		if s != nil {
+			if now > s.LastActiveAt {
+				s.LastActiveAt = now
+			}
+			if b.syncBusyLocked(s) {
+				changed = true
+			}
+		}
 	}
 	b.mu.Unlock()
 	if changed {
@@ -453,6 +686,11 @@ func cloneAny(v any) any {
 func (b *Bridge) Snapshot() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// Read-time settle: hello / /api-status roster rows and the enriched
+	// session/list must agree about which observed turns already went stale.
+	// No sessions_changed here — the push rides on the ListSessions settle,
+	// and every client that reads this snapshot gets the fresh value anyway.
+	b.settleTurnsLocked(time.Now().UnixMilli())
 	var pending []PendingReq
 	b.clientReqs.Range(func(key, value any) bool {
 		cr := value.(*clientRequest)
@@ -1373,6 +1611,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		return false
 	}
 	kind, _ := update[kSessionUpdate].(string)
+	// 回合观察（Busy 的观察腿）：两个载体（官方 session/update 与
+	// x.ai/session_notification）都经过这里，是唯一收口点。
+	b.observeUpdateKind(sid, kind)
 	// meta 保全：params._meta 非空时随 typed kind 事件携带。
 	var kindMeta any
 	if m, ok := params[kMeta].(map[string]any); ok && len(m) > 0 {
@@ -2457,10 +2698,16 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	// in flight" projection via busyCount — an overlapping prompt must not
 	// let the first resolver flip the session idle while the second is
 	// still running.
+	//
+	// A prompt this host sends starts an agent turn, so the observed leg is
+	// armed too: both legs then agree, and the release at promptTimeout
+	// cannot strand a still-working session in "idle" (the update stream
+	// keeps the turn open until turn_completed).
 	first := s.busyCount == 0
 	s.busyCount++
-	s.Busy = true
 	s.LastActiveAt = time.Now().UnixMilli()
+	b.openTurnLocked(sessionID, s.LastActiveAt)
+	b.syncBusyLocked(s)
 	// Keep last-session pointer fresh even if the user only talks to this
 	// session without re-loading it (multi-session focus via prompt).
 	b.rememberSessionLocked(sessionID, s.Cwd)
@@ -2472,11 +2719,18 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		b.Broadcast(Event{kType: "busy", kSessionID: sessionID})
 	}
 
+	// turnEnded records whether the agent actually finished this turn. It
+	// stays false on transport failures (timeout / write error / process
+	// death), where the agent may still be working.
+	turnEnded := false
 	defer func() {
-		b.releaseBusy(s, sessionID)
+		b.releaseBusy(s, sessionID, turnEnded)
 	}()
 
 	if err := b.ensureBooted(ctx); err != nil {
+		// The prompt never reached the agent — this turn does not exist, so
+		// release both legs instead of leaving a phantom running session.
+		turnEnded = true
 		return "", nil, err
 	}
 
@@ -2498,7 +2752,9 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 	res, err := b.request(ctx, "session/prompt", params, promptTimeout)
 	if err != nil {
-		b.broadcastPromptError(sessionID, err)
+		// 错误要不要上事件流、怎么留痕，由 reportPromptFailure 判定：回合
+		// 还在正常输出时，prompt 预算耗尽不是回合失败。
+		b.reportPromptFailure(sessionID, err)
 		// The client (browser) went away mid-turn. The agent process may be
 		// perfectly healthy — and other sessions may be running parallel
 		// turns in the same process — so nothing is killed or cancelled
@@ -2508,23 +2764,31 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		if errors.Is(err, context.Canceled) {
 			b.Cancel(sessionID)
 			b.Broadcast(Event{kType: "status", kText: "连接已断开，本次回复已取消，请重新发送", kSessionID: sessionID})
+			// The host just ordered this turn cancelled, so it stops
+			// claiming the session is working. If the agent keeps streaming
+			// anyway, its next update re-arms the observed turn — closing
+			// here cannot hide a live session for longer than one update.
+			turnEnded = true
 			return "", nil, err
 		}
 		// A plain JSON-RPC error is the AGENT rejecting the turn (e.g. the
 		// model API's 400 "Internal Error: …") — the process answered and is
 		// healthy; the error event above already surfaced the failure.
 		// Transport-level failures (timeout / write error) are logged and
-		// surfaced the same way — the host never kills or restarts the
-		// agent on its own (assume the agent is reliable; the process
+		// surfaced by reportPromptFailure — the host never kills or restarts
+		// the agent on its own (assume the agent is reliable; the process
 		// lifecycle belongs to the user via the restart endpoint). The
 		// failed turn is not retried.
-		// 留痕底层错误：区分超时 / 写失败 / 进程退出，事后才能还原事故。
 		var rpcErr *RPCError
-		if !errors.As(err, &rpcErr) {
-			log.Printf("[capri-host] prompt transport failure (session=%s): %v", sessionID, err)
+		if errors.As(err, &rpcErr) {
+			// The agent answered: this turn is over, both legs release.
+			turnEnded = true
 		}
+		// Otherwise the RPC died on the way, not on the turn: the agent may
+		// still be working it, so the observed turn stays armed.
 		return "", nil, err
 	}
+	turnEnded = true
 	sr, _ := res["stopReason"].(string)
 	if sr == "" {
 		sr = "unknown"
@@ -2540,9 +2804,53 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	return sr, meta, nil
 }
 
+// turnStillStreaming reports whether the agent is provably working on a turn
+// for this session right now: an observed turn whose last update landed
+// within turnLivenessWindow. A merely-open-but-silent turn does not qualify —
+// that is the shape a wedged agent leaves behind.
+func (b *Bridge) turnStillStreaming(sessionID string) bool {
+	now := time.Now().UnixMilli()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	w := b.turns[sessionID]
+	return w != nil && w.open && now-w.seenAt <= turnLivenessWindow.Milliseconds()
+}
+
+// reportPromptFailure decides how a failed session/prompt reaches clients and
+// what it leaves in the log. Returns whether the error rode the live channel.
+//
+// An agent JSON-RPC error means the turn itself failed (the process answered)
+// and a canceled caller context means the host just cancelled the turn — both
+// always surface, as before. A transport failure is different: the common one
+// is a turn that outlived the 30-minute promptTimeout while the agent kept
+// streaming it. Reporting that as a turn error made every client viewing the
+// session seal the live stream, drop an error row with a "restart agent"
+// button into the scrollback (restarting would kill the healthy turn it was
+// warning about) and reset its turn timer — mid-turn. While the update stream
+// proves work is ongoing, the failure is a host-side budget event: it stays in
+// the log. Clients still see the truth through the session's busy state, which
+// the observed turn keeps until turn_completed.
+func (b *Bridge) reportPromptFailure(sessionID string, err error) bool {
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) || errors.Is(err, context.Canceled) {
+		b.broadcastPromptError(sessionID, err)
+		return true
+	}
+	// 留痕底层错误：区分超时 / 写失败 / 进程退出，事后才能还原事故。
+	log.Printf("[capri-host] prompt transport failure (session=%s): %v", sessionID, err)
+	if b.turnStillStreaming(sessionID) {
+		log.Printf("[capri-host] prompt error not surfaced (session=%s): agent turn still streaming, session stays active", sessionID)
+		return false
+	}
+	b.broadcastPromptError(sessionID, err)
+	return true
+}
+
 // broadcastPromptError surfaces a prompt-turn failure on the live channel.
 // POST /api/prompt accepts immediately and no longer carries turn-level
-// error bodies, so every turn failure must ride the SSE/WS event stream.
+// error bodies, so every turn failure the host reports must ride the
+// SSE/WS event stream — see reportPromptFailure for which failures the host
+// does NOT report (a prompt-budget timeout on a turn that is still streaming).
 // source 标记（前端据此渲染）：agent 报错（RPCError — 进程活着、拒绝了
 // 回合）vs 传输失败（超时/写失败 — agent 可能不可达）；老版本客户端忽略
 // 该字段，仅按带 sessionId 的回合错误处理。sessionId 为空（如恢复/新建
@@ -2637,6 +2945,9 @@ func (b *Bridge) resetRoster(reason string) (string, string) {
 	b.ready = false
 	b.bootOK = false
 	b.sessions = make(map[string]*SessionState)
+	// Agent 进程已死：观察到的回合全部作废（没有进程还会发来
+	// turn_completed 收口）。
+	b.turns = make(map[string]*observedTurn)
 	b.activeSessionID = ""
 	// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
 	// 一并作废，避免 /api/queue/status 回放过期队列。
@@ -2898,9 +3209,16 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		lastActiveAt  int64
 		title         string
 		updatedAt     string
+		// turnOpen / turnSeenAt: the agent-observed turn, which is also what
+		// stands in for sessions this host process never created/loaded
+		// (they have no roster entry, hence no prompt counter).
+		turnOpen   bool
+		turnSeenAt int64
+		turnKnown  bool
 	}
 	states := make(map[string]*liveState, len(sessions))
 	b.mu.Lock()
+	settled := b.settleTurnsLocked(time.Now().UnixMilli())
 	for _, it := range sessions {
 		m, ok := it.(map[string]any)
 		if !ok {
@@ -2908,6 +3226,11 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		}
 		sid, _ := m[kSessionID].(string)
 		st := &liveState{state: "idle"}
+		if w := b.turns[sid]; w != nil {
+			st.turnOpen = w.open
+			st.turnSeenAt = w.seenAt
+			st.turnKnown = true
+		}
 		if s := b.sessions[sid]; s != nil {
 			st.live = true
 			st.state = s.State()
@@ -2922,6 +3245,10 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		states[sid] = st
 	}
 	b.mu.Unlock()
+	if settled {
+		// Observed turns expired: the badge moved, tell clients to refetch.
+		b.broadcastRosterChange()
+	}
 
 	// [bg] badge census: scan each session's persisted updates for task
 	// events (best-effort; missing files stay unbadged). Orphan log paths
@@ -2952,7 +3279,9 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 			continue
 		}
 		sid, _ := m[kSessionID].(string)
-		if st := states[sid]; st != nil && st.live {
+		st := states[sid]
+		switch {
+		case st != nil && st.live:
 			m["status"] = map[string]any{
 				"state":         st.state,
 				"busy":          st.busy,
@@ -2965,8 +3294,25 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 			if st.updatedAt != "" {
 				m[kUpdatedAt] = st.updatedAt
 			}
-		} else {
-			m["status"] = map[string]any{"state": "idle", "busy": false, "awaitingInput": false}
+		case st != nil && st.turnOpen:
+			// The session is not in this host's roster (another client
+			// started its turn, or the agent lists a session this process
+			// never created/loaded), so there is no prompt counter to read —
+			// but the agent's own update stream says it is working. Report
+			// what was observed rather than assert idle; awaiting-input is
+			// roster state, so it stays false here.
+			m["status"] = map[string]any{
+				"state":         "active",
+				"busy":          true,
+				"awaitingInput": false,
+				"lastActiveAt":  st.turnSeenAt,
+			}
+		default:
+			status := map[string]any{"state": "idle", "busy": false, "awaitingInput": false}
+			if st != nil && st.turnKnown && st.turnSeenAt > 0 {
+				status["lastActiveAt"] = st.turnSeenAt
+			}
+			m["status"] = status
 		}
 		cwd, _ := m["cwd"].(string)
 		if sum, ok := census[censusKey{sid, cwd}]; ok {
@@ -3497,11 +3843,14 @@ func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string
 }
 
 // forgetSessionLocked drops every per-session index entry for sid: the
-// roster row, queue snapshot, usage dedup cache and gen-rate bucket, plus
-// the active-session / last-session pointers when they pointed at it. The
-// caller holds b.mu.
+// roster row, the observed-turn entry, queue snapshot, usage dedup cache and
+// gen-rate bucket, plus the active-session / last-session pointers when they
+// pointed at it. The caller holds b.mu.
 func (b *Bridge) forgetSessionLocked(sessionID string) {
 	delete(b.sessions, sessionID)
+	if b.turns != nil {
+		delete(b.turns, sessionID)
+	}
 	if b.queueSnapshots != nil {
 		delete(b.queueSnapshots, sessionID)
 	}

@@ -88,7 +88,11 @@ type SessionState struct {
 	Cwd       string `json:"cwd,omitempty"`
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"`
-	Busy      bool   `json:"busy"`
+	// Busy: a turn is in flight. Projection of two legs — a session/prompt
+	// this host sent and has not been answered yet (busyCount), and an
+	// agent-observed turn from the update stream (Bridge.turns). Maintained
+	// by Bridge.syncBusyLocked; never write it outside that path.
+	Busy bool `json:"busy"`
 	// AwaitingInput: a permission / x.ai question is pending for this session.
 	AwaitingInput bool  `json:"awaitingInput"`
 	LastActiveAt  int64 `json:"lastActiveAt,omitempty"`
@@ -115,11 +119,19 @@ type SessionState struct {
 	gitMainRepo string
 
 	// busyCount: session/prompt turns currently in flight for this session.
-	// Busy is the boolean projection (busyCount > 0). Concurrent prompts
-	// are forwarded — the agent (xai-grok-shell) queues mid-turn turns in
-	// its own pending_inputs — so several turns can be in flight at once;
-	// only the last resolver flips the session idle. Not serialized.
+	// Concurrent prompts are forwarded — the agent (xai-grok-shell) queues
+	// mid-turn turns in its own pending_inputs — so several turns can be in
+	// flight at once; only the last resolver may end the host's claim on
+	// the session. Not serialized.
 	busyCount int
+}
+
+// observedTurn is one Bridge.turns entry: whether the agent is working on a
+// turn for a session as inferred from its own event stream, and the unix-ms
+// stamp of the update that last proved it.
+type observedTurn struct {
+	open   bool
+	seenAt int64
 }
 
 // State returns the dashboard classification: "active" (turn in flight),
