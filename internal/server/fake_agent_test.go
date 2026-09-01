@@ -67,6 +67,9 @@ const (
 	ACPHostFakeAgentSessionListCur  = "ACP_HOST_FAKE_AGENT_SESSION_LIST_CURSOR"
 	ACPHostFakeAgentSessionListMeta = "ACP_HOST_FAKE_AGENT_SESSION_LIST_META"
 	ACPHostFakeAgentAuthMeta        = "ACP_HOST_FAKE_AGENT_AUTH_META"
+	// initialize 响应的 `_meta`（如 agentInfo._meta.modelState 模型目录），
+	// 便于无会话 boot 状态下让 FE 拿到模型列表做 UI 验证。
+	ACPHostFakeAgentInitMeta = "ACP_HOST_FAKE_AGENT_INIT_META"
 )
 
 // fakeAgentMeta parses an env var as a JSON object for the canned `_meta`
@@ -150,6 +153,9 @@ func runFakeAgent() {
 			result = map[string]any{
 				"protocolVersion": 1,
 				"authMethods":     []any{map[string]any{"id": "cached_token"}},
+			}
+			if m := fakeAgentMeta(ACPHostFakeAgentInitMeta); m != nil {
+				result["_meta"] = m
 			}
 		case "authenticate":
 			result = map[string]any{}

@@ -3018,6 +3018,12 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 	if err := b.Boot(ctx); err != nil {
 		return err
 	}
+	// 无 sessionId 直接拒绝，绝不回退到 active 会话：FE 空状态（未锚定）
+	// 下发的切换请求落到别的会话上就失去了会话隔离（同 handleSetDefaultModel
+	// 的双动作语义）。
+	if sessionID == "" {
+		return &HTTPError{Code: 400, Msg: "需要 sessionId"}
+	}
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return errors.New("没有活跃会话")
 	}
