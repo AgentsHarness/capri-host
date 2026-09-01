@@ -21,6 +21,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,6 +40,9 @@ type Config struct {
 	URL       string // hub base URL, e.g. http://hub-host:8787
 	HostID    string
 	HostName  string
+	// Port is this host's local HTTP listen port (advertised to the hub
+	// so the FE can probe 127.0.0.1:<port>). 0 = omit.
+	Port      int
 	PairCode  string // one-time pairing code; ignored when a token exists
 	Token     string // existing token (HOST_TOKEN); takes precedence
 	LocalBase string // this host's local HTTP base, e.g. http://127.0.0.1:8765
@@ -397,11 +401,15 @@ func (c *Client) ensureToken(ctx context.Context) error {
 }
 
 func (c *Client) pair(ctx context.Context, code string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"code":     code,
 		"hostId":   c.cfg.HostID,
 		"hostName": c.cfg.HostName,
-	})
+	}
+	if p := c.listenPort(); p > 0 {
+		payload["port"] = p
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.URL+"/api/pair", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -865,15 +873,19 @@ func (c *Client) enqueueReplayLocked(evs []acp.Event) {
 // is pushed via maybeNotifyHostStatus.
 func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 	snap := bridge.Snapshot()
-	fields := hostStatusFieldsOf(snap)
-	payload, err := json.Marshal(map[string]any{
+	fields := c.hostStatusFieldsOf(snap)
+	frame := map[string]any{
 		"v":            1,
 		"type":         "host_status",
 		"ready":        fields.Ready,
 		"busy":         fields.Busy,
 		"booting":      fields.Booting,
 		"pendingCount": fields.PendingCount,
-	})
+	}
+	if fields.Port > 0 {
+		frame["port"] = fields.Port
+	}
+	payload, err := json.Marshal(frame)
 	if err != nil {
 		return
 	}
@@ -884,24 +896,51 @@ func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 }
 
 // hostStatusFields is the subset of the bridge Status snapshot the hub
-// registry mirrors (ready/busy/booting/pendingCount). pendingCount is the
-// number of pending client requests (permissions / x.ai questions); busy
-// means at least one session has a turn in flight; booting means the agent
-// process has not finished booting.
+// registry mirrors (ready/busy/booting/pendingCount), plus this host's
+// local HTTP listen port. pendingCount is the number of pending client
+// requests (permissions / x.ai questions); busy means at least one
+// session has a turn in flight; booting means the agent process has not
+// finished booting.
 type hostStatusFields struct {
 	Ready        bool
 	Busy         bool
 	Booting      bool
 	PendingCount int
+	Port         int
 }
 
-func hostStatusFieldsOf(s acp.Status) hostStatusFields {
+func (c *Client) hostStatusFieldsOf(s acp.Status) hostStatusFields {
 	return hostStatusFields{
 		Ready:        s.Ready,
 		Busy:         s.Busy,
 		Booting:      s.Booting,
 		PendingCount: len(s.PendingRequests),
+		Port:         c.listenPort(),
 	}
+}
+
+// listenPort returns the local HTTP port advertised to the hub: Config.Port
+// when set, else the port parsed from LocalBase (http://127.0.0.1:8765).
+func (c *Client) listenPort() int {
+	if c.cfg.Port > 0 && c.cfg.Port <= 65535 {
+		return c.cfg.Port
+	}
+	if c.cfg.LocalBase == "" {
+		return 0
+	}
+	u, err := url.Parse(c.cfg.LocalBase)
+	if err != nil {
+		return 0
+	}
+	p := u.Port()
+	if p == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n <= 0 || n > 65535 {
+		return 0
+	}
+	return n
 }
 
 // maybeNotifyHostStatus immediately re-sends host_status when the bridge
@@ -912,7 +951,7 @@ func hostStatusFieldsOf(s acp.Status) hostStatusFields {
 // Must run on state transitions only — the caller gates it on event
 // types, not per event, to avoid Snapshot() churn on chunk streams.
 func (c *Client) maybeNotifyHostStatus(bridge bridgeSource) {
-	cur := hostStatusFieldsOf(bridge.Snapshot())
+	cur := c.hostStatusFieldsOf(bridge.Snapshot())
 	c.statusMu.Lock()
 	last := c.lastStatus
 	c.statusMu.Unlock()

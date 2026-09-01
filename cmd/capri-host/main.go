@@ -39,6 +39,7 @@ func main() {
 			URL:       cfg.HubURL,
 			HostID:    cfg.HostID,
 			HostName:  cfg.HostName,
+			Port:      cfg.Port,
 			PairCode:  cfg.HubPairCode,
 			Token:     cfg.HostToken,
 			LocalBase: fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),

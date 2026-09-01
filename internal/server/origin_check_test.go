@@ -39,6 +39,48 @@ func TestSensitiveEndpointRejectsCrossOrigin(t *testing.T) {
 	}
 }
 
+// Deployed hub FE (Origin = HUB_URL) may call sensitive endpoints on the
+// local host port — that is the "远程站优先本机" shortcut. Other public
+// origins stay forbidden.
+func TestSensitiveEndpointAllowsTrustedHubOrigin(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	s.cfg.HubURL = "https://agents.example"
+
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/shell", strings.NewReader(`{"command":"echo hi"}`))
+	req.Header.Set("Origin", "https://agents.example")
+	rec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trusted hub Origin status = %d, body=%s; want 200", rec.Code, rec.Body.String())
+	}
+	if h := rec.Header().Get("Access-Control-Allow-Origin"); h != "https://agents.example" {
+		t.Fatalf("ACAO = %q, want hub origin echo", h)
+	}
+
+	// Preflight with Private Network Access must advertise Allow-Private-Network.
+	pre := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8765/api/shell", nil)
+	pre.Header.Set("Origin", "https://agents.example")
+	pre.Header.Set("Access-Control-Request-Method", "POST")
+	pre.Header.Set("Access-Control-Request-Private-Network", "true")
+	prerec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(prerec, pre)
+	if prerec.Code != http.StatusNoContent {
+		t.Fatalf("trusted hub preflight status = %d, want 204", prerec.Code)
+	}
+	if prerec.Header().Get("Access-Control-Allow-Private-Network") != "true" {
+		t.Fatalf("missing Access-Control-Allow-Private-Network on hub preflight")
+	}
+
+	// Unrelated public origin still denied even when HubURL is set.
+	evil := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/shell", strings.NewReader(`{}`))
+	evil.Header.Set("Origin", "https://evil.example")
+	evilRec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(evilRec, evil)
+	if evilRec.Code != http.StatusForbidden {
+		t.Fatalf("untrusted Origin status = %d, want 403", evilRec.Code)
+	}
+}
+
 // Local origins — FE dev server on another localhost port, same-origin
 // calls, and no Origin at all (curl / same-origin GET) — keep working.
 func TestSensitiveEndpointAllowsLocalOrigins(t *testing.T) {
