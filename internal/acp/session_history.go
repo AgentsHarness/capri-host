@@ -68,6 +68,10 @@ type updateLineMeta struct {
 	// hasPromptIndex=false，走 UserRunTurnTracker 的无标记规则。
 	promptIndex    int
 	hasPromptIndex bool
+
+	// 工具合成 ID 依赖字段：
+	isTurnCompleted bool
+	tool            *toolLineMeta
 }
 
 // normalizedHistory 是一个会话 updates.jsonl 的归一化视图（行级元数据）。
@@ -82,6 +86,8 @@ type normalizedHistory struct {
 	// promptPreviews 与 promptStarts 平行：每个存活轮次的首行预览（尽力
 	// 而为，多 chunk 累计、displayText 优先，见 turnIndexesOf）。
 	promptPreviews []string
+	// synthToolCallIDs 为缺失 ID 的工具调用映射出全局稳定唯一的合成 ID（msgSeq → ID）。
+	synthToolCallIDs map[int]string
 }
 
 // parseUpdateLineMeta 解析一行存储信封的元数据；行不是合法 JSON →
@@ -89,16 +95,8 @@ type normalizedHistory struct {
 func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 	var env struct {
 		Params struct {
-			Update struct {
-				SessionUpdate     string          `json:"sessionUpdate"`
-				TargetPromptIndex *int64          `json:"target_prompt_index"`
-				Content           json.RawMessage `json:"content"`
-				Meta              *struct {
-					PromptIndex *int64 `json:"promptIndex"`
-					HostTurn    bool   `json:"hostTurn"`
-				} `json:"_meta"`
-			} `json:"update"`
-			Meta struct {
+			Update updateWirePayload `json:"update"`
+			Meta   struct {
 				AgentTimestampMs int64 `json:"agentTimestampMs"`
 			} `json:"_meta"`
 		} `json:"params"`
@@ -108,8 +106,14 @@ func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 		return m, false
 	}
 	m.agentTsMs = env.Params.Meta.AgentTimestampMs
+	su := env.Params.Update.SessionUpdate
+	if su == "turn_completed" {
+		m.isTurnCompleted = true
+	} else if su == "tool_call" || su == "tool_call_update" {
+		m.tool = parseToolLineMetaFromWire(&env.Params.Update)
+	}
 	hostTurn := env.Params.Update.Meta != nil && env.Params.Update.Meta.HostTurn
-	m.isUserChunk = env.Params.Update.SessionUpdate == "user_message_chunk" && !hostTurn
+	m.isUserChunk = su == "user_message_chunk" && !hostTurn
 	if m.isUserChunk {
 		// 只有用户 chunk 行多解析一次 content（RawMessage 零拷贝引用，解析
 		// 成本只发生在用户行）；工具行永远不碰 content。
@@ -119,7 +123,7 @@ func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 			m.hasPromptIndex = true
 		}
 	}
-	m.isRewind = env.Params.Update.SessionUpdate == "rewind_marker"
+	m.isRewind = su == "rewind_marker"
 	if m.isRewind && env.Params.Update.TargetPromptIndex != nil {
 		m.rewindTarget = int(*env.Params.Update.TargetPromptIndex)
 		m.hasRewindTarget = true
@@ -253,6 +257,7 @@ func buildNormalizedHistory(path string) (*normalizedHistory, error) {
 		view.order = filtered
 	}
 	view.promptStarts, view.promptPreviews = turnIndexesOf(view)
+	view.synthToolCallIDs = resolveSyntheticToolCallIDs(view.order, view.lines)
 	return view, nil
 }
 
@@ -785,6 +790,9 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 				return UpdatesPage{}, fmt.Errorf("%w: missing envelope at msgSeq %d", errLocalHistoryRead, seq)
 			}
 			obj["msgSeq"] = seq
+			if synthID, ok := view.synthToolCallIDs[seq]; ok {
+				injectSynthToolCallID(obj, synthID)
+			}
 			updates = append(updates, obj)
 		}
 	}
