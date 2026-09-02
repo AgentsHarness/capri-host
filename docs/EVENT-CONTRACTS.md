@@ -74,6 +74,20 @@ host 进程重启后 seq 从 1 重新计数，而 hub 可能仍持有上一进�
   连接时以它恢复徽标（不用浏览器存储）。
 - roster：host 侧每个存活会话一行（busy / awaitingInput 分类），由
   `sessions_changed` 事件维护。
+- `busy` 是两条腿的投影：本 host 进程发出、尚未应答的 `session/prompt`
+  计数，加上从 agent 事件流观察到的回合（首个执行类 `session/update`
+  张开，`turn_completed` / `response_completed` 收口）。第一条腿在传输
+  失败时（长回合撞上 30 分钟 promptTimeout 是常见情形）会先归零，此时
+  第二条腿继续如实上报运行中；观察腿超过 30 分钟无任何 update 则按过期
+  处理（等待用户输入的除外），避免丢掉的终态事件把会话永久钉在 running。
+  只有执行类 kind 算证据：标题 / 模式 / 配置 / 命令表 / 模型切换等会话元
+  数据，以及 `usage_update`、后台任务与 monitor 轨，都不张开回合。
+- 回合错误的上报口径（`reportPromptFailure`）：agent 用 JSON-RPC error 拒绝
+  回合、以及 host 因浏览器断连主动取消，一律上事件流；纯传输失败要先看
+  观察腿——回合仍在输出（最近 `turnLivenessWindow` 内有 update）时，
+  promptTimeout 耗尽只是 host 侧的 RPC 预算到期，不是回合失败，只留日志不
+  发 `error` 事件。否则前端会收口正在流式的回答、往 scrollback 塞一条带
+  「重启 agent」按钮的错误行，而重启会真的杀掉那个健康在跑的回合。
 
 ## 7. 修改清单（改契约时勾对）
 
