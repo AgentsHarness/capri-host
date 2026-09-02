@@ -87,6 +87,8 @@ type Bridge struct {
 	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
 	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
 	usageLastUsed map[string]int64
+	// liveTools 是 per-session 的实时工具事件合成 ID 注入器。b.mu 保护。
+	liveTools map[string]*liveToolResolver
 	// replayDropped 累计被 Broadcast 就地拦下的 session/load 重放事件数
 	// （见 Broadcast 注释）；LoadSession 收尾时打一行统计后清零。
 	replayDropped atomic.Uint64
@@ -228,6 +230,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		bootDone:      make(chan struct{}),
 		genRate:       newGenRateTracker(),
 		usageLastUsed: make(map[string]int64),
+		liveTools:     make(map[string]*liveToolResolver),
 	}
 	b.bus.init()
 	b.nextAgentID.Store(1)
@@ -1767,10 +1770,12 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// active:false（不带 rate）——前端收到后清除速率显示（只在输
 		// 出过程中显示）。
 		b.genRate.reset(sid)
+		b.liveToolResolve(sid, "tool_call", update)
 		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
 		b.Broadcast(tag(Event{kType: "tool_call", kToolCall: update}))
 		return true
 	case "tool_call_update":
+		b.liveToolResolve(sid, "tool_call_update", update)
 		b.Broadcast(tag(Event{kType: "tool_call_update", kToolCallUpdate: update}))
 		return true
 	case "plan":
@@ -1867,6 +1872,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 回合终态：复位段状态并广播 active:false（不带 rate）——前端
 		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
 		b.genRate.reset(sid)
+		b.liveToolResolve(sid, "turn_completed", nil)
 		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
 		// response_completed 不广播 typed 事件：agent 实测从不发该
 		// kind（updates.jsonl 3383/3383 回合终态均为 turn_completed），
@@ -1984,6 +1990,20 @@ func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any
 		ev[kMetaOut] = meta
 	}
 	b.Broadcast(tag(ev))
+}
+
+func (b *Bridge) liveToolResolve(sid, su string, update map[string]any) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.liveTools == nil {
+		b.liveTools = make(map[string]*liveToolResolver)
+	}
+	r := b.liveTools[sid]
+	if r == nil {
+		r = &liveToolResolver{}
+		b.liveTools[sid] = r
+	}
+	r.handleLive(su, update)
 }
 
 // handleModelSwitchKind applies model_auto_switched / model_changed
@@ -4078,6 +4098,7 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 			page.PromptStarts = ps
 		}
 	}
+	normalizeSyntheticToolCallsInSlice(page.Updates)
 	log.Printf("[capri-host] session updates via _x.ai/session/updates ok (total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
 	// 透传出口同样投影（[C]「两条路径共用同一投影函数」）。stream=true 的
 	// 信封不走这个响应（以 session_updates_chunk 推流），没有可裁的页，
