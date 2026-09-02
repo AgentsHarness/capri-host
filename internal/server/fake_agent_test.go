@@ -86,6 +86,20 @@ func fakeAgentMeta(env string) map[string]any {
 	return m
 }
 
+// fakeAgentSessionRows 是 E2E 浏览器验证用的 canned 会话摘要行：指向临时
+// HOME 里预置的 sess-new 会话（updates.jsonl 由验证流程手工写入），FE
+// 侧边栏据此列出会话并可点击恢复。
+func fakeAgentSessionRows() []any {
+	return []any{map[string]any{
+		"info": map[string]any{
+			"id":  "sess-new",
+			"cwd": "/tmp",
+		},
+		"session_summary": "E2E 五轮会话",
+		"num_messages":    float64(15),
+	}}
+}
+
 // fakeAgentPermissionID is the JSON-RPC id the fake agent stamps on its
 // emitted permission request.
 const fakeAgentPermissionID float64 = 99
@@ -170,6 +184,23 @@ func runFakeAgent() {
 			if os.Getenv(ACPHostFakeAgentEmitPermission) == "1" {
 				emitPermissionRequest(out)
 			}
+		case "session/load":
+			// 恢复历史会话（浏览器端 continueSession / 重启回锚）。真实
+			// agent 会重放整段会话，fake agent 只回模型快照——历史内容由
+			// FE 经 /api/session-updates 自行拉取。
+			result = map[string]any{"busy": false}
+			if m := fakeAgentMeta(ACPHostFakeAgentInitMeta); m != nil {
+				if ms, ok := m["modelState"]; ok {
+					result["models"] = ms
+				}
+			}
+		case "_x.ai/session_summaries/workspace_list_recent":
+			// E2E 浏览器验证用：把预置在临时 HOME 里的会话暴露给 FE 侧边栏。
+			result = map[string]any{"result": fakeAgentSessionRows()}
+		case "_x.ai/session_summaries/workspace_list":
+			result = map[string]any{"result": map[string]any{
+				"all_sessions": map[string]any{"/tmp": fakeAgentSessionRows()},
+			}}
 		case "session/list":
 			result = map[string]any{"sessions": []any{}}
 			if v := os.Getenv(ACPHostFakeAgentSessionListCur); v != "" {
