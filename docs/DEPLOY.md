@@ -89,10 +89,11 @@ HOST_ID=macbook HOST_NAME="办公室 Mac" \
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `PORT` | `8765` | HTTP 端口（界面 + 接口） |
+| `BIND` | `127.0.0.1` | 监听地址。默认只听回环。同网段设备要访问就设 `0.0.0.0`，但那必须同时设 `FE_TOKEN`，否则启动即失败 |
 | `GROK_BIN` | `grok` | grok 可执行文件 |
 | `HOST_ID` | `local` | 多 Host 区分 |
 | `HOST_NAME` | `Local Host` | 界面展示名 |
-| `FE_TOKEN` | — | 本机接口访问密钥（`/api/*`、`/events`）。配了之后浏览器首次打开需要输入；与 Hub 的 `FE_TOKEN` 同语义，部署时建议配同一个值 |
+| `FE_TOKEN` | — | 本机接口访问密钥（`/api/*`、`/events`）。**与 Hub 的 `FE_TOKEN` 是两把独立的钥匙**：经 Hub 中继的请求由 Host 进程自注入凭据，浏览器用不着这把；只有浏览器直连本机端口（本机近路）才需要它。留空是最省事的配法（配合默认回环，近路就是免鉴权的本机请求）；配了也不要求和 Hub 同值——页面会先拿 Hub 那把探一次 `GET /api/probe`，同值就少弹一次窗，不同值才让你为这台补一把 |
 | `HUB_URL` | — | 设置后进入中继模式 |
 | `HUB_PAIR_CODE` | — | 一次性配对码 |
 | `HOST_TOKEN` | — | 已配对 token，优先于配对码 |
@@ -197,5 +198,5 @@ WantedBy=multi-user.target
 | QUIC 连不上 | UDP 8788 被挡，会自动走 WebSocket，功能不受影响 |
 | 端口被占 | `lsof -nP -iTCP:8765 -sTCP:LISTEN`，或换 `PORT` |
 | 找不到 `grok` | 先 `grok login`，或设 `GROK_BIN` |
-| 浏览器要 token | Hub 或 Host 设了 `FE_TOKEN`，在页面门禁输入同一个密钥 |
+| 浏览器要 token | 页面门禁只问 **Hub** 那把。Host 的 `FE_TOKEN` 是另一把：只有浏览器直连本机端口、且两把不同值时才会再问一次（可拒填，那台自动退回 Hub 中继） |
 | 前端白屏 / 旧界面 | 按上文重新拷贝 capri-fe 构建产物并重启 Host |
