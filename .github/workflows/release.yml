@@ -22,7 +22,9 @@ jobs:
       - name: Checkout capri-fe
         uses: actions/checkout@v5
         with:
-          repository: AgentsHarness/capri-fe
+          # Same GitHub owner as this repo: a fork builds that owner's
+          # capri-fe, upstream still builds AgentsHarness/capri-fe.
+          repository: ${{ github.repository_owner }}/capri-fe
           ref: ${{ inputs.fe_ref || 'main' }}
           path: capri-fe
 
