@@ -21,6 +21,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,6 +40,9 @@ type Config struct {
 	URL       string // hub base URL, e.g. http://hub-host:8787
 	HostID    string
 	HostName  string
+	// Port is this host's local HTTP listen port (advertised to the hub
+	// so the FE can probe 127.0.0.1:<port>). 0 = omit.
+	Port      int
 	PairCode  string // one-time pairing code; ignored when a token exists
 	Token     string // existing token (HOST_TOKEN); takes precedence
 	LocalBase string // this host's local HTTP base, e.g. http://127.0.0.1:8765
@@ -236,6 +240,16 @@ const replayHighWater = 2 * replayCap
 // (hello.seq never advances, and the same oversized frame is retried on
 // every reconnect).
 const maxFrameBytes = 8 << 20
+
+// maxRelayResponseBytes caps a relayed local-API response body. The respond
+// frame carries it verbatim, so the ceiling is the transport's own frame
+// limit: the hub's host-side WS read limit is 32MB and the QUIC length
+// prefix is a signed 31-bit count (33,554,431 bytes). 28MB leaves room for
+// the frame envelope. This bound is what a session-history page runs into —
+// a single agentic turn can carry tens of megabytes of tool output — so it
+// is deliberately generous; the FE's lite replay (§ acp detail projection) is
+// what keeps the actual pages small.
+const maxRelayResponseBytes = 28 << 20
 
 // replayFrameBudget bounds a single replay frame. A resume after a long
 // disconnect can carry thousands of buffered events; packing them into
@@ -471,11 +485,15 @@ func (c *Client) ensureToken(ctx context.Context) error {
 }
 
 func (c *Client) pair(ctx context.Context, code string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"code":     code,
 		"hostId":   c.cfg.HostID,
 		"hostName": c.cfg.HostName,
-	})
+	}
+	if p := c.listenPort(); p > 0 {
+		payload["port"] = p
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.URL+"/api/pair", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -961,15 +979,19 @@ func (c *Client) enqueueReplayLocked(evs []acp.Event) {
 // is pushed via maybeNotifyHostStatus.
 func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 	snap := bridge.Snapshot()
-	fields := hostStatusFieldsOf(snap)
-	payload, err := json.Marshal(map[string]any{
+	fields := c.hostStatusFieldsOf(snap)
+	frame := map[string]any{
 		"v":            1,
 		"type":         "host_status",
 		"ready":        fields.Ready,
 		"busy":         fields.Busy,
 		"booting":      fields.Booting,
 		"pendingCount": fields.PendingCount,
-	})
+	}
+	if fields.Port > 0 {
+		frame["port"] = fields.Port
+	}
+	payload, err := json.Marshal(frame)
 	if err != nil {
 		return
 	}
@@ -980,24 +1002,51 @@ func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 }
 
 // hostStatusFields is the subset of the bridge Status snapshot the hub
-// registry mirrors (ready/busy/booting/pendingCount). pendingCount is the
-// number of pending client requests (permissions / x.ai questions); busy
-// means at least one session has a turn in flight; booting means the agent
-// process has not finished booting.
+// registry mirrors (ready/busy/booting/pendingCount), plus this host's
+// local HTTP listen port. pendingCount is the number of pending client
+// requests (permissions / x.ai questions); busy means at least one
+// session has a turn in flight; booting means the agent process has not
+// finished booting.
 type hostStatusFields struct {
 	Ready        bool
 	Busy         bool
 	Booting      bool
 	PendingCount int
+	Port         int
 }
 
-func hostStatusFieldsOf(s acp.Status) hostStatusFields {
+func (c *Client) hostStatusFieldsOf(s acp.Status) hostStatusFields {
 	return hostStatusFields{
 		Ready:        s.Ready,
 		Busy:         s.Busy,
 		Booting:      s.Booting,
 		PendingCount: len(s.PendingRequests),
+		Port:         c.listenPort(),
 	}
+}
+
+// listenPort returns the local HTTP port advertised to the hub: Config.Port
+// when set, else the port parsed from LocalBase (http://127.0.0.1:8765).
+func (c *Client) listenPort() int {
+	if c.cfg.Port > 0 && c.cfg.Port <= 65535 {
+		return c.cfg.Port
+	}
+	if c.cfg.LocalBase == "" {
+		return 0
+	}
+	u, err := url.Parse(c.cfg.LocalBase)
+	if err != nil {
+		return 0
+	}
+	p := u.Port()
+	if p == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n <= 0 || n > 65535 {
+		return 0
+	}
+	return n
 }
 
 // maybeNotifyHostStatus immediately re-sends host_status when the bridge
@@ -1008,7 +1057,7 @@ func hostStatusFieldsOf(s acp.Status) hostStatusFields {
 // Must run on state transitions only — the caller gates it on event
 // types, not per event, to avoid Snapshot() churn on chunk streams.
 func (c *Client) maybeNotifyHostStatus(bridge bridgeSource) {
-	cur := hostStatusFieldsOf(bridge.Snapshot())
+	cur := c.hostStatusFieldsOf(bridge.Snapshot())
 	c.statusMu.Lock()
 	last := c.lastStatus
 	c.statusMu.Unlock()
@@ -2052,24 +2101,24 @@ func (c *Client) handleRelay(ctx context.Context, reqID, hostID, method, path st
 	defer res.Body.Close()
 	// Read one byte past the cap so an oversized body is detected instead
 	// of being silently truncated. The respond frame rides the host↔hub
-	// transport, where a 16MB+ frame would exceed the hub's WS read limit
-	// and kill the whole connection.
-	rb, err := io.ReadAll(io.LimitReader(res.Body, 16<<20+1))
+	// transport, where an over-limit frame would exceed the hub's read
+	// limit and kill the whole connection (see maxRelayResponseBytes).
+	rb, err := io.ReadAll(io.LimitReader(res.Body, maxRelayResponseBytes+1))
 	if err != nil {
 		c.respond(reqID, 502, mustJSON(map[string]any{"ok": false, "error": err.Error()}))
 		return
 	}
-	if len(rb) > 16<<20 {
-		c.respond(reqID, 502, mustJSON(map[string]any{"ok": false, "error": "本地响应过大（>16MB），无法中继"}))
+	if len(rb) > maxRelayResponseBytes {
+		c.respond(reqID, 502, mustJSON(map[string]any{"ok": false, "error": fmt.Sprintf("本地响应过大（>%dMB），无法中继", maxRelayResponseBytes>>20)}))
 		return
 	}
 	c.respond(reqID, res.StatusCode, json.RawMessage(rb))
 }
 
 // relayResponseWriter 是进程内中继的响应记录器：缓存状态码与响应体
-// （超过 16MB 即截断并标记——respond 帧走 host↔hub 传输，16MB+ 的帧会
-// 触发 hub 的 WS 读上限并杀掉整条连接，与回环路径语义一致）。Flush 按
-// no-op 处理：中继应答是单帧全量回传，流式 flush 无处可去。
+// （超过 maxRelayResponseBytes 即截断并标记——respond 帧走 host↔hub 传输，
+// 上限以上的帧会触发 hub 的 WS 读上限并杀掉整条连接，与回环路径同一门槛）。
+// Flush 按 no-op 处理：中继应答是单帧全量回传，流式 flush 无处可去。
 type relayResponseWriter struct {
 	hdr       http.Header
 	buf       bytes.Buffer
@@ -2083,7 +2132,7 @@ func (w *relayResponseWriter) Write(p []byte) (int, error) {
 	if w.truncated {
 		return len(p), nil // 继续吞掉写入，让 handler 正常走完
 	}
-	if w.buf.Len()+len(p) > 16<<20+1 {
+	if w.buf.Len()+len(p) > maxRelayResponseBytes+1 {
 		w.truncated = true
 		return len(p), nil
 	}
@@ -2125,7 +2174,7 @@ func (c *Client) relayInProcess(ctx context.Context, reqID, method, path string,
 		c.local.ServeHTTP(rec, req)
 	}()
 	if rec.truncated {
-		c.respond(reqID, 502, mustJSON(map[string]any{"ok": false, "error": "本地响应过大（>16MB），无法中继"}))
+		c.respond(reqID, 502, mustJSON(map[string]any{"ok": false, "error": fmt.Sprintf("本地响应过大（>%dMB），无法中继", maxRelayResponseBytes>>20)}))
 		return
 	}
 	if rec.code == 0 {

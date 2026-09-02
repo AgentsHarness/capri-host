@@ -550,7 +550,7 @@ func TestForwardLoopSeqAssignedAfterMerge(t *testing.T) {
 // — no seq, not an events frame, not in the replay buffer — so it cannot
 // collide with bridge.Broadcast seq.
 func TestHostStatusIsControlFrame(t *testing.T) {
-	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", Port: 8765, DisableQUIC: true})
 	c.sendCh = make(chan []byte, 4)
 	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
@@ -570,10 +570,13 @@ func TestHostStatusIsControlFrame(t *testing.T) {
 		if _, ok := f["events"]; ok {
 			t.Errorf("host_status must not be an events frame, payload=%s", payload)
 		}
-		for _, k := range []string{"ready", "busy", "booting", "pendingCount"} {
+		for _, k := range []string{"ready", "busy", "booting", "pendingCount", "port"} {
 			if _, ok := f[k]; !ok {
 				t.Errorf("host_status missing %s: %s", k, payload)
 			}
+		}
+		if int(f["port"].(float64)) != 8765 {
+			t.Errorf("port = %v, want 8765", f["port"])
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no host_status frame")
@@ -1238,10 +1241,10 @@ func TestEnqueueReplaySurvivesFullQueue(t *testing.T) {
 	}
 }
 
-// TestRelayRejectsOversizedLocalResponse: a local API response over 16MB
-// must be answered with an explicit error instead of being silently
-// truncated (a 16MB+ respond frame would exceed the hub read limit and
-// kill the whole connection).
+// TestRelayRejectsOversizedLocalResponse: a local API response over
+// maxRelayResponseBytes must be answered with an explicit error instead of
+// being silently truncated (an over-limit respond frame would exceed the
+// hub's read limit and kill the whole connection).
 func TestRelayRejectsOversizedLocalResponse(t *testing.T) {
 	fh := newFakeHub(t)
 	fh.streamFrames = []string{
@@ -1251,7 +1254,7 @@ func TestRelayRejectsOversizedLocalResponse(t *testing.T) {
 	ts := httptest.NewServer(fh.handler())
 	defer ts.Close()
 
-	big := strings.Repeat("z", 16<<20+10)
+	big := strings.Repeat("z", maxRelayResponseBytes+10)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeTestJSON(w, 200, map[string]any{"ok": true, "data": big})
 	}))
@@ -1279,6 +1282,37 @@ func TestRelayRejectsOversizedLocalResponse(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no respond for oversized relay")
+	}
+}
+
+// TestRelayResponseWriterSharesCeiling: the in-process relay (the production
+// path — LocalBase is empty, so the hub request is served by c.local) must
+// use the SAME ceiling as the loopback fallback below it. A second literal
+// here is how it drifted to 16MB while the fallback moved to 28MB, which
+// turned every 16–28MB detail=full history page into a 502 on a real hub.
+func TestRelayResponseWriterSharesCeiling(t *testing.T) {
+	chunk := bytes.Repeat([]byte("y"), 1<<20)
+	w := &relayResponseWriter{hdr: http.Header{}}
+	for i := 0; i < maxRelayResponseBytes>>20; i++ {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if w.truncated {
+			t.Fatalf("truncated at %d MiB, want the full %d MiB through", i+1, maxRelayResponseBytes>>20)
+		}
+	}
+	if w.buf.Len() != maxRelayResponseBytes {
+		t.Fatalf("buffered %d bytes, want %d", w.buf.Len(), maxRelayResponseBytes)
+	}
+	if _, err := w.Write(chunk); err != nil {
+		t.Fatalf("oversized write: %v", err)
+	}
+	if !w.truncated {
+		t.Fatal("no truncation one MiB past the ceiling")
+	}
+	// Once truncated, the handler must still be able to finish writing.
+	if n, err := w.Write(chunk); err != nil || n != len(chunk) {
+		t.Fatalf("post-truncate write = (%d, %v), want swallowed", n, err)
 	}
 }
 

@@ -89,6 +89,9 @@ type Bridge struct {
 	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
 	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
 	usageLastUsed map[string]int64
+	// replayDropped 累计被 Broadcast 就地拦下的 session/load 重放事件数
+	// （见 Broadcast 注释）；LoadSession 收尾时打一行统计后清零。
+	replayDropped atomic.Uint64
 	// agentStartedAt (unix ms) stamps the CURRENT agent process spawn.
 	// Clients compare it across hello events to detect an agent restart —
 	// the agent's permission mode is in-memory only and resets on restart,
@@ -364,7 +367,22 @@ func (b *Bridge) Subscribe() (ch chan Event, unsubscribe func()) {
 	return b.bus.subscribe()
 }
 
+// Broadcast publishes one event on the host's event bus.
+//
+// session/load 的整段重放（params._meta.isReplay，agent 在 replay.rs 给两条
+// 载体的每条通知都盖上）在这里就地拦掉：重放内容与 FE 经 HTTP
+// /api/session-updates 拉的是同一份，SSE/WS 再灌一遍只是几十 MB 白流量。
+// 拦在 publish 之前是必须的——全局 seq 由 eventBus.publish 分配
+// （event_bus.go），任何更晚的丢弃点（hub 上行、序列化前）都会在序列里留下
+// 永久空洞，FE 的 EventSequencer 会把后续所有 live 事件压在乱序缓冲里等一个
+// 谁都补不出来的前驱（liveSequencing.ts PENDING_SEQ_CAP）。
+// session_load_started / finished 是 host 自造的边界事件，不带该标记，照旧
+// 广播（FE 的多 tab 门控靠它们开关）。
 func (b *Bridge) Broadcast(ev Event) {
+	if replay, _ := ev[kReplayInternal].(bool); replay {
+		b.replayDropped.Add(1)
+		return
+	}
 	b.bus.publish(ev)
 }
 
@@ -1493,6 +1511,18 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 官方载体恒带 sessionId：直接用显式 id，绝不回落活动会话（多客户端
 	// 下回落会误标到宿主的活动会话）。
 	sid := sessionIdExplicit(params)
+	// agent 在 session/load 的整段重放里给每条通知打
+	// params._meta.isReplay（replay.rs）。派生事件一律盖上 host 内部标记
+	// （kReplayInternal），由 Broadcast 在分配 seq 之前整条拦掉（契约
+	// lite-replay [F]）——重放内容 FE 走 HTTP /api/session-updates 已拿到。
+	replay := paramsIsReplay(params)
+	tag := func(ev Event) Event {
+		ev[kSessionID] = sid
+		if replay {
+			ev[kReplayInternal] = true
+		}
+		return ev
+	}
 
 	update, _ := params[kUpdate].(map[string]any)
 	// Every standard session/update carries the session-accumulated
@@ -1514,7 +1544,7 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 				b.mu.Unlock()
 				if used != last {
 					b.trackUsage(sid, used, 0)
-					b.Broadcast(Event{kType: "usage", kUsed: used, kSize: nil, kSessionID: sid})
+					b.Broadcast(tag(Event{kType: "usage", kUsed: used, kSize: nil}))
 				}
 			}
 		}
@@ -1526,16 +1556,12 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// kind 只发 typed 事件（FE 已适配）；仅当 dispatch 返回 false
 	// （未建模 kind）时 generic session_notification 作为前向兼容载体
 	// 发出，形状保持现状。
-	if !b.dispatchSessionUpdateKind(sid, params, func(ev Event) Event {
-		ev[kSessionID] = sid
-		return ev
-	}) {
-		b.Broadcast(Event{
-			kType:      "session_notification",
-			kMethod:    "session/update",
-			kParams:    map[string]any{kUpdate: update},
-			kSessionID: sid,
-		})
+	if !b.dispatchSessionUpdateKind(sid, params, tag) {
+		b.Broadcast(tag(Event{
+			kType:   "session_notification",
+			kMethod: "session/update",
+			kParams: map[string]any{kUpdate: update},
+		}))
 	}
 
 	// grok ships usage inside turn_completed / response_completed
@@ -1559,10 +1585,21 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 		// client's `used`.
 		if len(ev) > 1 {
 			ev[kSize] = nil
-			ev[kSessionID] = sid
-			b.Broadcast(ev)
+			b.Broadcast(tag(ev))
 		}
 	}
+}
+
+// paramsIsReplay 报告这条 session/update 的 params._meta 是否带 agent 的
+// 重放标记（isReplay，replay.rs 为 session/load 重放的每条通知盖上）。
+// 只有真布尔值算重放——agent 写的是 serde bool，字符串/数字一律不认。
+func paramsIsReplay(params map[string]any) bool {
+	meta, ok := params[kMeta].(map[string]any)
+	if !ok {
+		return false
+	}
+	v, _ := meta["isReplay"].(bool)
+	return v
 }
 
 // attachStreamMeta copies the shell-stamped NotificationMeta (params._meta)
@@ -1637,6 +1674,19 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	if m, ok := params[kMeta].(map[string]any); ok && len(m) > 0 {
 		kindMeta = m
 	}
+	// image 事件不经 tag 闭包（imageEvent 自带 sessionId），重放标记只能在
+	// 这里单独补上。整个 dispatch 的广播点都过 tag，所以在这一处包一层即
+	// 覆盖两条载体（官方 session/update 与 x.ai/session/update）——漏掉任一
+	// 条都会让 session/load 的重放只有一半不上总线，进而把同一批历史里的
+	// 图片与文字事件劈成两半。
+	replay := paramsIsReplay(params)
+	if replay {
+		inner := tag
+		tag = func(ev Event) Event {
+			ev[kReplayInternal] = true
+			return inner(ev)
+		}
+	}
 	switch kind {
 	case "agent_message_chunk":
 		if text := contentText(update[kContent]); text != "" {
@@ -1678,9 +1728,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// Image blocks ride the same chunk carrier: emit one typed image
 		// event per block (text parts still go through the chunk event).
 		for _, img := range contentImages(update[kContent]) {
-			if ev, ok := imageEvent(sid, img); ok {
-				b.Broadcast(ev)
-			}
+			b.broadcastImage(sid, img, replay)
 		}
 		return true
 	case "user_message_chunk":
@@ -1712,9 +1760,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			b.Broadcast(tag(ev))
 		}
 		for _, img := range contentImages(update[kContent]) {
-			if ev, ok := imageEvent(sid, img); ok {
-				b.Broadcast(ev)
-			}
+			b.broadcastImage(sid, img, replay)
 		}
 		return true
 	case "agent_thought_chunk":
@@ -2047,11 +2093,17 @@ func unwrapExtMethod(method string, params map[string]any) (string, map[string]a
 // ext_notification event so nothing is silently dropped.
 func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 	// Tag every extension notification with its originating session so the
-	// dashboard can bucket multi-session activity.
+	// dashboard can bucket multi-session activity. session/load 的重放走
+	// dispatchSessionUpdateKind 的 tag 包装拦（两条载体共用）；这里的 generic
+	// 兜底广播不过 dispatch，必须自己盖章，否则未建模 kind 的重放仍会上总线。
 	sid := b.sessionIdFrom(params)
+	replay := paramsIsReplay(params)
 	withSid := func(ev Event) Event {
 		if sid != "" {
 			ev[kSessionID] = sid
+		}
+		if replay {
+			ev[kReplayInternal] = true
 		}
 		return ev
 	}
@@ -3036,6 +3088,12 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 	if err := b.Boot(ctx); err != nil {
 		return err
 	}
+	// 无 sessionId 直接拒绝，绝不回退到 active 会话：FE 空状态（未锚定）
+	// 下发的切换请求落到别的会话上就失去了会话隔离（同 handleSetDefaultModel
+	// 的双动作语义）。
+	if sessionID == "" {
+		return &HTTPError{Code: 400, Msg: "需要 sessionId"}
+	}
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return errors.New("没有活跃会话")
 	}
@@ -3640,6 +3698,9 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 	// Replay stream is complete once session/load returns — peers can
 	// rebuild from HTTP history now (initiator already does via its own
 	// loadHistory; this flag is for multi-tab viewers of the same sid).
+	if n := b.replayDropped.Swap(0); n > 0 {
+		log.Printf("[capri-host] session/load %s：拦下 %d 条重放事件（历史走 HTTP，不上总线）", sessionID[:min(8, len(sessionID))], n)
+	}
 	b.Broadcast(Event{
 		kType:      "session_load_finished",
 		kSessionID: sessionID,
@@ -3904,6 +3965,12 @@ type UpdatesPage struct {
 	// Btw：/btw 侧问回放记录（btw_history.jsonl；只在本地归一化路径可用，
 	// agent 透传路径不带）。不占 msgSeq 空间，分页游标不受影响。
 	Btw []SessionBtw `json:"btw,omitempty"`
+	// Projected / OmittedBytes 是 lite 投影的能力回显（契约 [B]，见
+	// lite.go）：只在投影真正生效时非空，由 handler 决定回不回相应键。
+	// json:"-"：本页从不整体序列化（handler 现拼响应），不给任何出口
+	// 多出键的机会。
+	Projected    string `json:"-"`
+	OmittedBytes int64  `json:"-"`
 }
 
 // SessionBtw 是一条 /btw 侧问的回放记录，由 host 从 agent 落盘的
@@ -3934,6 +4001,11 @@ type SessionUpdatesOpts struct {
 	Stream    bool
 	ChunkSize *int
 	TurnIndex *int
+	// Detail 是 host 侧响应投影档位（契约 [A]，见 lite.go）："lite" 只裁
+	// 工具正文，"meta" 连信封都不回，"full"/缺省/未知值 = 今天的逐字节
+	// 原样行为。它不上 agent 的 wire（agent 不认识该字段），只在
+	// Bridge.SessionUpdates 出口生效。
+	Detail string
 }
 
 // SessionUpdates fetches a session's stored updates (message history). Each
@@ -3949,6 +4021,9 @@ type SessionUpdatesOpts struct {
 // `_x.ai/session/updates` 透传（响应无 msgSeq、promptStarts 原样），
 // 两条路径互斥、按会话内容自动选择。stream=true 路径不改（agent 以
 // chunked 通知推流，本地分页无法替代）。
+//
+// opts.Detail 的投影（lite.go，契约 [C]）在两条路径的出口统一施加，
+// 回退路径不得漏裁；stream=true 不参与投影。
 func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...SessionUpdatesOpts) (UpdatesPage, error) {
 	o := SessionUpdatesOpts{}
 	if len(opts) > 0 {
@@ -3957,6 +4032,7 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 	if !o.Stream {
 		page, err := b.localUpdatesPage(sessionID, cwd, o)
 		if err == nil {
+			applyUpdatesDetail(&page, o)
 			log.Printf("[capri-host] session updates served locally (msgSeq total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
 			return page, nil
 		}
@@ -4017,6 +4093,12 @@ func (b *Bridge) SessionUpdates(ctx context.Context, sessionID, cwd string, opts
 		}
 	}
 	log.Printf("[capri-host] session updates via _x.ai/session/updates ok (total=%d promptStarts=%d)", page.TotalCount, len(page.PromptStarts))
+	// 透传出口同样投影（[C]「两条路径共用同一投影函数」）。stream=true 的
+	// 信封不走这个响应（以 session_updates_chunk 推流），没有可裁的页，
+	// 因此不回显 projected —— FE 按 host 不支持 lite 处理。
+	if !o.Stream {
+		applyUpdatesDetail(&page, o)
+	}
 	return page, nil
 }
 
@@ -4882,4 +4964,17 @@ func imageEvent(sid string, block map[string]any) (Event, bool) {
 		mime = "image/png"
 	}
 	return Event{kType: "image", kSessionID: sid, "data": data, "mimeType": mime}, true
+}
+
+// broadcastImage 广播 image 事件。imageEvent 自带 sessionId、不走调用方的
+// tag 闭包，重放标记（kReplayInternal）只能在这里补。
+func (b *Bridge) broadcastImage(sid string, block map[string]any, replay bool) {
+	ev, ok := imageEvent(sid, block)
+	if !ok {
+		return
+	}
+	if replay {
+		ev[kReplayInternal] = true
+	}
+	b.Broadcast(ev)
 }

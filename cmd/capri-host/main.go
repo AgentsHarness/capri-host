@@ -128,6 +128,7 @@ func main() {
 		URL:         cfg.HubURL,
 		HostID:      cfg.HostID,
 		HostName:    cfg.HostName,
+		Port:        cfg.Port,
 		PairCode:    cfg.HubPairCode,
 		Token:       cfg.HostToken,
 		LocalBase:   fmt.Sprintf("http://127.0.0.1:%d", cfg.Port),
@@ -160,6 +161,7 @@ func main() {
 	// relay was actually up.
 	srv.SetHubController(hubMgr)
 	go hubMgr.Run(ctx, bridge)
+
 
 	// Eager boot in background (non-fatal if grok missing until first prompt).
 	// Boot only warms the agent process — it does NOT create a session, so

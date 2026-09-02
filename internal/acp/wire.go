@@ -39,6 +39,12 @@ const (
 	kUpdate        = "update"
 	kSessionUpdate = "sessionUpdate"
 
+	// kReplayInternal 是 host 内部标记键，从不上 wire：agent 在
+	// session/load 重放的每条通知上打 params._meta.isReplay（replay.rs），
+	// 派生事件盖上该标记后由 Broadcast 在分配 seq 之前整条拦掉
+	// （见 bridge.go Broadcast）。
+	kReplayInternal = "_replay"
+
 	// session/update 各 kind 广播出的事件载荷键。
 	kText           = "text"
 	kContent        = "content"

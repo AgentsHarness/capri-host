@@ -79,7 +79,7 @@ func (s *Server) routes() http.Handler {
 	// 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
 	// 非 API 路径回退 index.html（实现见 web.go）
 	mux.HandleFunc("GET /", s.handleWeb)
-	return withCORS(withAuth(mux, s.cfg.AccessToken))
+	return s.withCORS(withAuth(mux, s.cfg.AccessToken))
 }
 
 // registerCoreRoutes 注册核心 API（回合、会话、权限、任务、终端外的主链路）。
@@ -194,18 +194,45 @@ func isLocalOrigin(r *http.Request) bool {
 	return strings.EqualFold(u.Host, r.Host)
 }
 
-func withCORS(next http.Handler) http.Handler {
+// allowSensitiveOrigin reports whether r may hit a sensitive endpoint:
+// local origins (Vite / same-host), or the configured HubURL's origin
+// (deployed FE on the hub talking straight to this host's 127.0.0.1 port).
+func (s *Server) allowSensitiveOrigin(r *http.Request) bool {
+	if isLocalOrigin(r) {
+		return true
+	}
+	return s.isTrustedHubOrigin(r.Header.Get("Origin"))
+}
+
+// isTrustedHubOrigin is true when origin matches cfg.HubURL's scheme+host
+// (path ignored). Empty HubURL → nothing trusted beyond local origins.
+func (s *Server) isTrustedHubOrigin(origin string) bool {
+	if origin == "" || s.cfg.HubURL == "" {
+		return false
+	}
+	ou, err := url.Parse(origin)
+	if err != nil || ou.Scheme == "" || ou.Host == "" {
+		return false
+	}
+	hu, err := url.Parse(s.cfg.HubURL)
+	if err != nil || hu.Scheme == "" || hu.Host == "" {
+		return false
+	}
+	return strings.EqualFold(ou.Scheme, hu.Scheme) && strings.EqualFold(ou.Host, hu.Host)
+}
+
+func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sensitive := isSensitiveEndpoint(r)
+		allowed := !sensitive || s.allowSensitiveOrigin(r)
 		if sensitive {
 			// Sensitive endpoints never answer `*`: echo the request Origin
-			// back only when it is a local origin, so a cross-origin web
-			// page can neither read nor invoke them.
-			if origin := r.Header.Get("Origin"); origin != "" && isLocalOrigin(r) {
+			// only when it is local or the trusted hub FE origin.
+			if origin := r.Header.Get("Origin"); origin != "" && allowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Add("Vary", "Origin")
 			}
-			if !isLocalOrigin(r) {
+			if !allowed {
 				writeJSON(w, http.StatusForbidden, map[string]any{
 					"ok": false, "error": "cross-origin request to sensitive endpoint denied",
 				})
@@ -213,7 +240,8 @@ func withCORS(next http.Handler) http.Handler {
 			}
 		} else {
 			// CORS for Vite dev: the FE runs on another localhost port and
-			// must reach every non-sensitive endpoint.
+			// must reach every non-sensitive endpoint. Hub FE on a public
+			// origin also probes /api/hosts + /api/status this way.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -221,6 +249,12 @@ func withCORS(next http.Handler) http.Handler {
 		// preflight must admit it or cross-origin direct host calls (hub
 		// mode 双连接) would be blocked by the browser.
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// Chrome Private Network Access: public HTTPS pages probing
+		// 127.0.0.1 send Access-Control-Request-Private-Network on
+		// preflight; without the matching Allow header the probe fails.
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" && allowed {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -812,6 +846,10 @@ type sessionUpdatesBody struct {
 	Stream    bool `json:"stream,omitempty"`
 	ChunkSize *int `json:"chunkSize,omitempty"`
 	TurnIndex *int `json:"turnIndex,omitempty"`
+	// detail 是历史页的响应投影档位（契约 lite-replay [A]，见
+	// acp/lite.go）："lite" 只裁工具正文，"meta" 只回分页锚点，
+	// "full"/缺省/未知值 = 信封逐字节原样。
+	Detail string `json:"detail,omitempty"`
 }
 
 // handleSessionUpdates fetches a session's stored updates (message history)
@@ -827,7 +865,7 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 sessionId 和 cwd"})
 		return
 	}
-	opts := acp.SessionUpdatesOpts{Offset: body.Offset, Limit: body.Limit, Stream: body.Stream}
+	opts := acp.SessionUpdatesOpts{Offset: body.Offset, Limit: body.Limit, Stream: body.Stream, Detail: body.Detail}
 	if body.ChunkSize != nil {
 		opts.ChunkSize = body.ChunkSize
 	}
@@ -844,7 +882,17 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		"sessionId":  body.SessionID,
 		"totalCount": page.TotalCount,
 		"hasMore":    page.HasMore,
-		"updates":    page.Updates,
+	}
+	// 能力回显（契约 [B]）：projected/omittedBytes 只在投影真正生效时带，
+	// 旧 host 不带该键 → FE 判定不支持 lite。meta 档省略 updates 键本身
+	// （而不是回空数组）——FE 要能区分「没回信封」与「会话没有历史」。
+	// detail 为 full/缺省/未知值时这两条分支都不进，响应与今天逐字节一致。
+	if page.Projected != acp.DetailMeta {
+		out["updates"] = page.Updates
+	}
+	if page.Projected != "" {
+		out["projected"] = page.Projected
+		out["omittedBytes"] = page.OmittedBytes
 	}
 	// promptStarts: pass through so FE can page history one user-turn at a
 	// time (see chat.ts previousTurnWindow). Omit when empty — older agents
