@@ -22,6 +22,11 @@ var version = acp.Version
 func main() {
 	log.Printf("[capri-host] version %s", version)
 	cfg := config.Load()
+	// 非回环监听必须配入站钥匙：withAuth 在 FE_TOKEN 为空时是刻意开放的
+	// （本机可信），那句话只在回环 socket 上成立。
+	if err := config.CheckBindPolicy(cfg); err != nil {
+		log.Fatalf("[capri-host] %v", err)
+	}
 	bridge := acp.NewBridge(acp.GrokConfig{
 		Bin:      cfg.GrokBin,
 		HostID:   cfg.HostID,
