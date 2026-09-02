@@ -3944,6 +3944,10 @@ type UpdatesPage struct {
 	TotalCount   int   `json:"totalCount"`
 	HasMore      bool  `json:"hasMore"`
 	PromptStarts []int `json:"promptStarts,omitempty"`
+	// PromptPreviews 与 PromptStarts 平行：每个存活轮次的首行预览（轮次
+	// 目录用）。只在本地归一化路径可用（透传路径无该键 → FE 回退为「已
+	// 加载轮才有预览」）。见 session_history.go turnIndexesOf。
+	PromptPreviews []string `json:"promptPreviews,omitempty"`
 	// Btw：/btw 侧问回放记录（btw_history.jsonl；只在本地归一化路径可用，
 	// agent 透传路径不带）。不占 msgSeq 空间，分页游标不受影响。
 	Btw []SessionBtw `json:"btw,omitempty"`

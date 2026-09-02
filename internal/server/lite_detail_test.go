@@ -109,6 +109,31 @@ func TestSessionUpdatesDetailDefaultByteIdentical(t *testing.T) {
 	}
 }
 
+// promptPreviews：本地路径的响应带与 promptStarts 平行的轮次首行预览
+// （默认 / lite / meta 三档都带——它来自归一化视图缓存，不随 detail 变化）；
+// 缺失该键的旧 host / 透传路径由 FE 回退为「目录只列已加载轮」。
+func TestSessionUpdatesDetailPromptPreviews(t *testing.T) {
+	home, sid := liteDetailSession(t)
+	for _, detail := range []string{"", "lite", "meta"} {
+		body := `{"sessionId":"` + sid + `","cwd":"/ws"}`
+		if detail != "" {
+			body = `{"sessionId":"` + sid + `","cwd":"/ws","detail":"` + detail + `"}`
+		}
+		raw := liteDetailBody(t, home, sid, body)
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("detail=%q body 不是 JSON: %v (%s)", detail, err, raw)
+		}
+		if !reflect.DeepEqual(m["promptStarts"], []any{float64(0)}) {
+			t.Fatalf("detail=%q promptStarts = %v, want [0]", detail, m["promptStarts"])
+		}
+		previews, ok := m["promptPreviews"].([]any)
+		if !ok || len(previews) != 1 || previews[0] != "看下这个文件" {
+			t.Errorf("detail=%q promptPreviews = %v, want [看下这个文件]", detail, m["promptPreviews"])
+		}
+	}
+}
+
 // lite：只裁工具正文，锚点与非工具信封不动，回显能力键。
 func TestSessionUpdatesDetailLite(t *testing.T) {
 	home, sid := liteDetailSession(t)

@@ -928,6 +928,12 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 	if len(page.PromptStarts) > 0 {
 		out["promptStarts"] = page.PromptStarts
 	}
+	// promptPreviews：与 promptStarts 平行的轮次首行预览（用户消息目录用，
+	// 本地归一化路径才有）。缺省 = 旧 host / 透传路径，FE 回退为目录只列
+	// 已加载轮。
+	if len(page.PromptPreviews) > 0 {
+		out["promptPreviews"] = page.PromptPreviews
+	}
 	// btw：/btw 侧问回放记录（本地归一化路径才有；见 SessionBtw）。
 	if len(page.Btw) > 0 {
 		out["btw"] = page.Btw
