@@ -4048,10 +4048,10 @@ type SessionUpdatesOpts struct {
 	Stream    bool
 	ChunkSize *int
 	TurnIndex *int
-	// Detail 是 host 侧响应投影档位（契约 [A]，见 lite.go）："lite" 只裁
-	// 工具正文，"meta" 连信封都不回，"full"/缺省/未知值 = 今天的逐字节
-	// 原样行为。它不上 agent 的 wire（agent 不认识该字段），只在
-	// Bridge.SessionUpdates 出口生效。
+	// Detail 是 host 侧响应投影档位（见 lite.go）："lite" 是首屏时间线
+	// （合成工具信封、thought 占位、丢掉正文），"meta" 连信封都不回，
+	// "full"/缺省/未知值 = 今天的逐字节原样行为。它不上 agent 的 wire
+	// （agent 不认识该字段），只在 Bridge.SessionUpdates 出口生效。
 	Detail string
 }
 
