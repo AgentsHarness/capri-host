@@ -1051,3 +1051,54 @@ func TestLiteEmptyToolCallIdNotCoalesced(t *testing.T) {
 		t.Errorf("空 id 工具被并到一起: %v / %v", liteUpdate(t, lite, 0)["title"], liteUpdate(t, lite, 1)["title"])
 	}
 }
+
+// thoughtChunkEnv 造一条连续 agent_thought_chunk 信封（正文足够大才会被裁成
+// {type, omitted} 占位）。msgSeq 由 litePageOf 按下标盖。
+func thoughtChunkEnv(sid string, text string) string {
+	return histEnvelope(sid, 0, 1000, map[string]any{
+		"sessionUpdate": "agent_thought_chunk",
+		"content":       map[string]any{"type": "text", "text": text},
+	})
+}
+
+// 连续多条 thought chunk 合成一封后，幸存信封必须带 msgSeqEnd = 末条 msgSeq，
+// 否则 FE 只能按 [msgSeq, msgSeq] 回拉第一条 chunk，展开后思考缺尾巴。
+func TestLiteThoughtCoalesceStampsMsgSeqEnd(t *testing.T) {
+	const sid = "sess-th"
+	big := func(r rune) string { return strings.Repeat(string(r), 300) }
+	f := &liteFixture{
+		lines: []string{
+			histEnvelope(sid, 0, 1000, msgUserChunkMeta("问", map[string]any{"promptIndex": float64(0)})),
+			thoughtChunkEnv(sid, big('甲')), // msgSeq 1
+			thoughtChunkEnv(sid, big('乙')), // msgSeq 2
+			thoughtChunkEnv(sid, big('丙')), // msgSeq 3
+			thoughtChunkEnv(sid, big('丁')), // msgSeq 4
+			histEnvelope(sid, 0, 1000, map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"content":       map[string]any{"type": "text", "text": "答"},
+			}), // msgSeq 5
+		},
+		body: map[string]string{},
+	}
+	page := litePageOf(t, f.lines)
+	liteProjectPage(&page)
+
+	// 4 条连续 thought 合成成 1 条 → 总条数应从 6 降到 3。
+	if len(page) != 3 {
+		t.Fatalf("合成后条数 = %d, want 3（user + 1 thought + agent）", len(page))
+	}
+	stamp, ok := liteStampOf(t, page, 1)
+	if !ok {
+		t.Fatalf("thought 幸存信封没有 lite 标记: %v", liteUpdate(t, page, 1))
+	}
+	if got := liteAsInt(stamp["omitted"]); got <= 0 {
+		t.Errorf("thought lite.omitted = %d, want > 0", got)
+	}
+	end, hasEnd := stamp["msgSeqEnd"]
+	if !hasEnd {
+		t.Fatalf("thought 幸存信封缺 msgSeqEnd（FE 会把窗口塌成第 1 条 chunk）: stamp=%v", stamp)
+	}
+	if got := liteAsInt(end); got != 4 {
+		t.Errorf("thought msgSeqEnd = %d, want 4（末条 chunk 的 msgSeq）", got)
+	}
+}

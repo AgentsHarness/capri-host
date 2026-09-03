@@ -61,6 +61,7 @@ type toolLineMeta struct {
 	url       string
 	query     string
 	taskID    string
+	glob      string
 
 	outputType    string
 	outputCmd     string
@@ -164,7 +165,7 @@ func parseRawInputFingerprint(ri map[string]any, tm *toolLineMeta) {
 	if cmd, ok := ri["command"].(string); ok && cmd != "" {
 		tm.command = cmd
 	}
-	for _, pKey := range []string{"target_file", "path", "filePath", "file_path", "targetFile"} {
+	for _, pKey := range []string{"target_file", "path", "filePath", "file_path", "targetFile", "file", "target_directory", "targetDirectory"} {
 		if p, ok := ri[pKey].(string); ok && p != "" {
 			tm.path = p
 			break
@@ -177,8 +178,14 @@ func parseRawInputFingerprint(ri map[string]any, tm *toolLineMeta) {
 	if u, ok := ri["url"].(string); ok && u != "" {
 		tm.url = u
 	}
-	if q, ok := ri["query"].(string); ok && q != "" {
-		tm.query = q
+	for _, qKey := range []string{"query", "pattern"} {
+		if q, ok := ri[qKey].(string); ok && q != "" && tm.query == "" {
+			tm.query = q
+			break
+		}
+	}
+	if g, ok := ri["glob"].(string); ok && g != "" && tm.glob == "" {
+		tm.glob = g
 	}
 	for _, tKey := range []string{"task_id", "taskId"} {
 		if tid, ok := ri[tKey].(string); ok && tid != "" {
@@ -213,6 +220,24 @@ func parseRawOutputFeatures(ro map[string]any, tm *toolLineMeta) {
 			tm.contentPrefix = clipPrefix(cnt, 80)
 		}
 	}
+	if ea, ok := ro["EditsApplied"].(map[string]any); ok {
+		if p, ok := ea["absolute_path"].(string); ok && p != "" && tm.path == "" {
+			tm.path = p
+		}
+	}
+	if fc, ok := ro["file_matches"].([]any); ok && len(fc) > 0 {
+		for _, item := range fc {
+			if fm, ok := item.(map[string]any); ok {
+				if p, ok := fm["path"].(string); ok && p != "" && tm.path == "" {
+					tm.path = p
+					break
+				}
+			}
+		}
+	}
+	if p, ok := ro["path"].(string); ok && p != "" && tm.path == "" {
+		tm.path = p
+	}
 }
 
 func parseContentRaw(raw json.RawMessage, tm *toolLineMeta) {
@@ -236,6 +261,12 @@ func parseContentText(content []any, tm *toolLineMeta) {
 		m, ok := item.(map[string]any)
 		if !ok {
 			continue
+		}
+		if p, ok := m["path"].(string); ok && p != "" && tm.path == "" {
+			tm.path = p
+		}
+		if t, ok := m["type"].(string); ok && t == "diff" && tm.outputType == "" {
+			tm.outputType = "SearchReplace"
 		}
 		if t, ok := m["text"].(string); ok && t != "" {
 			sb.WriteString(t)
@@ -375,7 +406,16 @@ func fingerprintMatch(u, sig *toolLineMeta) bool {
 	}
 	if u.path != "" {
 		matched = true
-		if sig.path != u.path {
+		if sig.path != "" {
+			if sig.path != u.path && !strings.HasPrefix(u.path, strings.TrimRight(sig.path, "/")+"/") {
+				return false
+			}
+		} else if sig.glob != "" {
+			trimmedGlob := strings.TrimLeft(sig.glob, "*/")
+			if !strings.HasSuffix(u.path, trimmedGlob) {
+				return false
+			}
+		} else {
 			return false
 		}
 		if u.hasOffset && (!sig.hasOffset || sig.offset != u.offset) {
@@ -410,7 +450,7 @@ func sameStartIdentity(a, b *toolLineMeta) bool {
 	if a.path != b.path || a.hasOffset != b.hasOffset || a.offset != b.offset {
 		return false
 	}
-	if a.url != b.url || a.query != b.query || a.taskID != b.taskID {
+	if a.url != b.url || a.query != b.query || a.taskID != b.taskID || a.glob != b.glob {
 		return false
 	}
 	if a.name != "" && b.name != "" && a.name != b.name {
@@ -462,18 +502,48 @@ func readLineNum(u *toolLineMeta) (int, bool) {
 
 func familyNamesForOutput(outputType string) []string {
 	switch outputType {
-	case "Bash":
+	case "Bash", "BackgroundTaskStarted":
 		return []string{"run_terminal_command"}
 	case "ReadFile":
 		return []string{"read_file"}
+	case "SearchReplace":
+		return []string{"search_replace", "write"}
+	case "GrepSearch":
+		return []string{"grep"}
+	case "ListDir":
+		return []string{"list_dir"}
 	case "WebSearch":
 		return []string{"web_search"}
+	case "WebFetch":
+		return []string{"web_fetch"}
 	case "SearchTool":
 		return []string{"search_tool"}
 	case "TaskOutput":
 		return []string{"get_command_or_subagent_output"}
+	case "KillTask":
+		return []string{"kill_command_or_subagent"}
 	case "TodosUpdated", "Todo":
 		return []string{"todo_write"}
+	case "AskUserQuestion":
+		return []string{"ask_user_question"}
+	case "EnterPlanMode":
+		return []string{"enter_plan_mode"}
+	case "ExitPlanMode":
+		return []string{"exit_plan_mode"}
+	case "Workflow":
+		return []string{"workflow"}
+	case "Monitor":
+		return []string{"monitor"}
+	case "SchedulerCreate":
+		return []string{"scheduler_create"}
+	case "SchedulerDelete":
+		return []string{"scheduler_delete"}
+	case "SchedulerList":
+		return []string{"scheduler_list"}
+	case "ImageGen":
+		return []string{"image_gen", "image_edit", "image_to_video", "reference_to_video"}
+	case "MCP":
+		return []string{"use_tool"}
 	default:
 		return nil
 	}
@@ -485,12 +555,32 @@ func familyNamesForKind(kind string) []string {
 		return []string{"run_terminal_command"}
 	case "read":
 		return []string{"read_file"}
-	case "fetch":
+	case "edit", "write":
+		return []string{"search_replace", "write"}
+	case "search":
+		return []string{"grep", "search_tool", "web_search"}
+	case "fetch", "web_fetch":
 		return []string{"web_fetch"}
+	case "web_search":
+		return []string{"web_search"}
+	case "list":
+		return []string{"list_dir"}
 	case "think":
 		return []string{"todo_write"}
+	case "plan", "enter_plan", "exit_plan":
+		return []string{"enter_plan_mode", "exit_plan_mode", "todo_write"}
 	case "other":
-		return []string{"search_tool", "get_command_or_subagent_output"}
+		return []string{"search_tool", "get_command_or_subagent_output", "kill_command_or_subagent"}
+	case "ask_user":
+		return []string{"ask_user_question"}
+	case "workflow":
+		return []string{"workflow"}
+	case "monitor":
+		return []string{"monitor"}
+	case "image_gen":
+		return []string{"image_gen", "image_edit", "image_to_video", "reference_to_video"}
+	case "use_tool":
+		return []string{"use_tool"}
 	default:
 		return nil
 	}
@@ -550,6 +640,21 @@ func matchUpdateToCall(u *toolLineMeta, open []openCall) int {
 	if names := familyNamesForOutput(u.outputType); len(names) > 0 {
 		if i := uniqueOpen(open, func(c *openCall) bool { return nameIn(names, c.meta.name) }); i >= 0 {
 			return i
+		}
+		if isTerminalStatus(u.status) {
+			matching := filterOpen(open, func(c *openCall) bool { return nameIn(names, c.meta.name) })
+			if len(matching) > 1 {
+				hasIdentical := false
+				for j := 1; j < len(matching); j++ {
+					if sameStartIdentity(&open[matching[0]].meta, &open[matching[j]].meta) {
+						hasIdentical = true
+						break
+					}
+				}
+				if !hasIdentical {
+					return matching[0]
+				}
+			}
 		}
 	}
 

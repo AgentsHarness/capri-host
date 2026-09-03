@@ -500,3 +500,32 @@ func TestSessionUpdatesInjectsTimestampSynthIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestSyntheticToolCallSearchReplaceAndGrep(t *testing.T) {
+	lines := []updateLineMeta{
+		// SearchReplace
+		{agentTsMs: 1000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "search_replace", path: "src/a.ts"}},
+		{agentTsMs: 1001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "edit", path: "src/a.ts"}},
+		{agentTsMs: 1002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "SearchReplace", path: "src/a.ts"}},
+
+		// Grep in dir with file match
+		{agentTsMs: 2000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "grep", path: "src/store", query: "foo"}},
+		{agentTsMs: 2001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "search", title: "foo"}},
+		{agentTsMs: 2002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "GrepSearch", path: "src/store/chat/foo.ts"}},
+	}
+	order := []int{0, 1, 2, 3, 4, 5}
+	synthIDs := resolveSyntheticToolCallIDs(order, lines)
+	idEdit := formatSynthCallID(1000, 0)
+	idGrep := formatSynthCallID(2000, 0)
+
+	for _, seq := range []int{0, 1, 2} {
+		if synthIDs[seq] != idEdit {
+			t.Errorf("edit seq %d got %v, want %v", seq, synthIDs[seq], idEdit)
+		}
+	}
+	for _, seq := range []int{3, 4, 5} {
+		if synthIDs[seq] != idGrep {
+			t.Errorf("grep seq %d got %v, want %v", seq, synthIDs[seq], idGrep)
+		}
+	}
+}
