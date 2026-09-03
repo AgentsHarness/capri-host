@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ── 会话历史归一化（msgSeq，契约 tmp/msgseq/CONTRACT.md）──────────────
@@ -37,11 +38,25 @@ import (
 // 无 msgSeq、promptStarts 原样）。
 var errMissingAgentMeta = errors.New("存在缺失 _meta.agentTimestampMs 的存储信封")
 
+// 轮次目录（用户消息目录）预览的截断上限（字节，UTF-8 安全）。FE 展示时
+// 自己再按首行 80 字符截断（userMessagePreview），这里是线上体积的上限。
+const tocPreviewMaxBytes = 512
+
+// tocPreviewRunMaxBytes 单 chunk 文本 / 单 run 累计文本的本地截断（字节）。
+// run 取首行前必须先拼完整（跨 chunk 拆分的 prompt，文本可能分布在多个
+// chunk 里），拼的过程要有上限；首行通常远短于此，超长行再被
+// tocPreviewMaxBytes 收口。
+const tocPreviewRunMaxBytes = 4096
+
 // updateLineMeta 是一行存储信封的行级元数据。缓存只存它，不缓存信封内容。
 type updateLineMeta struct {
 	line        int   // 信封在文件中的名次（0 起，按非空行计，含被跳过的坏行）
 	agentTsMs   int64 // params._meta.agentTimestampMs
 	isUserChunk bool  // update.sessionUpdate == "user_message_chunk" 且非 hostTurn
+	// preview 是该 chunk 的正文文本（displayText 优先），仅 isUserChunk 时
+	// 填充（截断到 tocPreviewRunMaxBytes，不取首行——run 累计后才取首行）。
+	// 其余行恒为空串。供 promptPreviews（轮次目录）使用。
+	preview string
 	// 回退标记（update.sessionUpdate == "rewind_marker"）：agent 侧
 	// updates.jsonl 是只追加的，/rewind 只落一条标记，被回退掉的那支
 	// 「死分支」仍留在文件里。回放前必须按标记截断，否则 FE 会把用户
@@ -53,6 +68,10 @@ type updateLineMeta struct {
 	// hasPromptIndex=false，走 UserRunTurnTracker 的无标记规则。
 	promptIndex    int
 	hasPromptIndex bool
+
+	// 工具合成 ID 依赖字段：
+	isTurnCompleted bool
+	tool            *toolLineMeta
 }
 
 // normalizedHistory 是一个会话 updates.jsonl 的归一化视图（行级元数据）。
@@ -64,6 +83,11 @@ type normalizedHistory struct {
 	// promptStarts：每个「新用户 prompt」首条 chunk 的 msgSeq（host 重算，
 	// 规则见 promptStartsOf / userRunTurnTracker）。
 	promptStarts []int
+	// promptPreviews 与 promptStarts 平行：每个存活轮次的首行预览（尽力
+	// 而为，多 chunk 累计、displayText 优先，见 turnIndexesOf）。
+	promptPreviews []string
+	// synthToolCallIDs 为缺失 ID 的工具调用映射出全局稳定唯一的合成 ID（msgSeq → ID）。
+	synthToolCallIDs map[int]string
 }
 
 // parseUpdateLineMeta 解析一行存储信封的元数据；行不是合法 JSON →
@@ -71,15 +95,8 @@ type normalizedHistory struct {
 func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 	var env struct {
 		Params struct {
-			Update struct {
-				SessionUpdate     string `json:"sessionUpdate"`
-				TargetPromptIndex *int64 `json:"target_prompt_index"`
-				Meta              *struct {
-					PromptIndex *int64 `json:"promptIndex"`
-					HostTurn    bool   `json:"hostTurn"`
-				} `json:"_meta"`
-			} `json:"update"`
-			Meta struct {
+			Update updateWirePayload `json:"update"`
+			Meta   struct {
 				AgentTimestampMs int64 `json:"agentTimestampMs"`
 			} `json:"_meta"`
 		} `json:"params"`
@@ -89,13 +106,24 @@ func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 		return m, false
 	}
 	m.agentTsMs = env.Params.Meta.AgentTimestampMs
-	hostTurn := env.Params.Update.Meta != nil && env.Params.Update.Meta.HostTurn
-	m.isUserChunk = env.Params.Update.SessionUpdate == "user_message_chunk" && !hostTurn
-	if m.isUserChunk && env.Params.Update.Meta != nil && env.Params.Update.Meta.PromptIndex != nil {
-		m.promptIndex = int(*env.Params.Update.Meta.PromptIndex)
-		m.hasPromptIndex = true
+	su := env.Params.Update.SessionUpdate
+	if su == "turn_completed" {
+		m.isTurnCompleted = true
+	} else if su == "tool_call" || su == "tool_call_update" {
+		m.tool = parseToolLineMetaFromWire(&env.Params.Update)
 	}
-	m.isRewind = env.Params.Update.SessionUpdate == "rewind_marker"
+	hostTurn := env.Params.Update.Meta != nil && env.Params.Update.Meta.HostTurn
+	m.isUserChunk = su == "user_message_chunk" && !hostTurn
+	if m.isUserChunk {
+		// 只有用户 chunk 行多解析一次 content（RawMessage 零拷贝引用，解析
+		// 成本只发生在用户行）；工具行永远不碰 content。
+		m.preview = userChunkText(env.Params.Update.Content)
+		if env.Params.Update.Meta != nil && env.Params.Update.Meta.PromptIndex != nil {
+			m.promptIndex = int(*env.Params.Update.Meta.PromptIndex)
+			m.hasPromptIndex = true
+		}
+	}
+	m.isRewind = su == "rewind_marker"
 	if m.isRewind && env.Params.Update.TargetPromptIndex != nil {
 		m.rewindTarget = int(*env.Params.Update.TargetPromptIndex)
 		m.hasRewindTarget = true
@@ -228,7 +256,8 @@ func buildNormalizedHistory(path string) (*normalizedHistory, error) {
 	if filtered, hadRewind := filterRewindBranch(view.order, meta); hadRewind {
 		view.order = filtered
 	}
-	view.promptStarts = promptStartsOf(view)
+	view.promptStarts, view.promptPreviews = turnIndexesOf(view)
+	view.synthToolCallIDs = resolveSyntheticToolCallIDs(view.order, view.lines)
 	return view, nil
 }
 
@@ -323,19 +352,145 @@ func filterRewindBranch(order []int, lines []updateLineMeta) ([]int, bool) {
 // agent 的文件行号）。规则与 filterRewindBranch / agent UserRunTurnTracker
 // 相同：连续 user run + promptIndex 优先；值为 msgSeq。
 func promptStartsOf(v *normalizedHistory) []int {
-	var ps []int
+	starts, _ := turnIndexesOf(v)
+	return starts
+}
+
+// turnIndexesOf 一次遍历归一化序同时产出：
+//   starts   — 每个「新用户 prompt」首条 chunk 的 msgSeq（与 promptStartsOf
+//              完全同一条 UserRunTurnTracker 规则，保证两者永不脱节）；
+//   previews — 与 starts 平行的首行预览（轮次目录）：该 run 全部 user chunk
+//              正文拼接（displayText 优先，见 userChunkText）后的第一个非空
+//              行，截断到 tocPreviewMaxBytes（UTF-8 安全）。
+//
+// 预览是尽力而为的展示元数据：多 chunk 拆分取拼接首行；空 run / 图块 run
+// 回退空串（FE 按自身隐藏规则过滤，host 保持内容无关）。
+func turnIndexesOf(v *normalizedHistory) (starts []int, previews []string) {
 	var tracker userRunTurnTracker
+	var runText strings.Builder
+	inRun := false
+	flushRun := func() {
+		if !inRun {
+			return
+		}
+		previews = append(previews, firstNonEmptyLine(runText.String()))
+		runText.Reset()
+		inRun = false
+	}
 	for seq, idx := range v.order {
 		m := &v.lines[idx]
 		if !m.isUserChunk {
 			tracker.onNonUser()
+			flushRun()
 			continue
 		}
-		if newRun, counts := tracker.onUserChunk(m.hasPromptIndex, m.promptIndex); newRun && counts {
-			ps = append(ps, seq)
+		if newRun, counts := tracker.onUserChunk(m.hasPromptIndex, m.promptIndex); newRun {
+			flushRun()
+			if counts {
+				starts = append(starts, seq)
+				inRun = true
+			}
+		}
+		if inRun && runText.Len() < tocPreviewRunMaxBytes {
+			runText.WriteString(m.preview)
 		}
 	}
-	return ps
+	flushRun()
+	return starts, previews
+}
+
+// userChunkText 提取一条 user_message_chunk 的正文文本（与 FE
+// contentParts / envelopeContentMeta 对齐）：content 为文本块数组、
+// {type:"text", text} / {content:...} 嵌套对象或裸字符串；content 是对象时
+// _meta.displayText（cron/shell 的可见文案）优先。结果截断到
+// tocPreviewRunMaxBytes（不取首行——跨 chunk 拆分由 turnIndexesOf 累计）。
+func userChunkText(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) == nil && obj != nil {
+		if dt, ok := blockDisplayText(obj); ok {
+			return truncateRunes(dt, tocPreviewRunMaxBytes)
+		}
+		var b strings.Builder
+		appendChunkText(&b, obj, tocPreviewRunMaxBytes)
+		return truncateRunes(b.String(), tocPreviewRunMaxBytes)
+	}
+	var arr []any
+	if json.Unmarshal(raw, &arr) == nil {
+		var b strings.Builder
+		appendChunkText(&b, arr, tocPreviewRunMaxBytes)
+		return truncateRunes(b.String(), tocPreviewRunMaxBytes)
+	}
+	return ""
+}
+
+// blockDisplayText 读 content 对象上的 displayText（_meta 或 meta）。
+func blockDisplayText(obj map[string]any) (string, bool) {
+	for _, key := range []string{"_meta", "meta"} {
+		if meta, ok := obj[key].(map[string]any); ok {
+			if dt, ok := meta["displayText"].(string); ok && dt != "" {
+				return dt, true
+			}
+		}
+	}
+	return "", false
+}
+
+// appendChunkText 把 content 节点里的文本追加进 b，语义与 FE 的
+// contentParts 文本提取对齐：字符串、{text}、{content} 嵌套递归；
+// image 块（{type:"image", data}）不进文本。
+func appendChunkText(b *strings.Builder, v any, budget int) {
+	if b.Len() >= budget {
+		return
+	}
+	switch t := v.(type) {
+	case string:
+		b.WriteString(t)
+	case []any:
+		for _, item := range t {
+			appendChunkText(b, item, budget)
+		}
+	case map[string]any:
+		if typ, _ := t["type"].(string); typ == "image" {
+			if _, ok := t["data"].(string); ok {
+				return
+			}
+		}
+		if s, ok := t["text"].(string); ok {
+			b.WriteString(s)
+			return
+		}
+		if inner, ok := t["content"]; ok {
+			appendChunkText(b, inner, budget)
+		}
+	}
+}
+
+// firstNonEmptyLine 取首个非空行（trim 后逐行判断，与 FE userMessagePreview
+// 同规则），超长按 tocPreviewMaxBytes 截断（UTF-8 安全）。空文本回退空串。
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return truncateRunes(line, tocPreviewMaxBytes)
+		}
+	}
+	return ""
+}
+
+// truncateRunes 把 s 截到最多 maxBytes 字节，按 rune 边界回退、绝不切出半
+// 个 UTF-8 字符（否则 FE 侧 JSON 里出现替换符）。
+func truncateRunes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := s[:maxBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 // sessionLineView 返回 rewind 截断后的行视图。优先走时间戳归一化（与
@@ -361,7 +516,7 @@ func sessionLineView(path string) (*normalizedHistory, error) {
 		order = filtered
 	}
 	view = &normalizedHistory{lines: meta, order: order}
-	view.promptStarts = promptStartsOf(view)
+	view.promptStarts, view.promptPreviews = turnIndexesOf(view)
 	return view, nil
 }
 
@@ -389,7 +544,7 @@ func rewindFilteredFileOrder(path string) (*normalizedHistory, error) {
 		order = filtered
 	}
 	view := &normalizedHistory{lines: meta, order: order}
-	view.promptStarts = promptStartsOf(view)
+	view.promptStarts, view.promptPreviews = turnIndexesOf(view)
 	return view, nil
 }
 
@@ -635,15 +790,19 @@ func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts
 				return UpdatesPage{}, fmt.Errorf("%w: missing envelope at msgSeq %d", errLocalHistoryRead, seq)
 			}
 			obj["msgSeq"] = seq
+			if synthID, ok := view.synthToolCallIDs[seq]; ok {
+				injectSynthToolCallID(obj, synthID)
+			}
 			updates = append(updates, obj)
 		}
 	}
 	return UpdatesPage{
-		Updates:      updates,
-		TotalCount:   total,
-		HasMore:      end < total,
-		PromptStarts: view.promptStarts,
-		Btw:          btwWindowRecords(b.grokHome(), cwd, sessionID, view, start, end),
+		Updates:        updates,
+		TotalCount:     total,
+		HasMore:        end < total,
+		PromptStarts:   view.promptStarts,
+		PromptPreviews: view.promptPreviews,
+		Btw:            btwWindowRecords(b.grokHome(), cwd, sessionID, view, start, end),
 	}, nil
 }
 

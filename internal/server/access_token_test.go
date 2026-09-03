@@ -161,6 +161,7 @@ func TestAuthRequiredForPath(t *testing.T) {
 		want bool
 	}{
 		{"/api/hosts", false},
+		{"/api/probe", true},
 		{"/api/status", true},
 		{"/api/prompt", true},
 		{"/api/shell", true},
