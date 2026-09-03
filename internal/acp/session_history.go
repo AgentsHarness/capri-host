@@ -86,7 +86,8 @@ type normalizedHistory struct {
 	// promptPreviews 与 promptStarts 平行：每个存活轮次的首行预览（尽力
 	// 而为，多 chunk 累计、displayText 优先，见 turnIndexesOf）。
 	promptPreviews []string
-	// synthToolCallIDs 为缺失 ID 的工具调用映射出全局稳定唯一的合成 ID（msgSeq → ID）。
+	// synthToolCallIDs 为缺失 ID 的工具调用映射出全局稳定唯一的合成 ID
+	// （msgSeq → synth:call:<agentTimestampMs>:<k>）。
 	synthToolCallIDs map[int]string
 }
 
@@ -107,7 +108,7 @@ func parseUpdateLineMeta(line []byte) (updateLineMeta, bool) {
 	}
 	m.agentTsMs = env.Params.Meta.AgentTimestampMs
 	su := env.Params.Update.SessionUpdate
-	if su == "turn_completed" {
+	if su == "turn_completed" || su == "response_completed" {
 		m.isTurnCompleted = true
 	} else if su == "tool_call" || su == "tool_call_update" {
 		m.tool = parseToolLineMetaFromWire(&env.Params.Update)
@@ -357,11 +358,12 @@ func promptStartsOf(v *normalizedHistory) []int {
 }
 
 // turnIndexesOf 一次遍历归一化序同时产出：
-//   starts   — 每个「新用户 prompt」首条 chunk 的 msgSeq（与 promptStartsOf
-//              完全同一条 UserRunTurnTracker 规则，保证两者永不脱节）；
-//   previews — 与 starts 平行的首行预览（轮次目录）：该 run 全部 user chunk
-//              正文拼接（displayText 优先，见 userChunkText）后的第一个非空
-//              行，截断到 tocPreviewMaxBytes（UTF-8 安全）。
+//
+//	starts   — 每个「新用户 prompt」首条 chunk 的 msgSeq（与 promptStartsOf
+//	           完全同一条 UserRunTurnTracker 规则，保证两者永不脱节）；
+//	previews — 与 starts 平行的首行预览（轮次目录）：该 run 全部 user chunk
+//	           正文拼接（displayText 优先，见 userChunkText）后的第一个非空
+//	           行，截断到 tocPreviewMaxBytes（UTF-8 安全）。
 //
 // 预览是尽力而为的展示元数据：多 chunk 拆分取拼接首行；空 run / 图块 run
 // 回退空串（FE 按自身隐藏规则过滤，host 保持内容无关）。
