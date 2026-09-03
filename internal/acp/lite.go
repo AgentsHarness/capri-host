@@ -3,6 +3,8 @@ package acp
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -79,6 +81,21 @@ var liteKeepKeys = map[string]bool{
 	"label":            true,
 	"mime_type":        true,
 	"mimeType":         true,
+	// 折叠行行头用到的计数：liteBudget 兜底裁剪也不许动，否则前端摘要会退化。
+	"match_count":  true,
+	"matchCount":   true,
+	"result_count": true,
+	"resultCount":  true,
+	"status_code":  true,
+	"statusCode":   true,
+	"total_lines":  true,
+	"totalLines":   true,
+	"total_pages":  true,
+	"totalPages":   true,
+	"exit_code":    true,
+	"exitCode":     true,
+	"entry_count":  true,
+	"entryCount":   true,
 }
 
 // liteHardKeepKeys：一字不动（command 不在此列，超长截头）。
@@ -121,6 +138,8 @@ var liteRawInputKeep = map[string]bool{
 	"timeout":          true,
 	"merge":            true,
 	"type":             true,
+	// use_tool 的折叠行行头是「Server + 动作名」，动作名只来自 tool_name。
+	"tool_name": true,
 }
 
 // liteParamsMetaKeep：FE 回放真读的 params._meta 键。
@@ -146,6 +165,12 @@ var liteUpdateMetaKeep = map[string]bool{
 
 type liteAcc struct {
 	omitted int
+	// 折叠行行头要显示、但正文一删就算不出来的数字：edit 的加减行数、
+	// grep 的命中文件数。投影时折出来打进 _meta.lite，前端在全量补全回来
+	// 之前照旧能画出行头后缀；补全后 _meta.lite 被抹掉，改由真实正文计算。
+	ins   int
+	del   int
+	files int
 }
 
 func (a *liteAcc) note(_ string, removed int) {
@@ -210,10 +235,14 @@ func liteProjectEnvelope(raw any) int {
 	if acc.omitted > 0 && (kind == "tool_call" || kind == "tool_call_update" || kind == "agent_thought_chunk") {
 		liteStamp(upd, acc.omitted, -1)
 	}
+	if kind == "tool_call" || kind == "tool_call_update" {
+		liteStampFold(upd, &acc)
+	}
 	return acc.omitted + metaAcc.omitted
 }
 
 func liteProjectTool(upd map[string]any, acc *liteAcc) {
+	liteFoldNumbers(upd, acc)
 	if blocks, ok := upd[kContent].([]any); ok && len(blocks) > 0 {
 		for _, b := range blocks {
 			acc.note("content", liteJSONLen(b))
@@ -411,16 +440,7 @@ func liteStamp(upd map[string]any, omitted, msgSeqEnd int) {
 	if omitted <= 0 && msgSeqEnd < 0 {
 		return
 	}
-	meta, ok := upd[kMeta].(map[string]any)
-	if !ok {
-		meta = map[string]any{}
-		upd[kMeta] = meta
-	}
-	stamp, _ := meta["lite"].(map[string]any)
-	if stamp == nil {
-		stamp = map[string]any{}
-		meta["lite"] = stamp
-	}
+	stamp := liteStampMap(upd)
 	prev := liteAsInt(stamp["omitted"])
 	if omitted > 0 {
 		stamp["omitted"] = prev + omitted
@@ -432,6 +452,248 @@ func liteStamp(upd map[string]any, omitted, msgSeqEnd int) {
 			stamp["msgSeqEnd"] = msgSeqEnd
 		}
 	}
+}
+
+func liteStampMap(upd map[string]any) map[string]any {
+	meta, ok := upd[kMeta].(map[string]any)
+	if !ok {
+		meta = map[string]any{}
+		upd[kMeta] = meta
+	}
+	stamp, _ := meta["lite"].(map[string]any)
+	if stamp == nil {
+		stamp = map[string]any{}
+		meta["lite"] = stamp
+	}
+	return stamp
+}
+
+// ── 折叠行行头的数字折算 ──────────────────────────────────────────────
+//
+// 前端折叠卡的后缀（edit 的 (+N/−M)、grep 的 (N matches in M files)）原先
+// 只能从正文算：lite 删掉 content / old_string / new_string / file_matches
+// 之后，行头就空着，要等全量补回来才有。这里在删之前把数字折进
+// _meta.lite.edits / _meta.lite.files，补全时标记被抹掉、改回由真实正文算，
+// 两条路口径一致。
+
+// liteStampFold 挂折算结果；标记本身的字节不计入 omitted。
+func liteStampFold(upd map[string]any, acc *liteAcc) {
+	if acc.ins == 0 && acc.del == 0 && acc.files == 0 {
+		return
+	}
+	stamp := liteStampMap(upd)
+	if acc.ins != 0 || acc.del != 0 {
+		stamp["edits"] = map[string]any{"ins": acc.ins, "del": acc.del}
+	}
+	if acc.files > 0 {
+		stamp["files"] = acc.files
+	}
+}
+
+func liteFoldNumbers(upd map[string]any, acc *liteAcc) {
+	// 失败的编辑前端按 error 渲染、行头不画加减行数，这里就不必折。
+	if ins, del, ok := liteEditFold(upd); ok && !liteStatusFailed(upd) {
+		acc.ins, acc.del = ins, del
+	}
+	if n, ok := liteFileFold(upd); ok {
+		acc.files = n
+	}
+}
+
+func liteStatusFailed(upd map[string]any) bool {
+	s, _ := upd["status"].(string)
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "failed", "error":
+		return true
+	}
+	return false
+}
+
+var (
+	liteEditTagRx    = regexp.MustCompile(`(?i)search|replace|edit`)
+	liteAppliedTagRx = regexp.MustCompile(`(?i)EditsApplied|applied`)
+	liteGrepTagRx    = regexp.MustCompile(`(?i)grep|search`)
+)
+
+// liteEditFold 端口前端 extractEditHunks 的取数顺序：先认 rawOutput 里结构化的
+// edits.details，认不到再看 content 的 diff 块。两处都没有则 ok=false。
+func liteEditFold(upd map[string]any) (int, int, bool) {
+	if details, ok := liteEditDetails(upd["rawOutput"]); ok {
+		ins, del := 0, 0
+		for _, item := range details {
+			d, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			i, l := liteDiffLineCounts(
+				liteFirstStr(d, "old_string", "oldString", "old_text"),
+				liteFirstStr(d, "new_string", "newString", "new_text"),
+			)
+			ins += i
+			del += l
+		}
+		return ins, del, true
+	}
+	blocks, ok := upd[kContent].([]any)
+	if !ok {
+		return 0, 0, false
+	}
+	ins, del, found := 0, 0, false
+	for _, item := range blocks {
+		b, ok := item.(map[string]any)
+		if !ok || b[kType] != "diff" {
+			continue
+		}
+		found = true
+		i, l := liteDiffLineCounts(liteStr(b["oldText"]), liteStr(b["newText"]))
+		ins += i
+		del += l
+	}
+	return ins, del, found
+}
+
+// liteEditDetails 剥 rawOutput 的 Rust enum tag 取 edits.details。剥法与前端
+// unwrapTagged 一致：单键 = 外部 tag，带 type / variant 键 = 内部 tag（body
+// 仍是整包）。
+func liteEditDetails(raw any) ([]any, bool) {
+	body := raw
+	if tag, inner := liteUnwrapTagged(raw); tag != "" && liteEditTagRx.MatchString(tag) {
+		body = inner
+	}
+	if tag, inner := liteUnwrapTagged(body); tag != "" && liteAppliedTagRx.MatchString(tag) {
+		body = inner
+	}
+	m, ok := body.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	src := m
+	if inner, ok := m["edits"].(map[string]any); ok {
+		src = inner
+	}
+	for _, cand := range []map[string]any{src, m} {
+		if details, ok := cand["details"].([]any); ok && len(details) > 0 {
+			for _, item := range details {
+				if _, ok := item.(map[string]any); ok {
+					return details, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// liteFileFold 取 grep 的命中文件数：file_matches 长度，退到 file_paths。
+// 两者都被裁掉时不折算（前端也就无从显示文件数，宁缺不编）。
+func liteFileFold(upd map[string]any) (int, bool) {
+	ro := upd["rawOutput"]
+	if tag, inner := liteUnwrapTagged(ro); tag != "" && liteGrepTagRx.MatchString(tag) {
+		ro = inner
+	}
+	m, ok := ro.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	for _, key := range []string{"file_matches", "fileMatches", "file_paths", "filePaths"} {
+		if arr, ok := m[key].([]any); ok && len(arr) > 0 {
+			return len(arr), true
+		}
+	}
+	return 0, false
+}
+
+func liteUnwrapTagged(v any) (string, any) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", nil
+	}
+	if len(m) == 1 {
+		for k, item := range m {
+			return k, item
+		}
+	}
+	if s, ok := m["type"].(string); ok {
+		return s, m
+	}
+	if s, ok := m["variant"].(string); ok {
+		return s, m
+	}
+	return "", nil
+}
+
+// liteDiffLineCounts 端口 simpleDiffLines 的计数规则：只有一侧有文本时整段
+// 计增或删；两侧都有则走同一条 LCS（超过 400 行退回「整段全算」的同一路径）。
+func liteDiffLineCounts(oldText, newText string) (int, int) {
+	switch {
+	case oldText == "" && newText == "":
+		return 0, 0
+	case oldText == "":
+		return len(liteSplitDiffLines(newText)), 0
+	case newText == "":
+		return 0, len(liteSplitDiffLines(oldText))
+	}
+	oldLines := liteSplitDiffLines(oldText)
+	newLines := liteSplitDiffLines(newText)
+	if len(oldLines)+len(newLines) <= 400 {
+		return liteLCSCounts(oldLines, newLines)
+	}
+	return len(newLines), len(oldLines)
+}
+
+func liteSplitDiffLines(s string) []string {
+	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+}
+
+// liteLCSCounts 与前端 diffLines 同一条 LCS（等长时优先删），只数增删行数。
+func liteLCSCounts(a, b []string) (int, int) {
+	m, n := len(a), len(b)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := m - 1; i >= 0; i-- {
+		for j := n - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+	i, j := 0, 0
+	ins, del := 0, 0
+	for i < m && j < n {
+		switch {
+		case a[i] == b[j]:
+			i++
+			j++
+		case dp[i+1][j] >= dp[i][j+1]:
+			i++
+			del++
+		default:
+			j++
+			ins++
+		}
+	}
+	del += m - i
+	ins += n - j
+	return ins, del
+}
+
+func liteFirstStr(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s := liteStr(m[k]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func liteStr(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func liteAsInt(v any) int {
@@ -585,6 +847,14 @@ func liteMergeMeta(dst, src map[string]any) {
 			end := liteAsInt(sm["msgSeqEnd"])
 			if end > liteAsInt(dm["msgSeqEnd"]) {
 				dm["msgSeqEnd"] = end
+			}
+			// edits / files 是「这一封正文折出来的行头数字」，合成时后到覆盖
+			// 先到——与前端整包替换 content / rawOutput 的取数口径一致；
+			// 累加会把同一次编辑数两遍。
+			for _, num := range []string{"edits", "files"} {
+				if v, ok := sm[num]; ok {
+					dm[num] = v
+				}
 			}
 			continue
 		}
