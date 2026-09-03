@@ -874,9 +874,9 @@ type sessionUpdatesBody struct {
 	Stream    bool `json:"stream,omitempty"`
 	ChunkSize *int `json:"chunkSize,omitempty"`
 	TurnIndex *int `json:"turnIndex,omitempty"`
-	// detail 是历史页的响应投影档位（契约 lite-replay [A]，见
-	// acp/lite.go）："lite" 只裁工具正文，"meta" 只回分页锚点，
-	// "full"/缺省/未知值 = 信封逐字节原样。
+	// detail 是历史页的响应投影档位（见 acp/lite.go）："lite" 是首屏
+	// 时间线（合成工具信封、thought 占位、丢掉正文），"meta" 只回分页
+	// 锚点，"full"/缺省/未知值 = 信封逐字节原样。
 	Detail string `json:"detail,omitempty"`
 }
 

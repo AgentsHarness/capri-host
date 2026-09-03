@@ -166,7 +166,7 @@ func TestSessionUpdatesDetailLite(t *testing.T) {
 	}
 	updates, _ := m["updates"].([]any)
 	if len(updates) != 4 {
-		t.Fatalf("updates 条数 = %d, want 4（不许删信封行）", len(updates))
+		t.Fatalf("updates 条数 = %d, want 4（本夹具无合成对象）", len(updates))
 	}
 	for i, raw := range updates {
 		env := raw.(map[string]any)
@@ -174,11 +174,10 @@ func TestSessionUpdatesDetailLite(t *testing.T) {
 			t.Errorf("信封 %d msgSeq = %v, want %d", i, env["msgSeq"], i)
 		}
 	}
-	// 工具信封：正文换摘要形状，params._meta 与保留字段原样。
 	upd := updates[2].(map[string]any)["params"].(map[string]any)["update"].(map[string]any)
 	ro := upd["rawOutput"].(map[string]any)
-	if stub, ok := ro["output"].(map[string]any); !ok || stub["omitted"] != float64(20002) {
-		t.Errorf("rawOutput.output 没换成 {omitted:20002}: %v", ro["output"])
+	if _, ok := ro["output"]; ok {
+		t.Errorf("rawOutput.output 还在: %v", ro["output"])
 	}
 	if ro["path"] != "/ws/pkg/main.go" || ro["exit_code"] != float64(0) {
 		t.Errorf("rawOutput 保留清单被改: %v", ro)
@@ -186,30 +185,22 @@ func TestSessionUpdatesDetailLite(t *testing.T) {
 	if upd["toolCallId"] != "tool-1" || upd["status"] != "completed" || upd["kind"] != "read" || upd["title"] != "Read main.go" {
 		t.Errorf("工具信封身份字段被改: %v", upd)
 	}
-	blocks, _ := upd["content"].([]any)
-	if len(blocks) != 1 {
-		t.Fatalf("content 块数 = %d, want 1", len(blocks))
-	}
-	block := blocks[0].(map[string]any)
-	if block["type"] != "content" {
-		t.Errorf("content[0].type = %v, want 原块 type", block["type"])
-	}
-	if _, ok := block["omitted"].(float64); !ok {
-		t.Errorf("content[0].omitted = %v, want 字节数", block["omitted"])
+	if _, ok := upd["content"]; ok {
+		t.Errorf("content 还在: %v", upd["content"])
 	}
 	meta := upd["_meta"].(map[string]any)
 	if meta["promptIndex"] != float64(0) {
 		t.Errorf("update._meta.promptIndex 被改: %v", meta)
 	}
-	if stamp, ok := meta["lite"].(map[string]any); !ok || stamp["fields"] == nil {
+	if stamp, ok := meta["lite"].(map[string]any); !ok || stamp["omitted"] == nil {
 		t.Errorf("工具信封没打 lite 标记: %v", meta)
 	}
-	// 非工具信封逐字节原样（用户/助手文本、回合终态）。
-	for _, i := range []int{0, 1, 3} {
-		fu := updates[i]
-		gu := fm["updates"].([]any)[i]
-		if !reflect.DeepEqual(mustMarshalLite(t, fu), mustMarshalLite(t, gu)) {
-			t.Errorf("信封 %d（非工具）被 lite 改了", i)
+	// 可见文本（用户/助手）的 update.content 原样。
+	for _, i := range []int{0, 1} {
+		fu := fm["updates"].([]any)[i].(map[string]any)["params"].(map[string]any)["update"].(map[string]any)
+		gu := updates[i].(map[string]any)["params"].(map[string]any)["update"].(map[string]any)
+		if !reflect.DeepEqual(fu["content"], gu["content"]) {
+			t.Errorf("信封 %d 可见正文被 lite 改了", i)
 		}
 	}
 }
