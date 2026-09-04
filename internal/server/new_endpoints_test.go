@@ -235,6 +235,8 @@ func TestNormalizeRewindPoints(t *testing.T) {
 
 func TestRewindExecuteEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 
 	rec := postJSON(t, s, "/api/rewind-execute", `{"sessionId":"sess-1","targetIndex":2}`)
 	if rec.Code != http.StatusOK {
@@ -242,6 +244,24 @@ func TestRewindExecuteEndpoint(t *testing.T) {
 	}
 	if m := decodeBody(t, rec); m["ok"] != true {
 		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	// 验证广播事件：session_rewound 与 sessions_changed
+	var gotRewound, gotSessionsChanged bool
+	deadline := time.After(2 * time.Second)
+	for !gotRewound || !gotSessionsChanged {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "session_rewound" && ev["sessionId"] == "sess-1" {
+				if idx, ok := ev["targetPromptIndex"].(int); ok && idx == 2 {
+					gotRewound = true
+				}
+			} else if ev["type"] == "sessions_changed" {
+				gotSessionsChanged = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for rewind broadcasts (gotRewound=%v, gotSessionsChanged=%v)", gotRewound, gotSessionsChanged)
+		}
 	}
 
 	// targetIndex 0 is a legitimate rewind target — must not 400.

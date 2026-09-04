@@ -3170,6 +3170,7 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		"reasoningEffort": reasoningEffort,
 		kSessionID:        sessionID,
 	})
+	b.broadcastRosterChange()
 	return nil
 }
 
@@ -4672,12 +4673,22 @@ func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetInde
 	if mode == "" {
 		mode = "conversation_only"
 	}
-	return b.request(ctx, "_x.ai/rewind/execute", map[string]any{
+	res, err := b.request(ctx, "_x.ai/rewind/execute", map[string]any{
 		kSessionID:          sessionID,
 		"targetPromptIndex": targetIndex,
 		"force":             true,
 		"mode":              mode,
 	}, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.Broadcast(Event{
+		kType:               "session_rewound",
+		kSessionID:          sessionID,
+		"targetPromptIndex": targetIndex,
+	})
+	b.broadcastRosterChange()
+	return res, nil
 }
 
 // SchedulerDelete calls x.ai/scheduler/delete: {sessionId, taskId} — stops
@@ -4823,6 +4834,9 @@ func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string
 	}); err != nil {
 		return nil, err
 	}
+	// Broadcast to all connected FE clients so every tab/device converges
+	// immediately (the agent notification is fire-and-forget and does not echo).
+	b.Broadcast(Event{kType: "yolo_mode_changed", kParams: params})
 	return map[string]any{"ok": true}, nil
 }
 
