@@ -43,6 +43,14 @@ func TestGitEndpoints(t *testing.T) {
 		t.Errorf("git/status explicit params = %v, want %v", params, want)
 	}
 
+	// git/diffs 缺省 includePatch 为 true
+	recDiff := postJSON(t, s, "/api/git/diffs", `{"cwd":"/ws","from":"HEAD","to":"working"}`)
+	wantOK(t, recDiff)
+	diffParams := recordedParams(t, s, recordPath, "/api/git/diffs", `{"cwd":"/ws","from":"HEAD","to":"working"}`, "_x.ai/git/diffs")
+	if diffParams["includePatch"] != true {
+		t.Errorf("git/diffs default includePatch = %v, want true", diffParams["includePatch"])
+	}
+
 	// commit 缺 message → 400。
 	rec = postJSON(t, s, "/api/git/commit", `{"cwd":"/ws"}`)
 	if rec.Code != http.StatusBadRequest {
