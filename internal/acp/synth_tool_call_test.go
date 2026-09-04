@@ -1,132 +1,47 @@
 package acp
 
 import (
+	"context"
 	"os"
 	"testing"
 )
 
 func TestSyntheticToolCallIDInjection(t *testing.T) {
-	// 测试场景 1：串行调用，toolCallId 为空，注入正确的 synth:call:<msgSeq>
 	t.Run("serial missing call id", func(t *testing.T) {
 		lines := []updateLineMeta{
-			{
-				agentTsMs: 1000,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call",
-					name:          "run_terminal_command",
-					command:       "ls -la",
-				},
-			},
-			{
-				agentTsMs: 1001,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					kind:          "execute",
-					command:       "ls -la",
-				},
-			},
-			{
-				agentTsMs: 1002,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					status:        "completed",
-					outputType:    "Bash",
-					outputCmd:     "ls -la",
-				},
-			},
+			{agentTsMs: 1000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "ls -la"}},
+			{agentTsMs: 1001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "execute", command: "ls -la"}},
+			{agentTsMs: 1002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "Bash", outputCmd: "ls -la"}},
 		}
 		order := []int{0, 1, 2}
 		synthIDs := resolveSyntheticToolCallIDs(order, lines)
-
-		wantID := "synth:call:0"
-		if synthIDs[0] != wantID {
-			t.Errorf("msgSeq 0 synthID = %v, want %v", synthIDs[0], wantID)
-		}
-		if synthIDs[1] != wantID {
-			t.Errorf("msgSeq 1 synthID = %v, want %v", synthIDs[1], wantID)
-		}
-		if synthIDs[2] != wantID {
-			t.Errorf("msgSeq 2 synthID = %v, want %v", synthIDs[2], wantID)
+		want := formatSynthCallID(1000, 0)
+		for seq := 0; seq < 3; seq++ {
+			if synthIDs[seq] != want {
+				t.Errorf("msgSeq %d synthID = %v, want %v", seq, synthIDs[seq], want)
+			}
 		}
 	})
 
-	// 测试场景 2：并发两个同族调用（read_file 读不同文件不同 offset），乱序完成，各归各的合成 ID
 	t.Run("parallel same family out of order completion", func(t *testing.T) {
 		lines := []updateLineMeta{
-			// seq 0: start read A (offset 1080)
-			{
-				agentTsMs: 1000,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call",
-					name:          "read_file",
-					path:          "src/a.rs",
-					offset:        1080,
-					hasOffset:     true,
-				},
-			},
-			// seq 1: update read A
-			{
-				agentTsMs: 1001,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					kind:          "read",
-					path:          "src/a.rs",
-				},
-			},
-			// seq 2: start read B (no offset)
-			{
-				agentTsMs: 1002,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call",
-					name:          "read_file",
-					path:          "src/b.rs",
-					offset:        0,
-					hasOffset:     false,
-				},
-			},
-			// seq 3: update read B
-			{
-				agentTsMs: 1003,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					kind:          "read",
-					path:          "src/b.rs",
-				},
-			},
-			// seq 4: B 完成了！(带 1→ content 前缀，无路径)
-			{
-				agentTsMs: 1004,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					status:        "completed",
-					outputType:    "ReadFile",
-					contentPrefix: "1→use std::path::Path;\n",
-				},
-			},
-			// seq 5: A 完成了！(带 1080→ content 前缀，无路径)
-			{
-				agentTsMs: 1005,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					status:        "completed",
-					outputType:    "ReadFile",
-					contentPrefix: "1080→tracing::debug!(\"hello\");\n",
-				},
-			},
+			{agentTsMs: 1000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/a.rs", offset: 1080, hasOffset: true}},
+			{agentTsMs: 1001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "read", path: "src/a.rs"}},
+			{agentTsMs: 1002, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/b.rs"}},
+			{agentTsMs: 1003, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "read", path: "src/b.rs"}},
+			{agentTsMs: 1004, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "ReadFile", contentPrefix: "1→use std::path::Path;\n"}},
+			{agentTsMs: 1005, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "ReadFile", contentPrefix: "1080→tracing::debug!(\"hello\");\n"}},
 		}
 		order := []int{0, 1, 2, 3, 4, 5}
 		synthIDs := resolveSyntheticToolCallIDs(order, lines)
-
-		idA := "synth:call:0"
-		idB := "synth:call:2"
-
+		idA := formatSynthCallID(1000, 0)
+		idB := formatSynthCallID(1002, 0)
 		if synthIDs[0] != idA || synthIDs[1] != idA {
-			t.Errorf("A starts/updates should have idA: %v, %v", synthIDs[0], synthIDs[1])
+			t.Errorf("A starts/updates: %v %v, want %v", synthIDs[0], synthIDs[1], idA)
 		}
 		if synthIDs[2] != idB || synthIDs[3] != idB {
-			t.Errorf("B starts/updates should have idB: %v, %v", synthIDs[2], synthIDs[3])
+			t.Errorf("B starts/updates: %v %v, want %v", synthIDs[2], synthIDs[3], idB)
 		}
-		// 验证 seq 4 是 B 的完成，seq 5 是 A 的完成！
 		if synthIDs[4] != idB {
 			t.Errorf("seq 4 (completed B) got %v, want %v", synthIDs[4], idB)
 		}
@@ -135,102 +50,128 @@ func TestSyntheticToolCallIDInjection(t *testing.T) {
 		}
 	})
 
-	// 测试场景 3：并发 web_fetch 与 bash，web_fetch 抛 SSRF 错误快速失败
-	t.Run("parallel web_fetch and bash with error", func(t *testing.T) {
+	t.Run("same file different offsets distinguished by line prefix not contains", func(t *testing.T) {
 		lines := []updateLineMeta{
-			// seq 0: web_fetch start
-			{
-				agentTsMs: 1000,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call",
-					name:          "web_fetch",
-					url:           "https://github.com/foo/bar",
-				},
-			},
-			// seq 1: web_fetch update
-			{
-				agentTsMs: 1001,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					kind:          "fetch",
-					url:           "https://github.com/foo/bar",
-				},
-			},
-			// seq 2: bash start
-			{
-				agentTsMs: 1002,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call",
-					name:          "run_terminal_command",
-					command:       "uname -m",
-				},
-			},
-			// seq 3: bash update
-			{
-				agentTsMs: 1003,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					kind:          "execute",
-					command:       "uname -m",
-				},
-			},
-			// seq 4: web_fetch failed with SSRF error
-			{
-				agentTsMs: 1004,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					status:        "failed",
-					errorMsg:      "SSRF blocked: github.com resolves to private IP",
-					contentText:   "Tool `web_fetch` failed: SSRF blocked",
-				},
-			},
-			// seq 5: bash completed
-			{
-				agentTsMs: 1005,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					status:        "completed",
-					outputType:    "Bash",
-					outputCmd:     "uname -m",
-				},
-			},
+			{agentTsMs: 2000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/a.rs", offset: 80, hasOffset: true}},
+			{agentTsMs: 2001, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/a.rs", offset: 1080, hasOffset: true}},
+			{agentTsMs: 2002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "ReadFile", contentPrefix: "1080→fn main() {\n"}},
+			{agentTsMs: 2003, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "ReadFile", contentPrefix: "80→use foo;\n"}},
 		}
-		order := []int{0, 1, 2, 3, 4, 5}
-		synthIDs := resolveSyntheticToolCallIDs(order, lines)
-
-		idFetch := "synth:call:0"
-		idBash := "synth:call:2"
-
-		if synthIDs[0] != idFetch || synthIDs[1] != idFetch || synthIDs[4] != idFetch {
-			t.Errorf("fetch events mismatch: seq0=%v, seq1=%v, seq4=%v, want %v", synthIDs[0], synthIDs[1], synthIDs[4], idFetch)
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1, 2, 3}, lines)
+		id80 := formatSynthCallID(2000, 0)
+		id1080 := formatSynthCallID(2001, 0)
+		if synthIDs[2] != id1080 {
+			t.Errorf("1080→ completion got %v, want %v (must not match offset 80 via Contains)", synthIDs[2], id1080)
 		}
-		if synthIDs[2] != idBash || synthIDs[3] != idBash || synthIDs[5] != idBash {
-			t.Errorf("bash events mismatch: seq2=%v, seq3=%v, seq5=%v, want %v", synthIDs[2], synthIDs[3], synthIDs[5], idBash)
+		if synthIDs[3] != id80 {
+			t.Errorf("80→ completion got %v, want %v", synthIDs[3], id80)
 		}
 	})
 
-	// 测试场景 4：原有非空 toolCallId 保持不变，不被覆盖
-	t.Run("preserves existing toolCallId", func(t *testing.T) {
+	t.Run("no-offset read does not steal 21→ as 1→", func(t *testing.T) {
 		lines := []updateLineMeta{
-			{
-				agentTsMs: 1000,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call",
-					toolCallID:    "real-call-123",
-					name:          "bash",
-				},
-			},
-			{
-				agentTsMs: 1001,
-				tool: &toolLineMeta{
-					sessionUpdate: "tool_call_update",
-					toolCallID:    "real-call-123",
-					status:        "completed",
-				},
-			},
+			{agentTsMs: 3000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/a.rs"}},
+			{agentTsMs: 3001, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/b.rs", offset: 21, hasOffset: true}},
+			{agentTsMs: 3002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "ReadFile", contentPrefix: "21→let x = 1;\n"}},
 		}
-		order := []int{0, 1}
-		synthIDs := resolveSyntheticToolCallIDs(order, lines)
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1, 2}, lines)
+		idB := formatSynthCallID(3001, 0)
+		if synthIDs[2] != idB {
+			t.Errorf("21→ completion got %v, want %v (1→ substring must not win)", synthIDs[2], idB)
+		}
+	})
+
+	t.Run("parallel web_fetch and bash with error", func(t *testing.T) {
+		lines := []updateLineMeta{
+			{agentTsMs: 1000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "web_fetch", url: "https://github.com/foo/bar"}},
+			{agentTsMs: 1001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "fetch", url: "https://github.com/foo/bar"}},
+			{agentTsMs: 1002, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "uname -m"}},
+			{agentTsMs: 1003, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "execute", command: "uname -m"}},
+			{agentTsMs: 1004, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "failed", errorMsg: "SSRF blocked: github.com resolves to private IP", contentText: "Tool `web_fetch` failed: SSRF blocked"}},
+			{agentTsMs: 1005, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "Bash", outputCmd: "uname -m"}},
+		}
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1, 2, 3, 4, 5}, lines)
+		idFetch := formatSynthCallID(1000, 0)
+		idBash := formatSynthCallID(1002, 0)
+		if synthIDs[0] != idFetch || synthIDs[1] != idFetch || synthIDs[4] != idFetch {
+			t.Errorf("fetch events mismatch: %v %v %v", synthIDs[0], synthIDs[1], synthIDs[4])
+		}
+		if synthIDs[2] != idBash || synthIDs[3] != idBash || synthIDs[5] != idBash {
+			t.Errorf("bash events mismatch: %v %v %v", synthIDs[2], synthIDs[3], synthIDs[5])
+		}
+	})
+
+	t.Run("parallel same command does not guess", func(t *testing.T) {
+		lines := []updateLineMeta{
+			{agentTsMs: 4000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "git status"}},
+			{agentTsMs: 4001, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "git status"}},
+			{agentTsMs: 4002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "Bash", outputCmd: "git status"}},
+			{agentTsMs: 4003, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "Bash", outputCmd: "git status"}},
+		}
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1, 2, 3}, lines)
+		if synthIDs[0] == "" || synthIDs[1] == "" || synthIDs[0] == synthIDs[1] {
+			t.Errorf("starts must get distinct ids, got %v %v", synthIDs[0], synthIDs[1])
+		}
+		if _, ok := synthIDs[2]; ok {
+			t.Errorf("ambiguous bash completion must not be assigned, got %v", synthIDs[2])
+		}
+		if _, ok := synthIDs[3]; ok {
+			t.Errorf("second ambiguous bash completion must not be assigned, got %v", synthIDs[3])
+		}
+	})
+
+	t.Run("bash output mentioning a read path does not steal the read", func(t *testing.T) {
+		lines := []updateLineMeta{
+			{agentTsMs: 6000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "git status"}},
+			{agentTsMs: 6001, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "git status"}},
+			{agentTsMs: 6002, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "read_file", path: "src/index.ts"}},
+			{agentTsMs: 6003, tool: &toolLineMeta{
+				sessionUpdate: "tool_call_update",
+				status:        "completed",
+				outputType:    "Bash",
+				outputCmd:     "git status",
+				contentText:   "src/index.ts: modified",
+			}},
+		}
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1, 2, 3}, lines)
+		readID := formatSynthCallID(6002, 0)
+		if synthIDs[2] != readID {
+			t.Fatalf("read start id = %v, want %v", synthIDs[2], readID)
+		}
+		if id, ok := synthIDs[3]; ok {
+			t.Errorf("ambiguous bash completion must not attach via path-in-text, got %v (read id %v)", id, readID)
+		}
+	})
+
+	t.Run("named calls stay out of anon open set", func(t *testing.T) {
+		lines := []updateLineMeta{
+			{agentTsMs: 5000, tool: &toolLineMeta{sessionUpdate: "tool_call", toolCallID: "real-1", name: "run_terminal_command", command: "ls"}},
+			{agentTsMs: 5001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", toolCallID: "real-1", status: "completed", outputType: "Bash", outputCmd: "ls"}},
+			{agentTsMs: 5002, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "run_terminal_command", command: "ls"}},
+			{agentTsMs: 5003, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "Bash", outputCmd: "ls"}},
+		}
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1, 2, 3}, lines)
+		if _, ok := synthIDs[0]; ok {
+			t.Errorf("named start must not enter synth map, got %v", synthIDs[0])
+		}
+		if _, ok := synthIDs[1]; ok {
+			t.Errorf("named update must not enter synth map, got %v", synthIDs[1])
+		}
+		want := formatSynthCallID(5002, 0)
+		if synthIDs[2] != want {
+			t.Errorf("anon start = %v, want %v", synthIDs[2], want)
+		}
+		if synthIDs[3] != want {
+			t.Errorf("anon completion captured by named call? got %v, want %v", synthIDs[3], want)
+		}
+	})
+
+	t.Run("preserves existing toolCallId on inject", func(t *testing.T) {
+		lines := []updateLineMeta{
+			{agentTsMs: 1000, tool: &toolLineMeta{sessionUpdate: "tool_call", toolCallID: "real-call-123", name: "bash"}},
+			{agentTsMs: 1001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", toolCallID: "real-call-123", status: "completed"}},
+		}
+		synthIDs := resolveSyntheticToolCallIDs([]int{0, 1}, lines)
 		if len(synthIDs) != 0 {
 			t.Errorf("synthIDs should be empty for existing call IDs, got %v", synthIDs)
 		}
@@ -243,7 +184,7 @@ func TestSyntheticToolCallIDInjection(t *testing.T) {
 				},
 			},
 		}
-		injectSynthToolCallID(obj, "synth:call:999")
+		injectSynthToolCallID(obj, "synth:call:999:0")
 		upd := obj[kParams].(map[string]any)[kUpdate].(map[string]any)
 		if upd["toolCallId"] != "real-call-123" {
 			t.Errorf("existing toolCallId overwritten! got %v", upd["toolCallId"])
@@ -251,7 +192,21 @@ func TestSyntheticToolCallIDInjection(t *testing.T) {
 	})
 }
 
-// TestRealSession01a0630cSyntheticInjection 对真实会话 01a0630c 进行端到端测试
+func TestParseLeadingLineNum(t *testing.T) {
+	if n, ok := parseLeadingLineNum("1080→tracing"); !ok || n != 1080 {
+		t.Errorf("1080→ got %d %v", n, ok)
+	}
+	if n, ok := parseLeadingLineNum("80→use"); !ok || n != 80 {
+		t.Errorf("80→ got %d %v", n, ok)
+	}
+	if n, ok := parseLeadingLineNum("21→let"); !ok || n != 21 {
+		t.Errorf("21→ got %d %v", n, ok)
+	}
+	if _, ok := parseLeadingLineNum("no line"); ok {
+		t.Error("plain text should not parse")
+	}
+}
+
 func TestRealSession01a0630cSyntheticInjection(t *testing.T) {
 	sessionPath := "/Users/benin/.grok/sessions/%2FUsers%2Fbenin%2Fccwork/01a0630c-9370-72e0-87ad-ded5d1af3198/updates.jsonl"
 	if _, err := os.Stat(sessionPath); err != nil {
@@ -263,44 +218,104 @@ func TestRealSession01a0630cSyntheticInjection(t *testing.T) {
 		t.Fatalf("buildNormalizedHistory failed: %v", err)
 	}
 
-	if len(view.synthToolCallIDs) == 0 {
-		t.Fatal("expected synthToolCallIDs to be populated for session 01a0630c")
-	}
-
-	// 验证会话中所有 tool_call 和 tool_call_update 是否都获得了非空 ID
-	toolCallsCount := 0
-	toolUpdatesCount := 0
+	toolCalls := 0
+	missingStarts := 0
 	for seq, lineIdx := range view.order {
 		m := &view.lines[lineIdx]
-		if m.tool == nil {
+		if m.tool == nil || m.tool.sessionUpdate != "tool_call" {
 			continue
 		}
+		toolCalls++
 		id, hasSynth := view.synthToolCallIDs[seq]
 		if m.tool.toolCallID != "" {
 			id = m.tool.toolCallID
 		}
-		if id == "" {
-			t.Fatalf("msgSeq %d (%s, name=%s, title=%s) missing toolCallId!", seq, m.tool.sessionUpdate, m.tool.name, m.tool.title)
+		if id == "" && !hasSynth {
+			missingStarts++
 		}
-		if m.tool.sessionUpdate == "tool_call" {
-			toolCallsCount++
-		} else if m.tool.sessionUpdate == "tool_call_update" {
-			toolUpdatesCount++
-		}
-		_ = hasSynth
 	}
-
-	if toolCallsCount < 180 {
-		t.Errorf("toolCallsCount = %d, expected >= 180", toolCallsCount)
+	if toolCalls < 180 {
+		t.Errorf("toolCallsCount = %d, expected >= 180", toolCalls)
 	}
-	if toolUpdatesCount < 350 {
-		t.Errorf("toolUpdatesCount = %d, expected >= 350", toolUpdatesCount)
+	if missingStarts != 0 {
+		t.Errorf("%d tool_call starts still have empty ids", missingStarts)
 	}
-	t.Logf("Session 01a0630c: successfully verified %d tool_calls and %d tool_call_updates with 100%% non-empty synth IDs!", toolCallsCount, toolUpdatesCount)
 }
 
-// TestSyntheticInjectionInSlice 透传切片单页测试
+func sliceEnv(ts int64, eventID string, update map[string]any) map[string]any {
+	return map[string]any{
+		"timestamp": ts,
+		kParams: map[string]any{
+			kUpdate: update,
+			kMeta: map[string]any{
+				"agentTimestampMs": ts,
+				"eventId":          eventID,
+			},
+		},
+	}
+}
+
 func TestSyntheticInjectionInSlice(t *testing.T) {
+	raw := []any{
+		sliceEnv(1000, "e0", map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "run_terminal_command",
+			"rawInput":      map[string]any{"command": "echo hello"},
+		}),
+		sliceEnv(1001, "e1", map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "",
+			"kind":          "execute",
+			"rawInput":      map[string]any{"command": "echo hello"},
+		}),
+		sliceEnv(1002, "e2", map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "",
+			"status":        "completed",
+			"rawOutput":     map[string]any{"type": "Bash", "command": "echo hello"},
+		}),
+	}
+	normalizeSyntheticToolCallsInSlice(raw)
+	want := formatSynthCallID(1000, 0)
+	for i, item := range raw {
+		upd := item.(map[string]any)[kParams].(map[string]any)[kUpdate].(map[string]any)
+		if upd["toolCallId"] != want {
+			t.Errorf("item %d toolCallId = %v, want %v", i, upd["toolCallId"], want)
+		}
+	}
+}
+
+func TestPassthroughPagesDoNotCollideIDs(t *testing.T) {
+	page1 := []any{
+		sliceEnv(1000, "e-a", map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "run_terminal_command",
+			"rawInput":      map[string]any{"command": "echo a"},
+		}),
+	}
+	page2 := []any{
+		sliceEnv(5000, "e-b", map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "run_terminal_command",
+			"rawInput":      map[string]any{"command": "echo b"},
+		}),
+	}
+	normalizeSyntheticToolCallsInSlice(page1)
+	normalizeSyntheticToolCallsInSlice(page2)
+	id1 := page1[0].(map[string]any)[kParams].(map[string]any)[kUpdate].(map[string]any)["toolCallId"]
+	id2 := page2[0].(map[string]any)[kParams].(map[string]any)[kUpdate].(map[string]any)["toolCallId"]
+	if id1 == id2 {
+		t.Errorf("two pages both got %v (page-local index collision)", id1)
+	}
+	if id1 != formatSynthCallID(1000, 0) || id2 != formatSynthCallID(5000, 0) {
+		t.Errorf("ids = %v %v", id1, id2)
+	}
+}
+
+func TestPassthroughFallsBackToEventIDWithoutTimestamp(t *testing.T) {
 	raw := []any{
 		map[string]any{
 			kParams: map[string]any{
@@ -308,39 +323,209 @@ func TestSyntheticInjectionInSlice(t *testing.T) {
 					"sessionUpdate": "tool_call",
 					"toolCallId":    "",
 					"title":         "run_terminal_command",
-					"rawInput":      map[string]any{"command": "echo hello"},
+					"rawInput":      map[string]any{"command": "echo z"},
 				},
-			},
-		},
-		map[string]any{
-			kParams: map[string]any{
-				kUpdate: map[string]any{
-					"sessionUpdate": "tool_call_update",
-					"toolCallId":    "",
-					"kind":          "execute",
-					"rawInput":      map[string]any{"command": "echo hello"},
-				},
-			},
-		},
-		map[string]any{
-			kParams: map[string]any{
-				kUpdate: map[string]any{
-					"sessionUpdate": "tool_call_update",
-					"toolCallId":    "",
-					"status":        "completed",
-					"rawOutput":     map[string]any{"type": "Bash", "command": "echo hello"},
-				},
+				kMeta: map[string]any{"eventId": "evt-z"},
 			},
 		},
 	}
-
 	normalizeSyntheticToolCallsInSlice(raw)
+	id := raw[0].(map[string]any)[kParams].(map[string]any)[kUpdate].(map[string]any)["toolCallId"]
+	if id != "synth:call:e:evt-z" {
+		t.Errorf("toolCallId = %v, want synth:call:e:evt-z", id)
+	}
+}
 
-	for i, item := range raw {
-		upd := item.(map[string]any)[kParams].(map[string]any)[kUpdate].(map[string]any)
-		id, _ := upd["toolCallId"].(string)
-		if id != "synth:call:0" {
-			t.Errorf("item %d toolCallId = %v, want synth:call:0", i, id)
+func TestLiveResolverSeedsHistoryIDs(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	const cwd = "/ws"
+	const T = int64(1_700_000_000_000)
+	writeSessionFile(t, home, cwd, sid, []string{
+		histEnvelope(sid, 0, T, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "run_terminal_command",
+			"rawInput":      map[string]any{"command": "uname -m"},
+		}),
+		histEnvelope(sid, 1, T+1, map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "",
+			"kind":          "execute",
+			"rawInput":      map[string]any{"command": "uname -m"},
+		}),
+	})
+	path := sessionUpdatesFile(home, cwd, sid)
+	view, err := buildNormalizedHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := formatSynthCallID(T, 0)
+	if view.synthToolCallIDs[0] != want {
+		t.Fatalf("history start id = %v, want %v", view.synthToolCallIDs[0], want)
+	}
+
+	r := &liveToolResolver{}
+	r.seedFrom(view)
+	if len(r.openCalls) != 1 {
+		t.Fatalf("seeded openCalls = %d, want 1", len(r.openCalls))
+	}
+	start := map[string]any{
+		"sessionUpdate": "tool_call",
+		"toolCallId":    "",
+		"title":         "run_terminal_command",
+		"rawInput":      map[string]any{"command": "uname -m"},
+	}
+	r.handleLive("tool_call", start, T, "")
+	if start["toolCallId"] != want {
+		t.Fatalf("live start reused id = %v, want %v", start["toolCallId"], want)
+	}
+	if len(r.openCalls) != 1 {
+		t.Fatalf("reused start must not append a second open call, got %d", len(r.openCalls))
+	}
+	upd := map[string]any{
+		"sessionUpdate": "tool_call_update",
+		"toolCallId":    "",
+		"status":        "completed",
+		"rawOutput":     map[string]any{"type": "Bash", "command": "uname -m"},
+	}
+	r.handleLive("tool_call_update", upd, T+2, "")
+	if upd["toolCallId"] != want {
+		t.Errorf("live completion id = %v, want history id %v", upd["toolCallId"], want)
+	}
+}
+
+func TestLiveToolResolveSkipsReplayAndJoinsHistory(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	const cwd = "/ws"
+	const T = int64(1_700_000_000_000)
+	writeSessionFile(t, home, cwd, sid, []string{
+		histEnvelope(sid, 0, T, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "run_terminal_command",
+			"rawInput":      map[string]any{"command": "uname -m"},
+		}),
+	})
+	b, _ := historyBridge(t, home)
+
+	start := map[string]any{
+		"sessionUpdate": "tool_call",
+		"toolCallId":    "",
+		"title":         "run_terminal_command",
+		"rawInput":      map[string]any{"command": "uname -m"},
+	}
+	params := map[string]any{kMeta: map[string]any{"agentTimestampMs": T, "eventId": sid + "-0"}}
+	b.liveToolResolve(sid, "tool_call", start, params, true)
+	if id, _ := start["toolCallId"].(string); id != "" {
+		t.Fatalf("replay must not inject, got %q", id)
+	}
+
+	done := map[string]any{
+		"sessionUpdate": "tool_call_update",
+		"toolCallId":    "",
+		"status":        "completed",
+		"rawOutput":     map[string]any{"type": "Bash", "command": "uname -m"},
+	}
+	b.liveToolResolve(sid, "tool_call_update", done, map[string]any{
+		kMeta: map[string]any{"agentTimestampMs": T + 2},
+	}, false)
+	want := formatSynthCallID(T, 0)
+	if done["toolCallId"] != want {
+		t.Fatalf("live completion id = %v, want %v", done["toolCallId"], want)
+	}
+}
+
+func TestLiveTurnCompletedClearsPendingStarts(t *testing.T) {
+	r := &liveToolResolver{
+		openCalls:     []openCall{{id: "synth:call:1:0"}},
+		pendingStarts: []openCall{{id: "synth:call:1:0", tsMs: 1}},
+	}
+	r.handleLive("turn_completed", nil, 0, "")
+	if len(r.openCalls) != 0 {
+		t.Errorf("openCalls after turn_completed = %d, want 0", len(r.openCalls))
+	}
+	if len(r.pendingStarts) != 0 {
+		t.Errorf("pendingStarts after turn_completed = %d, want 0", len(r.pendingStarts))
+	}
+}
+
+func TestLiveNewStartUsesTimestampID(t *testing.T) {
+	r := &liveToolResolver{}
+	r.seedFrom(nil)
+	upd := map[string]any{
+		"sessionUpdate": "tool_call",
+		"toolCallId":    "",
+		"title":         "run_terminal_command",
+		"rawInput":      map[string]any{"command": "echo hi"},
+	}
+	r.handleLive("tool_call", upd, 42, "")
+	if upd["toolCallId"] != formatSynthCallID(42, 0) {
+		t.Errorf("new live start id = %v, want %v", upd["toolCallId"], formatSynthCallID(42, 0))
+	}
+}
+
+func TestSessionUpdatesInjectsTimestampSynthIDs(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-1"
+	const T = int64(1_000_000)
+	writeSessionFile(t, home, "/ws", sid, []string{
+		histEnvelope(sid, 0, T, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "run_terminal_command",
+			"rawInput":      map[string]any{"command": "echo hi"},
+		}),
+		histEnvelope(sid, 1, T+1, map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "",
+			"status":        "completed",
+			"rawOutput":     map[string]any{"type": "Bash", "command": "echo hi"},
+		}),
+	})
+	b, _ := historyBridge(t, home)
+	page, err := b.SessionUpdates(context.Background(), sid, "/ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Updates) != 2 {
+		t.Fatalf("updates = %d, want 2", len(page.Updates))
+	}
+	want := formatSynthCallID(T, 0)
+	for i, raw := range page.Updates {
+		upd := raw.(map[string]any)[kParams].(map[string]any)[kUpdate].(map[string]any)
+		if upd["toolCallId"] != want {
+			t.Errorf("item %d toolCallId = %v, want %v", i, upd["toolCallId"], want)
+		}
+	}
+}
+
+func TestSyntheticToolCallSearchReplaceAndGrep(t *testing.T) {
+	lines := []updateLineMeta{
+		// SearchReplace
+		{agentTsMs: 1000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "search_replace", path: "src/a.ts"}},
+		{agentTsMs: 1001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "edit", path: "src/a.ts"}},
+		{agentTsMs: 1002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "SearchReplace", path: "src/a.ts"}},
+
+		// Grep in dir with file match
+		{agentTsMs: 2000, tool: &toolLineMeta{sessionUpdate: "tool_call", name: "grep", path: "src/store", query: "foo"}},
+		{agentTsMs: 2001, tool: &toolLineMeta{sessionUpdate: "tool_call_update", kind: "search", title: "foo"}},
+		{agentTsMs: 2002, tool: &toolLineMeta{sessionUpdate: "tool_call_update", status: "completed", outputType: "GrepSearch", path: "src/store/chat/foo.ts"}},
+	}
+	order := []int{0, 1, 2, 3, 4, 5}
+	synthIDs := resolveSyntheticToolCallIDs(order, lines)
+	idEdit := formatSynthCallID(1000, 0)
+	idGrep := formatSynthCallID(2000, 0)
+
+	for _, seq := range []int{0, 1, 2} {
+		if synthIDs[seq] != idEdit {
+			t.Errorf("edit seq %d got %v, want %v", seq, synthIDs[seq], idEdit)
+		}
+	}
+	for _, seq := range []int{3, 4, 5} {
+		if synthIDs[seq] != idGrep {
+			t.Errorf("grep seq %d got %v, want %v", seq, synthIDs[seq], idGrep)
 		}
 	}
 }

@@ -89,7 +89,8 @@ type Bridge struct {
 	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
 	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
 	usageLastUsed map[string]int64
-	// liveTools 是 per-session 的实时工具事件合成 ID 注入器。b.mu 保护。
+	// liveTools 是 per-session 的实时工具事件合成 ID 注入器（与历史主路径
+	// 同一套 synth:call:<ts>:<k>；首次非重放事件用历史视图做种子）。b.mu 保护。
 	liveTools map[string]*liveToolResolver
 	// replayDropped 累计被 Broadcast 就地拦下的 session/load 重放事件数
 	// （见 Broadcast 注释）；LoadSession 收尾时打一行统计后清零。
@@ -1788,12 +1789,12 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// active:false（不带 rate）——前端收到后清除速率显示（只在输
 		// 出过程中显示）。
 		b.genRate.reset(sid)
-		b.liveToolResolve(sid, "tool_call", update)
+		b.liveToolResolve(sid, "tool_call", update, params, replay)
 		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
 		b.Broadcast(tag(Event{kType: "tool_call", kToolCall: update}))
 		return true
 	case "tool_call_update":
-		b.liveToolResolve(sid, "tool_call_update", update)
+		b.liveToolResolve(sid, "tool_call_update", update, params, replay)
 		b.Broadcast(tag(Event{kType: "tool_call_update", kToolCallUpdate: update}))
 		return true
 	case "plan":
@@ -1890,7 +1891,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 回合终态：复位段状态并广播 active:false（不带 rate）——前端
 		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
 		b.genRate.reset(sid)
-		b.liveToolResolve(sid, "turn_completed", nil)
+		b.liveToolResolve(sid, "turn_completed", nil, params, replay)
 		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
 		// response_completed 不广播 typed 事件：agent 实测从不发该
 		// kind（updates.jsonl 3383/3383 回合终态均为 turn_completed），
@@ -2010,9 +2011,7 @@ func (b *Bridge) broadcastScheduledTaskDeleted(sid string, params map[string]any
 	b.Broadcast(tag(ev))
 }
 
-func (b *Bridge) liveToolResolve(sid, su string, update map[string]any) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (b *Bridge) liveToolLocked(sid string) *liveToolResolver {
 	if b.liveTools == nil {
 		b.liveTools = make(map[string]*liveToolResolver)
 	}
@@ -2021,7 +2020,45 @@ func (b *Bridge) liveToolResolve(sid, su string, update map[string]any) {
 		r = &liveToolResolver{}
 		b.liveTools[sid] = r
 	}
-	r.handleLive(su, update)
+	return r
+}
+
+// liveToolResolve 给实时工具事件打上与历史主路径同一套合成 ID。
+// session/load 重放（isReplay）整段跳过：HTTP 历史已经按 synth:call:<ts>:<k>
+// 注入过，重放再跑会把 live 计数器/open 集冲掉，后续真 live 对不上。
+func (b *Bridge) liveToolResolve(sid, su string, update, params map[string]any, replay bool) {
+	if replay {
+		return
+	}
+	ts, eventID := paramsSynthMeta(params)
+
+	b.mu.Lock()
+	r := b.liveToolLocked(sid)
+	if r.seeded {
+		r.handleLive(su, update, ts, eventID)
+		b.mu.Unlock()
+		return
+	}
+	cwd := ""
+	if s := b.sessions[sid]; s != nil {
+		cwd = s.Cwd
+	}
+	b.mu.Unlock()
+
+	var view *normalizedHistory
+	if cwd != "" && sid != "" {
+		if path := sessionUpdatesFile(b.grokHome(), cwd, sid); path != "" {
+			view, _ = b.normalizedSessionHistory(path)
+		}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	r = b.liveToolLocked(sid)
+	if !r.seeded {
+		r.seedFrom(view)
+	}
+	r.handleLive(su, update, ts, eventID)
 }
 
 // handleModelSwitchKind applies model_auto_switched / model_changed
@@ -3042,6 +3079,7 @@ func (b *Bridge) resetRoster(reason string) (string, string) {
 	// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
 	// 一并作废，避免 /api/queue/status 回放过期队列。
 	b.queueSnapshots = nil
+	b.liveTools = make(map[string]*liveToolResolver)
 	// lastSessionID / lastSessionCwd intentionally survive.
 	if b.cancelRd != nil {
 		b.cancelRd()
@@ -3942,9 +3980,9 @@ func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string
 }
 
 // forgetSessionLocked drops every per-session index entry for sid: the
-// roster row, the observed-turn entry, queue snapshot, usage dedup cache and
-// gen-rate bucket, plus the active-session / last-session pointers when they
-// pointed at it. The caller holds b.mu.
+// roster row, the observed-turn entry, queue snapshot, usage dedup cache,
+// live tool resolver and gen-rate bucket, plus the active-session /
+// last-session pointers when they pointed at it. The caller holds b.mu.
 func (b *Bridge) forgetSessionLocked(sessionID string) {
 	delete(b.sessions, sessionID)
 	if b.turns != nil {
@@ -3955,6 +3993,9 @@ func (b *Bridge) forgetSessionLocked(sessionID string) {
 	}
 	if b.usageLastUsed != nil {
 		delete(b.usageLastUsed, sessionID)
+	}
+	if b.liveTools != nil {
+		delete(b.liveTools, sessionID)
 	}
 	b.genRate.discard(sessionID)
 	if b.activeSessionID == sessionID {
@@ -4025,10 +4066,10 @@ type SessionUpdatesOpts struct {
 	Stream    bool
 	ChunkSize *int
 	TurnIndex *int
-	// Detail 是 host 侧响应投影档位（契约 [A]，见 lite.go）："lite" 只裁
-	// 工具正文，"meta" 连信封都不回，"full"/缺省/未知值 = 今天的逐字节
-	// 原样行为。它不上 agent 的 wire（agent 不认识该字段），只在
-	// Bridge.SessionUpdates 出口生效。
+	// Detail 是 host 侧响应投影档位（见 lite.go）："lite" 是首屏时间线
+	// （合成工具信封、thought 占位、丢掉正文），"meta" 连信封都不回，
+	// "full"/缺省/未知值 = 今天的逐字节原样行为。它不上 agent 的 wire
+	// （agent 不认识该字段），只在 Bridge.SessionUpdates 出口生效。
 	Detail string
 }
 

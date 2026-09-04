@@ -302,19 +302,15 @@ func liteOmittedOf(t *testing.T, updates []any, i int) int {
 	if !ok {
 		t.Fatalf("信封 %d 没有 lite 标记", i)
 	}
-	n, ok := stamp["omitted"].(int)
-	if !ok {
-		t.Fatalf("信封 %d 的 lite.omitted 类型 = %T", i, stamp["omitted"])
-	}
-	fields, ok := stamp["fields"].([]string)
-	if !ok || len(fields) == 0 {
-		t.Fatalf("信封 %d 的 lite.fields = %v", i, stamp["fields"])
+	n := liteAsInt(stamp["omitted"])
+	if n <= 0 {
+		t.Fatalf("信封 %d 的 lite.omitted = %v", i, stamp["omitted"])
 	}
 	return n
 }
 
-// liteSkeleton 抽出与正文无关的时间线骨架（位置、msgSeq、信封 method、
-// kind、params._meta），用于「lite 只裁正文」的对比断言。
+// liteSkeleton 抽出时间线位置（msgSeq / method / kind）。params._meta 会被
+// 收到回放真用的键，不进骨架。
 func liteSkeleton(t *testing.T, updates []any) []string {
 	t.Helper()
 	out := make([]string, 0, len(updates))
@@ -325,28 +321,26 @@ func liteSkeleton(t *testing.T, updates []any) []string {
 		kind, _ := upd[kSessionUpdate].(string)
 		out = append(out, strings.Join([]string{
 			string(mustJSON(t, env["msgSeq"])),
-			string(mustJSON(t, env["timestamp"])),
 			env[kMethod].(string),
 			kind,
-			string(mustJSON(t, params[kMeta])),
 		}, "|"))
 	}
 	return out
 }
 
-// 骨架一致：条数 / 顺序 / msgSeq / kind / params._meta 与 full 完全相同，
-// 整页裁掉的字节 = 各信封 lite.omitted 之和，且二次投影是空操作。
+// 夹具里工具 id 各不相同、无连续 thought：条数 / 顺序 / msgSeq / kind 与
+// full 相同；二次投影是空操作。
 func TestLiteProjectionKeepsTimelineSkeleton(t *testing.T) {
 	f := liteFixtureOf(t)
 	full := litePageOf(t, f.lines)
 	lite := litePageOf(t, f.lines)
 
-	omitted := liteProjectPage(lite)
+	omitted := liteProjectPage(&lite)
 	if omitted <= 0 {
 		t.Fatalf("omittedBytes = %d, want > 0", omitted)
 	}
 	if len(lite) != len(full) {
-		t.Fatalf("条数 = %d, want %d（绝不允许删信封行）", len(lite), len(full))
+		t.Fatalf("条数 = %d, want %d（夹具无合成对象）", len(lite), len(full))
 	}
 	if got, want := liteSkeleton(t, lite), liteSkeleton(t, full); !reflect.DeepEqual(got, want) {
 		t.Errorf("骨架被改了:\ngot  %q\nwant %q", got, want)
@@ -357,24 +351,19 @@ func TestLiteProjectionKeepsTimelineSkeleton(t *testing.T) {
 		if !reflect.DeepEqual(fullEnv["msgSeq"], liteEnv["msgSeq"]) {
 			t.Errorf("信封 %d msgSeq = %v, want %v", i, liteEnv["msgSeq"], fullEnv["msgSeq"])
 		}
-		fullParams := fullEnv[kParams].(map[string]any)
 		liteParams := liteEnv[kParams].(map[string]any)
-		if !reflect.DeepEqual(fullParams[kMeta], liteParams[kMeta]) {
-			t.Errorf("信封 %d params._meta 被改: %v, want %v", i, liteParams[kMeta], fullParams[kMeta])
+		meta, _ := liteParams[kMeta].(map[string]any)
+		for k := range meta {
+			if !liteParamsMetaKeep[k] {
+				t.Errorf("信封 %d params._meta 多了 %s", i, k)
+			}
 		}
-	}
-	var sum int
-	for i := range lite {
-		if _, ok := liteStampOf(t, lite, i); !ok {
-			continue
+		if _, ok := meta["agentTimestampMs"]; !ok {
+			t.Errorf("信封 %d 丢了 agentTimestampMs", i)
 		}
-		sum += liteOmittedOf(t, lite, i)
-	}
-	if int64(sum) != omitted {
-		t.Errorf("omittedBytes = %d, want Σ lite.omitted = %d", omitted, sum)
 	}
 	before := string(mustJSON(t, lite))
-	if again := liteProjectPage(lite); again != 0 {
+	if again := liteProjectPage(&lite); again != 0 {
 		t.Errorf("同一页二次投影又裁掉 %d 字节，want 0", again)
 	}
 	if after := string(mustJSON(t, lite)); after != before {
@@ -387,7 +376,7 @@ func TestLiteProjectionKeepsTimelineSkeleton(t *testing.T) {
 func TestLiteOmittedMatchesCutBytes(t *testing.T) {
 	f := liteFixtureOf(t)
 	lite := litePageOf(t, f.lines)
-	total := liteProjectPage(lite)
+	total := liteProjectPage(&lite)
 
 	strLen := func(s string) int { return len(s) + 2 }
 	// 信封 2：Bash —— 6 个 content 块（4 块摘要 + 2 块丢弃，全计入）+
@@ -403,11 +392,8 @@ func TestLiteOmittedMatchesCutBytes(t *testing.T) {
 	if got, want := liteOmittedOf(t, lite, 3), strLen(f.body["fileContent"])+strLen(f.body["fileConcise"]); got != want {
 		t.Errorf("Read lite.omitted = %d, want %d", got, want)
 	}
-	// 信封 4：Grep —— stdout + 被截掉的 5 条 file_matches（"" 的 stderr 不换形状）。
-	wantGrep := strLen(f.body["grepStdout"])
-	for _, m := range f.matches[20:] {
-		wantGrep += len(mustJSON(t, m))
-	}
+	// 信封 4：Grep —— stdout + 整棵 file_matches + 空 stderr（正文键一律删）。
+	wantGrep := strLen(f.body["grepStdout"]) + len(mustJSON(t, f.matches)) + strLen("")
 	if got := liteOmittedOf(t, lite, 4); got != wantGrep {
 		t.Errorf("Grep lite.omitted = %d, want %d", got, wantGrep)
 	}
@@ -426,9 +412,9 @@ func TestLiteOmittedMatchesCutBytes(t *testing.T) {
 	if got, want := liteOmittedOf(t, lite, 7), len(mustJSON(t, []any{map[string]any{"text": f.body["mcpText"], "type": "text"}})); got != want {
 		t.Errorf("unknown MCP lite.omitted = %d, want %d", got, want)
 	}
-	// 信封 8：plan_content 是唯一字段，整条不该被动 → 无标记。
-	if _, ok := liteStampOf(t, lite, 8); ok {
-		t.Error("PlanReady 信封被打上了 lite 标记")
+	// 信封 8：plan_content 按正文删，打 lite 标记。
+	if got, want := liteOmittedOf(t, lite, 8), strLen(f.body["planContent"]); got != want {
+		t.Errorf("PlanReady lite.omitted = %d, want %d", got, want)
 	}
 	// 非工具信封不打标记。
 	for _, i := range []int{0, 1, 9, 10, 11, 12, 13, 14} {
@@ -444,8 +430,8 @@ func TestLiteOmittedMatchesCutBytes(t *testing.T) {
 		}
 		sum += liteOmittedOf(t, lite, i)
 	}
-	if int64(sum) != total {
-		t.Errorf("omittedBytes = %d, want %d", total, sum)
+	if int64(sum) > total {
+		t.Errorf("omittedBytes = %d < Σ lite.omitted = %d", total, sum)
 	}
 }
 
@@ -455,7 +441,7 @@ func TestLiteKeepsPreserveList(t *testing.T) {
 	f := liteFixtureOf(t)
 	full := litePageOf(t, f.lines)
 	lite := litePageOf(t, f.lines)
-	liteProjectPage(lite)
+	liteProjectPage(&lite)
 
 	fullUpd := liteUpdate(t, full, 2)
 	liteUpd := liteUpdate(t, lite, 2)
@@ -472,8 +458,11 @@ func TestLiteKeepsPreserveList(t *testing.T) {
 			t.Errorf("update._meta.%v 被改: %v", k, liteMeta[k])
 		}
 	}
-	if len(liteMeta) != len(fullMeta)+1 {
-		t.Errorf("update._meta 键数 = %d, want %d（只多 lite）", len(liteMeta), len(fullMeta)+1)
+	if _, ok := liteMeta["lite"]; !ok {
+		t.Error("update._meta 没打 lite 标记")
+	}
+	if _, ok := liteMeta["x.ai/tool"]; !ok {
+		t.Error("update._meta 丢了 x.ai/tool")
 	}
 	// rawOutput 里的数字/布尔/null 标量与 rawInput 全貌。
 	ro := liteUpd["rawOutput"].(map[string]any)
@@ -489,39 +478,22 @@ func TestLiteKeepsPreserveList(t *testing.T) {
 		file["total_lines"] != float64(1200) || file["truncated"] != true {
 		t.Errorf("Read 保留清单被改: %v", file)
 	}
-	for _, tc := range []struct{ field, bodyKey string }{
-		{"content", "fileContent"},
-		{"content_concise", "fileConcise"},
-	} {
-		want := strOf(t, f.body[tc.bodyKey])
-		if file[tc.field] == nil || !isOmittedStub(file[tc.field], want) {
-			t.Errorf("Read rawOutput.file.%v 没换成 {omitted:%d}：%v", tc.field, want, file[tc.field])
-		}
+	if _, ok := file["content"]; ok {
+		t.Errorf("Read content 还在: %v", file["content"])
 	}
-	// Grep：前 20 条 path 原样，尾部 omittedCount，计数标量不动。
+	if _, ok := file["content_concise"]; ok {
+		t.Errorf("Read content_concise 还在: %v", file["content_concise"])
+	}
+	// Grep：计数标量不动，file_matches / stdout / stderr 整键删除。
 	grepRO := liteUpdate(t, lite, 4)["rawOutput"].(map[string]any)
-	if grepRO["match_count"] != float64(25) || grepRO["total_lines"] != float64(25) || grepRO["mode"] != "content" || grepRO["stderr"] != "" {
-		t.Errorf("Grep 计数/短文本被改: %v", grepRO)
+	if grepRO["match_count"] != float64(25) || grepRO["total_lines"] != float64(25) || grepRO["mode"] != "content" {
+		t.Errorf("Grep 计数被改: %v", grepRO)
 	}
-	kept, _ := json.Marshal(grepRO["file_matches"])
-	var items []map[string]any
-	if err := json.Unmarshal(kept, &items); err != nil {
-		t.Fatalf("file_matches 解码: %v", err)
+	if _, ok := grepRO["file_matches"]; ok {
+		t.Errorf("file_matches 还在: %v", grepRO["file_matches"])
 	}
-	if len(items) != liteMaxFileMatches+1 {
-		t.Fatalf("file_matches 长度 = %d, want %d（20 条 + omittedCount）", len(items), liteMaxFileMatches+1)
-	}
-	for i := 0; i < liteMaxFileMatches; i++ {
-		want := f.matches[i].(map[string]any)
-		if items[i]["path"] != want["path"] {
-			t.Errorf("file_matches[%d].path 被改: %v, want %v", i, items[i]["path"], want["path"])
-		}
-		if !reflect.DeepEqual(items[i]["line_numbers"], want["line_numbers"]) {
-			t.Errorf("file_matches[%d].line_numbers 被改: %v", i, items[i]["line_numbers"])
-		}
-	}
-	if items[liteMaxFileMatches]["omittedCount"] != float64(5) {
-		t.Errorf("file_matches 尾部 = %v, want {omittedCount:5}", items[liteMaxFileMatches])
+	if _, ok := grepRO["stdout"]; ok {
+		t.Errorf("stdout 还在: %v", grepRO["stdout"])
 	}
 	// Edit：insertions/deletions 与 not_found 短文本原样，正文换摘要。
 	editRO := liteUpdate(t, lite, 5)["rawOutput"].(map[string]any)
@@ -531,10 +503,12 @@ func TestLiteKeepsPreserveList(t *testing.T) {
 	if editRO["not_found"] != "NotFound: 没有第二处" || editRO["file_path"] != "/ws/pkg/main.go" || editRO["type"] != "EditsApplied" {
 		t.Errorf("Edit 短文本/路径被改: %v", editRO)
 	}
-	// plan_content 整段留下（保留清单优先于 2048 兜底预算）。
 	planRO := liteUpdate(t, lite, 8)["rawOutput"].(map[string]any)
-	if planRO["plan_content"] != f.body["planContent"] || planRO["ok"] != true {
-		t.Errorf("PlanReady.plan_content 被动过: %v", planRO["plan_content"])
+	if planRO["ok"] != true {
+		t.Errorf("PlanReady.ok 被改: %v", planRO["ok"])
+	}
+	if _, ok := planRO["plan_content"]; ok {
+		t.Errorf("plan_content 还在: %v", planRO["plan_content"])
 	}
 	// 未知形状的短文本与布尔不动。
 	mcpRO := liteUpdate(t, lite, 7)["rawOutput"].(map[string]any)
@@ -549,8 +523,8 @@ func TestLiteKeepsPreserveList(t *testing.T) {
 	if imgRO["mimeType"] != "image/png" || imgRO["type"] != "image" {
 		t.Errorf("image 元数据被改: %v", imgRO)
 	}
-	if want := strOf(t, f.body["imageData"]); !isOmittedStub(imgRO["data"], want) {
-		t.Errorf("image data 没换成 {omitted:%d}：%v", want, imgRO["data"])
+	if _, ok := imgRO["data"]; ok {
+		t.Errorf("image data 还在: %v", imgRO["data"])
 	}
 }
 
@@ -569,42 +543,20 @@ func isOmittedStub(v any, want int) bool {
 	return ok && n == want
 }
 
-// [C]1：content 数组整体换成 {type, omitted} 摘要，最多 4 块。
-func TestLiteContentSummaryShape(t *testing.T) {
+func TestLiteDropsContentKey(t *testing.T) {
 	f := liteFixtureOf(t)
 	lite := litePageOf(t, f.lines)
-	liteProjectPage(lite)
+	liteProjectPage(&lite)
 
 	upd := liteUpdate(t, lite, 2)
-	blocks, ok := upd[kContent].([]any)
-	if !ok {
-		t.Fatalf("content 不是数组: %T", upd[kContent])
-	}
-	if len(blocks) != liteMaxContentBlocks {
-		t.Fatalf("content 块数 = %d, want %d", len(blocks), liteMaxContentBlocks)
-	}
-	for i, b := range blocks {
-		block, ok := b.(map[string]any)
-		if !ok || len(block) != 2 {
-			t.Fatalf("content[%d] = %v, want 只有 type+omitted 两个键", i, b)
-		}
-		if block["type"] != "content" {
-			t.Errorf("content[%d].type = %v, want 原块的 type", i, block["type"])
-		}
-		if want := len(mustJSON(t, f.blocks[i])); block["omitted"] != want {
-			t.Errorf("content[%d].omitted = %v, want 原块序列化字节 %d", i, block["omitted"], want)
-		}
+	if _, ok := upd[kContent]; ok {
+		t.Fatalf("content 还在: %v", upd[kContent])
 	}
 	if _, ok := upd["locations"].([]any); !ok {
 		t.Errorf("locations 被改: %v", upd["locations"])
 	}
-	stamp, ok := liteStampOf(t, lite, 2)
-	if !ok {
+	if _, ok := liteStampOf(t, lite, 2); !ok {
 		t.Fatal("Bash 信封没打 lite 标记")
-	}
-	fields, _ := stamp["fields"].([]string)
-	if !reflect.DeepEqual(fields, []string{"content", "rawOutput.output", "rawOutput.output_for_prompt"}) {
-		t.Errorf("fields = %v, want 排序去重后的三个路径", fields)
 	}
 }
 
@@ -644,32 +596,8 @@ func TestLiteRawOutputBudgetKeepsLongestFirst(t *testing.T) {
 	if ro["count"] != float64(8) {
 		t.Errorf("数字标量被改: %v", ro["count"])
 	}
-	lines, ok := ro["lines"].([]any)
-	if !ok || len(lines) != len(lengths) {
-		t.Fatalf("数组长度被改（条数不许动）: %v", ro["lines"])
-	}
-	// 最长优先 ⇒ 被换掉的是前 k 项，剩下的仍全是字符串。
-	k := 0
-	for k < len(lines) {
-		if _, isStub := lines[k].(map[string]any); !isStub {
-			break
-		}
-		k++
-	}
-	if k == 0 || k == len(lines) {
-		t.Fatalf("摘要前缀长度 = %d, want 0 < k < %d", k, len(lines))
-	}
-	for i := k; i < len(lines); i++ {
-		if _, isStr := lines[i].(string); !isStr {
-			t.Errorf("lines[%d] 不是被保留的字符串而是 %T（顺序被打乱？）", i, lines[i])
-		}
-	}
-	stamp, ok := liteStampOf(t, []any{env}, 0)
-	if !ok {
+	if _, ok := liteStampOf(t, []any{env}, 0); !ok {
 		t.Fatal("没打 lite 标记")
-	}
-	if fields, _ := stamp["fields"].([]string); !reflect.DeepEqual(fields, []string{"rawOutput.lines[]"}) {
-		t.Errorf("fields = %v, want [rawOutput.lines[]]", fields)
 	}
 }
 
@@ -678,7 +606,7 @@ func TestLiteRawOutputBudgetKeepsLongestFirst(t *testing.T) {
 func TestLiteRawOutputBudgetOnRealShapes(t *testing.T) {
 	f := liteFixtureOf(t)
 	lite := litePageOf(t, f.lines)
-	liteProjectPage(lite)
+	liteProjectPage(&lite)
 	for _, i := range []int{2, 3, 4, 5, 6, 7} {
 		upd := liteUpdate(t, lite, i)
 		ro, ok := upd["rawOutput"]
@@ -691,17 +619,21 @@ func TestLiteRawOutputBudgetOnRealShapes(t *testing.T) {
 	}
 }
 
-// [C]6：非工具载体逐字节原样（1MB 的 agent_message_chunk、plan、task_*、
-// session_recap、compaction_*、turn_completed）。
-func TestLiteNeverTouchesNonToolCarriers(t *testing.T) {
+// 可见文本载体（user / agent_message）的 update 正文不动；params._meta
+// 收到保留清单。
+func TestLiteNeverTouchesVisibleText(t *testing.T) {
 	f := liteFixtureOf(t)
 	full := litePageOf(t, f.lines)
 	lite := litePageOf(t, f.lines)
-	liteProjectPage(lite)
-	for _, i := range []int{0, 1, 9, 10, 11, 12, 13, 14} {
-		if a, b := mustJSON(t, full[i]), mustJSON(t, lite[i]); !reflect.DeepEqual(a, b) {
-			t.Errorf("信封 %d（%v）不是逐字节原样：full %d 字节 / lite %d 字节",
-				i, liteUpdate(t, full, i)[kSessionUpdate], len(a), len(b))
+	liteProjectPage(&lite)
+	for _, i := range []int{0, 1, 9} {
+		fu := liteUpdate(t, full, i)
+		lu := liteUpdate(t, lite, i)
+		if !reflect.DeepEqual(fu[kContent], lu[kContent]) {
+			t.Errorf("信封 %d 的可见正文被改", i)
+		}
+		if fu[kSessionUpdate] != lu[kSessionUpdate] {
+			t.Errorf("信封 %d kind 被改", i)
 		}
 	}
 }
@@ -768,7 +700,7 @@ func TestSessionUpdatesLiteLocalPageMatchesFull(t *testing.T) {
 		t.Errorf("回显 = %q/%d, want lite/正数", lite.Projected, lite.OmittedBytes)
 	}
 	if len(lite.Updates) != len(full.Updates) {
-		t.Fatalf("条数 = %d, want %d", len(lite.Updates), len(full.Updates))
+		t.Fatalf("夹具条数 = %d, want %d（无合成对象）", len(lite.Updates), len(full.Updates))
 	}
 	if got, want := pageSeqs(t, lite), pageSeqs(t, full); !reflect.DeepEqual(got, want) {
 		t.Errorf("msgSeq = %v, want %v", got, want)
@@ -955,7 +887,7 @@ func TestLiteCollapsesArrayBodies(t *testing.T) {
 		"_meta": liteToolMeta(),
 	})
 	lite := litePageOf(t, []string{single})
-	if liteProjectPage(lite) == 0 {
+	if liteProjectPage(&lite) == 0 {
 		t.Fatal("数组正文一个字都没裁")
 	}
 	ro := liteUpdate(t, lite, 0)["rawOutput"].(map[string]any)
@@ -963,13 +895,8 @@ func TestLiteCollapsesArrayBodies(t *testing.T) {
 		t.Errorf("标量被改: %v", ro)
 	}
 	for _, key := range []string{"output", "stdout"} {
-		stub, ok := ro[key].(map[string]any)
-		if !ok {
-			t.Fatalf("rawOutput.%v 没换成摘要对象（数组形状漏裁）: %T", key, ro[key])
-		}
-		n, isNum := stub["omitted"].(int)
-		if !isNum || n <= 0 || len(stub) != 1 {
-			t.Fatalf("rawOutput.%v 摘要形状不对: %v", key, stub)
+		if _, ok := ro[key]; ok {
+			t.Fatalf("rawOutput.%v 还在（数组正文应整键删除）: %v", key, ro[key])
 		}
 	}
 	if _, ok := liteUpdate(t, lite, 0)[kMeta].(map[string]any)["lite"]; !ok {
@@ -977,7 +904,7 @@ func TestLiteCollapsesArrayBodies(t *testing.T) {
 	}
 	// 幂等：再投影一次不得把摘要再摘要一遍。
 	after, _ := json.Marshal(lite)
-	if again := liteProjectPage(lite); again != 0 {
+	if again := liteProjectPage(&lite); again != 0 {
 		t.Errorf("重复投影 omitted = %d, want 0", again)
 	}
 	if now, _ := json.Marshal(lite); !bytes.Equal(now, after) {
@@ -992,4 +919,186 @@ func repeatLiteStrs(prefix string, n int) []any {
 		out = append(out, prefix+strings.Repeat("x", 40))
 	}
 	return out
+}
+
+func TestLiteCoalescesSameToolCall(t *testing.T) {
+	sid := "sess-coalesce"
+	lines := []string{
+		histEnvelope(sid, 0, 1000, msgUserChunkMeta("跑", map[string]any{"promptIndex": float64(0)})),
+		histEnvelope(sid, 1, 1100, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "call-1",
+			"status":        "in_progress",
+			"kind":          "execute",
+			"title":         "ls",
+			"rawInput":      map[string]any{"command": "ls"},
+		}),
+		histEnvelope(sid, 2, 1200, map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "call-1",
+			"status":        "completed",
+			"rawOutput":     map[string]any{"exit_code": float64(0), "output": strings.Repeat("o", 9000)},
+		}),
+		histEnvelope(sid, 3, 1300, map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]any{"type": "text", "text": "好了"},
+		}),
+	}
+	lite := litePageOf(t, lines)
+	if liteProjectPage(&lite) == 0 {
+		t.Fatal("没裁")
+	}
+	if len(lite) != 3 {
+		t.Fatalf("条数 = %d, want 3（user + 合成工具 + agent）", len(lite))
+	}
+	upd := liteUpdate(t, lite, 1)
+	if upd["sessionUpdate"] != "tool_call" {
+		t.Errorf("幸存者 kind = %v, want 首封 tool_call", upd["sessionUpdate"])
+	}
+	if upd["status"] != "completed" {
+		t.Errorf("没合并终态 status: %v", upd["status"])
+	}
+	if upd["toolCallId"] != "call-1" {
+		t.Errorf("toolCallId = %v", upd["toolCallId"])
+	}
+	ro, _ := upd["rawOutput"].(map[string]any)
+	if ro["exit_code"] != float64(0) {
+		t.Errorf("exit_code 丢了: %v", ro)
+	}
+	if _, ok := ro["output"]; ok {
+		t.Errorf("output 还在: %v", ro["output"])
+	}
+	stamp, ok := liteStampOf(t, lite, 1)
+	if !ok {
+		t.Fatal("没打 lite")
+	}
+	if liteAsInt(stamp["msgSeqEnd"]) != 2 {
+		t.Errorf("msgSeqEnd = %v, want 2", stamp["msgSeqEnd"])
+	}
+	if liteEnvSeq(lite[1].(map[string]any)) != 1 {
+		t.Errorf("幸存者 msgSeq = %v, want 1", lite[1].(map[string]any)["msgSeq"])
+	}
+}
+
+func TestLiteCoalescesThoughtRun(t *testing.T) {
+	sid := "sess-th"
+	lines := []string{
+		histEnvelope(sid, 0, 1000, msgUserChunk("q")),
+		histEnvelope(sid, 1, 1100, map[string]any{
+			"sessionUpdate": "agent_thought_chunk",
+			"content":       map[string]any{"type": "text", "text": strings.Repeat("a", 800)},
+		}),
+		histEnvelope(sid, 2, 1200, map[string]any{
+			"sessionUpdate": "agent_thought_chunk",
+			"content":       map[string]any{"type": "text", "text": strings.Repeat("b", 900)},
+		}),
+		histEnvelope(sid, 3, 1300, map[string]any{
+			"sessionUpdate": "agent_message_chunk",
+			"content":       map[string]any{"type": "text", "text": "答"},
+		}),
+	}
+	lite := litePageOf(t, lines)
+	liteProjectPage(&lite)
+	if len(lite) != 3 {
+		t.Fatalf("条数 = %d, want 3（user + 合成 thought + agent）", len(lite))
+	}
+	upd := liteUpdate(t, lite, 1)
+	if upd["sessionUpdate"] != "agent_thought_chunk" {
+		t.Fatalf("kind = %v", upd["sessionUpdate"])
+	}
+	c, _ := upd[kContent].(map[string]any)
+	if c[kType] != "text" {
+		t.Errorf("thought stub type = %v", c[kType])
+	}
+	if liteAsInt(c["omitted"]) <= 0 {
+		t.Errorf("thought stub omitted = %v", c["omitted"])
+	}
+	stamp, ok := liteStampOf(t, lite, 1)
+	if !ok {
+		t.Fatal("thought 没打 lite")
+	}
+	if liteAsInt(stamp["msgSeqEnd"]) != 2 {
+		t.Errorf("thought msgSeqEnd = %v, want 2", stamp["msgSeqEnd"])
+	}
+	agent := liteUpdate(t, lite, 2)
+	if agent[kContent].(map[string]any)["text"] != "答" {
+		t.Errorf("agent 正文被改: %v", agent[kContent])
+	}
+}
+
+func TestLiteEmptyToolCallIdNotCoalesced(t *testing.T) {
+	sid := "sess-empty"
+	lines := []string{
+		histEnvelope(sid, 0, 1000, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "a",
+			"rawOutput":     map[string]any{"output": strings.Repeat("x", 900)},
+		}),
+		histEnvelope(sid, 1, 1100, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "",
+			"title":         "b",
+			"rawOutput":     map[string]any{"output": strings.Repeat("y", 900)},
+		}),
+	}
+	lite := litePageOf(t, lines)
+	liteProjectPage(&lite)
+	if len(lite) != 2 {
+		t.Fatalf("空 id 被合成了：条数 = %d, want 2", len(lite))
+	}
+	if liteUpdate(t, lite, 0)["title"] != "a" || liteUpdate(t, lite, 1)["title"] != "b" {
+		t.Errorf("空 id 工具被并到一起: %v / %v", liteUpdate(t, lite, 0)["title"], liteUpdate(t, lite, 1)["title"])
+	}
+}
+
+// thoughtChunkEnv 造一条连续 agent_thought_chunk 信封（正文足够大才会被裁成
+// {type, omitted} 占位）。msgSeq 由 litePageOf 按下标盖。
+func thoughtChunkEnv(sid string, text string) string {
+	return histEnvelope(sid, 0, 1000, map[string]any{
+		"sessionUpdate": "agent_thought_chunk",
+		"content":       map[string]any{"type": "text", "text": text},
+	})
+}
+
+// 连续多条 thought chunk 合成一封后，幸存信封必须带 msgSeqEnd = 末条 msgSeq，
+// 否则 FE 只能按 [msgSeq, msgSeq] 回拉第一条 chunk，展开后思考缺尾巴。
+func TestLiteThoughtCoalesceStampsMsgSeqEnd(t *testing.T) {
+	const sid = "sess-th"
+	big := func(r rune) string { return strings.Repeat(string(r), 300) }
+	f := &liteFixture{
+		lines: []string{
+			histEnvelope(sid, 0, 1000, msgUserChunkMeta("问", map[string]any{"promptIndex": float64(0)})),
+			thoughtChunkEnv(sid, big('甲')), // msgSeq 1
+			thoughtChunkEnv(sid, big('乙')), // msgSeq 2
+			thoughtChunkEnv(sid, big('丙')), // msgSeq 3
+			thoughtChunkEnv(sid, big('丁')), // msgSeq 4
+			histEnvelope(sid, 0, 1000, map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"content":       map[string]any{"type": "text", "text": "答"},
+			}), // msgSeq 5
+		},
+		body: map[string]string{},
+	}
+	page := litePageOf(t, f.lines)
+	liteProjectPage(&page)
+
+	// 4 条连续 thought 合成成 1 条 → 总条数应从 6 降到 3。
+	if len(page) != 3 {
+		t.Fatalf("合成后条数 = %d, want 3（user + 1 thought + agent）", len(page))
+	}
+	stamp, ok := liteStampOf(t, page, 1)
+	if !ok {
+		t.Fatalf("thought 幸存信封没有 lite 标记: %v", liteUpdate(t, page, 1))
+	}
+	if got := liteAsInt(stamp["omitted"]); got <= 0 {
+		t.Errorf("thought lite.omitted = %d, want > 0", got)
+	}
+	end, hasEnd := stamp["msgSeqEnd"]
+	if !hasEnd {
+		t.Fatalf("thought 幸存信封缺 msgSeqEnd（FE 会把窗口塌成第 1 条 chunk）: stamp=%v", stamp)
+	}
+	if got := liteAsInt(end); got != 4 {
+		t.Errorf("thought msgSeqEnd = %d, want 4（末条 chunk 的 msgSeq）", got)
+	}
 }

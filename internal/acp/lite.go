@@ -3,26 +3,31 @@ package acp
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
+	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
 // ─────────────────────────────────────────────────────────────────────
-// lite.go — /api/session-updates 的投影档位（契约 lite-replay [A][B][C]）。
+// lite.go — /api/session-updates 的投影档位（契约 lite-replay [A][B]）。
 //
-// 历史页里绝大多数字节是工具正文（Bash 输出、Read 文件内容、Edit 双向
-// diff、Grep 的 stdout）。lite 只裁这些正文，时间线骨架一个字都不动：信封
-// 条数、顺序、顶层 msgSeq、params._meta、promptStarts/totalCount/hasMore
-// 与 btw 锚点归属全部原样，FE 拿到的是同一份滚动条，展开某条工具卡时再按
-// 需拉全量把字段填回原行。meta 档更进一步：连信封都不回，只回锚点。
+// lite 是首屏时间线：折叠工具卡 + 折叠 thought 头 + 可见的 user/assistant
+// 文本。full 由 FE 按窗口再拉，把正文填回原行。
 //
-// 计量口径统一为 encoding/json 的紧凑序列化字节数（与 writeJSON 同口径）：
-// lite.omitted / omittedBytes 是「被裁掉内容」的体积，不含替换进来的
-// {"omitted": N} 摘要与 lite 标记自身新增的字节。
+// 投影做四件事：
+//  1. 工具信封：删正文（content / 正文键 / file_matches），rawInput 只留
+//     行头字段，command 留短头；
+//  2. thought：正文换成 {type, omitted}，连续 thought 合成一封；
+//  3. 同 toolCallId 的 tool_call + update 合成一封（空 id 不合，以免误并）；
+//  4. params._meta 只留回放真用的时间戳/token。
+//
+// 条数因此可以少于 full；msgSeq / promptStarts / totalCount / hasMore
+// 语义不变。被合成掉的信封把 msgSeqEnd 打在幸存者 _meta.lite 上，FE 按
+// [msgSeq, msgSeqEnd] 回拉 full。
+//
+// omittedBytes = 被删正文 + 被合成掉的信封骨架（与 writeJSON 同口径）。
 // ─────────────────────────────────────────────────────────────────────
 
-// detail 档位（[A]）。"full"、缺省与任何未知取值都落回「不投影」，即今天
-// 的逐字节原样行为——旧 FE 不发 detail 时响应不得有任何变化。
 const (
 	DetailFull = "full"
 	DetailLite = "lite"
@@ -30,41 +35,17 @@ const (
 )
 
 const (
-	// liteRawOutputBudget 是 [C]4 的兜底预算：投影后单条 update.rawOutput
-	// 的序列化字节数上限。它是尽力而为的天花板，不是硬不变量——两条结构性
-	// 例外优先于它：[C]3 的硬保留清单（plan_content 实测单条 19.6KB，是
-	// planDoc.ts 的依赖）与不参与裁剪的标量数组（Grep 每个 match 的
-	// line_number，20 个 file_matches 就能堆到 9KB）。本机 20 个大会话
-	// 34361 条信封实测越界 229 条（0.7%），最大 19.7KB，合计约占 lite 后
-	// 字节的 1%；command 这类保留键的截断头不在越界样本里（0/229）。
+	// liteRawOutputBudget：投影后单条 rawOutput 的尽力而为上限。
 	liteRawOutputBudget = 2048
-	// liteMaxContentBlocks / liteMaxFileMatches 是摘要保留上限（[C]1 /
-	// [C]3）：超出部分整项丢弃并计入 omitted。
-	liteMaxContentBlocks = 4
-	liteMaxFileMatches   = 20
-	// liteLongStringBytes：实测正文键之外，未知工具形状里多长的字符串算
-	// 正文。短文本（NotFound/error 之类）原样保留（[C]3）。
+	// liteLongStringBytes：未知工具形状里多长的字符串算正文。
 	liteLongStringBytes = 512
-	// liteCapStringBytes 是对**保留清单里的键**也生效的兜底上限：直连 bash
-	// 的 heredoc 会把整个文件塞进 command（实测单页 rawOutput.command 100KB
-	// + rawInput.command 62KB），一律留头部 + 省略标记。FE 的行头只看得到
-	// 命令开头，全文在补全时回来；lite 行的去重键已改用
-	// toolCallId+status+kind+title，截断不会打碎 live↔快照去重。
-	liteCapStringBytes = 8192
-	// liteCapHeadBytes：截断后保留的头部长度。
-	liteCapHeadBytes = 2048
+	// liteCapStringBytes / liteCapHeadBytes：行头 command 的封顶。
+	// FE 折叠卡只看得到命令开头。
+	liteCapStringBytes = 512
+	liteCapHeadBytes   = 256
 )
 
-// liteBodyKeys：实测工具结果里的「正文」键，即 [C]2 列举路径的末级键名
-// （Bash 的 output/output_for_prompt/output_delta、FileContent.content
-// (_concise)、ImageContent.data、Grep 的 stdout/stderr、EditsApplied 的
-// old/new_string、Content.content、MultiResult.results[].output、
-// Result.output、rawInput 的 content/new_string/old_string）。
-//
-// 命中即**整棵换形状**，不看值的类型：Bash/Grep 的 output 与 stdout 实测是
-// **行数组**（单页里一项就 1.0MB / 555KB），只裁字符串会整类漏掉；逐元素裁
-// 则留下上千个 {"omitted":N} 壳。容器键（edits / results / details /
-// file_matches …）不在表内，交给递归下钻。
+// liteBodyKeys：工具结果里的正文键，命中即整棵删除。
 var liteBodyKeys = map[string]bool{
 	"output":            true,
 	"output_delta":      true,
@@ -76,13 +57,10 @@ var liteBodyKeys = map[string]bool{
 	"stderr":            true,
 	"new_string":        true,
 	"old_string":        true,
+	"plan_content":      true,
 }
 
-// liteKeepKeys：[C]3 保留清单里的字符串型键（数字/布尔标量本就不在裁剪
-// 范围内，无需登记）。命中即整棵子树不碰：title/kind/status/toolCallId/
-// locations 是 FE 画工具卡与算去重键的依赖，plan_content 是 planDoc.ts 的
-// 依赖，path/command 是「展开前也要能认出是哪个文件/哪条命令」的依赖，
-// type/sessionUpdate 是形状判别键。
+// liteKeepKeys：形状判别 / 行头 / id。命中则不按正文删（command 仍封顶）。
 var liteKeepKeys = map[string]bool{
 	"type":             true,
 	"sessionUpdate":    true,
@@ -98,18 +76,29 @@ var liteKeepKeys = map[string]bool{
 	"session_id":       true,
 	"child_session_id": true,
 	"messageId":        true,
-	"plan_content":     true,
 	"command":          true,
 	"name":             true,
 	"label":            true,
 	"mime_type":        true,
 	"mimeType":         true,
+	// 折叠行行头用到的计数：liteBudget 兜底裁剪也不许动，否则前端摘要会退化。
+	"match_count":  true,
+	"matchCount":   true,
+	"result_count": true,
+	"resultCount":  true,
+	"status_code":  true,
+	"statusCode":   true,
+	"total_lines":  true,
+	"totalLines":   true,
+	"total_pages":  true,
+	"totalPages":   true,
+	"exit_code":    true,
+	"exitCode":     true,
+	"entry_count":  true,
+	"entryCount":   true,
 }
 
-// liteHardKeepKeys 是保留清单里**一字都不能动**的那部分：形状判别键、
-// FE 的行头标题与 id、以及 planDoc.ts 依赖的 plan 正文。其余保留键
-// （command / current_dir / path 之类）超过 liteCapStringBytes 仍会被截成
-// 头部 + 省略标记——它们是给人看的文本，不是键。
+// liteHardKeepKeys：一字不动（command 不在此列，超长截头）。
 var liteHardKeepKeys = map[string]bool{
 	"type":             true,
 	"sessionUpdate":    true,
@@ -122,60 +111,100 @@ var liteHardKeepKeys = map[string]bool{
 	"session_id":       true,
 	"child_session_id": true,
 	"messageId":        true,
-	"plan_content":     true,
 	"name":             true,
 	"label":            true,
 	"mime_type":        true,
 	"mimeType":         true,
 }
 
-// liteAcc 累计单条信封的裁剪结果。
+// liteRawInputKeep：折叠卡行头用到的 rawInput 键，其余整键删除。
+var liteRawInputKeep = map[string]bool{
+	"path":             true,
+	"file_path":        true,
+	"filePath":         true,
+	"target_file":      true,
+	"target_directory": true,
+	"command":          true,
+	"pattern":          true,
+	"glob":             true,
+	"query":            true,
+	"url":              true,
+	"variant":          true,
+	"offset":           true,
+	"limit":            true,
+	"head_limit":       true,
+	"is_background":    true,
+	"description":      true,
+	"timeout":          true,
+	"merge":            true,
+	"type":             true,
+	// use_tool 的折叠行行头是「Server + 动作名」，动作名只来自 tool_name。
+	"tool_name": true,
+}
+
+// liteParamsMetaKeep：FE 回放真读的 params._meta 键。
+var liteParamsMetaKeep = map[string]bool{
+	"agentTimestampMs": true,
+	"turnStartMs":      true,
+	"streamStartMs":    true,
+	"totalTokens":      true,
+}
+
+// liteUpdateMetaKeep：update._meta 里折叠卡 / 去重 / 补全标记需要的键。
+var liteUpdateMetaKeep = map[string]bool{
+	"lite":               true,
+	"x.ai/tool":          true,
+	"bash_mode":          true,
+	"is_background":      true,
+	"child_session_id":   true,
+	"promptIndex":        true,
+	"hostTurn":           true,
+	"hideFromScrollback": true,
+	"modelId":            true,
+}
+
 type liteAcc struct {
 	omitted int
-	fields  []string
+	// 折叠行行头要显示、但正文一删就算不出来的数字：edit 的加减行数、
+	// grep 的命中文件数。投影时折出来打进 _meta.lite，前端在全量补全回来
+	// 之前照旧能画出行头后缀；补全后 _meta.lite 被抹掉，改由真实正文计算。
+	ins   int
+	del   int
+	files int
 }
 
-// note 记下一处裁剪：removed 是被裁掉内容的序列化字节数。
-func (a *liteAcc) note(path string, removed int) {
-	if removed <= 0 {
-		return
+func (a *liteAcc) note(_ string, removed int) {
+	if removed > 0 {
+		a.omitted += removed
 	}
-	a.omitted += removed
-	a.fields = append(a.fields, path)
 }
 
-// applyUpdatesDetail 在 SessionUpdates 的两条出口（本地分页 /
-// _x.ai/session/updates 透传）上统一施加投影——回退路径不得漏裁。
-// stream=true 不参与：信封以 session_updates_chunk 通知推流，响应里没有
-// 可投影的页，此时不回显 projected（FE 按「host 不支持」处理）。
 func applyUpdatesDetail(page *UpdatesPage, o SessionUpdatesOpts) {
 	switch o.Detail {
 	case DetailLite:
 		page.Projected = DetailLite
-		page.OmittedBytes = liteProjectPage(page.Updates)
+		page.OmittedBytes = liteProjectPage(&page.Updates)
 	case DetailMeta:
 		page.Projected = DetailMeta
-		// [B]：不回 updates 键（handler 据此省略），而不是回空数组伪装成
-		// 「无历史」。锚点字段仍在 page 上，语义不变。
 		page.Updates = nil
 	}
 }
 
-// liteProjectPage 对一页存储信封就地施加 lite 投影（[C]），返回整页被裁掉
-// 的总字节数。信封一律原地改写：调用方给的是本次请求从 updates.jsonl（或
-// agent 响应）现读的副本，投影不会污染归一化缓存或下一次服务。
-func liteProjectPage(updates []any) int64 {
+// liteProjectPage 就地投影并可能缩短切片（合成信封）。调用方给的是本次
+// 请求现读的副本，不会污染归一化缓存。
+func liteProjectPage(updates *[]any) int64 {
+	if updates == nil || *updates == nil {
+		return 0
+	}
 	var total int64
-	for _, raw := range updates {
+	for _, raw := range *updates {
 		total += int64(liteProjectEnvelope(raw))
 	}
-	return total
+	return total + liteCoalesce(updates)
 }
 
-// liteProjectEnvelope 投影单条存储信封，返回该信封被裁掉的字节数
-// （0 = 一字未动）。[C]6 的禁区在这里是结构性的：只有 params.update 的
-// content / rawOutput / rawInput 三个键会被写，信封其余部分（timestamp、
-// method、params.sessionId、params._meta、顶层 msgSeq）一概不读不写。
+// liteProjectEnvelope 投影单条信封。工具 / thought 裁正文，所有信封都
+// 收 params._meta。已打 lite 标记的视为投影过（幂等）。
 func liteProjectEnvelope(raw any) int {
 	env, ok := raw.(map[string]any)
 	if !ok {
@@ -185,102 +214,126 @@ func liteProjectEnvelope(raw any) int {
 	if !ok {
 		return 0
 	}
+	var acc, metaAcc liteAcc
+	liteStripMap(params[kMeta], liteParamsMetaKeep, "params._meta", &metaAcc)
 	upd, ok := params[kUpdate].(map[string]any)
 	if !ok {
-		return 0
+		return acc.omitted + metaAcc.omitted
 	}
-	// 只允许触碰工具信封（[C]）；agent_message_chunk / thought /
-	// user_message_chunk / plan / task_* / turn_completed / recap /
-	// compaction_* / _x.ai/session/update 载体全部原样穿过去。
-	switch kind, _ := upd[kSessionUpdate].(string); kind {
-	case "tool_call", "tool_call_update":
-	default:
-		return 0
-	}
-	// 幂等：一页最多投影一次，重复调用不得把摘要再摘要一遍。
+	kind, _ := upd[kSessionUpdate].(string)
 	if meta, ok := upd[kMeta].(map[string]any); ok {
 		if _, done := meta["lite"]; done {
-			return 0
+			return metaAcc.omitted
 		}
 	}
+	switch kind {
+	case "tool_call", "tool_call_update":
+		liteProjectTool(upd, &acc)
+	case "agent_thought_chunk":
+		liteProjectThought(upd, &acc)
+	}
+	if acc.omitted > 0 && (kind == "tool_call" || kind == "tool_call_update" || kind == "agent_thought_chunk") {
+		liteStamp(upd, acc.omitted, -1)
+	}
+	if kind == "tool_call" || kind == "tool_call_update" {
+		liteStampFold(upd, &acc)
+	}
+	return acc.omitted + metaAcc.omitted
+}
 
-	var acc liteAcc
+func liteProjectTool(upd map[string]any, acc *liteAcc) {
+	liteFoldNumbers(upd, acc)
 	if blocks, ok := upd[kContent].([]any); ok && len(blocks) > 0 {
-		upd[kContent] = liteContentSummary(blocks, &acc)
-	}
-	for _, key := range []string{"rawOutput", "rawInput"} {
-		v, present := upd[key]
-		if !present || v == nil {
-			continue
+		for _, b := range blocks {
+			acc.note("content", liteJSONLen(b))
 		}
-		// 根节点自身是字符串（个别工具把 rawOutput 发成正文）时得单独换，
-		// 递归只能改容器内部的元素。
+		delete(upd, kContent)
+	}
+	if v, ok := upd["rawOutput"]; ok && v != nil {
 		if s, isStr := v.(string); isStr {
-			if stub, removed, ok := liteStubString(s); ok {
-				upd[key] = stub
-				acc.note(key, removed)
+			acc.note("rawOutput", liteJSONLen(s))
+			delete(upd, "rawOutput")
+		} else {
+			liteTrimValue("rawOutput", "", v, acc)
+			if ro := upd["rawOutput"]; ro != nil {
+				liteBudget("rawOutput", ro, acc)
+				if m, ok := ro.(map[string]any); ok && len(m) == 0 {
+					delete(upd, "rawOutput")
+				}
 			}
+		}
+	}
+	if v, ok := upd["rawInput"]; ok && v != nil {
+		upd["rawInput"] = liteFilterRawInput(v, acc)
+		if m, ok := upd["rawInput"].(map[string]any); ok && len(m) == 0 {
+			delete(upd, "rawInput")
+		}
+	}
+	liteStripMap(upd[kMeta], liteUpdateMetaKeep, "update._meta", acc)
+}
+
+func liteProjectThought(upd map[string]any, acc *liteAcc) {
+	c := upd[kContent]
+	if c == nil {
+		return
+	}
+	size := liteJSONLen(c)
+	stub := map[string]any{kType: "text", "omitted": size}
+	if size <= liteJSONLen(stub) {
+		return
+	}
+	upd[kContent] = stub
+	acc.note("content", size)
+}
+
+func liteFilterRawInput(v any, acc *liteAcc) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		if s, isStr := v.(string); isStr {
+			nv, ch := liteCapKeepString("rawInput", s, acc)
+			if ch {
+				return nv
+			}
+		}
+		return v
+	}
+	for k, item := range m {
+		if !liteRawInputKeep[k] {
+			acc.note("rawInput."+k, liteJSONLen(item))
+			delete(m, k)
 			continue
 		}
-		if nv, changed := liteTrimValue(key, "", v, &acc); changed {
-			upd[key] = nv
-		}
-	}
-	// [C]4 的兜底预算只管 rawOutput；rawInput 已由正文键 + 长度阈值裁完。
-	if ro := upd["rawOutput"]; ro != nil {
-		liteBudget("rawOutput", ro, &acc)
-	}
-	if len(acc.fields) == 0 {
-		return 0
-	}
-	liteStamp(upd, acc)
-	return acc.omitted
-}
-
-// liteContentSummary 把 update.content 换成摘要块（[C]1）：每块只留
-// {"type": 原块的 type, "omitted": 原块序列化字节数}，最多
-// liteMaxContentBlocks 块，其余整块丢弃并计入 omitted。
-func liteContentSummary(blocks []any, acc *liteAcc) []any {
-	if len(blocks) > liteMaxContentBlocks {
-		for _, dropped := range blocks[liteMaxContentBlocks:] {
-			acc.note("content", liteJSONLen(dropped))
-		}
-		blocks = blocks[:liteMaxContentBlocks]
-	}
-	out := make([]any, 0, len(blocks))
-	for _, b := range blocks {
-		size := liteJSONLen(b)
-		stub := map[string]any{"omitted": size}
-		if block, ok := b.(map[string]any); ok {
-			if typ, hasType := block[kType]; hasType {
-				stub[kType] = typ
+		if s, isStr := item.(string); isStr && k == "command" {
+			if nv, ch := liteCapKeepString("rawInput.command", s, acc); ch {
+				m[k] = nv
 			}
 		}
-		out = append(out, stub)
-		acc.note("content", size)
 	}
-	return out
+	return m
 }
 
-// liteTrimValue 递归处理 rawOutput / rawInput 里的每个值，返回替换后的值与
-// 是否改动。规则与键名无关地通用（[C]2「不能只 hard-code」），优先级：
-//  1. 正文键 → 值不论形状（字符串、Bash/Grep 的行数组、结果对象）整块换成
-//     统一摘要 {"omitted": N}；
-//  2. 硬保留键（形状判别键、id、title、plan_content）→ 一字不动；
-//  3. 其余保留键的字符串超 liteCapStringBytes → 截成头部 + 省略标记
-//     （heredoc 直连 bash 的 command 实测单页 100KB+）；
-//  4. 未知键：字符串按 liteLongStringBytes 阈值当正文裁，容器下钻；
-//  5. 数字/布尔/null 永远原样。
-//
-// path 用 agent 落盘的 serde 记法（数组元素写作 `[]`），与 [C]2 列举的路径
-// 同形，FE 直接当展示用的字段名。
-func liteTrimValue(path, key string, v any, acc *liteAcc) (any, bool) {
-	if liteBodyKeys[key] {
-		if stub, removed, ok := liteStubValue(v); ok {
-			acc.note(path, removed)
-			return stub, true
+func liteStripMap(v any, keep map[string]bool, path string, acc *liteAcc) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return
+	}
+	for k, item := range m {
+		if keep[k] {
+			continue
 		}
-		return v, false
+		acc.note(path+"."+k, liteJSONLen(item))
+		delete(m, k)
+	}
+}
+
+func liteTrimValue(path, key string, v any, acc *liteAcc) (any, bool) {
+	if key == "file_matches" {
+		acc.note(path, liteJSONLen(v))
+		return nil, true
+	}
+	if liteBodyKeys[key] {
+		acc.note(path, liteJSONLen(v))
+		return nil, true
 	}
 	if s, isStr := v.(string); isStr {
 		if liteHardKeepKeys[key] {
@@ -292,15 +345,10 @@ func liteTrimValue(path, key string, v any, acc *liteAcc) (any, bool) {
 		if liteJSONLen(s) < liteLongStringBytes {
 			return v, false
 		}
-		stub, removed, ok := liteStubString(s)
-		if !ok {
-			return v, false
-		}
-		acc.note(path, removed)
-		return stub, true
+		acc.note(path, liteJSONLen(s))
+		return nil, true
 	}
 	if liteKeepKeys[key] {
-		// locations / x.ai/tool 这类结构：FE 直接依赖，整棵不钻。
 		return v, false
 	}
 	switch t := v.(type) {
@@ -308,48 +356,39 @@ func liteTrimValue(path, key string, v any, acc *liteAcc) (any, bool) {
 		changed := false
 		for k, item := range t {
 			nv, ch := liteTrimValue(path+"."+k, k, item, acc)
-			if ch {
+			if !ch {
+				continue
+			}
+			changed = true
+			if nv == nil {
+				delete(t, k)
+			} else {
 				t[k] = nv
-				changed = true
 			}
 		}
 		return t, changed
 	case []any:
-		out := t
 		changed := false
-		// [C]3：file_matches 超 20 项截到 20 项，追加 {"omittedCount": M}
-		// ——FE 靠它写「还有 N 个文件」，保留项里的 path 由 liteKeepKeys 保住。
-		if key == "file_matches" && len(out) > liteMaxFileMatches {
-			dropped := out[liteMaxFileMatches:]
-			kept := make([]any, 0, liteMaxFileMatches+1)
-			kept = append(kept, out[:liteMaxFileMatches]...)
-			kept = append(kept, map[string]any{"omittedCount": len(dropped)})
-			for _, d := range dropped {
-				acc.note(path, liteJSONLen(d))
-			}
-			out = kept
-			changed = true
-		}
-		for i, item := range out {
+		for i, item := range t {
 			nv, ch := liteTrimValue(path+"[]", key, item, acc)
 			if ch {
-				out[i] = nv
+				t[i] = nv
 				changed = true
 			}
 		}
-		return out, changed
+		return t, changed
 	}
 	return v, false
 }
 
-// liteCapKeepString 给保留键的巨型字符串封顶：命令类键不是正文，但 heredoc
-// 直连 bash 会把整个文件内容写进 command，留头部足够画行头，全文在补全时回来。
-// 按 rune 边界回退，绝不切出半个 UTF-8 字符（否则 FE 侧 JSON 里出现替换符）。
 func liteCapKeepString(path, s string, acc *liteAcc) (any, bool) {
 	if len(s) <= liteCapStringBytes {
 		return s, false
 	}
-	head := s[:liteCapHeadBytes]
+	head := s
+	if len(head) > liteCapHeadBytes {
+		head = s[:liteCapHeadBytes]
+	}
 	for len(head) > 0 && !utf8.ValidString(head) {
 		head = head[:len(head)-1]
 	}
@@ -358,120 +397,507 @@ func liteCapKeepString(path, s string, acc *liteAcc) (any, bool) {
 	return head + fmt.Sprintf("…[已省略 %d 字节]", removed), true
 }
 
-// liteStubString 把正文字符串换成统一形状 {"omitted": 原序列化字节数}；
-// 换完更大就不换（短正文换摘要纯属浪费，也让 omitted 恒为正）。
-func liteStubString(s string) (map[string]any, int, bool) {
-	return liteStubValue(s)
-}
-
-// liteStubValue 是 liteStubString 的通用版：正文键的值不论形状（字符串、
-// 行数组、结果对象）都按同一口径换形状。
-func liteStubValue(v any) (map[string]any, int, bool) {
-	size := liteJSONLen(v)
-	stub := map[string]any{"omitted": size}
-	if size <= liteJSONLen(stub) {
-		return nil, 0, false
-	}
-	return stub, size, true
-}
-
-// liteBudget 是 [C]4 的兜底：投影后 rawOutput 仍超预算时，按「最长字符串
-// 优先」继续裁。候选集合不含 keep 键下的子树（[C]3 是硬约束）与已是摘要
-// 的值；裁无可裁仍超限就到此为止，宁可超限也不违反保留清单（超限的实际
-// 来源见 liteRawOutputBudget 注释）。
 func liteBudget(path string, v any, acc *liteAcc) {
 	size := liteJSONLen(v)
 	if size <= liteRawOutputBudget {
 		return
 	}
-	var refs []liteStrRef
-	liteCollectStrings(path, "", v, &refs)
-	sort.SliceStable(refs, func(i, j int) bool { return refs[i].size > refs[j].size })
-	for i := range refs {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return
+	}
+	type kv struct {
+		k    string
+		n    int
+		keep bool
+	}
+	var keys []kv
+	for k, item := range m {
+		keys = append(keys, kv{k: k, n: liteJSONLen(item), keep: liteKeepKeys[k] || liteHardKeepKeys[k]})
+	}
+	// 非 keep 键按体积从大到小删，直到进预算。
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j].n > keys[i].n {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+	for _, it := range keys {
 		if size <= liteRawOutputBudget {
 			return
 		}
-		r := &refs[i]
-		stub, removed, ok := liteStubString(r.s)
-		if !ok {
+		if it.keep {
 			continue
 		}
-		r.set(stub)
-		acc.note(r.path, removed)
-		size -= r.size - liteJSONLen(stub)
+		acc.note(path+"."+it.k, it.n)
+		delete(m, it.k)
+		size -= it.n
 	}
 }
 
-// liteStrRef 是一个仍可裁的字符串叶子及其写回位置。
-type liteStrRef struct {
-	m    map[string]any // 与 arr 二选一
-	key  string
-	arr  []any
-	idx  int
-	s    string
-	size int
-	path string
-}
-
-func (r *liteStrRef) set(v any) {
-	if r.m != nil {
-		r.m[r.key] = v
+func liteStamp(upd map[string]any, omitted, msgSeqEnd int) {
+	if omitted <= 0 && msgSeqEnd < 0 {
 		return
 	}
-	r.arr[r.idx] = v
-}
-
-func liteCollectStrings(path, key string, v any, out *[]liteStrRef) {
-	if liteKeepKeys[key] {
-		return
+	stamp := liteStampMap(upd)
+	prev := liteAsInt(stamp["omitted"])
+	if omitted > 0 {
+		stamp["omitted"] = prev + omitted
+	} else if _, ok := stamp["omitted"]; !ok {
+		stamp["omitted"] = prev
 	}
-	switch t := v.(type) {
-	case map[string]any:
-		for k, item := range t {
-			if liteKeepKeys[k] {
-				continue
-			}
-			if s, ok := item.(string); ok {
-				*out = append(*out, liteStrRef{m: t, key: k, s: s, size: liteJSONLen(s), path: path + "." + k})
-				continue
-			}
-			liteCollectStrings(path+"."+k, k, item, out)
-		}
-	case []any:
-		for i, item := range t {
-			if s, ok := item.(string); ok {
-				*out = append(*out, liteStrRef{arr: t, idx: i, s: s, size: liteJSONLen(s), path: path + "[]"})
-				continue
-			}
-			liteCollectStrings(path+"[]", key, item, out)
+	if msgSeqEnd >= 0 {
+		if cur := liteAsInt(stamp["msgSeqEnd"]); msgSeqEnd > cur {
+			stamp["msgSeqEnd"] = msgSeqEnd
 		}
 	}
 }
 
-// liteStamp 在 params.update._meta 打投影标记（[C]5）。放 _meta 是有意的：
-// FE 的去重键函数 toolReplayPayload 会 delete _meta，标记因此不参与
-// live↔历史合并。update 原本没有 _meta 时新建一个——只有真被裁过的信封
-// 才会多出这个键。fields 排序去重，保证同一次请求的多次投影结果可比。
-func liteStamp(upd map[string]any, acc liteAcc) {
-	fields := acc.fields
-	sort.Strings(fields)
-	deduped := make([]string, 0, len(fields))
-	for _, f := range fields {
-		if len(deduped) == 0 || deduped[len(deduped)-1] != f {
-			deduped = append(deduped, f)
-		}
-	}
+func liteStampMap(upd map[string]any) map[string]any {
 	meta, ok := upd[kMeta].(map[string]any)
 	if !ok {
 		meta = map[string]any{}
 		upd[kMeta] = meta
 	}
-	meta["lite"] = map[string]any{"omitted": acc.omitted, "fields": deduped}
+	stamp, _ := meta["lite"].(map[string]any)
+	if stamp == nil {
+		stamp = map[string]any{}
+		meta["lite"] = stamp
+	}
+	return stamp
 }
 
-// liteJSONLen 按 encoding/json 的紧凑序列化口径量字节数；量不出来的值记
-// 0（等价于「没有可裁的东西」，宁可不裁也不改形状）。
+// ── 折叠行行头的数字折算 ──────────────────────────────────────────────
+//
+// 前端折叠卡的后缀（edit 的 (+N/−M)、grep 的 (N matches in M files)）原先
+// 只能从正文算：lite 删掉 content / old_string / new_string / file_matches
+// 之后，行头就空着，要等全量补回来才有。这里在删之前把数字折进
+// _meta.lite.edits / _meta.lite.files，补全时标记被抹掉、改回由真实正文算，
+// 两条路口径一致。
+
+// liteStampFold 挂折算结果；标记本身的字节不计入 omitted。
+func liteStampFold(upd map[string]any, acc *liteAcc) {
+	if acc.ins == 0 && acc.del == 0 && acc.files == 0 {
+		return
+	}
+	stamp := liteStampMap(upd)
+	if acc.ins != 0 || acc.del != 0 {
+		stamp["edits"] = map[string]any{"ins": acc.ins, "del": acc.del}
+	}
+	if acc.files > 0 {
+		stamp["files"] = acc.files
+	}
+}
+
+func liteFoldNumbers(upd map[string]any, acc *liteAcc) {
+	// 失败的编辑前端按 error 渲染、行头不画加减行数，这里就不必折。
+	if ins, del, ok := liteEditFold(upd); ok && !liteStatusFailed(upd) {
+		acc.ins, acc.del = ins, del
+	}
+	if n, ok := liteFileFold(upd); ok {
+		acc.files = n
+	}
+}
+
+func liteStatusFailed(upd map[string]any) bool {
+	s, _ := upd["status"].(string)
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "failed", "error":
+		return true
+	}
+	return false
+}
+
+var (
+	liteEditTagRx    = regexp.MustCompile(`(?i)search|replace|edit`)
+	liteAppliedTagRx = regexp.MustCompile(`(?i)EditsApplied|applied`)
+	liteGrepTagRx    = regexp.MustCompile(`(?i)grep|search`)
+)
+
+// liteEditFold 端口前端 extractEditHunks 的取数顺序：先认 rawOutput 里结构化的
+// edits.details，认不到再看 content 的 diff 块。两处都没有则 ok=false。
+func liteEditFold(upd map[string]any) (int, int, bool) {
+	if details, ok := liteEditDetails(upd["rawOutput"]); ok {
+		ins, del := 0, 0
+		for _, item := range details {
+			d, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			i, l := liteDiffLineCounts(
+				liteFirstStr(d, "old_string", "oldString", "old_text"),
+				liteFirstStr(d, "new_string", "newString", "new_text"),
+			)
+			ins += i
+			del += l
+		}
+		return ins, del, true
+	}
+	blocks, ok := upd[kContent].([]any)
+	if !ok {
+		return 0, 0, false
+	}
+	ins, del, found := 0, 0, false
+	for _, item := range blocks {
+		b, ok := item.(map[string]any)
+		if !ok || b[kType] != "diff" {
+			continue
+		}
+		found = true
+		i, l := liteDiffLineCounts(liteStr(b["oldText"]), liteStr(b["newText"]))
+		ins += i
+		del += l
+	}
+	return ins, del, found
+}
+
+// liteEditDetails 剥 rawOutput 的 Rust enum tag 取 edits.details。剥法与前端
+// unwrapTagged 一致：单键 = 外部 tag，带 type / variant 键 = 内部 tag（body
+// 仍是整包）。
+func liteEditDetails(raw any) ([]any, bool) {
+	body := raw
+	if tag, inner := liteUnwrapTagged(raw); tag != "" && liteEditTagRx.MatchString(tag) {
+		body = inner
+	}
+	if tag, inner := liteUnwrapTagged(body); tag != "" && liteAppliedTagRx.MatchString(tag) {
+		body = inner
+	}
+	m, ok := body.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	src := m
+	if inner, ok := m["edits"].(map[string]any); ok {
+		src = inner
+	}
+	for _, cand := range []map[string]any{src, m} {
+		if details, ok := cand["details"].([]any); ok && len(details) > 0 {
+			for _, item := range details {
+				if _, ok := item.(map[string]any); ok {
+					return details, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// liteFileFold 取 grep 的命中文件数：file_matches 长度，退到 file_paths。
+// 两者都被裁掉时不折算（前端也就无从显示文件数，宁缺不编）。
+func liteFileFold(upd map[string]any) (int, bool) {
+	ro := upd["rawOutput"]
+	if tag, inner := liteUnwrapTagged(ro); tag != "" && liteGrepTagRx.MatchString(tag) {
+		ro = inner
+	}
+	m, ok := ro.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	for _, key := range []string{"file_matches", "fileMatches", "file_paths", "filePaths"} {
+		if arr, ok := m[key].([]any); ok && len(arr) > 0 {
+			return len(arr), true
+		}
+	}
+	return 0, false
+}
+
+func liteUnwrapTagged(v any) (string, any) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", nil
+	}
+	if len(m) == 1 {
+		for k, item := range m {
+			return k, item
+		}
+	}
+	if s, ok := m["type"].(string); ok {
+		return s, m
+	}
+	if s, ok := m["variant"].(string); ok {
+		return s, m
+	}
+	return "", nil
+}
+
+// liteDiffLineCounts 端口 simpleDiffLines 的计数规则：只有一侧有文本时整段
+// 计增或删；两侧都有则走同一条 LCS（超过 400 行退回「整段全算」的同一路径）。
+func liteDiffLineCounts(oldText, newText string) (int, int) {
+	switch {
+	case oldText == "" && newText == "":
+		return 0, 0
+	case oldText == "":
+		return len(liteSplitDiffLines(newText)), 0
+	case newText == "":
+		return 0, len(liteSplitDiffLines(oldText))
+	}
+	oldLines := liteSplitDiffLines(oldText)
+	newLines := liteSplitDiffLines(newText)
+	if len(oldLines)+len(newLines) <= 400 {
+		return liteLCSCounts(oldLines, newLines)
+	}
+	return len(newLines), len(oldLines)
+}
+
+func liteSplitDiffLines(s string) []string {
+	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+}
+
+// liteLCSCounts 与前端 diffLines 同一条 LCS（等长时优先删），只数增删行数。
+func liteLCSCounts(a, b []string) (int, int) {
+	m, n := len(a), len(b)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := m - 1; i >= 0; i-- {
+		for j := n - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+	i, j := 0, 0
+	ins, del := 0, 0
+	for i < m && j < n {
+		switch {
+		case a[i] == b[j]:
+			i++
+			j++
+		case dp[i+1][j] >= dp[i][j+1]:
+			i++
+			del++
+		default:
+			j++
+			ins++
+		}
+	}
+	del += m - i
+	ins += n - j
+	return ins, del
+}
+
+func liteFirstStr(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s := liteStr(m[k]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func liteStr(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func liteAsInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	}
+	return 0
+}
+
+func liteToolID(upd map[string]any) string {
+	if s, ok := upd["toolCallId"].(string); ok && s != "" {
+		return s
+	}
+	if s, ok := upd["tool_call_id"].(string); ok && s != "" {
+		return s
+	}
+	return ""
+}
+
+func liteEnvSeq(env map[string]any) int {
+	return liteAsInt(env["msgSeq"])
+}
+
+func liteUpdOf(raw any) (env, params, upd map[string]any, kind string, ok bool) {
+	env, ok = raw.(map[string]any)
+	if !ok {
+		return nil, nil, nil, "", false
+	}
+	params, _ = env[kParams].(map[string]any)
+	if params == nil {
+		return env, nil, nil, "", false
+	}
+	upd, _ = params[kUpdate].(map[string]any)
+	if upd == nil {
+		return env, params, nil, "", false
+	}
+	kind, _ = upd[kSessionUpdate].(string)
+	return env, params, upd, kind, true
+}
+
+// liteCoalesce 合成同 id 工具信封、连续 thought。返回合成掉信封的骨架
+// 字节（已计入各信封自己的正文 omitted 的不再加）。第二个返回值恒 0，
+// 骨架计入第一个。
+func liteCoalesce(updates *[]any) int64 {
+	src := *updates
+	firstByID := map[string]int{}
+	thoughtRun := -1
+	var skeleton int64
+	for i, raw := range src {
+		env, _, upd, kind, ok := liteUpdOf(raw)
+		if !ok {
+			thoughtRun = -1
+			continue
+		}
+		switch kind {
+		case "tool_call", "tool_call_update":
+			thoughtRun = -1
+			id := liteToolID(upd)
+			if id == "" {
+				continue
+			}
+			prev, seen := firstByID[id]
+			if !seen {
+				firstByID[id] = i
+				continue
+			}
+			skeleton += int64(liteJSONLen(raw))
+			liteMergeTool(src[prev], env)
+			src[i] = nil
+		case "agent_thought_chunk":
+			if thoughtRun < 0 {
+				thoughtRun = i
+				continue
+			}
+			skeleton += int64(liteJSONLen(raw))
+			liteMergeThought(src[thoughtRun], env)
+			src[i] = nil
+		default:
+			thoughtRun = -1
+		}
+	}
+	out := src[:0]
+	for _, raw := range src {
+		if raw != nil {
+			out = append(out, raw)
+		}
+	}
+	*updates = out
+	return skeleton
+}
+
+func liteMergeTool(dstRaw any, srcEnv map[string]any) {
+	_, _, dstUpd, _, ok := liteUpdOf(dstRaw)
+	if !ok || dstUpd == nil {
+		return
+	}
+	_, _, srcUpd, _, ok := liteUpdOf(srcEnv)
+	if !ok || srcUpd == nil {
+		return
+	}
+	for k, v := range srcUpd {
+		if k == kSessionUpdate {
+			continue
+		}
+		if k == "rawInput" || k == "rawOutput" || k == kMeta {
+			dm, dok := dstUpd[k].(map[string]any)
+			sm, sok := v.(map[string]any)
+			if dok && sok {
+				if k == kMeta {
+					liteMergeMeta(dm, sm)
+				} else {
+					for mk, mv := range sm {
+						dm[mk] = mv
+					}
+				}
+				continue
+			}
+		}
+		dstUpd[k] = v
+	}
+	seq := liteEnvSeq(srcEnv)
+	if sm, ok := srcUpd[kMeta].(map[string]any); ok {
+		if lite, ok := sm["lite"].(map[string]any); ok {
+			if end := liteAsInt(lite["msgSeqEnd"]); end > seq {
+				seq = end
+			}
+		}
+	}
+	// 正文 omitted 已在 liteMergeMeta 里累加；这里只推进 msgSeqEnd。
+	liteStamp(dstUpd, 0, seq)
+}
+
+func liteMergeMeta(dst, src map[string]any) {
+	for k, v := range src {
+		if k == "lite" {
+			sm, _ := v.(map[string]any)
+			dm, _ := dst[k].(map[string]any)
+			if dm == nil {
+				dm = map[string]any{}
+				dst[k] = dm
+			}
+			dm["omitted"] = liteAsInt(dm["omitted"]) + liteAsInt(sm["omitted"])
+			end := liteAsInt(sm["msgSeqEnd"])
+			if end > liteAsInt(dm["msgSeqEnd"]) {
+				dm["msgSeqEnd"] = end
+			}
+			// edits / files 是「这一封正文折出来的行头数字」，合成时后到覆盖
+			// 先到——与前端整包替换 content / rawOutput 的取数口径一致；
+			// 累加会把同一次编辑数两遍。
+			for _, num := range []string{"edits", "files"} {
+				if v, ok := sm[num]; ok {
+					dm[num] = v
+				}
+			}
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+func liteMergeThought(dstRaw any, srcEnv map[string]any) {
+	_, _, dstUpd, _, ok := liteUpdOf(dstRaw)
+	if !ok || dstUpd == nil {
+		return
+	}
+	_, _, srcUpd, _, ok := liteUpdOf(srcEnv)
+	if !ok {
+		return
+	}
+	extra := 0
+	if sm, ok := srcUpd[kMeta].(map[string]any); ok {
+		if lite, ok := sm["lite"].(map[string]any); ok {
+			extra = liteAsInt(lite["omitted"])
+		}
+	}
+	if extra == 0 {
+		extra = liteJSONLen(srcUpd[kContent])
+	}
+	if c, ok := dstUpd[kContent].(map[string]any); ok {
+		c["omitted"] = liteAsInt(c["omitted"]) + extra
+	}
+	seq := liteEnvSeq(srcEnv)
+	if sm, ok := srcUpd[kMeta].(map[string]any); ok {
+		if lite, ok := sm["lite"].(map[string]any); ok {
+			if end := liteAsInt(lite["msgSeqEnd"]); end > seq {
+				seq = end
+			}
+		}
+	}
+	liteStamp(dstUpd, extra, seq)
+}
+
 func liteJSONLen(v any) int {
+	if v == nil {
+		return 0
+	}
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return 0
