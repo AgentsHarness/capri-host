@@ -3113,10 +3113,33 @@ func (b *Bridge) SetMode(ctx context.Context, sessionID, modeID string) (map[str
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, errors.New("没有活跃会话")
 	}
-	return b.request(ctx, "session/set_mode", map[string]any{
+	res, err := b.request(ctx, "session/set_mode", map[string]any{
 		kSessionID: sessionID,
 		"modeId":   modeID,
 	}, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	var modes any
+	if act := b.sessions[sessionID]; act != nil {
+		mm, ok := act.modes.(map[string]any)
+		if !ok || mm == nil {
+			mm = map[string]any{}
+			act.modes = mm
+		}
+		mm["currentModeId"] = modeID
+		modes = cloneAny(act.modes)
+	} else {
+		modes = map[string]any{"currentModeId": modeID}
+	}
+	b.mu.Unlock()
+	b.Broadcast(Event{
+		kType:      "modes_update",
+		"modes":    modes,
+		kSessionID: sessionID,
+	})
+	return res, nil
 }
 
 // SetModel calls session/set_model (grok's /model switch; the wire method
@@ -4499,10 +4522,22 @@ func (b *Bridge) RenameSession(ctx context.Context, sessionID, title string) (ma
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	return b.request(ctx, "_x.ai/session/rename", map[string]any{
-		kSessionID: b.resolveSessionID(sessionID),
+	sid := b.resolveSessionID(sessionID)
+	res, err := b.request(ctx, "_x.ai/session/rename", map[string]any{
+		kSessionID: sid,
 		kTitle:     title,
 	}, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.Broadcast(Event{
+		kType:          "session_info",
+		kSessionID:     sid,
+		"title":         title,
+		"titleIsManual": true,
+	})
+	b.broadcastRosterChange()
+	return res, nil
 }
 
 // Recap fires x.ai/recap (fire-and-forget "where was I" summary; the recap
@@ -4624,7 +4659,12 @@ func (b *Bridge) CompactConversation(ctx context.Context, sessionID, note string
 	if note != "" {
 		params["userContext"] = note
 	}
-	return b.request(ctx, "_x.ai/compact_conversation", params, 60*time.Second)
+	res, err := b.request(ctx, "_x.ai/compact_conversation", params, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.broadcastRosterChange()
+	return res, nil
 }
 
 // RewindPoints calls x.ai/rewind/points: {sessionId} → the agent's list of
@@ -4781,7 +4821,36 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 // JSON-RPC id and returns a bare ok — the frontend applies its local
 // desired state. SessionId defaults to the active session.
 func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error) {
-	return b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{kSessionID: sessionID})
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	res, err := b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{kSessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	newMode := "plan"
+	if act := b.sessions[sessionID]; act != nil {
+		mm, ok := act.modes.(map[string]any)
+		if !ok || mm == nil {
+			mm = map[string]any{}
+			act.modes = mm
+		}
+		if cur, _ := mm["currentModeId"].(string); cur == "plan" {
+			newMode = "default"
+		}
+		mm["currentModeId"] = newMode
+	}
+	b.mu.Unlock()
+	b.Broadcast(Event{
+		kType:      "modes_update",
+		"modes":    map[string]any{"currentModeId": newMode},
+		kSessionID: sessionID,
+	})
+	return res, nil
 }
 
 // PermissionsReset sends x.ai/permissions/reset: {sessionId} — clears the
@@ -4791,7 +4860,12 @@ func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[stri
 // with no client/session scoping), so the host writes it without a
 // JSON-RPC id. Frontends should treat it as process-global.
 func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
-	return b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{kSessionID: sessionID})
+	res, err := b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{kSessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	b.Broadcast(Event{kType: "permissions_reset"})
+	return res, nil
 }
 
 // SetPermissionMode sends x.ai/yolo_mode_changed as a fire-and-forget
