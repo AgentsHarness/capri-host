@@ -421,6 +421,98 @@ func TestModelsUpdateCarriesRaw(t *testing.T) {
 	}
 }
 
+// models/update（config.toml 热重载）：会话当前档位不被新目录的静态默认档
+// 覆盖——目录刷新只换 availableModels，会话选中的 reasoningEffort 原样保留
+//（当前模型仍提供该档位时），且当前模型条目上的静态默认 effort 被清除，
+// 免得 FE / session-info 把默认档当会话当前档。
+func TestModelsUpdatePreservesSessionEffort(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "glm-5.3",
+		"reasoningEffort": "high",
+		"availableModels": []any{
+			map[string]any{"modelId": "glm-5.3", "_meta": map[string]any{
+				"reasoningEffort": "high",
+				"reasoningEfforts": []any{
+					map[string]any{"value": "low"},
+					map[string]any{"value": "high"},
+					map[string]any{"value": "max"},
+				},
+			}},
+		},
+	}
+	b.mu.Unlock()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	// 热重载后的新目录：glm-5.3 仍提供 low/high/max，但 _meta.reasoningEffort
+	// 是静态默认档 low（config 未标 default 时 agent 取第一档）。
+	incoming := map[string]any{
+		"currentModelId": "glm-5.3",
+		"availableModels": []any{
+			map[string]any{"modelId": "glm-5.3", "_meta": map[string]any{
+				"reasoningEffort": "low",
+				"reasoningEfforts": []any{
+					map[string]any{"value": "low"},
+					map[string]any{"value": "high"},
+					map[string]any{"value": "max"},
+				},
+			}},
+		},
+	}
+	b.handleXaiNotification("x.ai/models/update", incoming)
+	ev := <-ch
+	merged, _ := ev["params"].(map[string]any)
+	if merged["reasoningEffort"] != "high" {
+		t.Errorf("merged reasoningEffort = %v, want high preserved", merged["reasoningEffort"])
+	}
+	// 当前模型条目上的静态默认档被清除（会话档位以 top-level 为准）。
+	avail, _ := merged["availableModels"].([]any)
+	mm, _ := avail[0].(map[string]any)
+	meta, _ := mm["_meta"].(map[string]any)
+	if v, ok := meta["reasoningEffort"]; ok {
+		t.Errorf("current-model meta reasoningEffort = %v, want cleared", v)
+	}
+}
+
+// models/update：当前模型不再提供会话原档位（模型换了或档位被删）时，
+// 会话档位回落到新目录默认（清空 top-level，让消费端取目录默认）。
+func TestModelsUpdateDropsStaleSessionEffort(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "glm-5.3",
+		"reasoningEffort": "high",
+		"availableModels": []any{
+			map[string]any{"modelId": "glm-5.3"},
+		},
+	}
+	b.mu.Unlock()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	// 新目录：当前模型换成 grok-4（不再提供 high）。
+	incoming := map[string]any{
+		"currentModelId": "grok-4",
+		"availableModels": []any{
+			map[string]any{"modelId": "grok-4", "_meta": map[string]any{
+				"reasoningEffort": "low",
+				"reasoningEfforts": []any{map[string]any{"value": "low"}},
+			}},
+		},
+	}
+	b.handleXaiNotification("x.ai/models/update", incoming)
+	ev := <-ch
+	merged, _ := ev["params"].(map[string]any)
+	if merged["currentModelId"] != "grok-4" {
+		t.Fatalf("merged currentModelId = %v, want grok-4", merged["currentModelId"])
+	}
+	if v, ok := merged["reasoningEffort"]; ok {
+		t.Errorf("merged reasoningEffort = %v, want dropped for new model", v)
+	}
+}
+
 // chunk / user_chunk 事件不携带完整原始 update（fullUpdate）：typed 字段即
 // wire 契约，两条出口（SSE / hub）本就剥离该键，FE 无消费者。
 func TestChunkEventsCarryNoFullUpdate(t *testing.T) {

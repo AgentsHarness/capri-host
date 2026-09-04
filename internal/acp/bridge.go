@@ -3226,9 +3226,11 @@ func modelDisplayName(models any, modelID string) string {
 // applyModelsCatalog refreshes a session's cached catalog from a
 // machine-wide x.ai/models/update broadcast, keeping the session's current
 // model when it is still offered (falling back to the broadcast's current
-// otherwise, like the TUI's update_catalog). Reasoning-effort fields are
-// left untouched — the broadcast carries each model's static default, not
-// this session's choice.
+// otherwise, like the TUI's update_catalog). The session's chosen
+// reasoningEffort also survives the refresh when the still-offered model
+// keeps listing it — the broadcast carries each model's static default,
+// which would otherwise clobber the user's in-session choice (e.g. high
+// reverting to the catalog default low on a config.toml reload).
 func (b *Bridge) applyModelsCatalog(s *SessionState, incoming map[string]any) {
 	models, ok := s.models.(map[string]any)
 	if !ok {
@@ -3259,10 +3261,63 @@ func (b *Bridge) applyModelsCatalog(s *SessionState, incoming map[string]any) {
 		}
 		models["availableModels"] = inAvail
 		models["currentModelId"] = cur
+		// Preserve the session's chosen effort when the still-current model
+		// still offers it: clear the incoming static-default effort on that
+		// model's catalog entry (and any top-level effort copied from it by
+		// the agent) so consumers see the session's choice, not the default.
+		prevEffort, _ := models["reasoningEffort"].(string)
+		if cur != "" && prevEffort != "" && effortStillOffered(inAvail, cur, prevEffort) {
+			for _, raw := range inAvail {
+				mm, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if id, _ := mm["modelId"].(string); id != cur {
+					continue
+				}
+				if meta, ok := mm[kMeta].(map[string]any); ok {
+					delete(meta, "reasoningEffort")
+				}
+			}
+		} else {
+			// Model changed or the effort is no longer offered: the session
+			// falls back to the new catalog's default for the current model.
+			delete(models, "reasoningEffort")
+		}
 	} else if c, ok := incoming["currentModelId"].(string); ok {
 		// Catalog-less payload: only the current id changed.
 		models["currentModelId"] = c
 	}
+}
+
+// effortStillOffered reports whether the model's refreshed catalog entry
+// still lists effort among its reasoningEfforts values/ids.
+func effortStillOffered(avail []any, modelID, effort string) bool {
+	for _, raw := range avail {
+		mm, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := mm["modelId"].(string); id != modelID {
+			continue
+		}
+		meta, _ := mm[kMeta].(map[string]any)
+		list, _ := meta["reasoningEfforts"].([]any)
+		for _, e := range list {
+			em, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, _ := em["value"].(string); v == effort {
+				return true
+			}
+			if id, _ := em["id"].(string); id == effort {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // ListSessionsOpts carries the optional official session/list params the
