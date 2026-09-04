@@ -463,3 +463,93 @@ func TestAgentRejectedPromptAlwaysSurfaced(t *testing.T) {
 		t.Error("session still busy after the agent answered with an error")
 	}
 }
+
+// promptStall 看门狗：当底层 agent 一上来就彻底静默死锁时，在 stallTimeout 内提前熔断，
+// 不必盲等 30 分钟。
+func TestPromptStallWatchdogTriggersOnSilentAgent(t *testing.T) {
+	oldTimeout := promptStallTimeout
+	promptStallTimeout = 50 * time.Millisecond
+	defer func() { promptStallTimeout = oldTimeout }()
+
+	b, w := metaReadyBridge(t)
+	sub, unsub := b.Subscribe()
+	defer unsub()
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{kType: "text", "text": "hi"}}, PromptOpts{})
+		done <- err
+	}()
+	waitLineCount(t, w, 1)
+
+	// agent 彻底静默（不发 update，不回 RPC）
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrPromptStalled) {
+			t.Fatalf("want ErrPromptStalled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stall watchdog did not trigger in time")
+	}
+
+	ev, ok := firstEvent(sub, kError)
+	if !ok {
+		t.Fatal("stall watchdog produced no error event on live channel")
+	}
+	if ev["source"] != "transport" {
+		t.Errorf("error source = %v, want transport", ev["source"])
+	}
+	if ev["message"] != ErrPromptStalled.Error() {
+		t.Errorf("error message = %v, want %v", ev["message"], ErrPromptStalled.Error())
+	}
+	b.mu.Lock()
+	busy := b.sessions["s1"].Busy
+	b.mu.Unlock()
+	if busy {
+		t.Error("session still busy after stall watchdog triggered")
+	}
+}
+
+// promptStall 看门狗解冻：只要底层 agent 有 update 到达（比如正常的流式输出或思考），
+// 看门狗立刻解除，允许后续长任务正常运行。
+func TestPromptStallWatchdogDisarmedOnActivity(t *testing.T) {
+	oldTimeout := promptStallTimeout
+	promptStallTimeout = 80 * time.Millisecond
+	defer func() { promptStallTimeout = oldTimeout }()
+
+	b, w := metaReadyBridge(t)
+	_, unsub := b.Subscribe()
+	defer unsub()
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := b.PromptWithOpts(ctx, "s1", []ContentBlock{{kType: "text", "text": "hi"}}, PromptOpts{})
+		done <- err
+	}()
+	waitLineCount(t, w, 1)
+
+	// 收到 agent 的活动 update（如回显、思考或工具调用）
+	time.Sleep(10 * time.Millisecond)
+	feedUpdate(t, b, "s1", "user_message_chunk")
+
+	// 睡眠超过 promptStallTimeout，看门狗已解除，不会误杀
+	time.Sleep(120 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("stall watchdog triggered prematurely despite activity: %v", err)
+	default:
+	}
+
+	// 正常应答 RPC
+	resolveLine(t, b, w, 0, map[string]any{"stopReason": "end_turn"})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error on resolved prompt: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt never resolved")
+	}
+}
