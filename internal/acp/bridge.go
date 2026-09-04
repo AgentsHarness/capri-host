@@ -42,6 +42,17 @@ const (
 	turnLivenessWindow = 5 * time.Minute
 )
 
+var (
+	// promptStallTimeout 是发出 prompt 后整个会话持续无任何 update 活动的熔断上限。
+	// 正常情况下 agent 在进入模型推理前（1~2ms）就会发出 user_message_chunk 或 queue 广播。
+	// 若超过该时间仍 0 活动且整个 session 持续静默，判定为底层进入推理前死锁，提前熔断，
+	// 避免前端无意义等待 30 分钟。
+	promptStallTimeout = 90 * time.Second
+)
+
+// ErrPromptStalled 在发出 prompt 且整个会话持续无任何活动达到 promptStallTimeout 时抛出。
+var ErrPromptStalled = errors.New("session/prompt 启动超时: agent 进程无响应（可能发生死锁）")
+
 // Bridge owns one grok agent stdio process and manages multiple ACP
 // sessions inside it (the agent is multi-session, like the Grok Build TUI:
 // each session runs its own turn; the host tracks their live states for the
@@ -1453,6 +1464,18 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 				if c, ok := m["code"].(float64); ok {
 					code = int(c)
 				}
+				if d, ok := m["data"]; ok && d != nil {
+					switch dataVal := d.(type) {
+					case string:
+						if dataVal != "" && dataVal != em {
+							em = fmt.Sprintf("%s: %s", em, dataVal)
+						}
+					default:
+						if bs, err := json.Marshal(d); err == nil && len(bs) > 0 {
+							em = fmt.Sprintf("%s: %s", em, string(bs))
+						}
+					}
+				}
 			}
 			// Typed wrap: the agent REPLIED with an error, so the process is
 			// healthy — callers distinguish this from transport failures
@@ -2859,11 +2882,72 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	if len(opts.Meta) > 0 {
 		params[kMeta] = opts.Meta
 	}
-	res, err := b.request(ctx, "session/prompt", params, promptTimeout)
+
+	sentAt := time.Now().UnixMilli()
+	promptCtx, cancelPrompt := context.WithCancel(ctx)
+	defer cancelPrompt()
+
+	var stalled atomic.Bool
+	stallTimeout := promptStallTimeout
+	if stallTimeout > 0 {
+		stallDone := make(chan struct{})
+		defer close(stallDone)
+		checkInterval := 1 * time.Second
+		if stallTimeout < checkInterval {
+			checkInterval = stallTimeout / 3
+			if checkInterval < 5*time.Millisecond {
+				checkInterval = 5 * time.Millisecond
+			}
+		}
+		go func() {
+			ticker := time.NewTicker(checkInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stallDone:
+					return
+				case <-promptCtx.Done():
+					return
+				case now := <-ticker.C:
+					nowMs := now.UnixMilli()
+					if nowMs-sentAt < stallTimeout.Milliseconds() {
+						continue
+					}
+					b.mu.Lock()
+					w := b.turns[sessionID]
+					lastActivity := int64(0)
+					if w != nil {
+						lastActivity = w.seenAt
+					}
+					b.mu.Unlock()
+
+					// 如果自发出 prompt 以来没有任何活动 update（seenAt 未推进）
+					if lastActivity <= sentAt {
+						log.Printf("[capri-host] prompt stall detected (session=%s): 持续无活动超过 %v，判定底层可能死锁，提前熔断", sessionID, stallTimeout)
+						stalled.Store(true)
+						cancelPrompt()
+						return
+					}
+					// 已经有活动 update 到达，解除看门狗
+					return
+				}
+			}
+		}()
+	}
+
+	res, err := b.request(promptCtx, "session/prompt", params, promptTimeout)
 	if err != nil {
+		if stalled.Load() {
+			err = ErrPromptStalled
+		}
 		// 错误要不要上事件流、怎么留痕，由 reportPromptFailure 判定：回合
 		// 还在正常输出时，prompt 预算耗尽不是回合失败。
 		b.reportPromptFailure(sessionID, err)
+		if stalled.Load() {
+			b.Cancel(sessionID)
+			turnEnded = true
+			return "", nil, err
+		}
 		// The client (browser) went away mid-turn. The agent process may be
 		// perfectly healthy — and other sessions may be running parallel
 		// turns in the same process — so nothing is killed or cancelled
@@ -2941,7 +3025,7 @@ func (b *Bridge) turnStillStreaming(sessionID string) bool {
 // the observed turn keeps until turn_completed.
 func (b *Bridge) reportPromptFailure(sessionID string, err error) bool {
 	var rpcErr *RPCError
-	if errors.As(err, &rpcErr) || errors.Is(err, context.Canceled) {
+	if errors.As(err, &rpcErr) || errors.Is(err, context.Canceled) || errors.Is(err, ErrPromptStalled) {
 		b.broadcastPromptError(sessionID, err)
 		return true
 	}
