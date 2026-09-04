@@ -1,8 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -32,10 +37,11 @@ func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGitDiffs(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Cwd   string   `json:"cwd"`
-		From  string   `json:"from"`
-		To    string   `json:"to"`
-		Paths []string `json:"paths"`
+		Cwd          string   `json:"cwd"`
+		From         string   `json:"from"`
+		To           string   `json:"to"`
+		Paths        []string `json:"paths"`
+		IncludePatch *bool    `json:"includePatch"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -50,6 +56,11 @@ func (s *Server) handleGitDiffs(w http.ResponseWriter, r *http.Request) {
 	if len(body.Paths) > 0 {
 		params["paths"] = body.Paths
 	}
+	includePatch := true
+	if body.IncludePatch != nil {
+		includePatch = *body.IncludePatch
+	}
+	params["includePatch"] = includePatch
 	s.xaiCall(w, r, "x.ai/git/diffs", params)
 }
 
@@ -606,6 +617,381 @@ func (s *Server) handleWorktreeDbPath(w http.ResponseWriter, r *http.Request) {
 	s.xaiCall(w, r, "x.ai/git/worktree/db/path", map[string]any{})
 }
 
+// runGitCmd executes git plumbing or commands in cwd and returns trimmed stdout/stderr.
+func runGitCmd(ctx context.Context, cwd string, args ...string) (string, error) {
+	if cwd == "" {
+		return "", fmt.Errorf("cwd 不能为空")
+	}
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", cwd}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	outStr := strings.TrimSpace(stdout.String())
+	errStr := strings.TrimSpace(stderr.String())
+	if err != nil {
+		if errStr != "" {
+			return "", fmt.Errorf("%s", errStr)
+		}
+		return "", err
+	}
+	if outStr != "" {
+		return outStr, nil
+	}
+	return errStr, nil
+}
+
+func (s *Server) handleGitInit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd string `json:"cwd"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, "init")
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd         string `json:"cwd"`
+		Remote      string `json:"remote,omitempty"`
+		Branch      string `json:"branch,omitempty"`
+		Force       bool   `json:"force,omitempty"`
+		SetUpstream bool   `json:"setUpstream,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	remote := body.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	args := []string{"push"}
+	if body.Force {
+		args = append(args, "--force-with-lease")
+	}
+	if body.SetUpstream {
+		args = append(args, "-u")
+	}
+	args = append(args, remote)
+	if body.Branch != "" {
+		args = append(args, body.Branch)
+	} else {
+		args = append(args, "HEAD")
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) handleGitPull(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd    string `json:"cwd"`
+		Remote string `json:"remote,omitempty"`
+		Branch string `json:"branch,omitempty"`
+		Rebase bool   `json:"rebase,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	remote := body.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	args := []string{"pull"}
+	if body.Rebase {
+		args = append(args, "--rebase")
+	}
+	args = append(args, remote)
+	if body.Branch != "" {
+		args = append(args, body.Branch)
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd    string `json:"cwd"`
+		Remote string `json:"remote,omitempty"`
+		Prune  bool   `json:"prune,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	remote := body.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	args := []string{"fetch"}
+	if body.Prune {
+		args = append(args, "--prune")
+	}
+	args = append(args, remote)
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+type GitLogEntry struct {
+	Hash      string `json:"hash"`
+	ShortHash string `json:"shortHash"`
+	Author    string `json:"author"`
+	Email     string `json:"email"`
+	Timestamp int64  `json:"timestamp"`
+	Date      string `json:"date"`
+	Message   string `json:"message"`
+	Refs      string `json:"refs,omitempty"`
+}
+
+func (s *Server) handleGitLog(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd      string `json:"cwd"`
+		MaxCount int    `json:"maxCount,omitempty"`
+		Skip     int    `json:"skip,omitempty"`
+		Branch   string `json:"branch,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	maxCount := body.MaxCount
+	if maxCount <= 0 {
+		maxCount = 30
+	} else if maxCount > 100 {
+		maxCount = 100
+	}
+	args := []string{
+		"log",
+		fmt.Sprintf("-n%d", maxCount),
+		fmt.Sprintf("--skip=%d", body.Skip),
+		"--pretty=format:%H%x00%h%x00%an%x00%ae%x00%at%x00%ad%x00%s%x00%d",
+		"--date=relative",
+	}
+	if body.Branch != "" {
+		args = append(args, body.Branch)
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "commits": []GitLogEntry{}})
+		return
+	}
+	var entries []GitLogEntry
+	if out != "" {
+		lines := strings.Split(out, "\n")
+		for _, line := range lines {
+			parts := strings.Split(line, "\x00")
+			if len(parts) >= 7 {
+				var ts int64
+				fmt.Sscanf(parts[4], "%d", &ts)
+				refs := ""
+				if len(parts) > 7 {
+					refs = strings.TrimSpace(parts[7])
+					refs = strings.TrimPrefix(refs, "(")
+					refs = strings.TrimSuffix(refs, ")")
+				}
+				entries = append(entries, GitLogEntry{
+					Hash:      parts[0],
+					ShortHash: parts[1],
+					Author:    parts[2],
+					Email:     parts[3],
+					Timestamp: ts,
+					Date:      parts[5],
+					Message:   parts[6],
+					Refs:      refs,
+				})
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "commits": entries})
+}
+
+type GitStashItem struct {
+	Index   int    `json:"index"`
+	Ref     string `json:"ref"`
+	Hash    string `json:"hash"`
+	Date    string `json:"date"`
+	Message string `json:"message"`
+}
+
+func (s *Server) handleGitStashList(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd string `json:"cwd"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, "stash", "list", "--pretty=format:%gd%x00%h%x00%cr%x00%gs")
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "stashes": []GitStashItem{}})
+		return
+	}
+	var list []GitStashItem
+	if out != "" {
+		lines := strings.Split(out, "\n")
+		for i, line := range lines {
+			parts := strings.Split(line, "\x00")
+			if len(parts) >= 4 {
+				list = append(list, GitStashItem{
+					Index:   i,
+					Ref:     parts[0],
+					Hash:    parts[1],
+					Date:    parts[2],
+					Message: parts[3],
+				})
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "stashes": list})
+}
+
+func (s *Server) handleGitStashPop(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd   string `json:"cwd"`
+		Index string `json:"index,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	args := []string{"stash", "pop"}
+	if body.Index != "" {
+		ref := body.Index
+		if !strings.HasPrefix(ref, "stash@{") {
+			ref = fmt.Sprintf("stash@{%s}", ref)
+		}
+		args = append(args, ref)
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) handleGitStashDrop(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd   string `json:"cwd"`
+		Index string `json:"index,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	args := []string{"stash", "drop"}
+	if body.Index != "" {
+		ref := body.Index
+		if !strings.HasPrefix(ref, "stash@{") {
+			ref = fmt.Sprintf("stash@{%s}", ref)
+		}
+		args = append(args, ref)
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) handleGitBranchCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd      string `json:"cwd"`
+		Branch   string `json:"branch"`
+		Checkout bool   `json:"checkout,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" || body.Branch == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd 和 branch"})
+		return
+	}
+	var args []string
+	if body.Checkout {
+		args = []string{"checkout", "-b", body.Branch}
+	} else {
+		args = []string{"branch", body.Branch}
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, args...)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) handleGitBranchDelete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd    string `json:"cwd"`
+		Branch string `json:"branch"`
+		Force  bool   `json:"force,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" || body.Branch == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd 和 branch"})
+		return
+	}
+	flag := "-d"
+	if body.Force {
+		flag = "-D"
+	}
+	out, err := runGitCmd(r.Context(), body.Cwd, "branch", flag, body.Branch)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
 // registerExtGitRoutes 注册本域路由（路由与实现同址）。
 func (s *Server) registerExtGitRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/git/status", s.handleGitStatus)
@@ -636,4 +1022,14 @@ func (s *Server) registerExtGitRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/git/worktree/db/stats", s.handleWorktreeDbStats)
 	mux.HandleFunc("POST /api/git/worktree/db/rebuild", s.handleWorktreeDbRebuild)
 	mux.HandleFunc("POST /api/git/worktree/db/path", s.handleWorktreeDbPath)
+	mux.HandleFunc("POST /api/git/init", s.handleGitInit)
+	mux.HandleFunc("POST /api/git/push", s.handleGitPush)
+	mux.HandleFunc("POST /api/git/pull", s.handleGitPull)
+	mux.HandleFunc("POST /api/git/fetch", s.handleGitFetch)
+	mux.HandleFunc("POST /api/git/log", s.handleGitLog)
+	mux.HandleFunc("POST /api/git/stash/list", s.handleGitStashList)
+	mux.HandleFunc("POST /api/git/stash/pop", s.handleGitStashPop)
+	mux.HandleFunc("POST /api/git/stash/drop", s.handleGitStashDrop)
+	mux.HandleFunc("POST /api/git/branch/create", s.handleGitBranchCreate)
+	mux.HandleFunc("POST /api/git/branch/delete", s.handleGitBranchDelete)
 }
