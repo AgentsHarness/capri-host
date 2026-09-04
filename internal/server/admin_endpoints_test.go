@@ -173,6 +173,8 @@ func TestSetModePermissionModeNotification(t *testing.T) {
 	notifPath := filepath.Join(t.TempDir(), "notifs.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordNotifs, notifPath)
 	s, _ := newFakeAgentServer(t)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 
 	cases := []struct {
 		modeID     string
@@ -210,6 +212,27 @@ func TestSetModePermissionModeNotification(t *testing.T) {
 			t.Fatalf("notif %d (%s) params = %v, want {yolo_mode:%v auto_mode:%v permission_mode:%q}",
 				i, tc.modeID, params, tc.yolo, tc.auto, tc.permission)
 		}
+	}
+
+	// 验证广播事件给已连接的 FE 订阅者：每一个模式切换都推了 yolo_mode_changed 广播
+	for i, tc := range cases {
+		for {
+			select {
+			case ev := <-ch:
+				if ev["type"] != "yolo_mode_changed" {
+					continue
+				}
+				p, _ := ev["params"].(map[string]any)
+				if p["yolo_mode"] != tc.yolo || p["auto_mode"] != tc.auto || p["permission_mode"] != tc.permission {
+					t.Fatalf("broadcast %d params = %v, want {yolo_mode:%v auto_mode:%v permission_mode:%q}",
+						i, p, tc.yolo, tc.auto, tc.permission)
+				}
+				goto nextCase
+			case <-time.After(2 * time.Second):
+				t.Fatalf("broadcast %d (%s) timeout waiting for yolo_mode_changed event", i, tc.modeID)
+			}
+		}
+	nextCase:
 	}
 }
 
