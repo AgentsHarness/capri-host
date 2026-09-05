@@ -1,7 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -169,5 +174,97 @@ func TestExtWorktreeEndpoints(t *testing.T) {
 	for _, c := range cases {
 		rec := postJSON(t, s, c.path, c.body)
 		wantOK(t, rec)
+	}
+}
+
+// TestGitStateEndpoint — /api/git/state 用真实临时仓库验证：干净仓库
+// mergeInProgress=false；制造合并冲突后 mergeInProgress=true 并列出冲突文件。
+// 非仓库目录返回 ok:false。
+func TestGitStateEndpoint(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git 不可用")
+	}
+	s, _ := newFakeAgentServer(t)
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, strings.TrimSpace(out.String()))
+		}
+	}
+	writeFile := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	getState := func() GitRepoState {
+		t.Helper()
+		rec := postJSON(t, s, "/api/git/state", fmt.Sprintf(`{"cwd":%q}`, dir))
+		wantOK(t, rec)
+		var body struct {
+			Ok    bool         `json:"ok"`
+			State GitRepoState `json:"state"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode /api/git/state response: %v", err)
+		}
+		return body.State
+	}
+
+	git("init")
+	git("config", "user.email", "t@example.com")
+	git("config", "user.name", "T")
+	writeFile("base\n")
+	git("add", ".")
+	git("commit", "-m", "base")
+	git("checkout", "-b", "feature")
+	writeFile("feature\n")
+	git("commit", "-am", "feature")
+	git("checkout", "-")
+	writeFile("main\n")
+	git("commit", "-am", "main")
+
+	clean := getState()
+	if clean.MergeInProgress || clean.RebaseInProgress || clean.CherryPickInProgress {
+		t.Errorf("clean repo state = %+v, want no in-progress operation", clean)
+	}
+	if clean.ConflictCount != 0 || len(clean.Conflicts) != 0 {
+		t.Errorf("clean repo conflicts = %+v, want none", clean)
+	}
+
+	// 合并 feature → 冲突（merge 失败是预期，忽略错误）。
+	_ = exec.Command("git", "-C", dir, "merge", "feature").Run()
+	state := getState()
+	if !state.MergeInProgress {
+		t.Errorf("conflicted repo mergeInProgress = false, want true (%+v)", state)
+	}
+	if state.ConflictCount != 1 || len(state.Conflicts) != 1 || state.Conflicts[0] != "f.txt" {
+		t.Errorf("conflicted repo conflicts = %+v, want [f.txt]", state.Conflicts)
+	}
+
+	// 非 git 目录 → HTTP 200 但 ok:false。
+	rec := postJSON(t, s, "/api/git/state", fmt.Sprintf(`{"cwd":%q}`, t.TempDir()))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("non-repo status = %d, want 200", rec.Code)
+	}
+	var nonRepo struct {
+		Ok    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &nonRepo); err != nil {
+		t.Fatalf("decode non-repo response: %v", err)
+	}
+	if nonRepo.Ok || nonRepo.Error == "" {
+		t.Errorf("non-repo /api/git/state = %s, want ok:false with error", rec.Body.String())
+	}
+
+	// 缺 cwd → 400。
+	if rec := postJSON(t, s, "/api/git/state", `{}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("missing cwd status = %d, want 400", rec.Code)
 	}
 }
