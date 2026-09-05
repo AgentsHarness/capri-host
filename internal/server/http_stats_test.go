@@ -94,9 +94,9 @@ func TestSessionStatsEndpoint(t *testing.T) {
 	// 首 token = 用户发出 → 本回合第一条流的 streamStart，每回合一次：
 	// (5000−3000 + 22000−20000) / 2 = 2000。工具后的第二流不计入。
 	eq("firstTokenAvgMs", 2000)
-	// 吞吐 = 输出 token / 生成窗口。三流都是单包，窗口 = Σ(末包 −
-	// streamStart) = (5200−5000)+(8300−8000)+(22500−22000) = 1000ms
-	// → 300 / 1000 × 1000 = 300 tok/s。
+	// 带 streamStart 的单 chunk 也能覆盖首包批量生成时间。三条流窗口：
+	// (5200−5000)+(8300−8000)+(22500−22000) = 1000ms；
+	// 300 / 1000 × 1000 = 300 tok/s。
 	if got, _ := stats["tokensPerSec"].(float64); got != 300 {
 		t.Errorf("stats.tokensPerSec = %v, want 300", got)
 	}
@@ -143,10 +143,10 @@ func TestSessionStatsNoMetaFallback(t *testing.T) {
 	if _, ok := stats["firstTokenAvgMs"]; ok {
 		t.Errorf("firstTokenAvgMs = %v, want omitted (no _meta)", stats["firstTokenAvgMs"])
 	}
-	// 无 chunk / 无 streamStartMs → 生成窗口不可用，回退 apiDuration：
-	// 50 / 3000 × 1000 ≈ 16.67。
-	if got, _ := stats["tokensPerSec"].(float64); got < 16.6 || got > 16.7 {
-		t.Errorf("tokensPerSec = %v, want ≈16.67 (apiDuration fallback)", got)
+	// 无 chunk / 无 streamStartMs 时没有可观测的纯生成窗口，指标省略，
+	// 不使用 apiDurationMs 作为替代。
+	if _, ok := stats["tokensPerSec"]; ok {
+		t.Errorf("tokensPerSec = %v, want omitted (no pure generation window)", stats["tokensPerSec"])
 	}
 }
 
@@ -194,6 +194,8 @@ func TestSessionStatsInProgressTurnNotCounted(t *testing.T) {
 	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
 	m := decodeBody(t, rec)
 	stats, _ := m["stats"].(map[string]any)
+	// 回合 1 有两个可完成的流，窗口 = (2500−2000)+(4500−4000)
+	// = 1000ms，outputTokens=500，因此纯生成速度为 500 tok/s。
 	if got, _ := stats["tokensPerSec"].(float64); got != 500 {
 		t.Errorf("tokensPerSec = %v, want 500（进行中回合不得提前计入分母）", got)
 	}
@@ -234,6 +236,7 @@ func TestSessionStatsLateTailExtendsWindow(t *testing.T) {
 	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
 	m := decodeBody(t, rec)
 	stats, _ := m["stats"].(map[string]any)
+	// 窗口 = 2400−2000 = 400ms；纯生成吞吐 = 100 / 0.4 = 250 tok/s。
 	if got, _ := stats["tokensPerSec"].(float64); got != 250 {
 		t.Errorf("tokensPerSec = %v, want 250（晚到尾巴只延窗口，不双计）", got)
 	}
@@ -270,9 +273,10 @@ func TestSessionStatsStrayNoSsChunkNotPoison(t *testing.T) {
 	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
 	m := decodeBody(t, rec)
 	stats, _ := m["stats"].(map[string]any)
-	// 窗口 = 2300−2000 = 300ms → 100/0.3 ≈ 333.3。毒化回退则是 100/9 ≈ 11.1。
+	// 该流已有 streamStart，后续缺失 streamStart 的 chunk 仍属于同一流；
+	// 窗口 = 2300−2000 = 300ms → 100 / 0.3 ≈ 333.3 tok/s。
 	if got, _ := stats["tokensPerSec"].(float64); got < 333 || got > 334 {
-		t.Errorf("tokensPerSec = %v, want ≈333.3（单条缺 ss 不得打回 apiDuration）", got)
+		t.Errorf("tokensPerSec = %v, want ≈333.3（单条缺 ss 不得改变已有流口径）", got)
 	}
 }
 
@@ -303,8 +307,9 @@ func TestSessionStatsStreamingUsesStreamStartToLast(t *testing.T) {
 	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
 	m := decodeBody(t, rec)
 	stats, _ := m["stats"].(map[string]any)
+	// 带 streamStart 的纯生成窗口 = 3000−1000 = 2000ms，200 / 2 = 100 tok/s。
 	if got, _ := stats["tokensPerSec"].(float64); got != 100 {
-		t.Errorf("tokensPerSec = %v, want 100（streamStart→末包，不是首包→末包）", got)
+		t.Errorf("tokensPerSec = %v, want 100（streamStart 覆盖首包批量生成时间）", got)
 	}
 	// 首 token = streamStart − 用户发出 = 1000 − 100 = 900
 	// （不含 thought 包生成 2000−1000）。
@@ -341,6 +346,142 @@ func TestSessionStatsFirstTokenWaitsForStreamStart(t *testing.T) {
 	stats, _ := m["stats"].(map[string]any)
 	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1000 {
 		t.Errorf("firstTokenAvgMs = %v, want 1000（2000−1000，不是 2500−1000）", got)
+	}
+	// 先无 ss 的可见字与后到的 streamStart 是同一条流，窗口 = 2800−2000，
+	// 不是拆成 0 窗口临时流 + 新流（那会省略吞吐或把分母加两次）。
+	if got, _ := stats["tokensPerSec"].(float64); got != 62.5 {
+		t.Errorf("tokensPerSec = %v, want 62.5（50 / 0.8s，窗口 2800−2000）", got)
+	}
+}
+
+// 两条无 ss 可见 chunk 之后才出现 streamStart：仍是一条流，窗口用 ss→末包。
+func TestSessionStatsNoSsThenStreamStartOneStream(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": "a"}},
+			map[string]any{"agentTimestampMs": float64(2500)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": "a2"}},
+			map[string]any{"agentTimestampMs": float64(2600)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "b"}},
+			map[string]any{"agentTimestampMs": float64(2800), "streamStartMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 50, "totalTokens": 150,
+				"modelCalls": 1, "apiDurationMs": 3000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	// 若拆成两条流，分母会变成 (2600−2500)+(2800−2000)=900ms → 55.5。
+	if got, _ := stats["tokensPerSec"].(float64); got != 62.5 {
+		t.Errorf("tokensPerSec = %v, want 62.5（一条流 2800−2000，不是 100+800）", got)
+	}
+}
+
+// 老数据全程无 streamStart：≥2 个可见 chunk 回退首包 → 末包。
+func TestSessionStatsNoStreamStartTwoChunks(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "a"}},
+			map[string]any{"agentTimestampMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "b"}},
+			map[string]any{"agentTimestampMs": float64(3000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 100, "totalTokens": 200,
+				"modelCalls": 1, "apiDurationMs": 5000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	if got, _ := stats["tokensPerSec"].(float64); got != 100 {
+		t.Errorf("tokensPerSec = %v, want 100（无 ss 两包，窗口 3000−2000）", got)
+	}
+	if _, ok := stats["firstTokenAvgMs"]; ok {
+		t.Errorf("firstTokenAvgMs = %v, want omitted（无 streamStart）", stats["firstTokenAvgMs"])
+	}
+}
+
+// 无 streamStart 的单包无法得到正窗口，省略吞吐，不回退 apiDuration。
+func TestSessionStatsNoStreamStartSingleChunkOmits(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "a"}},
+			map[string]any{"agentTimestampMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 100, "totalTokens": 200,
+				"modelCalls": 1, "apiDurationMs": 5000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	if _, ok := stats["tokensPerSec"]; ok {
+		t.Errorf("tokensPerSec = %v, want omitted（无 ss 单包）", stats["tokensPerSec"])
+	}
+}
+
+// 空 thought 仍用其 streamStart 记首 token，且不占一条 0 窗口把吞吐否决掉。
+func TestSessionStatsEmptyThoughtStillCountsFirstToken(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": ""}},
+			map[string]any{"agentTimestampMs": float64(1500), "streamStartMs": float64(1200)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "list_dir"},
+			map[string]any{"agentTimestampMs": float64(1600), "turnStartMs": float64(1000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "b"}},
+			map[string]any{"agentTimestampMs": float64(2000), "streamStartMs": float64(1800)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 50, "totalTokens": 150,
+				"modelCalls": 2, "apiDurationMs": 3000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	if got, _ := stats["firstTokenAvgMs"].(float64); got != 200 {
+		t.Errorf("firstTokenAvgMs = %v, want 200（1200−1000，不是 1800−1000）", got)
+	}
+	// 空 thought 不占窗口；message 窗口 = 2000−1800 = 200ms → 250 tok/s。
+	if got, _ := stats["tokensPerSec"].(float64); got != 250 {
+		t.Errorf("tokensPerSec = %v, want 250（空 thought 不得留下 0 窗口）", got)
 	}
 }
 
