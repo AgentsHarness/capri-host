@@ -3131,10 +3131,33 @@ func (b *Bridge) SetMode(ctx context.Context, sessionID, modeID string) (map[str
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return nil, errors.New("没有活跃会话")
 	}
-	return b.request(ctx, "session/set_mode", map[string]any{
+	res, err := b.request(ctx, "session/set_mode", map[string]any{
 		kSessionID: sessionID,
 		"modeId":   modeID,
 	}, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	var modes any
+	if act := b.sessions[sessionID]; act != nil {
+		mm, ok := act.modes.(map[string]any)
+		if !ok || mm == nil {
+			mm = map[string]any{}
+			act.modes = mm
+		}
+		mm["currentModeId"] = modeID
+		modes = cloneAny(act.modes)
+	} else {
+		modes = map[string]any{"currentModeId": modeID}
+	}
+	b.mu.Unlock()
+	b.Broadcast(Event{
+		kType:      "modes_update",
+		"modes":    modes,
+		kSessionID: sessionID,
+	})
+	return res, nil
 }
 
 // SetModel calls session/set_model (grok's /model switch; the wire method
@@ -3188,6 +3211,7 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		"reasoningEffort": reasoningEffort,
 		kSessionID:        sessionID,
 	})
+	b.broadcastRosterChange()
 	return nil
 }
 
@@ -3244,9 +3268,11 @@ func modelDisplayName(models any, modelID string) string {
 // applyModelsCatalog refreshes a session's cached catalog from a
 // machine-wide x.ai/models/update broadcast, keeping the session's current
 // model when it is still offered (falling back to the broadcast's current
-// otherwise, like the TUI's update_catalog). Reasoning-effort fields are
-// left untouched — the broadcast carries each model's static default, not
-// this session's choice.
+// otherwise, like the TUI's update_catalog). The session's chosen
+// reasoningEffort also survives the refresh when the still-offered model
+// keeps listing it — the broadcast carries each model's static default,
+// which would otherwise clobber the user's in-session choice (e.g. high
+// reverting to the catalog default low on a config.toml reload).
 func (b *Bridge) applyModelsCatalog(s *SessionState, incoming map[string]any) {
 	models, ok := s.models.(map[string]any)
 	if !ok {
@@ -3277,10 +3303,63 @@ func (b *Bridge) applyModelsCatalog(s *SessionState, incoming map[string]any) {
 		}
 		models["availableModels"] = inAvail
 		models["currentModelId"] = cur
+		// Preserve the session's chosen effort when the still-current model
+		// still offers it: clear the incoming static-default effort on that
+		// model's catalog entry (and any top-level effort copied from it by
+		// the agent) so consumers see the session's choice, not the default.
+		prevEffort, _ := models["reasoningEffort"].(string)
+		if cur != "" && prevEffort != "" && effortStillOffered(inAvail, cur, prevEffort) {
+			for _, raw := range inAvail {
+				mm, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if id, _ := mm["modelId"].(string); id != cur {
+					continue
+				}
+				if meta, ok := mm[kMeta].(map[string]any); ok {
+					delete(meta, "reasoningEffort")
+				}
+			}
+		} else {
+			// Model changed or the effort is no longer offered: the session
+			// falls back to the new catalog's default for the current model.
+			delete(models, "reasoningEffort")
+		}
 	} else if c, ok := incoming["currentModelId"].(string); ok {
 		// Catalog-less payload: only the current id changed.
 		models["currentModelId"] = c
 	}
+}
+
+// effortStillOffered reports whether the model's refreshed catalog entry
+// still lists effort among its reasoningEfforts values/ids.
+func effortStillOffered(avail []any, modelID, effort string) bool {
+	for _, raw := range avail {
+		mm, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := mm["modelId"].(string); id != modelID {
+			continue
+		}
+		meta, _ := mm[kMeta].(map[string]any)
+		list, _ := meta["reasoningEfforts"].([]any)
+		for _, e := range list {
+			em, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, _ := em["value"].(string); v == effort {
+				return true
+			}
+			if id, _ := em["id"].(string); id == effort {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // ListSessionsOpts carries the optional official session/list params the
@@ -4464,10 +4543,22 @@ func (b *Bridge) RenameSession(ctx context.Context, sessionID, title string) (ma
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	return b.request(ctx, "_x.ai/session/rename", map[string]any{
-		kSessionID: b.resolveSessionID(sessionID),
+	sid := b.resolveSessionID(sessionID)
+	res, err := b.request(ctx, "_x.ai/session/rename", map[string]any{
+		kSessionID: sid,
 		kTitle:     title,
 	}, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.Broadcast(Event{
+		kType:          "session_info",
+		kSessionID:     sid,
+		"title":         title,
+		"titleIsManual": true,
+	})
+	b.broadcastRosterChange()
+	return res, nil
 }
 
 // Recap fires x.ai/recap (fire-and-forget "where was I" summary; the recap
@@ -4589,7 +4680,12 @@ func (b *Bridge) CompactConversation(ctx context.Context, sessionID, note string
 	if note != "" {
 		params["userContext"] = note
 	}
-	return b.request(ctx, "_x.ai/compact_conversation", params, 60*time.Second)
+	res, err := b.request(ctx, "_x.ai/compact_conversation", params, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.broadcastRosterChange()
+	return res, nil
 }
 
 // RewindPoints calls x.ai/rewind/points: {sessionId} → the agent's list of
@@ -4638,12 +4734,22 @@ func (b *Bridge) RewindExecute(ctx context.Context, sessionID string, targetInde
 	if mode == "" {
 		mode = "conversation_only"
 	}
-	return b.request(ctx, "_x.ai/rewind/execute", map[string]any{
+	res, err := b.request(ctx, "_x.ai/rewind/execute", map[string]any{
 		kSessionID:          sessionID,
 		"targetPromptIndex": targetIndex,
 		"force":             true,
 		"mode":              mode,
 	}, 60*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	b.Broadcast(Event{
+		kType:               "session_rewound",
+		kSessionID:          sessionID,
+		"targetPromptIndex": targetIndex,
+	})
+	b.broadcastRosterChange()
+	return res, nil
 }
 
 // SchedulerDelete calls x.ai/scheduler/delete: {sessionId, taskId} — stops
@@ -4736,7 +4842,36 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 // JSON-RPC id and returns a bare ok — the frontend applies its local
 // desired state. SessionId defaults to the active session.
 func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error) {
-	return b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{kSessionID: sessionID})
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	res, err := b.XaiNotify(ctx, "x.ai/toggle_plan_mode", map[string]any{kSessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	newMode := "plan"
+	if act := b.sessions[sessionID]; act != nil {
+		mm, ok := act.modes.(map[string]any)
+		if !ok || mm == nil {
+			mm = map[string]any{}
+			act.modes = mm
+		}
+		if cur, _ := mm["currentModeId"].(string); cur == "plan" {
+			newMode = "default"
+		}
+		mm["currentModeId"] = newMode
+	}
+	b.mu.Unlock()
+	b.Broadcast(Event{
+		kType:      "modes_update",
+		"modes":    map[string]any{"currentModeId": newMode},
+		kSessionID: sessionID,
+	})
+	return res, nil
 }
 
 // PermissionsReset sends x.ai/permissions/reset: {sessionId} — clears the
@@ -4746,7 +4881,12 @@ func (b *Bridge) TogglePlanMode(ctx context.Context, sessionID string) (map[stri
 // with no client/session scoping), so the host writes it without a
 // JSON-RPC id. Frontends should treat it as process-global.
 func (b *Bridge) PermissionsReset(ctx context.Context, sessionID string) (map[string]any, error) {
-	return b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{kSessionID: sessionID})
+	res, err := b.XaiNotify(ctx, "x.ai/permissions/reset", map[string]any{kSessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	b.Broadcast(Event{kType: "permissions_reset"})
+	return res, nil
 }
 
 // SetPermissionMode sends x.ai/yolo_mode_changed as a fire-and-forget
@@ -4789,6 +4929,9 @@ func (b *Bridge) SetPermissionMode(ctx context.Context, mode string) (map[string
 	}); err != nil {
 		return nil, err
 	}
+	// Broadcast to all connected FE clients so every tab/device converges
+	// immediately (the agent notification is fire-and-forget and does not echo).
+	b.Broadcast(Event{kType: "yolo_mode_changed", kParams: params})
 	return map[string]any{"ok": true}, nil
 }
 

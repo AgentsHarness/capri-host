@@ -56,6 +56,13 @@ const ACPHostFakeAgentRecordRequests = "ACP_HOST_FAKE_AGENT_RECORD_REQUESTS"
 // mid-turn (e.g. the SSE hello busy flag).
 const ACPHostFakeAgentPromptDelayMs = "ACP_HOST_FAKE_AGENT_PROMPT_DELAY_MS"
 
+// ACPHostFakeAgentModelsUpdate, when set (a JSON SessionModelState
+// payload), makes the fake agent emit an x.ai/models/update notification
+// right after answering session/prompt — tests use it to exercise the
+// host's catalog-refresh merge (session effort preservation on config
+// hot-reload).
+const ACPHostFakeAgentModelsUpdate = "ACP_HOST_FAKE_AGENT_MODELS_UPDATE"
+
 // ACPHostFakeAgentPromptMeta / SessionNewMeta / SessionListCursor /
 // SessionListMeta / AuthMeta: JSON strings injected into the fake agent's
 // canned responses (`_meta` / pagination cursor) so tests can assert the
@@ -219,6 +226,12 @@ func runFakeAgent() {
 			if m := fakeAgentMeta(ACPHostFakeAgentPromptMeta); m != nil {
 				result["_meta"] = m
 			}
+			// 目录刷新广播（config 热重载模拟）：响应先写回，再发通知。
+			if m := fakeAgentMeta(ACPHostFakeAgentModelsUpdate); m != nil {
+				writeResult(out, id, result)
+				emitNotification(out, "x.ai/models/update", m)
+				continue
+			}
 		case "_x.ai/session/delete":
 			result = map[string]any{"ok": true}
 		case "_x.ai/compact_conversation":
@@ -273,6 +286,22 @@ func runFakeAgent() {
 		out.WriteByte('\n')
 		out.Flush()
 	}
+}
+
+// writeResult flushes one JSON-RPC response line for the given id.
+func writeResult(out *bufio.Writer, id any, result map[string]any) {
+	resp, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	out.Write(resp)
+	out.WriteByte('\n')
+	out.Flush()
+}
+
+// emitNotification writes one fire-and-forget JSON-RPC notification line.
+func emitNotification(out *bufio.Writer, method string, params map[string]any) {
+	n, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+	out.Write(n)
+	out.WriteByte('\n')
+	out.Flush()
 }
 
 // newFakeAgentServer builds a Server whose bridge talks to the test binary

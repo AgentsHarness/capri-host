@@ -94,6 +94,8 @@ func TestMemoryRewriteEndpoint(t *testing.T) {
 
 func TestTogglePlanModeEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 
 	rec := postJSON(t, s, "/api/toggle-plan-mode", `{"sessionId":"sess-1"}`)
 	if rec.Code != http.StatusOK {
@@ -109,6 +111,19 @@ func TestTogglePlanModeEndpoint(t *testing.T) {
 		t.Fatalf("resp = %s, want no planMode (notification, no reply)", rec.Body.String())
 	}
 
+	var gotModesUpdate bool
+	deadline := time.After(2 * time.Second)
+	for !gotModesUpdate {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "modes_update" {
+				gotModesUpdate = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for modes_update after toggle-plan-mode")
+		}
+	}
+
 	// No sessionId and no active session → 404.
 	rec2 := postJSON(t, s, "/api/toggle-plan-mode", `{}`)
 	if rec2.Code != http.StatusNotFound {
@@ -120,6 +135,8 @@ func TestTogglePlanModeEndpoint(t *testing.T) {
 
 func TestPermissionsResetEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 
 	rec := postJSON(t, s, "/api/permissions-reset", `{"sessionId":"sess-1"}`)
 	if rec.Code != http.StatusOK {
@@ -127,6 +144,19 @@ func TestPermissionsResetEndpoint(t *testing.T) {
 	}
 	if m := decodeBody(t, rec); m["ok"] != true {
 		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	var gotReset bool
+	deadline := time.After(2 * time.Second)
+	for !gotReset {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "permissions_reset" {
+				gotReset = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for permissions_reset broadcast")
+		}
 	}
 
 	// No sessionId and no active session → 404.
@@ -173,6 +203,8 @@ func TestSetModePermissionModeNotification(t *testing.T) {
 	notifPath := filepath.Join(t.TempDir(), "notifs.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordNotifs, notifPath)
 	s, _ := newFakeAgentServer(t)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 
 	cases := []struct {
 		modeID     string
@@ -211,21 +243,57 @@ func TestSetModePermissionModeNotification(t *testing.T) {
 				i, tc.modeID, params, tc.yolo, tc.auto, tc.permission)
 		}
 	}
+
+	// 验证广播事件给已连接的 FE 订阅者：每一个模式切换都推了 yolo_mode_changed 广播
+	for i, tc := range cases {
+		for {
+			select {
+			case ev := <-ch:
+				if ev["type"] != "yolo_mode_changed" {
+					continue
+				}
+				p, _ := ev["params"].(map[string]any)
+				if p["yolo_mode"] != tc.yolo || p["auto_mode"] != tc.auto || p["permission_mode"] != tc.permission {
+					t.Fatalf("broadcast %d params = %v, want {yolo_mode:%v auto_mode:%v permission_mode:%q}",
+						i, p, tc.yolo, tc.auto, tc.permission)
+				}
+				goto nextCase
+			case <-time.After(2 * time.Second):
+				t.Fatalf("broadcast %d (%s) timeout waiting for yolo_mode_changed event", i, tc.modeID)
+			}
+		}
+	nextCase:
+	}
 }
 
 // Session-mode ids (plan) keep the legacy session/set_mode request path —
 // the fake agent answers it, so the endpoint still returns the agent result.
 func TestSetModePlanStillSessionSetMode(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
-	createActiveSession(t, s)
+	sid := createActiveSession(t, s)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 
-	rec := postJSON(t, s, "/api/set-mode", `{"modeId":"plan"}`)
+	rec := postJSON(t, s, "/api/set-mode", `{"modeId":"plan","sessionId":"`+sid+`"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 	m := decodeBody(t, rec)
 	if m["ok"] != true {
 		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+
+	select {
+	case ev := <-ch:
+		if ev["type"] != "modes_update" {
+			t.Fatalf("type = %v, want modes_update", ev["type"])
+		}
+		modes, _ := ev["modes"].(map[string]any)
+		if modes["currentModeId"] != "plan" {
+			t.Fatalf("currentModeId = %v, want plan", modes["currentModeId"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for modes_update broadcast")
 	}
 	// The fake agent answers unknown methods with {} — a real agent answers
 	// session/set_mode with its response, and the host passes it through.

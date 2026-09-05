@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/AgentsHarness/capri-host/internal/config"
@@ -170,6 +171,8 @@ func TestSetModelForwardsSessionID(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
 	s, _ := newFakeAgentServer(t)
+	ch, unsub := s.bridge.Subscribe()
+	defer unsub()
 	sid := createActiveSession(t, s)
 
 	rec := postJSON(t, s, "/api/set-model",
@@ -188,5 +191,19 @@ func TestSetModelForwardsSessionID(t *testing.T) {
 	meta, _ := params["_meta"].(map[string]any)
 	if meta["reasoningEffort"] != "high" {
 		t.Errorf("_meta = %v, want reasoningEffort high", params["_meta"])
+	}
+
+	// 验证广播事件中包含 sessions_changed
+	var gotSessionsChanged bool
+	deadline := time.After(2 * time.Second)
+	for !gotSessionsChanged {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "sessions_changed" {
+				gotSessionsChanged = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for sessions_changed after set-model")
+		}
 	}
 }

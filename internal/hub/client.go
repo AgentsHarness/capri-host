@@ -96,10 +96,12 @@ type Client struct {
 	stateMu sync.Mutex
 	token   string
 
-	// forwardEvents is true only while at least one browser is subscribed
-	// to the hub's /ws/fe stream. The hub pushes {type:"subscribers",
-	// count:N} (and hello.subscribers) so idle hosts stop uploading
-	// bridge traffic; host_status heartbeats always continue.
+	// forwardEvents is true only while at least one browser is watching
+	// THIS host. The hub pushes {type:"subscribers", count:N} (and
+	// hello.subscribers) where N counts the /ws/fe subscribers that receive
+	// this host's stream (a browser filtered to another host, or with no
+	// live browser at all, is not an audience here) so idle hosts stop
+	// uploading bridge traffic; host_status heartbeats always continue.
 	fwdMu         sync.Mutex
 	forwardEvents bool
 	fwdKnown      bool // false until the hub tells us a count
@@ -595,7 +597,7 @@ func (c *Client) clearState() {
 // ── event forwarding (bridge → hub) ───────────────────────────────────
 
 // setBrowserSubscribers enables/disables bridge→hub event upload based on
-// the hub's live browser /ws/fe subscriber count.
+// the hub's live browser subscriber count for THIS host.
 func (c *Client) setBrowserSubscribers(count int) {
 	enable := count > 0
 	c.fwdMu.Lock()
