@@ -26,11 +26,15 @@ import (
 //     首个带 streamStartMs 的 thought/message chunk 的 streamStartMs −
 //     回合起点（user_message 的 agentTimestampMs，_meta.turnStartMs 优先）。
 //     不含 thought 整包生成时间；缺 streamStartMs 的回合跳过；
-//   - tokensPerSec     Σ outputTokens / 生成窗口 × 1000。每流窗口 =
-//     末包 − streamStart（与 live gen_rate、firstToken 同一时间零点，
-//     含 thought 首包生成）。缺 streamStart 时回退首包 → 末包。窗口
-//     与 usage 按回合配对（pending，见 accumulateUsage）——进行中回合
-//     不进分母。无生成窗口时回退 llmDurationMs；
+//   - tokensPerSec     纯生成吞吐 = Σ outputTokens / Σ 生成窗口 × 1000。带
+//     streamStartMs 的流窗口 = 最后一个可见输出 chunk − streamStartMs，
+//     覆盖 Grok 首包批量生成的时间；缺 streamStartMs 时才回退为首包 →
+//     末包。同流先无 ss 后出现 streamStartMs 时并入当前流，不拆成两条。
+//     工具执行、回合间等待和 API 总耗时不进入分母。窗口与 usage
+//     按回合配对（pending，见 accumulateUsage）——进行中回合不进分母。
+//     单 chunk 只要有 streamStartMs 也可计算；完全没有可观测窗口时不返回
+//     指标，不再用 apiDurationMs 冒充纯生成时间。分子使用 agent 回合终态
+//     提供的真实 outputTokens。
 //   - cacheHitRate     Σ cachedReadTokens / Σ inputTokens（钳制 [0,1]）；
 //   - inputTokens / outputTokens / totalTokens / cachedReadTokens /
 //     modelCalls：Σ usage（与 usage-report 同源同口径）。
@@ -60,7 +64,7 @@ type sessionStatsAccumulator struct {
 	turnStartMs int64
 	// tool_call 开始时间（epoch ms），按 toolCallId。
 	toolStarts map[string]int64
-	// 最近一个 LLM 流的起点（去重新流）。
+	// 最近一个 LLM 流的起点（去重新流），仅用于首 token 延迟。
 	lastStreamStartMs int64
 	// 本回合是否已记过首 token（每回合只计第一条流的 streamStart）。
 	turnFirstChunkSeen bool
@@ -68,11 +72,21 @@ type sessionStatsAccumulator struct {
 	firstTokenSumMs int64
 	firstTokenCount int64
 
-	// 生成窗口（ms）：已与 usage 配对提交的分母。
+	// 纯生成窗口（ms）：已与 usage 配对提交的分母。
 	genDurationMs int64
+	// 当前回合每条可观测流的生成窗口。usage 到达时，只有所有可观测流
+	// 都有正窗口，才保留纯生成速度；无法观测到完整流时不输出速度。
+	turnStreamWindows []int64
+	currentStream     int
+
+	// 只要有一个已完成回合无法把 outputTokens 与正的纯生成窗口配对，
+	// 整个 tokensPerSec 就保持省略，避免用部分数据制造精确假象。
+	pureSpeedValid bool
+
 	// 当前回合已封口、尚未随 usage 提交的窗口。新用户消息若尚未见到
 	// usage 则丢弃（打断的回合没有分子可配对）。
 	pendingGenMs int64
+
 	// 当前打开的流。
 	streamOpen         bool
 	streamFirstChunkMs int64
@@ -107,7 +121,11 @@ func (b *Bridge) SessionStats(ctx context.Context, cwd, sessionID string) (*Sess
 	}
 	defer f.Close()
 
-	acc := &sessionStatsAccumulator{toolStarts: make(map[string]int64)}
+	acc := &sessionStatsAccumulator{
+		toolStarts:     make(map[string]int64),
+		currentStream:  -1,
+		pureSpeedValid: true,
+	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
 	rank := 0
@@ -183,6 +201,8 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 	case "user_message_chunk":
 		a.closeStream()
 		a.pendingGenMs = 0
+		a.turnStreamWindows = nil
+		a.currentStream = -1
 		if hostTurnUpdate(upd) {
 			return
 		}
@@ -217,7 +237,9 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 			}
 		}
 	case "agent_thought_chunk", "agent_message_chunk":
-		// 首 token：本回合第一条 LLM 流的 streamStart − 用户发出。
+		var content any
+		visible := json.Unmarshal(upd["content"], &content) == nil && contentText(content) != ""
+		// 首 token 只看 streamStart，空占位 chunk 仍算流起点。
 		// 缺 streamStartMs 则等后续同回合 chunk，不把可见字时间当成流起点。
 		if !a.turnFirstChunkSeen && a.turnStartMs > 0 && streamStartMs > 0 && streamStartMs >= a.turnStartMs {
 			a.firstTokenSumMs += streamStartMs - a.turnStartMs
@@ -225,20 +247,25 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 			a.turnFirstChunkSeen = true
 		}
 		if streamStartMs > 0 {
-			if streamStartMs != a.lastStreamStartMs {
-				a.closeStream()
-				a.streamOpen = true
+			if a.streamOpen && a.lastStreamStartMs == 0 {
+				// 临时无 ss 流等到了 streamStart：并入当前流。
 				a.lastStreamStartMs = streamStartMs
-				a.streamFirstChunkMs = 0
-				a.streamLastChunkMs = 0
-				a.streamClosedWin = 0
+			} else if streamStartMs != a.lastStreamStartMs {
+				a.openStream(streamStartMs)
 			} else if !a.streamOpen {
 				// 同流晚到尾巴：重开，保留已记的首包与已提交窗口。
 				a.streamOpen = true
 			}
-			a.noteChunk(agentTsMs)
+			if visible {
+				a.noteChunk(agentTsMs)
+			}
 		} else if a.streamOpen {
-			// 缺 streamStartMs 但属于已计时流：吸收进当前窗口，不毒化整段。
+			if visible {
+				a.noteChunk(agentTsMs)
+			}
+		} else if visible && agentTsMs > 0 {
+			// 无 streamStartMs：先记临时流，≥2 个可见 chunk 才有正窗口。
+			a.openStream(0)
 			a.noteChunk(agentTsMs)
 		}
 	case "turn_completed", "response_completed":
@@ -278,15 +305,32 @@ func (a *sessionStatsAccumulator) accumulateUsage(usage map[string]any) {
 	s.TotalTokens += tot
 	s.CachedReadTokens += cr
 	s.ModelCalls += mc
-	a.genDurationMs += a.pendingGenMs
+	if out > 0 {
+		validWindow := len(a.turnStreamWindows) > 0 && a.pendingGenMs > 0
+		for _, win := range a.turnStreamWindows {
+			if win <= 0 {
+				validWindow = false
+				break
+			}
+		}
+		if !validWindow {
+			a.pureSpeedValid = false
+		} else {
+			a.genDurationMs += a.pendingGenMs
+		}
+	}
 	a.pendingGenMs = 0
+	// usage 是回合终态；下一回合由 user_message_chunk 重新建立流列表。
+	a.turnStreamWindows = nil
+	a.currentStream = -1
 	if v, ok := asInt(usage["apiDurationMs"]); ok && v > 0 {
 		s.LLMDurationMs += v
 	}
 }
 
-// streamGenWindow 一条 LLM 流的生成窗口（ms）：末包 − streamStart。
-// 缺 streamStart 时回退首包 → 末包（老数据）。
+// streamGenWindow 计算一条流的纯生成窗口（ms）。带 streamStartMs 时，
+// streamStartMs 是该流的生成起点，需覆盖首包批量生成；缺失时回退为
+// 首个可见输出 chunk 到最后一个可见输出 chunk。
 func streamGenWindow(first, last, streamStart int64) int64 {
 	if last <= 0 {
 		return 0
@@ -300,16 +344,39 @@ func streamGenWindow(first, last, streamStart int64) int64 {
 	return 0
 }
 
+// openStream 开始一条新流。streamStart=0 表示临时无 ss 流。
+func (a *sessionStatsAccumulator) openStream(streamStart int64) {
+	a.closeStream()
+	a.streamOpen = true
+	a.lastStreamStartMs = streamStart
+	a.streamFirstChunkMs = 0
+	a.streamLastChunkMs = 0
+	a.streamClosedWin = 0
+	a.turnStreamWindows = append(a.turnStreamWindows, 0)
+	a.currentStream = len(a.turnStreamWindows) - 1
+}
+
 // closeStream 封口当前流：窗口差额计入 pending。幂等。
 func (a *sessionStatsAccumulator) closeStream() {
 	if !a.streamOpen {
 		return
 	}
 	a.streamOpen = false
+	if a.streamFirstChunkMs == 0 && a.streamLastChunkMs == 0 {
+		// 无可见输出（空占位 chunk 开的流）：不占窗口槽。
+		if n := len(a.turnStreamWindows); n > 0 && a.currentStream == n-1 {
+			a.turnStreamWindows = a.turnStreamWindows[:n-1]
+		}
+		a.currentStream = -1
+		return
+	}
 	win := streamGenWindow(a.streamFirstChunkMs, a.streamLastChunkMs, a.lastStreamStartMs)
 	if win > a.streamClosedWin {
 		a.pendingGenMs += win - a.streamClosedWin
 		a.streamClosedWin = win
+	}
+	if a.currentStream >= 0 && a.currentStream < len(a.turnStreamWindows) && win > a.turnStreamWindows[a.currentStream] {
+		a.turnStreamWindows[a.currentStream] = win
 	}
 }
 
@@ -323,10 +390,8 @@ func (a *sessionStatsAccumulator) finish() {
 		}
 		s.CacheHitRate = rate
 	}
-	if a.genDurationMs > 0 {
+	if a.pureSpeedValid && a.genDurationMs > 0 {
 		s.TokensPerSec = float64(s.OutputTokens) / float64(a.genDurationMs) * 1000
-	} else if s.LLMDurationMs > 0 {
-		s.TokensPerSec = float64(s.OutputTokens) / float64(s.LLMDurationMs) * 1000
 	}
 	if a.firstTokenCount > 0 {
 		s.FirstTokenAvgMs = a.firstTokenSumMs / a.firstTokenCount
