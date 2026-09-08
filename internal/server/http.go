@@ -1153,18 +1153,37 @@ func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
+// x.ai/task/kill 的终止来源，即 agent 侧 TaskKillSource 的 wire 名（camelCase
+// 由 serde 决定）。clientUi = 单条 UI 终止，agent 会在任务收尾时补一条
+// "killed by the user" 唤醒；teardown = 静默，不再为这条任务唤醒模型。
+const (
+	taskKillSourceClientUI = "clientUi"
+	taskKillSourceTeardown = "teardown"
+)
+
 // handleTaskKill kills a background task via x.ai/task/kill
 // ({sessionId?} empty resolves to the active session).
+//
+// 可选的 {source} 原样转发给 agent：它决定这次终止要不要通知模型。只认
+// 上表两个值——其余字符串 agent 的 serde 会直接拒掉整个请求（含 source
+// 字段的 kill 请求整体失败），杀掉的是"终止"本身，比回一个 400 更糟。
 func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID string `json:"sessionId,omitempty"`
 		TaskID    string `json:"taskId"`
+		Source    string `json:"source,omitempty"`
 	}
 	if err := readJSON(r, &body); err != nil || body.TaskID == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 taskId"})
 		return
 	}
-	res, err := s.bridge.TaskKill(r.Context(), body.SessionID, body.TaskID)
+	switch body.Source {
+	case "", taskKillSourceClientUI, taskKillSourceTeardown:
+	default:
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "source 只支持 clientUi / teardown"})
+		return
+	}
+	res, err := s.bridge.TaskKill(r.Context(), body.SessionID, body.TaskID, body.Source)
 	if err != nil {
 		writeAgentError(w, "x.ai/task/kill", err)
 		return

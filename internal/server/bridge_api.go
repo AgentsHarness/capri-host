@@ -91,7 +91,7 @@ type mcpAPI interface {
 // taskAPI：后台任务与终端/子代理控制。
 type taskAPI interface {
 	TaskList(ctx context.Context, sessionID ...string) (map[string]any, error)
-	TaskKill(ctx context.Context, sessionID, taskID string) (map[string]any, error)
+	TaskKill(ctx context.Context, sessionID, taskID, source string) (map[string]any, error)
 	TaskLog(sessionID, cwd, taskID string) (*acp.TaskLog, error)
 	SubagentCancel(ctx context.Context, sessionID, subagentID string) (map[string]any, error)
 	TerminalPtyInput(ctx context.Context, terminalID, data string) (map[string]any, error)
