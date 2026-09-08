@@ -65,12 +65,14 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 	var out struct {
-		OK     bool `json:"ok"`
-		Events []struct {
+		OK       bool `json:"ok"`
+		Detached any  `json:"detached"`
+		Events   []struct {
 			Kind    string `json:"kind"`
 			TaskID  string `json:"taskId"`
 			Command string `json:"command"`
 			Running bool   `json:"running"`
+			PID     int    `json:"pid"`
 		} `json:"events"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
@@ -82,6 +84,16 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 	ev := out.Events[0]
 	if ev.Kind != "task_backgrounded" || ev.TaskID != "t-1" || ev.Command != "npm run dev" || !ev.Running {
 		t.Fatalf("event = %+v", ev)
+	}
+	// The probe attributes the holder, so the frontend can name the pid in
+	// its detached-process hint.
+	if ev.PID != os.Getpid() {
+		t.Fatalf("event pid = %d, want %d", ev.PID, os.Getpid())
+	}
+	// No session is active in this bridge, so nothing may be labelled
+	// detached — the frontend would otherwise distrust its own tasks.
+	if arr, ok := out.Detached.([]any); !ok || len(arr) != 0 {
+		t.Fatalf("detached = %v, want empty list", out.Detached)
 	}
 
 	// Unknown session → empty events, still ok.

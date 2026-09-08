@@ -13,8 +13,9 @@ import (
 
 func (s *Server) handleMCPReadResource(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Server string `json:"server"`
-		URI    string `json:"uri"`
+		SessionID string `json:"sessionId,omitempty"`
+		Server    string `json:"server"`
+		URI       string `json:"uri"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -23,8 +24,14 @@ func (s *Server) handleMCPReadResource(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 server 和 uri"})
 		return
 	}
-	// sessionId 可选省略：缺省走 agent 池。
-	s.xaiCall(w, r, "x.ai/mcp/read_resource", map[string]any{"server": body.Server, "uri": body.URI})
+	// camelCase wire：sessionId 空串让 XaiCall 填活动会话（走会话 MCP 池，
+	// 与 /api/mcp/list 同源）。省略该键会被 agent 当成「无会话 → agent 池」，
+	// 热加载进会话的 HTTP 服务器（如 jxust-yqlx）会报 server not found。
+	s.xaiCall(w, r, "x.ai/mcp/read_resource", map[string]any{
+		"sessionId": body.SessionID,
+		"server":    body.Server,
+		"uri":       body.URI,
+	})
 }
 
 func (s *Server) handleMCPAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -95,10 +102,13 @@ func (s *Server) handleMCPCall(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 server 和 tool"})
 		return
 	}
-	// camelCase wire：sessionId（可选，缺省走 agent 池）/ server / serverUrl / tool / arguments。
-	params := map[string]any{"server": body.Server, "tool": body.Tool}
-	if body.SessionID != "" {
-		params["sessionId"] = body.SessionID
+	// camelCase wire：sessionId 空串让 XaiCall 填活动会话（走会话 MCP 池，
+	// 与 /api/mcp/list 同源）。省略该键会被 agent 当成「无会话 → agent 池」，
+	// 热加载进会话的 HTTP 服务器会报 server not found。
+	params := map[string]any{
+		"sessionId": body.SessionID,
+		"server":    body.Server,
+		"tool":      body.Tool,
 	}
 	if body.ServerURL != "" {
 		params["serverUrl"] = body.ServerURL

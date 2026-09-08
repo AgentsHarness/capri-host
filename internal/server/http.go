@@ -950,9 +950,10 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSessionRunningTasks returns the session's STILL-RUNNING tasks
-// (task_backgrounded orphans whose output log was written recently) — the
-// web equivalent of the TUI's live tasks pane. The persisted timeline is
-// only used to surface current work, not to replay history.
+// (task_backgrounded orphans whose output log was written recently) plus
+// the detached subset — those the agent's own registry does not know and
+// therefore cannot kill. The persisted timeline is only used to surface
+// current work, not to replay history.
 func (s *Server) handleSessionRunningTasks(w http.ResponseWriter, r *http.Request) {
 	var body sessionUpdatesBody
 	if err := readJSON(r, &body); err != nil {
@@ -968,10 +969,18 @@ func (s *Server) handleSessionRunningTasks(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	// Tasks the liveness probe still sees but the agent's registry does not
+	// know: the frontend must NOT list them as running tasks (it could not
+	// kill them) — it surfaces them as a one-off detached hint.
+	detached := s.bridge.DetachedRunningTasks(r.Context(), body.SessionID, body.Cwd)
+	if detached == nil {
+		detached = []acp.TaskEvent{}
+	}
 	writeJSON(w, 200, map[string]any{
 		"ok":        true,
 		"sessionId": body.SessionID,
 		"events":    events,
+		"detached":  detached,
 	})
 }
 
@@ -1163,9 +1172,18 @@ func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
-// handleTaskList lists background tasks via x.ai/task/list.
+// handleTaskList lists background tasks via x.ai/task/list. An explicit
+// {sessionId} asks for that session's registry; without it the active
+// session answers.
 func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
-	res, err := s.bridge.TaskList(r.Context())
+	var body struct {
+		SessionID string `json:"sessionId,omitempty"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.TaskList(r.Context(), body.SessionID)
 	if err != nil {
 		writeAgentError(w, "x.ai/task/list", err)
 		return

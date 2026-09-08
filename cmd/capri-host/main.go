@@ -28,9 +28,10 @@ func main() {
 		log.Fatalf("[capri-host] %v", err)
 	}
 	bridge := acp.NewBridge(acp.GrokConfig{
-		Bin:      cfg.GrokBin,
-		HostID:   cfg.HostID,
-		HostName: cfg.HostName,
+		Bin:         cfg.GrokBin,
+		HostID:      cfg.HostID,
+		HostName:    cfg.HostName,
+		ResidentCap: cfg.ResidentCap,
 	})
 	srv := server.New(cfg, bridge)
 
@@ -87,6 +88,10 @@ func main() {
 			log.Printf("[capri-host] server stopped: %v", err)
 		}
 	}()
+
+	// grok 在 stdio 客户端不断开时不会自己 idle-unload；host 按 resident
+	// 上限把空闲会话 session/close 掉，名册仍留给 FE 列表/再 load。
+	bridge.StartIdleUnload(ctx)
 
 	<-ctx.Done()
 	log.Printf("[capri-host] shutting down…")

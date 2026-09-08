@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -247,6 +248,66 @@ func TestRunningTasksLivenessProbe(t *testing.T) {
 	}
 	if running[0].TaskID != "t-alive" || !running[0].Running {
 		t.Errorf("running[0] = %+v, want t-alive with Running=true", running[0])
+	}
+	// The holder attribution: this test process is the one holding the fd.
+	if running[0].PID != os.Getpid() {
+		t.Errorf("running[0].PID = %d, want %d (the test process holds the log)",
+			running[0].PID, os.Getpid())
+	}
+}
+
+// TestDetachedRunningTasksWithoutActiveSession: ownership may only be
+// judged against the agent's ACTIVE session (x.ai/task/list has no session
+// override). With no session active, even a liveness-probed running task
+// must NOT be reported as detached — the frontend would be told to distrust
+// a task it actually owns.
+func TestDetachedRunningTasksWithoutActiveSession(t *testing.T) {
+	home := t.TempDir()
+	heldLog := filepath.Join(home, "held.log")
+	held, err := os.OpenFile(heldLog, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	writeSessionFile(t, home, "/Users/benin/ccwork", "sess-abc", []string{
+		envLine(1, bgUpdateWithLog("t-alive", "npm run dev", heldLog)),
+	})
+
+	b := NewBridge(GrokConfig{Bin: "grok", HostID: "h", HostName: "host", GrokHome: home})
+	running, err := b.SessionRunningTasks("sess-abc", "/Users/benin/ccwork")
+	if err != nil || len(running) != 1 {
+		t.Fatalf("probe should see the task running: %d %v", len(running), err)
+	}
+	if got := b.DetachedRunningTasks(context.Background(), "sess-abc", "/Users/benin/ccwork"); got != nil {
+		t.Fatalf("detached = %+v, want nil without an active session", got)
+	}
+}
+
+func TestLiveRegistryTaskIDs(t *testing.T) {
+	// The three envelope shapes the bridge can hand back.
+	cases := map[string]map[string]any{
+		"nested ExtMethodResult": {"result": map[string]any{
+			"result": map[string]any{"tasks": []any{
+				map[string]any{"task_id": "t-1"},
+			}},
+		}},
+		"flat result": {"result": map[string]any{
+			"tasks": []any{map[string]any{"taskId": "t-2"}},
+		}},
+		"bare": {"tasks": []any{
+			map[string]any{"task_id": "t-3"},
+			"garbage",
+			map[string]any{"command": "no id"},
+		}},
+	}
+	for name, res := range cases {
+		ids := liveRegistryTaskIDs(res)
+		if len(ids) != 1 {
+			t.Errorf("%s: ids = %v, want exactly one", name, ids)
+		}
+	}
+	if ids := liveRegistryTaskIDs(nil); len(ids) != 0 {
+		t.Errorf("nil reply: ids = %v, want empty", ids)
 	}
 }
 

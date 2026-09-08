@@ -18,6 +18,18 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+func replayItemsOf(evs []acp.Event) []replayItem {
+	out := make([]replayItem, 0, len(evs))
+	for _, ev := range evs {
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, replayItem{seq: eventSeq(ev), raw: raw})
+	}
+	return out
+}
+
 // fakeHub stands in for capri-hub in tests (WS transport).
 type fakeHub struct {
 	t            *testing.T
@@ -1122,16 +1134,15 @@ func TestSendReplayAfterChunksFrames(t *testing.T) {
 
 	// 100 events × ~40KB ≈ 4MB backlog — far beyond one frame budget.
 	const n = 100
-	c.seqMu.Lock()
+	backlog := make([]acp.Event, 0, n)
 	for i := 1; i <= n; i++ {
-		c.nextSeq++
-		c.replay = append(c.replay, acp.Event{
-			"seq":  float64(c.nextSeq),
+		backlog = append(backlog, acp.Event{
+			"seq":  uint64(i),
 			"type": "chunk",
 			"text": strings.Repeat("x", 40<<10),
 		})
 	}
-	c.seqMu.Unlock()
+	c.seqAndReplay(backlog)
 
 	if last := c.sendReplayAfter(0); last != n {
 		t.Fatalf("sendReplayAfter last = %d, want %d", last, n)
@@ -1205,7 +1216,7 @@ func TestEnqueueReplaySurvivesFullQueue(t *testing.T) {
 		// The production replay path (sendReplayAfter) holds enqueueMu
 		// across enqueueReplayLocked — mirror that here.
 		c.enqueueMu.Lock()
-		c.enqueueReplayLocked(evs)
+		c.enqueueReplayLocked(replayItemsOf(evs))
 		c.enqueueMu.Unlock()
 		close(replayDone)
 	}()
@@ -1556,11 +1567,31 @@ func TestReplayRingCompaction(t *testing.T) {
 	}
 	// Oldest retained seq after the compaction at replayHighWater+1.
 	wantFirst := uint64(replayHighWater + 1 - replayCap + 1)
-	if got := eventSeq(c.replay[0]); got != wantFirst {
+	if got := c.replay[0].seq; got != wantFirst {
 		t.Errorf("first replay seq = %d, want %d", got, wantFirst)
 	}
-	if got := eventSeq(c.replay[len(c.replay)-1]); got != uint64(replayHighWater+5) {
+	if got := c.replay[len(c.replay)-1].seq; got != uint64(replayHighWater+5) {
 		t.Errorf("last replay seq = %d, want %d", got, replayHighWater+5)
+	}
+}
+
+// TestReplayRingStoresBytesNotMaps: after seqAndReplay the ring must not
+// alias the caller's Event map — mutating it must not change what reconnect
+// would re-send.
+func TestReplayRingStoresBytesNotMaps(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	ev := acp.Event{"type": "error", "message": "orig", "seq": uint64(1)}
+	c.seqAndReplay([]acp.Event{ev})
+	ev["message"] = "mutated"
+	c.seqMu.Lock()
+	raw := append([]byte(nil), c.replay[0].raw...)
+	c.seqMu.Unlock()
+	var stored map[string]any
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored["message"] != "orig" {
+		t.Fatalf("ring saw %v after caller mutated the Event map", stored["message"])
 	}
 }
 

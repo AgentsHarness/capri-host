@@ -36,6 +36,9 @@ type Config struct {
 	// semantics as the hub's FE_TOKEN — deploy the same value so the
 	// browser gate and the host port share one credential.
 	AccessToken string
+	// ResidentCap is passed to the grok bridge idle-unload supervisor.
+	// 0 = use the bridge default (4). Negative = disable (RESIDENT_CAP=0).
+	ResidentCap int
 }
 
 func Load() Config {
@@ -60,7 +63,22 @@ func Load() Config {
 		HostName:    envOr("HOST_NAME", "Local Host"),
 		HubQUICPin:  strings.TrimSpace(os.Getenv("HUB_QUIC_PIN")),
 		AccessToken: envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")),
+		ResidentCap: envResidentCap(),
 	}
+}
+
+// envResidentCap reads RESIDENT_CAP. Unset → 0 (bridge default of 4).
+// 0 or a non-positive / unparsable value → -1 (disable idle-unload).
+func envResidentCap() int {
+	v := strings.TrimSpace(os.Getenv("RESIDENT_CAP"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return -1
+	}
+	return n
 }
 
 func envOr(k, def string) string {
