@@ -1882,7 +1882,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		return true
 	case "config_option_update":
 		b.mu.Lock()
-		if co := update[kConfigOptions]; co != nil {
+		if co := pick([]map[string]any{update}, kConfigOptions, "options"); co != nil {
 			if s := b.sessions[sid]; s != nil {
 				s.configOpts = co
 			}
@@ -1895,7 +1895,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		b.Broadcast(tag(Event{kType: "config_options_update", kConfigOptions: co}))
 		return true
 	case "available_commands_update":
-		b.Broadcast(tag(Event{kType: "commands_update", kCommands: update[kCommands]}))
+		// ACP AvailableCommandsUpdate is {availableCommands}, not {commands}.
+		cmds := pick([]map[string]any{update}, kAvailableCommands, "available_commands", kCommands)
+		b.Broadcast(tag(Event{kType: "commands_update", kCommands: cmds}))
 		return true
 	case "session_info_update", "session_info":
 		// session_info_update 是官方 ACP SessionUpdate 的 kind（serde tag
@@ -1912,11 +1914,15 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			}
 		}
 		b.mu.Unlock()
-		b.Broadcast(tag(Event{
+		ev := Event{
 			kType:      "session_info",
 			kTitle:     update[kTitle],
 			kUpdatedAt: update[kUpdatedAt],
-		}))
+		}
+		if v, ok := titleIsManualFrom(params, update); ok {
+			ev["titleIsManual"] = v
+		}
+		b.Broadcast(tag(ev))
 		return true
 	case "scheduled_task_created":
 		// 复用 x.ai 通道的归一化 helper（task/rawTask/rawParams/meta 保全，
@@ -2429,6 +2435,28 @@ func toInt64(v any) int64 {
 	return n
 }
 
+// titleIsManualFrom reads x.ai/titleIsManual off params._meta or
+// update._meta (live session_info used to drop it, so a later auto-title
+// overwrote a manual rename).
+func titleIsManualFrom(params, update map[string]any) (bool, bool) {
+	for _, m := range []map[string]any{params, update} {
+		if m == nil {
+			continue
+		}
+		meta, _ := m[kMeta].(map[string]any)
+		if meta == nil {
+			continue
+		}
+		if v, ok := meta["x.ai/titleIsManual"].(bool); ok {
+			return v, true
+		}
+		if v, ok := meta["titleIsManual"].(bool); ok {
+			return v, true
+		}
+	}
+	return false, false
+}
+
 // pick returns the first present value found under any of the given keys,
 // checking each map in order (snake_case/camelCase wire compatibility).
 // Returns nil when nothing matched.
@@ -2536,7 +2564,7 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 	// request is settled (any path), broadcast so other tabs drop the card
 	// — without this the answering tab clears locally but siblings keep a
 	// zombie permission / question UI until reload.
-	defer b.broadcastClientRequestResolved(reqID, cr.SessionID)
+	defer b.broadcastClientRequestResolved(reqID, cr)
 	timer := time.NewTimer(approvalTimeout)
 	defer timer.Stop()
 	// Peek first: the user's answer may have landed at the same instant
@@ -2562,10 +2590,11 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 		default:
 		}
 		b.clientReqs.Delete(reqID)
+		cr.errMsg = "审批超时"
 		if cr.isPermission {
 			b.respond(cr.AgentID, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
 		} else {
-			b.respondError(cr.AgentID, "审批超时", -32002)
+			b.respondError(cr.AgentID, cr.errMsg, -32002)
 		}
 	}
 }
@@ -2573,13 +2602,35 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 // broadcastClientRequestResolved notifies every SSE subscriber that a
 // forwarded client request (permission / x.ai question / …) is no longer
 // pending. Clients remove matching pending / xaiRequests rows by requestId.
-func (b *Bridge) broadcastClientRequestResolved(reqID, sessionID string) {
+// method / cancelled / error / outcome ride along so a sibling tab can
+// apply side effects (e.g. leave plan mode after exit_plan_mode) without
+// waiting on a later CurrentModeUpdate that the shell may drop.
+func (b *Bridge) broadcastClientRequestResolved(reqID string, cr *clientRequest) {
 	ev := Event{
 		kType:       "client_request_resolved",
 		"requestId": reqID,
 	}
-	if sessionID != "" {
-		ev[kSessionID] = sessionID
+	if cr == nil {
+		b.Broadcast(ev)
+		return
+	}
+	if cr.SessionID != "" {
+		ev[kSessionID] = cr.SessionID
+	}
+	if cr.Method != "" {
+		ev[kMethod] = cr.Method
+	}
+	if cr.cancel {
+		ev["cancelled"] = true
+	}
+	if cr.errMsg != "" {
+		ev["error"] = cr.errMsg
+	}
+	if cr.result != nil {
+		ev["result"] = cr.result
+		if o, ok := cr.result["outcome"].(string); ok && o != "" {
+			ev["outcome"] = o
+		}
 	}
 	b.Broadcast(ev)
 }

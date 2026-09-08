@@ -934,3 +934,54 @@ func TestCurrentModeUpdateSnakeCaseAndModeState(t *testing.T) {
 		t.Fatalf("modeState currentModeId = %v, want ask", modes[kCurrentModeId])
 	}
 }
+
+func TestAvailableCommandsUpdateForwardsAvailableCommands(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	cmds := []any{map[string]any{"name": "deploy", "description": "deploy"}}
+	b.handleSessionUpdate(map[string]any{
+		kSessionID: "s1",
+		kUpdate: map[string]any{
+			kSessionUpdate:     "available_commands_update",
+			kAvailableCommands: cmds,
+		},
+	})
+	ev := <-ch
+	if ev[kType] != "commands_update" {
+		t.Fatalf("type = %v, want commands_update", ev[kType])
+	}
+	got, _ := ev[kCommands].([]any)
+	if len(got) != 1 {
+		t.Fatalf("commands = %v, want [{name:deploy}]", ev[kCommands])
+	}
+	row, _ := got[0].(map[string]any)
+	if row["name"] != "deploy" {
+		t.Errorf("command name = %v, want deploy", row["name"])
+	}
+}
+
+func TestSessionInfoForwardsTitleIsManual(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	b.handleSessionUpdate(map[string]any{
+		kSessionID: "s1",
+		kMeta:      map[string]any{"x.ai/titleIsManual": true},
+		kUpdate: map[string]any{
+			kSessionUpdate: "session_info_update",
+			kTitle:         "手动标题",
+		},
+	})
+	ev := <-ch
+	if ev[kType] != "session_info" {
+		t.Fatalf("type = %v, want session_info", ev[kType])
+	}
+	if ev["titleIsManual"] != true {
+		t.Fatalf("titleIsManual = %v, want true", ev["titleIsManual"])
+	}
+	if ev[kTitle] != "手动标题" {
+		t.Errorf("title = %v, want 手动标题", ev[kTitle])
+	}
+}
