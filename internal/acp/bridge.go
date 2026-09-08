@@ -4687,16 +4687,24 @@ func (b *Bridge) SubagentCancel(ctx context.Context, sessionID, subagentID strin
 	}, 30*time.Second)
 }
 
-// TaskKill calls x.ai/task/kill: {sessionId, taskId} (empty sessionId
+// TaskKill calls x.ai/task/kill: {sessionId, taskId, source?} (empty sessionId
 // resolves to the active one; unknown id → agent 404).
-func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID string) (map[string]any, error) {
+//
+// source 是 agent 侧 TaskKillSource 的 wire 名（clientUi / teardown），它决定
+// 任务收尾时 agent 要不要为这条终止唤醒模型；空 = 不上 wire，由 agent 用它的
+// 缺省值。宿主不猜语义，原样转发。
+func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID, source string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	return b.request(ctx, "_x.ai/task/kill", map[string]any{
+	params := map[string]any{
 		kSessionID: b.resolveSessionID(sessionID),
 		"taskId":   taskID,
-	}, 30*time.Second)
+	}
+	if source != "" {
+		params["source"] = source
+	}
+	return b.request(ctx, "_x.ai/task/kill", params, 30*time.Second)
 }
 
 // TaskList calls x.ai/task/list: {sessionId} → {tasks: [TaskSnapshot…]}.
