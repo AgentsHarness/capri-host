@@ -1667,6 +1667,48 @@ func attachStreamMeta(ev Event, params map[string]any) Event {
 	return ev
 }
 
+// currentModeIDOf reads the ACP CurrentModeUpdate id (camelCase on the
+// wire; snake_case accepted for older x.ai carriers).
+func currentModeIDOf(update map[string]any) string {
+	if id, ok := update[kCurrentModeId].(string); ok && id != "" {
+		return id
+	}
+	if id, ok := update["current_mode_id"].(string); ok && id != "" {
+		return id
+	}
+	return ""
+}
+
+// applyCurrentModeUpdateLocked patches the session's SessionModeState from
+// a current_mode_update. Caller holds b.mu. Broadcasts a clone so later
+// in-place writes cannot race SSE/hub serialization.
+func (b *Bridge) applyCurrentModeUpdateLocked(sid string, update map[string]any) any {
+	s := b.sessions[sid]
+	if ms := update[kModeState]; ms != nil {
+		if s != nil {
+			s.modes = ms
+		}
+		return cloneAny(ms)
+	}
+	id := currentModeIDOf(update)
+	if id == "" {
+		if s != nil {
+			return cloneAny(s.modes)
+		}
+		return nil
+	}
+	if s != nil {
+		mm, ok := s.modes.(map[string]any)
+		if !ok || mm == nil {
+			mm = map[string]any{}
+			s.modes = mm
+		}
+		mm[kCurrentModeId] = id
+		return cloneAny(s.modes)
+	}
+	return map[string]any{kCurrentModeId: id}
+}
+
 // dispatchSessionUpdateKind routes one sessionUpdate `update` to its typed
 // events. Returns whether the kind is modeled (handled): true → the caller
 // must NOT emit the generic session_notification (FE 消费 typed 事件);
@@ -1830,16 +1872,11 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		}))
 		return true
 	case "current_mode_update":
+		// ACP CurrentModeUpdate is {currentModeId} (enter_plan_mode /
+		// exit_plan_mode and session/set_mode). Looking only for modeState
+		// left s.modes stale, so the FE composer never followed the agent.
 		b.mu.Lock()
-		if ms := update[kModeState]; ms != nil {
-			if s := b.sessions[sid]; s != nil {
-				s.modes = ms
-			}
-		}
-		var modes any
-		if s := b.sessions[sid]; s != nil {
-			modes = s.modes
-		}
+		modes := b.applyCurrentModeUpdateLocked(sid, update)
 		b.mu.Unlock()
 		b.Broadcast(tag(Event{kType: "modes_update", "modes": modes}))
 		return true

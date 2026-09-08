@@ -830,3 +830,107 @@ func TestQueueStatusSnapshotCache(t *testing.T) {
 		t.Errorf("QueueStatus after resetRoster = %v, want nil", snap3)
 	}
 }
+
+// ACP CurrentModeUpdate 是 {currentModeId}，不是 {modeState}。agent 经
+// enter_plan_mode / exit_plan_mode 进出 plan 时只发 currentModeId；host
+// 必须把它写进 s.modes 再广播，否则 FE composer 一直停在旧模式。
+func TestCurrentModeUpdatePatchesCurrentModeId(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].modes = map[string]any{
+		"currentModeId": "default",
+		"availableModes": []any{
+			map[string]any{"id": "default"},
+			map[string]any{"id": "plan"},
+		},
+	}
+	b.mu.Unlock()
+
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	drain := func() map[string]any {
+		t.Helper()
+		select {
+		case ev := <-ch:
+			return ev
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for modes_update")
+			return nil
+		}
+	}
+
+	b.handleSessionUpdate(map[string]any{
+		kSessionID: "s1",
+		kUpdate: map[string]any{
+			kSessionUpdate: "current_mode_update",
+			kCurrentModeId: "plan",
+		},
+	})
+	ev := drain()
+	if ev[kType] != "modes_update" {
+		t.Fatalf("type = %v, want modes_update", ev[kType])
+	}
+	if ev[kSessionID] != "s1" {
+		t.Errorf("sessionId = %v, want s1", ev[kSessionID])
+	}
+	modes, _ := ev["modes"].(map[string]any)
+	if modes[kCurrentModeId] != "plan" {
+		t.Fatalf("broadcast currentModeId = %v, want plan", modes[kCurrentModeId])
+	}
+	if modes["availableModes"] == nil {
+		t.Error("availableModes dropped; patch must keep the existing catalog")
+	}
+	b.mu.Lock()
+	cached, _ := b.sessions["s1"].modes.(map[string]any)
+	got := cached[kCurrentModeId]
+	b.mu.Unlock()
+	if got != "plan" {
+		t.Errorf("session cache currentModeId = %v, want plan", got)
+	}
+
+	b.handleSessionUpdate(map[string]any{
+		kSessionID: "s1",
+		kUpdate: map[string]any{
+			kSessionUpdate: "current_mode_update",
+			kCurrentModeId: "default",
+		},
+	})
+	ev = drain()
+	modes, _ = ev["modes"].(map[string]any)
+	if modes[kCurrentModeId] != "default" {
+		t.Fatalf("exit broadcast currentModeId = %v, want default", modes[kCurrentModeId])
+	}
+}
+
+func TestCurrentModeUpdateSnakeCaseAndModeState(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	b.handleSessionUpdate(map[string]any{
+		kSessionID: "s1",
+		kUpdate: map[string]any{
+			kSessionUpdate:    "current_mode_update",
+			"current_mode_id": "plan",
+		},
+	})
+	ev := <-ch
+	modes, _ := ev["modes"].(map[string]any)
+	if modes[kCurrentModeId] != "plan" {
+		t.Fatalf("snake_case currentModeId = %v, want plan", modes[kCurrentModeId])
+	}
+
+	b.handleSessionUpdate(map[string]any{
+		kSessionID: "s1",
+		kUpdate: map[string]any{
+			kSessionUpdate: "current_mode_update",
+			kModeState:     map[string]any{kCurrentModeId: "ask"},
+		},
+	})
+	ev = <-ch
+	modes, _ = ev["modes"].(map[string]any)
+	if modes[kCurrentModeId] != "ask" {
+		t.Fatalf("modeState currentModeId = %v, want ask", modes[kCurrentModeId])
+	}
+}
