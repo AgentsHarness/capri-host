@@ -533,6 +533,40 @@ func strOf(t *testing.T, s string) int {
 	return len(s) + 2
 }
 
+// 回放行头的命令必须完整：rawInput.command 不封顶、不拼「…[已省略 N 字节]」，
+// 也不计入 lite.omitted（回归：曾按 512/256 截头，620 字节的命令会显示成
+// 前 256 字节 +「…[已省略 364 字节]」）。
+func TestLiteKeepsLongCommandWhole(t *testing.T) {
+	const sid = "sess-cmd"
+	cmd := "ha" + strings.Repeat("x", 618) // 620 字节 > 512 封顶阈值
+	body := strings.Repeat("o", 9000)
+	lines := []string{
+		histEnvelope(sid, 0, 1000, msgUserChunkMeta("跑", map[string]any{"promptIndex": float64(0)})),
+		histEnvelope(sid, 1, 1100, map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "call-cmd",
+			"status":        "completed",
+			"kind":          "execute",
+			"title":         "Run",
+			"rawInput":      map[string]any{"command": cmd, "timeout": float64(300)},
+			"rawOutput":     map[string]any{"exit_code": float64(0), "output": body},
+		}),
+	}
+	lite := litePageOf(t, lines)
+	liteProjectPage(&lite)
+
+	ri, ok := liteUpdate(t, lite, 1)["rawInput"].(map[string]any)
+	if !ok {
+		t.Fatalf("rawInput 没了: %v", liteUpdate(t, lite, 1))
+	}
+	if ri["command"] != cmd {
+		t.Errorf("rawInput.command 被裁: len=%v, want %d", len(ri["command"].(string)), len(cmd))
+	}
+	if got, want := liteOmittedOf(t, lite, 1), strOf(t, body); got != want {
+		t.Errorf("lite.omitted = %d, want %d（只算被删的 output，不含 command）", got, want)
+	}
+}
+
 // isOmittedStub 判断 v 是否是 {"omitted": want} 统一形状。
 func isOmittedStub(v any, want int) bool {
 	stub, ok := v.(map[string]any)
