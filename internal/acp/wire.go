@@ -53,6 +53,7 @@ const (
 	kEntries        = "entries"
 	kCommands       = "commands"
 	kModeState      = "modeState"
+	kCurrentModeId  = "currentModeId"
 	kConfigOptions  = "configOptions"
 	kTitle          = "title"
 	kUpdatedAt      = "updatedAt"
