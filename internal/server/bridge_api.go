@@ -51,6 +51,7 @@ type sessionAPI interface {
 	SessionLoadHistory(ctx context.Context, beforeID string) (map[string]any, error)
 	SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...acp.SessionUpdatesOpts) (acp.UpdatesPage, error)
 	SessionRunningTasks(sessionID, cwd string) ([]acp.TaskEvent, error)
+	DetachedRunningTasks(ctx context.Context, sessionID, cwd string) []acp.TaskEvent
 	CompactConversation(ctx context.Context, sessionID, note string) (map[string]any, error)
 	Recap(ctx context.Context, sessionID string, auto bool) (map[string]any, error)
 	RewindPoints(ctx context.Context, sessionID string) (map[string]any, error)
@@ -89,7 +90,7 @@ type mcpAPI interface {
 
 // taskAPI：后台任务与终端/子代理控制。
 type taskAPI interface {
-	TaskList(ctx context.Context) (map[string]any, error)
+	TaskList(ctx context.Context, sessionID ...string) (map[string]any, error)
 	TaskKill(ctx context.Context, sessionID, taskID string) (map[string]any, error)
 	TaskLog(sessionID, cwd, taskID string) (*acp.TaskLog, error)
 	SubagentCancel(ctx context.Context, sessionID, subagentID string) (map[string]any, error)

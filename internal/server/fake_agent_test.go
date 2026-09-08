@@ -74,6 +74,12 @@ const (
 	ACPHostFakeAgentSessionListCur  = "ACP_HOST_FAKE_AGENT_SESSION_LIST_CURSOR"
 	ACPHostFakeAgentSessionListMeta = "ACP_HOST_FAKE_AGENT_SESSION_LIST_META"
 	ACPHostFakeAgentAuthMeta        = "ACP_HOST_FAKE_AGENT_AUTH_META"
+	// ACPHostFakeAgentTasks (a JSON array of task snapshots) canned for
+	// x.ai/task/list, and ACPHostFakeAgentKillOutcome canned for
+	// x.ai/task/kill ("killed" | "already_exited" | "not_found") — the UI
+	// verification path for the top task strip and the kill verdict.
+	ACPHostFakeAgentTasks       = "ACP_HOST_FAKE_AGENT_TASKS"
+	ACPHostFakeAgentKillOutcome = "ACP_HOST_FAKE_AGENT_KILL_OUTCOME"
 	// initialize 响应的 `_meta`（如 agentInfo._meta.modelState 模型目录），
 	// 便于无会话 boot 状态下让 FE 拿到模型列表做 UI 验证。
 	ACPHostFakeAgentInitMeta = "ACP_HOST_FAKE_AGENT_INIT_META"
@@ -247,6 +253,29 @@ func runFakeAgent() {
 			result = map[string]any{"ok": true}
 		case "_x.ai/scheduler/delete":
 			result = map[string]any{"ok": true}
+		case "_x.ai/task/list":
+			// ExtMethodResult envelope: {result:{tasks:[...]}} — the canned
+			// array is the top task strip's only source in the UI.
+			tasks := []any{}
+			if raw := os.Getenv(ACPHostFakeAgentTasks); raw != "" {
+				_ = json.Unmarshal([]byte(raw), &tasks)
+			}
+			result = map[string]any{"result": map[string]any{"tasks": tasks}}
+		case "_x.ai/task/kill":
+			// Echo the id and the canned verdict so the UI's kill feedback
+			// (killed / already_exited / not_found) is exercisable end to end.
+			var params map[string]any
+			if p, ok := msg["params"].(map[string]any); ok {
+				params = p
+			}
+			outcome := os.Getenv(ACPHostFakeAgentKillOutcome)
+			if outcome == "" {
+				outcome = "killed"
+			}
+			result = map[string]any{"result": map[string]any{
+				"taskId":  params["taskId"],
+				"outcome": outcome,
+			}}
 		case "_x.ai/billing":
 			// ExtMethodResult envelope with billing/quota payload.
 			result = map[string]any{"result": map[string]any{"plan": "pro", "credits": "42.50"}}

@@ -124,6 +124,13 @@ type SessionState struct {
 	// flight at once; only the last resolver may end the host's claim on
 	// the session. Not serialized.
 	busyCount int
+
+	// unloaded: grok no longer holds this session resident (idle-unload
+	// called session/close). The row stays in the host roster so FE
+	// session/list still shows it as idle and a later load/prompt can
+	// session/load it back. Zero value (false) = still resident. Not
+	// serialized.
+	unloaded bool
 }
 
 // observedTurn is one Bridge.turns entry: whether the agent is working on a

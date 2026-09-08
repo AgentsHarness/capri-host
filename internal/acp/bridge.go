@@ -179,6 +179,10 @@ type GrokConfig struct {
 	// GrokHome overrides the grok data dir (~/.grok) used to locate
 	// session updates files (task timeline / [bg] badge scans).
 	GrokHome string
+	// ResidentCap bounds how many sessions stay loaded in the grok
+	// process. Zero = DefaultResidentCap (4). Negative = disable the
+	// idle-unload supervisor (tests, or RESIDENT_CAP=0).
+	ResidentCap int
 }
 
 // lastSessionFile is the on-disk form of the most recently active session.
@@ -577,6 +581,16 @@ func (b *Bridge) activeSessionLocked() *SessionState {
 		return b.sessions[id]
 	}
 	return nil
+}
+
+// ActiveSessionID returns the session clients are currently attached to
+// ("" when none). Callers that must attribute agent-side state to a
+// specific session use this to refuse guessing when the question is about
+// some other (read-only, historical) session.
+func (b *Bridge) ActiveSessionID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.activeSessionID
 }
 
 // broadcastRosterChange pushes sessions_changed so clients refresh the
@@ -1143,6 +1157,7 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 		b.sessions[sid] = s
 	}
 	s.Cwd = cwd
+	s.unloaded = false
 	s.modes = sessRes["modes"]
 	s.configOpts = sessRes[kConfigOptions]
 	s.models = sessRes["models"]
@@ -2824,6 +2839,24 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		b.broadcastPromptError(sessionID, &HTTPError{Code: 404, Msg: "会话不存在"})
 		return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
 	}
+	// Idle-unload 只把 grok 侧 actor 卸掉，名册行还在（HasSession 仍
+	// 为 true，避免 FE 点空闲会话发 prompt 吃 404）。prompt 前先
+	// session/load 灌回去。
+	if s.unloaded {
+		cwd := s.Cwd
+		b.mu.Unlock()
+		if _, err := b.LoadSession(ctx, sessionID, cwd); err != nil {
+			b.broadcastPromptError(sessionID, err)
+			return "", nil, err
+		}
+		b.mu.Lock()
+		s = b.sessions[sessionID]
+		if s == nil {
+			b.mu.Unlock()
+			b.broadcastPromptError(sessionID, &HTTPError{Code: 404, Msg: "会话不存在"})
+			return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
+		}
+	}
 	// A busy session no longer 409s: the agent accepts mid-turn
 	// session/prompt and queues it in its own pending_inputs (popped when
 	// the current turn ends), so we just forward. Busy stays the "any turn
@@ -3832,6 +3865,7 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
+	act.unloaded = false
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the load response — they reflect the restored session.
@@ -4021,6 +4055,7 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
+	act.unloaded = false
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the resume response — they reflect the session.
@@ -4089,12 +4124,11 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	return sessRes, nil
 }
 
-// CloseSession calls session/close (sessionId defaults to the active one)
-// and removes the session from the roster on success: the active-session
-// pointer is cleared when it pointed at the closed session, and a matching
-// in-memory last-session pointer is cleared too (the disk file is left
-// untouched — it is only a hint, and restoring a closed session fails with
-// a 404 anyway).
+// CloseSession is the explicit client close: session/close then drop the
+// row from the live roster (forgetSessionLocked). Disk history is left
+// intact. Idle-unload (SweepIdleUnload) is a different path — it also
+// calls session/close but keeps the roster row so FE can still list and
+// later session/load the conversation.
 func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -4615,8 +4649,8 @@ func (b *Bridge) RenameSession(ctx context.Context, sessionID, title string) (ma
 		return nil, err
 	}
 	b.Broadcast(Event{
-		kType:          "session_info",
-		kSessionID:     sid,
+		kType:           "session_info",
+		kSessionID:      sid,
 		"title":         title,
 		"titleIsManual": true,
 	})
@@ -4668,9 +4702,19 @@ func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID string) (map[st
 // TaskList calls x.ai/task/list: {sessionId} → {tasks: [TaskSnapshot…]}.
 // Each snapshot includes output/command so the FE block viewer can show
 // live stdout (TUI OpenBlockViewer for BgTask).
-func (b *Bridge) TaskList(ctx context.Context) (map[string]any, error) {
+//
+// Without an explicit id it answers for the ACTIVE session (and 404s when
+// there is none). Callers that refresh a specific session — e.g. the top
+// task strip for a session being resumed — must pass that id: the agent
+// registry is per session, and asking for the active one would paint
+// another session's tasks onto this view.
+func (b *Bridge) TaskList(ctx context.Context, sessionID ...string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
+	}
+	if len(sessionID) > 0 && sessionID[0] != "" {
+		return b.request(ctx, "_x.ai/task/list", map[string]any{kSessionID: sessionID[0]},
+			30*time.Second)
 	}
 	b.mu.Lock()
 	act := b.activeSessionLocked()

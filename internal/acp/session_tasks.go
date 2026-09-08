@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -82,6 +83,16 @@ type TaskEvent struct {
 	// Running: task still running (no completion in file AND its output
 	// log is held open by a live process — see probeOpenLogs).
 	Running bool `json:"running,omitempty"`
+	// PID of the process the kernel reports as holding the output log —
+	// set only on liveness-probed results (see logHolder).
+	PID int `json:"pid,omitempty"`
+}
+
+// logHolder is the open-fd attribution for one task output log: which
+// process the kernel says still holds it.
+type logHolder struct {
+	PID     int
+	Command string
 }
 
 // TaskSummary is the cheap per-session task census for the history
@@ -391,11 +402,12 @@ func jsonBool(raw json.RawMessage) *bool {
 const lsofTimeout = 5 * time.Second
 
 // probeOpenLogs returns the subset of paths currently held open by a
-// live process (kernel-level liveness). Returns nil when lsof is
-// unavailable so callers can fall back. Paths are canonicalized before
-// comparison (macOS lsof reports /var/... as /private/var/...).
-func probeOpenLogs(paths []string) map[string]bool {
-	open := make(map[string]bool, len(paths))
+// live process (kernel-level liveness) mapped to the holding process.
+// Returns nil when lsof is unavailable so callers can fall back. Paths
+// are canonicalized before comparison (macOS lsof reports /var/... as
+// /private/var/...).
+func probeOpenLogs(paths []string) map[string]logHolder {
+	open := make(map[string]logHolder, len(paths))
 	if len(paths) == 0 {
 		return open
 	}
@@ -421,18 +433,30 @@ func probeOpenLogs(paths []string) map[string]bool {
 		// while still printing the matches on stdout). Parse stdout
 		// regardless; an empty match set falls out naturally.
 	}
-	matched := make(map[string]bool, len(paths))
+	holders := make(map[string]logHolder, len(paths))
 	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
 		// Header row: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME.
 		if len(f) < 9 || f[0] == "COMMAND" {
 			continue
 		}
-		matched[canon(f[len(f)-1])] = true
+		path := canon(f[len(f)-1])
+		// A backgrounded command's whole tree shares the log fd (wrapper
+		// shell + its children), so one path yields several rows. Keep the
+		// first: it is only an attribution hint for the UI, and any row of
+		// the tree proves the task is alive.
+		if _, seen := holders[path]; seen {
+			continue
+		}
+		h := logHolder{Command: f[0]}
+		if pid, err := strconv.Atoi(f[1]); err == nil {
+			h.PID = pid
+		}
+		holders[path] = h
 	}
 	for _, p := range paths {
-		if matched[canon(p)] {
-			open[p] = true
+		if h, ok := holders[canon(p)]; ok {
+			open[p] = h
 		}
 	}
 	return open
@@ -487,18 +511,22 @@ func runningTasks(events []TaskEvent) []TaskEvent {
 	}
 	open := probeOpenLogs(paths)
 	if open == nil {
-		// No lsof: fall back to the mtime heuristic.
-		open = make(map[string]bool, len(paths))
+		// No lsof: fall back to the mtime heuristic (no PID attribution).
+		open = make(map[string]logHolder, len(paths))
 		for _, p := range paths {
 			if taskLogFresh(p) {
-				open[p] = true
+				open[p] = logHolder{}
 			}
 		}
 	}
 	out := make([]TaskEvent, 0, len(orphans))
 	for _, e := range orphans {
-		if e.OutputFile != "" && open[e.OutputFile] {
+		if e.OutputFile == "" {
+			continue
+		}
+		if h, alive := open[e.OutputFile]; alive {
 			e.Running = true
+			e.PID = h.PID
 			out = append(out, e)
 		}
 	}
@@ -590,10 +618,11 @@ func censusEvents(events []TaskEvent) (TaskSummary, []string) {
 	return sum, orphanPaths
 }
 
-// applyProbe fills TaskSummary.BgRunning from a pre-computed open-set.
-func applyProbe(sum TaskSummary, orphanPaths []string, open map[string]bool) TaskSummary {
+// applyProbe fills TaskSummary.BgRunning from a pre-computed open-set
+// (membership is the liveness verdict; the holder identity is unused here).
+func applyProbe(sum TaskSummary, orphanPaths []string, open map[string]logHolder) TaskSummary {
 	for _, p := range orphanPaths {
-		if open[p] {
+		if _, alive := open[p]; alive {
 			sum.BgRunning++
 		}
 	}
@@ -622,6 +651,84 @@ func (b *Bridge) SessionRunningTasks(sessionID, cwd string) ([]TaskEvent, error)
 	return runningTasks(events), nil
 }
 
+// DetachedRunningTasks returns the still-running tasks of a session that
+// the agent process does NOT hold in its live registry — background
+// commands left behind by a previous grok generation (a hard-killed or
+// crashed agent never ran its ProcessScope reaper) or held by another
+// client's process (an open TUI on the same session).
+//
+// The frontend shows only registry-owned tasks (it can kill those); these
+// are surfaced as a one-off hint instead, so nothing looks controllable
+// that is not. Ownership can only be judged against the ACTIVE session —
+// x.ai/task/list takes no session override — so probing any other session
+// reports nothing rather than mislabelling that session's own tasks.
+func (b *Bridge) DetachedRunningTasks(ctx context.Context, sessionID, cwd string) []TaskEvent {
+	running, err := b.SessionRunningTasks(sessionID, cwd)
+	if err != nil || len(running) == 0 {
+		return nil
+	}
+	if b.ActiveSessionID() != sessionID {
+		return nil
+	}
+	res, err := b.TaskList(ctx, sessionID)
+	if err != nil {
+		return nil
+	}
+	owned := liveRegistryTaskIDs(res)
+	out := make([]TaskEvent, 0, len(running))
+	for _, e := range running {
+		if e.TaskID == "" || owned[e.TaskID] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// liveRegistryTaskIDs walks an x.ai/task/list reply and returns every task
+// id the agent's registry knows (running or still inside its completed
+// tombstone TTL). A missing or garbled payload yields an empty set —
+// callers treat "cannot attribute" as "report nothing".
+func liveRegistryTaskIDs(res map[string]any) map[string]bool {
+	ids := map[string]bool{}
+	// The agent answers through the ExtMethodResult envelope and the bridge
+	// may or may not have unwrapped it, so the task array can live at
+	// `.tasks`, `.result.tasks` or `.result.result.tasks`.
+	for node, depth := res, 0; node != nil && depth < 3; node, depth = nestedResultMap(node), depth+1 {
+		raw, ok := node["tasks"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range raw {
+			t, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := t["task_id"].(string)
+			if id == "" {
+				id, _ = t["taskId"].(string)
+			}
+			if id != "" {
+				ids[id] = true
+			}
+		}
+	}
+	return ids
+}
+
+// nestedResultMap unwraps one {result: {...}} envelope layer, returning an
+// empty map when there is none.
+func nestedResultMap(res map[string]any) map[string]any {
+	if res == nil {
+		return map[string]any{}
+	}
+	inner, ok := res["result"].(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	return inner
+}
+
 // sessionTaskCensus computes the badge census for one session item:
 // counts + the orphan log paths for the shared liveness probe.
 // Failures (missing file, unreadable) are silent — the badge is cosmetic.
@@ -638,22 +745,22 @@ func sessionTaskCensus(grokHome, cwd, sessionID string) (TaskSummary, []string) 
 }
 
 // probeOrphanPaths runs the open-fd liveness probe over every session's
-// orphan log paths in ONE lsof invocation and returns the open set
-// (mtime fallback when lsof is unavailable).
-func probeOrphanPaths(all map[censusKey][]string) map[string]bool {
+// orphan log paths in ONE lsof invocation and returns the holders keyed by
+// path (mtime fallback when lsof is unavailable, without PID attribution).
+func probeOrphanPaths(all map[censusKey][]string) map[string]logHolder {
 	paths := make([]string, 0, 16)
 	for _, ps := range all {
 		paths = append(paths, ps...)
 	}
 	if len(paths) == 0 {
-		return map[string]bool{}
+		return map[string]logHolder{}
 	}
 	open := probeOpenLogs(paths)
 	if open == nil {
-		open = make(map[string]bool, len(paths))
+		open = make(map[string]logHolder, len(paths))
 		for _, p := range paths {
 			if taskLogFresh(p) {
-				open[p] = true
+				open[p] = logHolder{}
 			}
 		}
 	}
@@ -681,8 +788,11 @@ type TaskLog struct {
 	Output      string `json:"output,omitempty"`
 	Completed   bool   `json:"completed,omitempty"`
 	Running     bool   `json:"running,omitempty"`
-	Failed      bool   `json:"failed,omitempty"`
-	Truncated   bool   `json:"truncated,omitempty"`
+	// PID of the process holding the log open — set only while Running
+	// and only when lsof is available (see probeOpenLogs).
+	PID       int  `json:"pid,omitempty"`
+	Failed    bool `json:"failed,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // taskLogMaxBytes caps one reconstructed log so a giant output file
@@ -765,9 +875,16 @@ func (b *Bridge) TaskLog(sessionID, cwd, taskID string) (*TaskLog, error) {
 	if !out.Completed && out.OutputFile != "" {
 		open := probeOpenLogs([]string{out.OutputFile})
 		if open == nil {
-			open = map[string]bool{out.OutputFile: taskLogFresh(out.OutputFile)}
+			if taskLogFresh(out.OutputFile) {
+				open = map[string]logHolder{out.OutputFile: {}}
+			} else {
+				open = map[string]logHolder{}
+			}
 		}
-		out.Running = open[out.OutputFile]
+		if h, alive := open[out.OutputFile]; alive {
+			out.Running = true
+			out.PID = h.PID
+		}
 	}
 	return out, nil
 }

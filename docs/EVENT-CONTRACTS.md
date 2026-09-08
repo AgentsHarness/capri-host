@@ -44,7 +44,9 @@ capri-fe 事件门、acp-hub `internal/hub/` 消费侧）。本文件是
 
 ## 4. 断线恢复（host ↔ hub 上行）
 
-- hub-client 维护有界回放环 `replay`；`lastSentSeq` 证明 **入队**，
+- hub-client 维护有界回放环 `replay`（容量 `replayCap=1000`，高水位
+  `2*cap` 时压成新数组；槽位是 seq + 已序列化 JSON，不持有 Event map）；
+  `lastSentSeq` 证明 **入队**，
   `hubAckSeq`（hub 经 hello.seq / ping 附带 seq 回执）证明 **送达**。
 - 重连后 hub 在 hello 里带 `hello.seq`（其最后见过的 seq）；host 从该点
   之后重放缓冲事件（`sendReplayAfter`）。

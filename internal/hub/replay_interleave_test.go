@@ -34,11 +34,14 @@ func TestReplayLiveInterleaveNoLoss(t *testing.T) {
 		c.sendCh = make(chan []byte, 4096)
 		c.setBrowserSubscribers(1) // browser online → live forwarding re-arms
 
-		// Simulated disconnect backlog: 2400 events × ~4KB ≈ 10MB,
-		// chunked into ~10 replay frames at the 1MB frame budget.
+		// Simulated disconnect backlog: 800 events × ~4KB ≈ 3.2MB,
+		// chunked into several replay frames at the 1MB frame budget.
+		// Kept under replayCap (1000) so the ring does not compact away
+		// the head of the backlog this test is asserting arrives intact.
 		big := strings.Repeat("x", 4000)
-		backlog := make([]acp.Event, 0, 2400)
-		for i := 1; i <= 2400; i++ {
+		const n = 800
+		backlog := make([]acp.Event, 0, n)
+		for i := 1; i <= n; i++ {
 			backlog = append(backlog, acp.Event{"type": "chunk", "text": big, "seq": uint64(i)})
 		}
 		c.seqAndReplay(backlog)
@@ -87,7 +90,7 @@ func TestReplayLiveInterleaveNoLoss(t *testing.T) {
 		liveWG.Add(1)
 		go func() {
 			defer liveWG.Done()
-			seq := uint64(2401)
+			seq := uint64(n + 1)
 			for {
 				select {
 				case <-stopLive:

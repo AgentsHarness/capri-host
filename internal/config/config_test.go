@@ -1,6 +1,8 @@
 package config
 
-import "testing"
+import (
+	"testing"
+)
 
 // 默认只听回环；BIND / HOST_BIND 显式改写。
 func TestLoadBindAddr(t *testing.T) {
@@ -70,5 +72,24 @@ func TestCheckBindPolicy(t *testing.T) {
 		if !tc.wantErr && err != nil {
 			t.Errorf("%s: want nil, got %v", tc.name, err)
 		}
+	}
+}
+
+func TestEnvResidentCap(t *testing.T) {
+	t.Setenv("RESIDENT_CAP", "")
+	if got := envResidentCap(); got != 0 {
+		t.Fatalf("unset → %d, want 0 (bridge default)", got)
+	}
+	t.Setenv("RESIDENT_CAP", "8")
+	if got := envResidentCap(); got != 8 {
+		t.Fatalf("RESIDENT_CAP=8 → %d", got)
+	}
+	t.Setenv("RESIDENT_CAP", "0")
+	if got := envResidentCap(); got != -1 {
+		t.Fatalf("RESIDENT_CAP=0 → %d, want -1 (disable)", got)
+	}
+	t.Setenv("RESIDENT_CAP", "nope")
+	if got := envResidentCap(); got != -1 {
+		t.Fatalf("garbage → %d, want -1", got)
 	}
 }
