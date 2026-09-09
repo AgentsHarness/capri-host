@@ -49,6 +49,9 @@ type Config struct {
 	// rather than swallowed here — Load has no way to report it otherwise
 	// and a silently ignored config is indistinguishable from a broken host.
 	ConfigError error
+	// ResidentCap is passed to the grok bridge idle-unload supervisor.
+	// 0 = use the bridge default (4). Negative = disable (RESIDENT_CAP=0).
+	ResidentCap int
 }
 
 // DefaultHostID and DefaultHostName are the compiled-in identity used when
@@ -103,8 +106,23 @@ func Load() Config {
 	envBool(&c.EnableTray, "CAPRI_TRAY")
 	// BIND / HOST_BIND: upstream default is loopback-only; env always wins here.
 	c.BindAddr = bindAddr()
+	c.ResidentCap = envResidentCap()
 
 	return c
+}
+
+// envResidentCap reads RESIDENT_CAP. Unset → 0 (bridge default of 4).
+// 0 or a non-positive / unparsable value → -1 (disable idle-unload).
+func envResidentCap() int {
+	v := strings.TrimSpace(os.Getenv("RESIDENT_CAP"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return -1
+	}
+	return n
 }
 
 // envSet overwrites dst when the named variable is set and non-empty.

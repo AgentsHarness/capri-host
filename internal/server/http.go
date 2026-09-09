@@ -969,9 +969,10 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSessionRunningTasks returns the session's STILL-RUNNING tasks
-// (task_backgrounded orphans whose output log was written recently) — the
-// web equivalent of the TUI's live tasks pane. The persisted timeline is
-// only used to surface current work, not to replay history.
+// (task_backgrounded orphans whose output log was written recently) plus
+// the detached subset — those the agent's own registry does not know and
+// therefore cannot kill. The persisted timeline is only used to surface
+// current work, not to replay history.
 func (s *Server) handleSessionRunningTasks(w http.ResponseWriter, r *http.Request) {
 	var body sessionUpdatesBody
 	if err := readJSON(r, &body); err != nil {
@@ -987,10 +988,18 @@ func (s *Server) handleSessionRunningTasks(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	// Tasks the liveness probe still sees but the agent's registry does not
+	// know: the frontend must NOT list them as running tasks (it could not
+	// kill them) — it surfaces them as a one-off detached hint.
+	detached := s.bridge.DetachedRunningTasks(r.Context(), body.SessionID, body.Cwd)
+	if detached == nil {
+		detached = []acp.TaskEvent{}
+	}
 	writeJSON(w, 200, map[string]any{
 		"ok":        true,
 		"sessionId": body.SessionID,
 		"events":    events,
+		"detached":  detached,
 	})
 }
 
@@ -1163,18 +1172,37 @@ func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
+// x.ai/task/kill 的终止来源，即 agent 侧 TaskKillSource 的 wire 名（camelCase
+// 由 serde 决定）。clientUi = 单条 UI 终止，agent 会在任务收尾时补一条
+// "killed by the user" 唤醒；teardown = 静默，不再为这条任务唤醒模型。
+const (
+	taskKillSourceClientUI = "clientUi"
+	taskKillSourceTeardown = "teardown"
+)
+
 // handleTaskKill kills a background task via x.ai/task/kill
 // ({sessionId?} empty resolves to the active session).
+//
+// 可选的 {source} 原样转发给 agent：它决定这次终止要不要通知模型。只认
+// 上表两个值——其余字符串 agent 的 serde 会直接拒掉整个请求（含 source
+// 字段的 kill 请求整体失败），杀掉的是"终止"本身，比回一个 400 更糟。
 func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID string `json:"sessionId,omitempty"`
 		TaskID    string `json:"taskId"`
+		Source    string `json:"source,omitempty"`
 	}
 	if err := readJSON(r, &body); err != nil || body.TaskID == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 taskId"})
 		return
 	}
-	res, err := s.bridge.TaskKill(r.Context(), body.SessionID, body.TaskID)
+	switch body.Source {
+	case "", taskKillSourceClientUI, taskKillSourceTeardown:
+	default:
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "source 只支持 clientUi / teardown"})
+		return
+	}
+	res, err := s.bridge.TaskKill(r.Context(), body.SessionID, body.TaskID, body.Source)
 	if err != nil {
 		writeAgentError(w, "x.ai/task/kill", err)
 		return
@@ -1182,9 +1210,18 @@ func (s *Server) handleTaskKill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
 }
 
-// handleTaskList lists background tasks via x.ai/task/list.
+// handleTaskList lists background tasks via x.ai/task/list. An explicit
+// {sessionId} asks for that session's registry; without it the active
+// session answers.
 func (s *Server) handleTaskList(w http.ResponseWriter, r *http.Request) {
-	res, err := s.bridge.TaskList(r.Context())
+	var body struct {
+		SessionID string `json:"sessionId,omitempty"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.TaskList(r.Context(), body.SessionID)
 	if err != nil {
 		writeAgentError(w, "x.ai/task/list", err)
 		return

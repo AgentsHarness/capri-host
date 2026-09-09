@@ -65,12 +65,14 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 	var out struct {
-		OK     bool `json:"ok"`
-		Events []struct {
+		OK       bool `json:"ok"`
+		Detached any  `json:"detached"`
+		Events   []struct {
 			Kind    string `json:"kind"`
 			TaskID  string `json:"taskId"`
 			Command string `json:"command"`
 			Running bool   `json:"running"`
+			PID     int    `json:"pid"`
 		} `json:"events"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
@@ -82,6 +84,16 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 	ev := out.Events[0]
 	if ev.Kind != "task_backgrounded" || ev.TaskID != "t-1" || ev.Command != "npm run dev" || !ev.Running {
 		t.Fatalf("event = %+v", ev)
+	}
+	// The probe attributes the holder, so the frontend can name the pid in
+	// its detached-process hint.
+	if ev.PID != os.Getpid() {
+		t.Fatalf("event pid = %d, want %d", ev.PID, os.Getpid())
+	}
+	// No session is active in this bridge, so nothing may be labelled
+	// detached — the frontend would otherwise distrust its own tasks.
+	if arr, ok := out.Detached.([]any); !ok || len(arr) != 0 {
+		t.Fatalf("detached = %v, want empty list", out.Detached)
 	}
 
 	// Unknown session → empty events, still ok.
@@ -100,4 +112,74 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 	if rec3.Code != http.StatusBadRequest {
 		t.Fatalf("bad body status = %d", rec3.Code)
 	}
+}
+
+// TestTaskKillSourcePassthrough covers the three things /api/task-kill must
+// get right about `source` (the agent's TaskKillSource — it decides whether
+// the model is woken with a "killed by the user" note for this task):
+// forward it verbatim, omit it when the client sent none, and refuse a value
+// the agent's serde would reject outright (that would fail the kill itself).
+func TestTaskKillSourcePassthrough(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		// wantSource is the source key expected on the wire; absent means it
+		// must not be sent at all.
+		wantSource string
+		status     int
+	}{
+		{"silent teardown forwarded", `{"taskId":"t-1","source":"teardown"}`, "teardown", http.StatusOK},
+		{"explicit clientUi forwarded", `{"taskId":"t-1","source":"clientUi"}`, "clientUi", http.StatusOK},
+		{"omitted stays omitted", `{"taskId":"t-1"}`, "", http.StatusOK},
+		{"unknown source rejected", `{"taskId":"t-1","source":"ModelTool"}`, "", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
+			t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
+			s, _ := newFakeAgentServer(t)
+			createActiveSession(t, s)
+
+			rec := postJSON(t, s, "/api/task-kill", tc.body)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d, body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			params := killRequestSentToAgent(t, recordPath)
+			if tc.status != http.StatusOK {
+				if params != nil {
+					t.Errorf("rejected request must never reach the agent, saw %v", params)
+				}
+				return
+			}
+			if params == nil {
+				t.Fatal("kill never reached the agent")
+			}
+			source, present := params["source"]
+			if tc.wantSource == "" {
+				if present {
+					t.Errorf("agent saw source=%v, want the key omitted", source)
+				}
+				return
+			}
+			if source != tc.wantSource {
+				t.Errorf("agent saw source=%v, want %q", source, tc.wantSource)
+			}
+		})
+	}
+}
+
+// killRequestSentToAgent returns the params of the first _x.ai/task/kill the
+// host forwarded, or nil when no kill went out at all.
+func killRequestSentToAgent(t *testing.T, recordPath string) map[string]any {
+	t.Helper()
+	for _, line := range readRecordedRequests(t, recordPath) {
+		if line["method"] != "_x.ai/task/kill" {
+			continue
+		}
+		params, ok := line["params"].(map[string]any)
+		if !ok {
+			t.Fatalf("_x.ai/task/kill carried no params: %v", line)
+		}
+		return params
+	}
+	return nil
 }

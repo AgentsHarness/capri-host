@@ -37,9 +37,9 @@ import (
 
 // Config configures the hub client.
 type Config struct {
-	URL       string // hub base URL, e.g. http://hub-host:8787
-	HostID    string
-	HostName  string
+	URL      string // hub base URL, e.g. http://hub-host:8787
+	HostID   string
+	HostName string
 	// Port is this host's local HTTP listen port (advertised to the hub
 	// so the FE can probe 127.0.0.1:<port>). 0 = omit.
 	Port      int
@@ -147,7 +147,7 @@ type Client struct {
 	// frame — see noteHubAck).
 	seqMu       sync.Mutex
 	nextSeq     uint64
-	replay      []acp.Event // ring, newest at the end, capped
+	replay      []replayItem // ring, newest at the end, capped
 	lastSentSeq uint64
 	hubAckSeq   uint64
 
@@ -228,8 +228,19 @@ type Client struct {
 	repairCh chan struct{}
 }
 
-// replayCap bounds the host-side replay buffer (events).
-const replayCap = 5000
+// replayItem is one ring slot. seq is denormalized for watermark
+// compares; raw is the marshaled Event so the map (and any large tool
+// payload it referenced) can be GC'd once seqAndReplay returns.
+type replayItem struct {
+	seq uint64
+	raw json.RawMessage
+}
+
+// replayCap bounds the host-side replay buffer (events). 1000 critical+
+// droppable events covers a hub blip; FE HTTP history covers anything
+// older. Was 5000 — Event maps in the ring were the host's steady-state
+// heap.
+const replayCap = 1000
 
 // replayHighWater is where seqAndReplay compacts back down to replayCap
 // (amortized, see seqAndReplay).
@@ -631,21 +642,27 @@ func (c *Client) seqAndReplay(evs []acp.Event) {
 	c.seqMu.Lock()
 	defer c.seqMu.Unlock()
 	for _, ev := range evs {
-		if s := eventSeq(ev); s == 0 {
+		s := eventSeq(ev)
+		if s == 0 {
 			c.nextSeq++
 			ev["seq"] = c.nextSeq
+			s = c.nextSeq
 		} else if s > c.nextSeq {
 			c.nextSeq = s
 		}
-		c.replay = append(c.replay, ev)
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			continue
+		}
+		c.replay = append(c.replay, replayItem{seq: s, raw: raw})
 		if len(c.replay) > replayHighWater {
-			// Compact into a FRESH array rather than resliceing: Go keeps
+			// Compact into a FRESH array rather than reslicing: Go keeps
 			// the whole backing array alive for as long as any slice of it
 			// is, so `c.replay = c.replay[n:]` would pin every dropped
-			// Event map (session updates can be large) until the next
-			// reallocation — roughly doubling steady-state memory. Compact
-			// at the high-water mark so the copy stays amortized O(1).
-			trimmed := make([]acp.Event, replayCap, replayHighWater)
+			// payload until the next reallocation — roughly doubling
+			// steady-state memory. Compact at the high-water mark so the
+			// copy stays amortized O(1).
+			trimmed := make([]replayItem, replayCap, replayHighWater)
 			copy(trimmed, c.replay[len(c.replay)-replayCap:])
 			c.replay = trimmed
 		}
@@ -906,7 +923,7 @@ func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 	var idx int
 	// 第一个事件实际 seq > after 的位置。一律按事件自带 seq 比较。
 	for idx = 0; idx < len(c.replay); idx++ {
-		if eventSeq(c.replay[idx]) > after {
+		if c.replay[idx].seq > after {
 			break
 		}
 	}
@@ -914,11 +931,11 @@ func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 		c.seqMu.Unlock()
 		return 0
 	}
-	evs := append([]acp.Event(nil), c.replay[idx:]...)
-	last := eventSeq(evs[len(evs)-1])
+	items := append([]replayItem(nil), c.replay[idx:]...)
+	last := items[len(items)-1].seq
 	// Release before enqueue so noteLastSentSeq can take seqMu.
 	c.seqMu.Unlock()
-	c.enqueueReplayLocked(evs)
+	c.enqueueReplayLocked(items)
 	return last
 }
 
@@ -937,14 +954,8 @@ func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 // gap-pull buffer too, so the transcript would be permanently lost.
 // Live enqueues simply wait for the lock and then land after the
 // replay, in strictly increasing seq order.
-func (c *Client) enqueueReplayLocked(evs []acp.Event) {
-	raws := make([][]byte, len(evs))
-	for i, ev := range evs {
-		if raw, err := json.Marshal(ev); err == nil {
-			raws[i] = raw
-		}
-	}
-	var frame []acp.Event
+func (c *Client) enqueueReplayLocked(items []replayItem) {
+	var frame []replayItem
 	size := 0
 	flush := func() {
 		if len(frame) == 0 {
@@ -954,18 +965,78 @@ func (c *Client) enqueueReplayLocked(evs []acp.Event) {
 		// catch-up, so frames must not be dropped when the send queue
 		// happens to be full (a dropped replay frame would leave the hub
 		// missing transcript after the resume).
-		c.enqueueEventsLocked(frame, true)
+		c.enqueueReplayFrameLocked(frame)
 		frame = nil
 		size = 0
 	}
-	for i, ev := range evs {
-		if len(frame) > 0 && size+len(raws[i]) > replayFrameBudget {
+	for _, it := range items {
+		if len(frame) > 0 && size+len(it.raw) > replayFrameBudget {
 			flush()
 		}
-		frame = append(frame, ev)
-		size += len(raws[i])
+		frame = append(frame, it)
+		size += len(it.raw)
 	}
 	flush()
+}
+
+// enqueueReplayFrameLocked writes one events frame from already-marshaled
+// ring slots (no Event map round-trip). Caller holds enqueueMu.
+func (c *Client) enqueueReplayFrameLocked(items []replayItem) {
+	if len(items) == 0 || c.sendCh == nil {
+		return
+	}
+	raws := make([]json.RawMessage, len(items))
+	for i, it := range items {
+		raws[i] = it.raw
+	}
+	payload := c.marshalEventsFrameRaw(items[0].seq, raws)
+	if payload == nil {
+		return
+	}
+	select {
+	case c.sendCh <- payload:
+		c.noteLastSentSeqItems(items)
+	case <-time.After(5 * time.Second):
+		c.needCatchUp.Store(true)
+		log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(items))
+	}
+}
+
+func (c *Client) noteLastSentSeqItems(items []replayItem) {
+	var max uint64
+	for _, it := range items {
+		if it.seq > max {
+			max = it.seq
+		}
+	}
+	if max == 0 {
+		return
+	}
+	c.seqMu.Lock()
+	if max > c.lastSentSeq {
+		c.lastSentSeq = max
+	}
+	c.seqMu.Unlock()
+}
+
+// marshalEventsFrameRaw builds a type:"events" frame from pre-marshaled
+// event objects. json.RawMessage is emitted verbatim so replay does not
+// unmarshal into Event maps.
+func (c *Client) marshalEventsFrameRaw(seqStart uint64, raws []json.RawMessage) []byte {
+	payload, err := json.Marshal(struct {
+		V        int               `json:"v"`
+		Type     string            `json:"type"`
+		SeqStart uint64            `json:"seqStart"`
+		Events   []json.RawMessage `json:"events"`
+	}{V: 1, Type: "events", SeqStart: seqStart, Events: raws})
+	if err != nil {
+		return nil
+	}
+	if len(payload) > maxFrameBytes {
+		log.Printf("[hub-client] 事件帧过大（%d KB），丢弃 %d 条事件（重放缓冲已保留）", len(payload)>>10, len(raws))
+		return nil
+	}
+	return payload
 }
 
 // enqueueHostStatus sends a control frame (not an events frame) so it

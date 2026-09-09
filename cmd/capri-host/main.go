@@ -120,6 +120,7 @@ func main() {
 		// default AppDir is ~/.capri-host, which is exactly where this file
 		// already lived — existing installs see no change.
 		LastSessionFile: filepath.Join(config.AppDir(), "last-session.json"),
+		ResidentCap:     cfg.ResidentCap,
 	})
 	srv := server.New(cfg, bridge)
 
@@ -189,6 +190,10 @@ func main() {
 		log.Printf("[capri-host] server stopped: %v", err)
 		serveErr <- err
 	}()
+
+	// grok 在 stdio 客户端不断开时不会自己 idle-unload；host 按 resident
+	// 上限把空闲会话 session/close 掉，名册仍留给 FE 列表/再 load。
+	bridge.StartIdleUnload(ctx)
 
 	// A bind failure is the one startup error a tray user must be told about:
 	// nothing else in the UI would ever appear, and the log is not somewhere

@@ -181,6 +181,10 @@ type GrokConfig struct {
 	// GrokHome overrides the grok data dir (~/.grok) used to locate
 	// session updates files (task timeline / [bg] badge scans).
 	GrokHome string
+	// ResidentCap bounds how many sessions stay loaded in the grok
+	// process. Zero = DefaultResidentCap (4). Negative = disable the
+	// idle-unload supervisor (tests, or RESIDENT_CAP=0).
+	ResidentCap int
 }
 
 // lastSessionFile is the on-disk form of the most recently active session.
@@ -591,6 +595,16 @@ func (b *Bridge) activeSessionLocked() *SessionState {
 		return b.sessions[id]
 	}
 	return nil
+}
+
+// ActiveSessionID returns the session clients are currently attached to
+// ("" when none). Callers that must attribute agent-side state to a
+// specific session use this to refuse guessing when the question is about
+// some other (read-only, historical) session.
+func (b *Bridge) ActiveSessionID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.activeSessionID
 }
 
 // broadcastRosterChange pushes sessions_changed so clients refresh the
@@ -1157,6 +1171,7 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 		b.sessions[sid] = s
 	}
 	s.Cwd = cwd
+	s.unloaded = false
 	s.modes = sessRes["modes"]
 	s.configOpts = sessRes[kConfigOptions]
 	s.models = sessRes["models"]
@@ -1670,6 +1685,48 @@ func attachStreamMeta(ev Event, params map[string]any) Event {
 	return ev
 }
 
+// currentModeIDOf reads the ACP CurrentModeUpdate id (camelCase on the
+// wire; snake_case accepted for older x.ai carriers).
+func currentModeIDOf(update map[string]any) string {
+	if id, ok := update[kCurrentModeId].(string); ok && id != "" {
+		return id
+	}
+	if id, ok := update["current_mode_id"].(string); ok && id != "" {
+		return id
+	}
+	return ""
+}
+
+// applyCurrentModeUpdateLocked patches the session's SessionModeState from
+// a current_mode_update. Caller holds b.mu. Broadcasts a clone so later
+// in-place writes cannot race SSE/hub serialization.
+func (b *Bridge) applyCurrentModeUpdateLocked(sid string, update map[string]any) any {
+	s := b.sessions[sid]
+	if ms := update[kModeState]; ms != nil {
+		if s != nil {
+			s.modes = ms
+		}
+		return cloneAny(ms)
+	}
+	id := currentModeIDOf(update)
+	if id == "" {
+		if s != nil {
+			return cloneAny(s.modes)
+		}
+		return nil
+	}
+	if s != nil {
+		mm, ok := s.modes.(map[string]any)
+		if !ok || mm == nil {
+			mm = map[string]any{}
+			s.modes = mm
+		}
+		mm[kCurrentModeId] = id
+		return cloneAny(s.modes)
+	}
+	return map[string]any{kCurrentModeId: id}
+}
+
 // dispatchSessionUpdateKind routes one sessionUpdate `update` to its typed
 // events. Returns whether the kind is modeled (handled): true → the caller
 // must NOT emit the generic session_notification (FE 消费 typed 事件);
@@ -1833,22 +1890,17 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		}))
 		return true
 	case "current_mode_update":
+		// ACP CurrentModeUpdate is {currentModeId} (enter_plan_mode /
+		// exit_plan_mode and session/set_mode). Looking only for modeState
+		// left s.modes stale, so the FE composer never followed the agent.
 		b.mu.Lock()
-		if ms := update[kModeState]; ms != nil {
-			if s := b.sessions[sid]; s != nil {
-				s.modes = ms
-			}
-		}
-		var modes any
-		if s := b.sessions[sid]; s != nil {
-			modes = s.modes
-		}
+		modes := b.applyCurrentModeUpdateLocked(sid, update)
 		b.mu.Unlock()
 		b.Broadcast(tag(Event{kType: "modes_update", "modes": modes}))
 		return true
 	case "config_option_update":
 		b.mu.Lock()
-		if co := update[kConfigOptions]; co != nil {
+		if co := pick([]map[string]any{update}, kConfigOptions, "options"); co != nil {
 			if s := b.sessions[sid]; s != nil {
 				s.configOpts = co
 			}
@@ -1861,7 +1913,9 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		b.Broadcast(tag(Event{kType: "config_options_update", kConfigOptions: co}))
 		return true
 	case "available_commands_update":
-		b.Broadcast(tag(Event{kType: "commands_update", kCommands: update[kCommands]}))
+		// ACP AvailableCommandsUpdate is {availableCommands}, not {commands}.
+		cmds := pick([]map[string]any{update}, kAvailableCommands, "available_commands", kCommands)
+		b.Broadcast(tag(Event{kType: "commands_update", kCommands: cmds}))
 		return true
 	case "session_info_update", "session_info":
 		// session_info_update 是官方 ACP SessionUpdate 的 kind（serde tag
@@ -1878,11 +1932,15 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 			}
 		}
 		b.mu.Unlock()
-		b.Broadcast(tag(Event{
+		ev := Event{
 			kType:      "session_info",
 			kTitle:     update[kTitle],
 			kUpdatedAt: update[kUpdatedAt],
-		}))
+		}
+		if v, ok := titleIsManualFrom(params, update); ok {
+			ev["titleIsManual"] = v
+		}
+		b.Broadcast(tag(ev))
 		return true
 	case "scheduled_task_created":
 		// 复用 x.ai 通道的归一化 helper（task/rawTask/rawParams/meta 保全，
@@ -2395,6 +2453,28 @@ func toInt64(v any) int64 {
 	return n
 }
 
+// titleIsManualFrom reads x.ai/titleIsManual off params._meta or
+// update._meta (live session_info used to drop it, so a later auto-title
+// overwrote a manual rename).
+func titleIsManualFrom(params, update map[string]any) (bool, bool) {
+	for _, m := range []map[string]any{params, update} {
+		if m == nil {
+			continue
+		}
+		meta, _ := m[kMeta].(map[string]any)
+		if meta == nil {
+			continue
+		}
+		if v, ok := meta["x.ai/titleIsManual"].(bool); ok {
+			return v, true
+		}
+		if v, ok := meta["titleIsManual"].(bool); ok {
+			return v, true
+		}
+	}
+	return false, false
+}
+
 // pick returns the first present value found under any of the given keys,
 // checking each map in order (snake_case/camelCase wire compatibility).
 // Returns nil when nothing matched.
@@ -2502,7 +2582,7 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 	// request is settled (any path), broadcast so other tabs drop the card
 	// — without this the answering tab clears locally but siblings keep a
 	// zombie permission / question UI until reload.
-	defer b.broadcastClientRequestResolved(reqID, cr.SessionID)
+	defer b.broadcastClientRequestResolved(reqID, cr)
 	timer := time.NewTimer(approvalTimeout)
 	defer timer.Stop()
 	// Peek first: the user's answer may have landed at the same instant
@@ -2528,10 +2608,11 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 		default:
 		}
 		b.clientReqs.Delete(reqID)
+		cr.errMsg = "审批超时"
 		if cr.isPermission {
 			b.respond(cr.AgentID, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
 		} else {
-			b.respondError(cr.AgentID, "审批超时", -32002)
+			b.respondError(cr.AgentID, cr.errMsg, -32002)
 		}
 	}
 }
@@ -2539,13 +2620,35 @@ func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
 // broadcastClientRequestResolved notifies every SSE subscriber that a
 // forwarded client request (permission / x.ai question / …) is no longer
 // pending. Clients remove matching pending / xaiRequests rows by requestId.
-func (b *Bridge) broadcastClientRequestResolved(reqID, sessionID string) {
+// method / cancelled / error / outcome ride along so a sibling tab can
+// apply side effects (e.g. leave plan mode after exit_plan_mode) without
+// waiting on a later CurrentModeUpdate that the shell may drop.
+func (b *Bridge) broadcastClientRequestResolved(reqID string, cr *clientRequest) {
 	ev := Event{
 		kType:       "client_request_resolved",
 		"requestId": reqID,
 	}
-	if sessionID != "" {
-		ev[kSessionID] = sessionID
+	if cr == nil {
+		b.Broadcast(ev)
+		return
+	}
+	if cr.SessionID != "" {
+		ev[kSessionID] = cr.SessionID
+	}
+	if cr.Method != "" {
+		ev[kMethod] = cr.Method
+	}
+	if cr.cancel {
+		ev["cancelled"] = true
+	}
+	if cr.errMsg != "" {
+		ev["error"] = cr.errMsg
+	}
+	if cr.result != nil {
+		ev["result"] = cr.result
+		if o, ok := cr.result["outcome"].(string); ok && o != "" {
+			ev["outcome"] = o
+		}
 	}
 	b.Broadcast(ev)
 }
@@ -2841,6 +2944,24 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// 补一条 live 事件，前端按带 sessionId 的回合级错误渲染。
 		b.broadcastPromptError(sessionID, &HTTPError{Code: 404, Msg: "会话不存在"})
 		return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
+	}
+	// Idle-unload 只把 grok 侧 actor 卸掉，名册行还在（HasSession 仍
+	// 为 true，避免 FE 点空闲会话发 prompt 吃 404）。prompt 前先
+	// session/load 灌回去。
+	if s.unloaded {
+		cwd := s.Cwd
+		b.mu.Unlock()
+		if _, err := b.LoadSession(ctx, sessionID, cwd); err != nil {
+			b.broadcastPromptError(sessionID, err)
+			return "", nil, err
+		}
+		b.mu.Lock()
+		s = b.sessions[sessionID]
+		if s == nil {
+			b.mu.Unlock()
+			b.broadcastPromptError(sessionID, &HTTPError{Code: 404, Msg: "会话不存在"})
+			return "", nil, &HTTPError{Code: 404, Msg: "会话不存在"}
+		}
 	}
 	// A busy session no longer 409s: the agent accepts mid-turn
 	// session/prompt and queues it in its own pending_inputs (popped when
@@ -3850,6 +3971,7 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
+	act.unloaded = false
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the load response — they reflect the restored session.
@@ -4039,6 +4161,7 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		b.sessions[sessionID] = act
 	}
 	act.Cwd = cwd
+	act.unloaded = false
 	b.ready = true
 	b.bootError = ""
 	// Prefer fields from the resume response — they reflect the session.
@@ -4107,12 +4230,11 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 	return sessRes, nil
 }
 
-// CloseSession calls session/close (sessionId defaults to the active one)
-// and removes the session from the roster on success: the active-session
-// pointer is cleared when it pointed at the closed session, and a matching
-// in-memory last-session pointer is cleared too (the disk file is left
-// untouched — it is only a hint, and restoring a closed session fails with
-// a 404 anyway).
+// CloseSession is the explicit client close: session/close then drop the
+// row from the live roster (forgetSessionLocked). Disk history is left
+// intact. Idle-unload (SweepIdleUnload) is a different path — it also
+// calls session/close but keeps the roster row so FE can still list and
+// later session/load the conversation.
 func (b *Bridge) CloseSession(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -4636,8 +4758,8 @@ func (b *Bridge) RenameSession(ctx context.Context, sessionID, title string) (ma
 		return nil, err
 	}
 	b.Broadcast(Event{
-		kType:          "session_info",
-		kSessionID:     sid,
+		kType:           "session_info",
+		kSessionID:      sid,
 		"title":         title,
 		"titleIsManual": true,
 	})
@@ -4674,24 +4796,42 @@ func (b *Bridge) SubagentCancel(ctx context.Context, sessionID, subagentID strin
 	}, 30*time.Second)
 }
 
-// TaskKill calls x.ai/task/kill: {sessionId, taskId} (empty sessionId
+// TaskKill calls x.ai/task/kill: {sessionId, taskId, source?} (empty sessionId
 // resolves to the active one; unknown id → agent 404).
-func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID string) (map[string]any, error) {
+//
+// source 是 agent 侧 TaskKillSource 的 wire 名（clientUi / teardown），它决定
+// 任务收尾时 agent 要不要为这条终止唤醒模型；空 = 不上 wire，由 agent 用它的
+// 缺省值。宿主不猜语义，原样转发。
+func (b *Bridge) TaskKill(ctx context.Context, sessionID, taskID, source string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
 	}
-	return b.request(ctx, "_x.ai/task/kill", map[string]any{
+	params := map[string]any{
 		kSessionID: b.resolveSessionID(sessionID),
 		"taskId":   taskID,
-	}, 30*time.Second)
+	}
+	if source != "" {
+		params["source"] = source
+	}
+	return b.request(ctx, "_x.ai/task/kill", params, 30*time.Second)
 }
 
 // TaskList calls x.ai/task/list: {sessionId} → {tasks: [TaskSnapshot…]}.
 // Each snapshot includes output/command so the FE block viewer can show
 // live stdout (TUI OpenBlockViewer for BgTask).
-func (b *Bridge) TaskList(ctx context.Context) (map[string]any, error) {
+//
+// Without an explicit id it answers for the ACTIVE session (and 404s when
+// there is none). Callers that refresh a specific session — e.g. the top
+// task strip for a session being resumed — must pass that id: the agent
+// registry is per session, and asking for the active one would paint
+// another session's tasks onto this view.
+func (b *Bridge) TaskList(ctx context.Context, sessionID ...string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
+	}
+	if len(sessionID) > 0 && sessionID[0] != "" {
+		return b.request(ctx, "_x.ai/task/list", map[string]any{kSessionID: sessionID[0]},
+			30*time.Second)
 	}
 	b.mu.Lock()
 	act := b.activeSessionLocked()

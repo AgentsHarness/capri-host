@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -765,6 +766,58 @@ func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
 }
 
+// GitRepoState — 仓库进行中状态（merge/rebase/cherry-pick）与冲突文件清单，
+// 只读信息，FE git 面板横幅用。
+type GitRepoState struct {
+	MergeInProgress      bool     `json:"mergeInProgress"`
+	RebaseInProgress     bool     `json:"rebaseInProgress"`
+	CherryPickInProgress bool     `json:"cherryPickInProgress"`
+	Conflicts            []string `json:"conflicts"`
+	ConflictCount        int      `json:"conflictCount"`
+}
+
+// handleGitState — POST /api/git/state → 仓库进行中状态。直接跑 git
+// （同 push/pull/fetch），不依赖 agent 会话；非 git 目录返回 ok:false。
+// 进行中状态以 gitDir 下的标记文件/目录存在性为准（worktree 下 rev-parse
+// --git-dir 会返回链接后的 gitdir，路径已正确解析）；冲突清单取未合并条目。
+func (s *Server) handleGitState(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cwd string `json:"cwd"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Cwd == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
+		return
+	}
+	gitDir, err := runGitCmd(r.Context(), body.Cwd, "rev-parse", "--git-dir")
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(body.Cwd, gitDir)
+	}
+	markerExists := func(name string) bool {
+		_, statErr := os.Stat(filepath.Join(gitDir, name))
+		return statErr == nil
+	}
+	state := GitRepoState{Conflicts: []string{}}
+	state.MergeInProgress = markerExists("MERGE_HEAD")
+	state.RebaseInProgress = markerExists("rebase-merge") || markerExists("rebase-apply")
+	state.CherryPickInProgress = markerExists("CHERRY_PICK_HEAD")
+	if out, conflictErr := runGitCmd(r.Context(), body.Cwd, "diff", "--name-only", "--diff-filter=U"); conflictErr == nil && out != "" {
+		for _, line := range strings.Split(out, "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				state.Conflicts = append(state.Conflicts, line)
+			}
+		}
+	}
+	state.ConflictCount = len(state.Conflicts)
+	writeJSON(w, 200, map[string]any{"ok": true, "state": state})
+}
+
 type GitLogEntry struct {
 	Hash      string `json:"hash"`
 	ShortHash string `json:"shortHash"`
@@ -860,7 +913,8 @@ func (s *Server) handleGitStashList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 cwd"})
 		return
 	}
-	out, err := runGitCmd(r.Context(), body.Cwd, "stash", "list", "--pretty=format:%gd%x00%h%x00%cr%x00%gs")
+	// %cI 严格 ISO 8601，前端 GitPanel 统一格式化为本地 "YYYY-MM-DD HH:mm"。
+	out, err := runGitCmd(r.Context(), body.Cwd, "stash", "list", "--pretty=format:%gd%x00%h%x00%cI%x00%gs")
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "stashes": []GitStashItem{}})
 		return
@@ -1026,6 +1080,7 @@ func (s *Server) registerExtGitRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/git/push", s.handleGitPush)
 	mux.HandleFunc("POST /api/git/pull", s.handleGitPull)
 	mux.HandleFunc("POST /api/git/fetch", s.handleGitFetch)
+	mux.HandleFunc("POST /api/git/state", s.handleGitState)
 	mux.HandleFunc("POST /api/git/log", s.handleGitLog)
 	mux.HandleFunc("POST /api/git/stash/list", s.handleGitStashList)
 	mux.HandleFunc("POST /api/git/stash/pop", s.handleGitStashPop)

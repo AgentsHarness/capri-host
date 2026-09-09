@@ -16,7 +16,7 @@ import (
 //
 // 投影做四件事：
 //  1. 工具信封：删正文（content / 正文键 / file_matches），rawInput 只留
-//     行头字段，command 留短头；
+//     行头字段，command 原样（回放行头要完整命令）；
 //  2. thought：正文换成 {type, omitted}，连续 thought 合成一封；
 //  3. 同 toolCallId 的 tool_call + update 合成一封（空 id 不合，以免误并）；
 //  4. params._meta 只留回放真用的时间戳/token。
@@ -39,8 +39,8 @@ const (
 	liteRawOutputBudget = 2048
 	// liteLongStringBytes：未知工具形状里多长的字符串算正文。
 	liteLongStringBytes = 512
-	// liteCapStringBytes / liteCapHeadBytes：行头 command 的封顶。
-	// FE 折叠卡只看得到命令开头。
+	// liteCapStringBytes / liteCapHeadBytes：保留字符串（path / title 等）的封顶。
+	// command 不走这里——回放行头要完整命令，见 liteHardKeepKeys。
 	liteCapStringBytes = 512
 	liteCapHeadBytes   = 256
 )
@@ -98,7 +98,7 @@ var liteKeepKeys = map[string]bool{
 	"entryCount":   true,
 }
 
-// liteHardKeepKeys：一字不动（command 不在此列，超长截头）。
+// liteHardKeepKeys：一字不动（含 command——回放行头要完整命令，不截头）。
 var liteHardKeepKeys = map[string]bool{
 	"type":             true,
 	"sessionUpdate":    true,
@@ -115,6 +115,7 @@ var liteHardKeepKeys = map[string]bool{
 	"label":            true,
 	"mime_type":        true,
 	"mimeType":         true,
+	"command":          true,
 }
 
 // liteRawInputKeep：折叠卡行头用到的 rawInput 键，其余整键删除。
@@ -302,11 +303,6 @@ func liteFilterRawInput(v any, acc *liteAcc) any {
 			acc.note("rawInput."+k, liteJSONLen(item))
 			delete(m, k)
 			continue
-		}
-		if s, isStr := item.(string); isStr && k == "command" {
-			if nv, ch := liteCapKeepString("rawInput.command", s, acc); ch {
-				m[k] = nv
-			}
 		}
 	}
 	return m
