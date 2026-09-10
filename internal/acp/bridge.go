@@ -98,6 +98,10 @@ type Bridge struct {
 	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
 	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
 	usageLastUsed map[string]int64
+	// ledger 是用量落盘台账（~/.capri-host/usage-ledger.jsonl）。它把回合
+	// 用量在源文件被删之前抄一份，使历史用量不随 agent 的 30 天会话清理
+	// 消失；见 usage_ledger.go。非 nil（关闭时内部判空跳过）。
+	ledger *usageLedger
 	// liveTools 是 per-session 的实时工具事件合成 ID 注入器（与历史主路径
 	// 同一套 synth:call:<ts>:<k>；首次非重放事件用历史视图做种子）。b.mu 保护。
 	liveTools map[string]*liveToolResolver
@@ -179,6 +183,14 @@ type GrokConfig struct {
 	// GrokHome overrides the grok data dir (~/.grok) used to locate
 	// session updates files (task timeline / [bg] badge scans).
 	GrokHome string
+	// UsageLedgerFile overrides the default ~/.capri-host/usage-ledger.jsonl
+	// so tests can inject a temp path without touching the real home.
+	UsageLedgerFile string
+	// UsageLedgerOn turns the usage ledger on. It is explicit opt-in on
+	// purpose: the ledger scans the real ~/.grok and writes to the user's
+	// ~/.capri-host, so a Bridge built without a GrokHome override (tests,
+	// embedders) must not do that by accident. cmd/capri-host sets it.
+	UsageLedgerOn bool
 	// ResidentCap bounds how many sessions stay loaded in the grok
 	// process. Zero = DefaultResidentCap (4). Negative = disable the
 	// idle-unload supervisor (tests, or RESIDENT_CAP=0).
@@ -248,6 +260,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		usageLastUsed: make(map[string]int64),
 		liveTools:     make(map[string]*liveToolResolver),
 	}
+	b.ledger = newUsageLedger(b.usageLedgerPath())
 	b.bus.init()
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
@@ -5276,6 +5289,12 @@ func (b *Bridge) Shutdown() {
 		b.cancelRd()
 	}
 	b.mu.Unlock()
+
+	// Flush the usage ledger so the process's last turns are persisted even
+	// if the periodic sync has not fired yet.
+	if err := b.syncUsageLedger(); err != nil {
+		log.Printf("[capri-host] 退出前用量台账落盘失败: %v", err)
+	}
 
 	// Stop the goal loop: a continuation turn can be blocked on a
 	// 30-minute prompt or waiting for the session to go idle, and must

@@ -39,6 +39,12 @@ type Config struct {
 	// ResidentCap is passed to the grok bridge idle-unload supervisor.
 	// 0 = use the bridge default (4). Negative = disable (RESIDENT_CAP=0).
 	ResidentCap int
+	// UsageLedger picks the usage ledger mode read from USAGE_LEDGER:
+	// "" / "1" / "on" = default (enabled), "0" / "off" = disabled. The
+	// ledger copies per-turn usage into ~/.capri-host/usage-ledger.jsonl
+	// before the agent's 30-day session cleanup can delete the source
+	// updates.jsonl, so /usage history outlives that cleanup.
+	UsageLedger string
 }
 
 func Load() Config {
@@ -64,7 +70,19 @@ func Load() Config {
 		HubQUICPin:  strings.TrimSpace(os.Getenv("HUB_QUIC_PIN")),
 		AccessToken: envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")),
 		ResidentCap: envResidentCap(),
+		UsageLedger: strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
 	}
+}
+
+// UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the
+// ledger off ("0" / "off" / "false" / "no"). Unset means enabled: the
+// ledger is what keeps /usage history past the agent's 30-day cleanup.
+func (c Config) UsageLedgerDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(c.UsageLedger)) {
+	case "0", "off", "false", "no", "disable", "disabled":
+		return true
+	}
+	return false
 }
 
 // envResidentCap reads RESIDENT_CAP. Unset → 0 (bridge default of 4).
