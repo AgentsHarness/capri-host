@@ -117,8 +117,15 @@ func (s *Server) reloadModels(r *http.Request) bool {
 	return true
 }
 
+// handleModelsList — POST /api/models/list → x.ai/models/list（主动拉取 agent 模型目录）。
+func (s *Server) handleModelsList(w http.ResponseWriter, r *http.Request) {
+	s.xaiCall(w, r, "x.ai/models/list", map[string]any{})
+}
+
 // registerModelRoutes 注册本域路由（路由与实现同址）。
 func (s *Server) registerModelRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/models/list", s.handleModelsList)
+	mux.HandleFunc("POST /api/models", s.handleModelsList)
 	mux.HandleFunc("POST /api/set-default-model", s.handleSetDefaultModel)
 	mux.HandleFunc("POST /api/custom-models", s.handleCustomModels)
 	mux.HandleFunc("POST /api/custom-model", s.handleCustomModelUpsert)

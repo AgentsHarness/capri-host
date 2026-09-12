@@ -464,3 +464,39 @@ func TestBridgeTaskLogRunningAndNotFound(t *testing.T) {
 		t.Errorf("unknown session err = %v, want ErrTaskLogNotFound", err)
 	}
 }
+
+func TestSessionRunningTasksFromBackgroundTasksSnapshot(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "grok", HostID: "h", HostName: "host"})
+	b.sessions["sess-snap"] = &SessionState{
+		SessionID: "sess-snap",
+		Cwd:       "/ws",
+		backgroundTasks: []any{
+			map[string]any{
+				"task_id":         "t-1",
+				"command":         "npm run dev",
+				"display_command": "dev server",
+				"description":     "vite dev",
+				"status":          "running",
+				"output_file":     "/tmp/out.log",
+				"cwd":             "/ws",
+			},
+			map[string]any{
+				"task_id": "t-2",
+				"command": "git pull",
+				"status":  "completed",
+				"cwd":     "/ws",
+			},
+		},
+	}
+
+	events, err := b.SessionRunningTasks("sess-snap", "/ws")
+	if err != nil {
+		t.Fatalf("SessionRunningTasks error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events count = %d, want 1 running task: %v", len(events), events)
+	}
+	if events[0].TaskID != "t-1" || events[0].Command != "dev server" || !events[0].Running {
+		t.Errorf("events[0] = %+v, want running t-1 dev server", events[0])
+	}
+}

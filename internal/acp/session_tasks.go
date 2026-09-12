@@ -403,9 +403,7 @@ const lsofTimeout = 5 * time.Second
 
 // probeOpenLogs returns the subset of paths currently held open by a
 // live process (kernel-level liveness) mapped to the holding process.
-// Returns nil when lsof is unavailable so callers can fall back. Paths
-// are canonicalized before comparison (macOS lsof reports /var/... as
-// /private/var/...).
+// Used as a fallback when BackgroundTasks snapshot is not available.
 func probeOpenLogs(paths []string) map[string]logHolder {
 	open := make(map[string]logHolder, len(paths))
 	if len(paths) == 0 {
@@ -426,25 +424,16 @@ func probeOpenLogs(paths []string) map[string]logHolder {
 	out, err := exec.CommandContext(ctx, "lsof", inputs...).Output()
 	if err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return nil // no lsof — caller falls back
+			return nil
 		}
-		// lsof's exit code is NOT a reliable "no match" signal with
-		// multiple operands (it exits 1 when ANY file matches nothing,
-		// while still printing the matches on stdout). Parse stdout
-		// regardless; an empty match set falls out naturally.
 	}
 	holders := make(map[string]logHolder, len(paths))
 	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
-		// Header row: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME.
 		if len(f) < 9 || f[0] == "COMMAND" {
 			continue
 		}
 		path := canon(f[len(f)-1])
-		// A backgrounded command's whole tree shares the log fd (wrapper
-		// shell + its children), so one path yields several rows. Keep the
-		// first: it is only an attribution hint for the UI, and any row of
-		// the tree proves the task is alive.
 		if _, seen := holders[path]; seen {
 			continue
 		}
@@ -629,14 +618,53 @@ func applyProbe(sum TaskSummary, orphanPaths []string, open map[string]logHolder
 	return sum
 }
 
-// SessionRunningTasks returns the session's tasks that are STILL RUNNING:
-// task_backgrounded events without a matching task_completed whose output
-// log is held open by a live process (lsof probe). This is the web
-// equivalent of the TUI's live tasks pane — the timeline is only used to
-// surface current work, not to dump history into the scrollback. Missing
-// files yield an empty list, not an error, so the frontend stays resilient
-// when the session predates this host or lives in another workspace.
+// SessionRunningTasks returns the session's tasks that are STILL RUNNING.
+// Authoritative source is the in-memory BackgroundTasks snapshot (SessionUpdate::BackgroundTasks);
+// falls back to parsing updates.jsonl timeline if no snapshot is available.
 func (b *Bridge) SessionRunningTasks(sessionID, cwd string) ([]TaskEvent, error) {
+	b.mu.Lock()
+	s := b.sessions[sessionID]
+	var snapshot []any
+	if s != nil && s.backgroundTasks != nil {
+		snapshot = s.backgroundTasks
+	}
+	b.mu.Unlock()
+
+	if snapshot != nil {
+		out := make([]TaskEvent, 0, len(snapshot))
+		for _, item := range snapshot {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			status, _ := m["status"].(string)
+			if status == "running" {
+				tid, _ := m["task_id"].(string)
+				if tid == "" {
+					tid, _ = m["taskId"].(string)
+				}
+				cmd, _ := m["command"].(string)
+				dispCmd, _ := m["display_command"].(string)
+				if dispCmd != "" {
+					cmd = dispCmd
+				}
+				desc, _ := m["description"].(string)
+				outPath, _ := m["output_file"].(string)
+				taskCwd, _ := m["cwd"].(string)
+				out = append(out, TaskEvent{
+					Kind:        taskEventBackgrounded,
+					TaskID:      tid,
+					Command:     cmd,
+					Description: desc,
+					OutputFile:  outPath,
+					Cwd:         taskCwd,
+					Running:     true,
+				})
+			}
+		}
+		return out, nil
+	}
+
 	path := sessionUpdatesFile(b.grokHome(), cwd, sessionID)
 	if path == "" {
 		return nil, fmt.Errorf("无法解析会话目录 (home=%q)", b.grokHome())

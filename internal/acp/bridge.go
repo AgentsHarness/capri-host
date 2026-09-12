@@ -1978,6 +1978,28 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	case "scheduled_task_deleted":
 		b.broadcastScheduledTaskDeleted(sid, params, tag)
 		return true
+	case "background_tasks":
+		// SessionUpdate::BackgroundTasks 原生全量快照：
+		// 权威替换原 updates.jsonl 扫描与 lsof 探测。
+		var rawTasks []any
+		if t, ok := update["tasks"].([]any); ok {
+			rawTasks = t
+		}
+		b.mu.Lock()
+		if s := b.sessions[sid]; s != nil {
+			s.backgroundTasks = rawTasks
+		}
+		b.mu.Unlock()
+		ev := Event{
+			kType:      "background_tasks",
+			"tasks":    rawTasks,
+			"truncated": update["truncated"],
+		}
+		if kindMeta != nil {
+			ev[kMetaOut] = kindMeta
+		}
+		b.Broadcast(tag(ev))
+		return true
 	case "task_backgrounded", "task_completed", "monitor_event":
 		// 形状与其它 kind typed 事件统一：{type, update, sessionId}
 		// （update = 原始 update 对象）。x.ai standalone 通知通道
@@ -2030,8 +2052,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		"memory_dream_completed", "memory_session_saved", "memory_files",
 		"feedback_request", "relay_sync_status", "auto_recovery_started",
 		"auto_recovery_exhausted", "hook_annotation", "hook_execution",
-		"hooks_changed", "plugins_changed", "plugin_updates_installed",
-		"session_summary_generated", "session_recap", "session_recap_unavailable",
+		"hook_run_started", "hooks_changed", "plugins_changed", "plugin_updates_installed",
+		"session_status", "session_summary_generated", "session_recap", "session_recap_unavailable",
 		"last_turn_summary", "subagent_spawned", "subagent_progress",
 		"subagent_finished",
 		"scheduled_task_fired", "tool_call_delta_chunk", "image_compressed",
@@ -3397,11 +3419,93 @@ func (b *Bridge) SetMode(ctx context.Context, sessionID, modeID string) (map[str
 	return res, nil
 }
 
-// SetModel calls session/set_model (grok's /model switch; the wire method
-// is snake_case per the ACP method table). An optional reasoningEffort is
-// forwarded in _meta, matching how the TUI applies --effort. Empty
-// sessionId resolves to the active session; the cache patch targets the
-// resolved session.
+// SetConfigOption calls the official ACP session/set_config_option method.
+// Supports configId="model" (value=modelId) and configId="reasoning_effort" (value=effort).
+// Returns the updated configOptions array/object from the agent.
+func (b *Bridge) SetConfigOption(ctx context.Context, sessionID, configID, value string) (any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 400, Msg: "需要 sessionId"}
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, errors.New("没有活跃会话")
+	}
+	params := map[string]any{
+		kSessionID: sessionID,
+		"configId":  configID,
+		"value":     value,
+	}
+	resp, err := b.request(ctx, "session/set_config_option", params, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update cached configOptions and models for the session
+	var configOpts any
+	if resp != nil {
+		if co, ok := resp[kConfigOptions]; ok {
+			configOpts = co
+		} else if co, ok := resp["options"]; ok {
+			configOpts = co
+		}
+	}
+
+	b.mu.Lock()
+	var models any
+	var name string
+	var modelID string
+	var effort string
+	if act := b.sessions[sessionID]; act != nil {
+		if configOpts != nil {
+			act.configOpts = configOpts
+		}
+		if m, ok := act.models.(map[string]any); ok {
+			if cm, ok := m["currentModelId"].(string); ok {
+				modelID = cm
+			}
+			if re, ok := m["reasoningEffort"].(string); ok {
+				effort = re
+			}
+		}
+		if configID == "model" {
+			modelID = value
+			b.patchSessionModels(act, modelID, effort)
+		} else if configID == "reasoning_effort" {
+			effort = value
+			b.patchSessionModels(act, modelID, effort)
+		}
+		models = act.models
+		name = modelDisplayName(models, modelID)
+	}
+	b.mu.Unlock()
+
+	if configOpts != nil {
+		b.Broadcast(Event{
+			kType:          "config_options_update",
+			kConfigOptions: configOpts,
+			kSessionID:     sessionID,
+		})
+	}
+	if models != nil {
+		b.Broadcast(Event{kType: "models_update", kParams: models, kSessionID: sessionID})
+	}
+	if modelID != "" {
+		b.Broadcast(Event{
+			kType:             "model",
+			"modelId":         modelID,
+			"modelName":       name,
+			"reasoningEffort": effort,
+			kSessionID:        sessionID,
+		})
+	}
+	b.broadcastRosterChange()
+	return resp, nil
+}
+
+// SetModel calls session/set_config_option (or falls back to session/set_model)
+// to switch the session's model and optional reasoningEffort.
 func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) error {
 	if err := b.Boot(ctx); err != nil {
 		return err
@@ -3415,6 +3519,17 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return errors.New("没有活跃会话")
 	}
+
+	// 优先尝试官方 session/set_config_option 端点规范切换
+	_, optErr := b.SetConfigOption(ctx, sessionID, "model", modelID)
+	if optErr == nil {
+		if reasoningEffort != "" {
+			_, _ = b.SetConfigOption(ctx, sessionID, "reasoning_effort", reasoningEffort)
+		}
+		return nil
+	}
+
+	// 若 agent 尚未支持 session/set_config_option（如返回 -32601），回退到旧版 session/set_model
 	params := map[string]any{
 		kSessionID: sessionID,
 		"modelId":  modelID,
@@ -4830,6 +4945,25 @@ func (b *Bridge) SubagentCancel(ctx context.Context, sessionID, subagentID strin
 		kSessionID:   b.resolveSessionID(sessionID),
 		"subagentId": subagentID,
 	}, 30*time.Second)
+}
+
+// SubagentMessage calls x.ai/subagent/message: {sessionId, agentAddress, queue, content}
+// to steer or queue text to an active child subagent.
+func (b *Bridge) SubagentMessage(ctx context.Context, sessionID, agentAddress string, queue bool, content []any) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	sid := b.resolveSessionID(sessionID)
+	if sid == "" {
+		return nil, errors.New("没有活跃会话")
+	}
+	params := map[string]any{
+		kSessionID:     sid,
+		"agentAddress": agentAddress,
+		"queue":        queue,
+		"content":      content,
+	}
+	return b.request(ctx, "_x.ai/subagent/message", params, 30*time.Second)
 }
 
 // TaskKill calls x.ai/task/kill: {sessionId, taskId, source?} (empty sessionId
