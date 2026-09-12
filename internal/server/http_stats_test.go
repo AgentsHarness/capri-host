@@ -143,10 +143,10 @@ func TestSessionStatsNoMetaFallback(t *testing.T) {
 	if _, ok := stats["firstTokenAvgMs"]; ok {
 		t.Errorf("firstTokenAvgMs = %v, want omitted (no _meta)", stats["firstTokenAvgMs"])
 	}
-	// 无 chunk / 无 streamStartMs 时没有可观测的纯生成窗口，指标省略，
-	// 不使用 apiDurationMs 作为替代。
-	if _, ok := stats["tokensPerSec"]; ok {
-		t.Errorf("tokensPerSec = %v, want omitted (no pure generation window)", stats["tokensPerSec"])
+	// 无 chunk / 无 streamStartMs：一个回合都观测不到纯生成窗口，退回
+	// apiDurationMs 兜底，状态条不留空。50 / 3000 × 1000 ≈ 16.67。
+	if got, _ := stats["tokensPerSec"].(float64); got < 16.6 || got > 16.7 {
+		t.Errorf("tokensPerSec = %v, want ≈16.67 (apiDuration fallback)", got)
 	}
 }
 
@@ -421,8 +421,8 @@ func TestSessionStatsNoStreamStartTwoChunks(t *testing.T) {
 	}
 }
 
-// 无 streamStart 的单包无法得到正窗口，省略吞吐，不回退 apiDuration。
-func TestSessionStatsNoStreamStartSingleChunkOmits(t *testing.T) {
+// 无 streamStart 的单包：该回合观测不到纯生成窗口，退回 apiDuration 兜底。
+func TestSessionStatsNoStreamStartSingleChunkFallsBack(t *testing.T) {
 	home := t.TempDir()
 	sid := "s1"
 	lines := []string{
@@ -443,8 +443,9 @@ func TestSessionStatsNoStreamStartSingleChunkOmits(t *testing.T) {
 	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
 	m := decodeBody(t, rec)
 	stats, _ := m["stats"].(map[string]any)
-	if _, ok := stats["tokensPerSec"]; ok {
-		t.Errorf("tokensPerSec = %v, want omitted（无 ss 单包）", stats["tokensPerSec"])
+	// 100 / 5000 × 1000 = 20。
+	if got, _ := stats["tokensPerSec"].(float64); got != 20 {
+		t.Errorf("tokensPerSec = %v, want 20（单包无窗口，退回 apiDuration）", got)
 	}
 }
 
@@ -482,6 +483,98 @@ func TestSessionStatsEmptyThoughtStillCountsFirstToken(t *testing.T) {
 	// 空 thought 不占窗口；message 窗口 = 2000−1800 = 200ms → 250 tok/s。
 	if got, _ := stats["tokensPerSec"].(float64); got != 250 {
 		t.Errorf("tokensPerSec = %v, want 250（空 thought 不得留下 0 窗口）", got)
+	}
+}
+
+// agent 1.0.25 起每个推理步骤先发一个纯空白占位 chunk（ts == ss），
+// 夹在真实内容流之间。这类占位不占窗口槽：既不算零窗口废掉会话，
+// 也不把相邻流的窗口截短。
+func TestSessionStatsPlaceholderStreamsSkipped(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		// 整条流只有占位（回合开始时步骤占位）：不得占槽。
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": " "}},
+			map[string]any{"agentTimestampMs": float64(2000), "streamStartMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "list_dir"},
+			map[string]any{"agentTimestampMs": float64(2100)}),
+		// 内容流：占位先到（ts==ss），真实内容后到。窗口仍按 ss 起算，
+		// 不因占位被剔出时间线而缩短。
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": " "}},
+			map[string]any{"agentTimestampMs": float64(3000), "streamStartMs": float64(3000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": "thinking"}},
+			map[string]any{"agentTimestampMs": float64(5000), "streamStartMs": float64(3000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t2", "title": "grep"},
+			map[string]any{"agentTimestampMs": float64(5100)}),
+		// 又一条整条只有占位的流：同样跳过。
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "  "}},
+			map[string]any{"agentTimestampMs": float64(6000), "streamStartMs": float64(6000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 100, "totalTokens": 200,
+				"modelCalls": 1, "apiDurationMs": 9000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	// 分母只含真实内容流：占位流不占窗口，内容流窗口 = 5000 − 3000 = 2000ms。
+	// 100 / 2 ≈ 50 tok/s（若占位占了槽，会退化成 apiDuration 兜底 ≈11.1）。
+	if got, _ := stats["tokensPerSec"].(float64); got != 50 {
+		t.Errorf("tokensPerSec = %v, want 50（占位流跳过，窗口 2000ms）", got)
+	}
+}
+
+// 整回合全是占位（没有任何真实内容的回合）：该回合分子分母一起跳过，
+// 同一会话里其余回合照常计量，不让一个空回合废掉整个会话。
+func TestSessionStatsPlaceholderOnlyTurnSkipped(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": " "}},
+			map[string]any{"agentTimestampMs": float64(2000), "streamStartMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 999, "totalTokens": 1099,
+				"modelCalls": 1, "apiDurationMs": 4000,
+			}}, nil),
+		// 第二回合有真实内容：ss=10000 → chunk@10500。
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "again"}},
+			map[string]any{"agentTimestampMs": float64(9000), "promptId": "p2"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "done"}},
+			map[string]any{"agentTimestampMs": float64(10500), "streamStartMs": float64(10000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 200, "outputTokens": 100, "totalTokens": 300,
+				"modelCalls": 1, "apiDurationMs": 2000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	// 只有第二回合参与：100 / 500 × 1000 = 200 tok/s。
+	// 若空回合把 999 个 token 或 4000ms 掺进来，值会明显偏离。
+	if got, _ := stats["tokensPerSec"].(float64); got != 200 {
+		t.Errorf("tokensPerSec = %v, want 200（空回合分子分母一起跳过）", got)
 	}
 }
 

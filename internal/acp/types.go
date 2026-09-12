@@ -189,6 +189,12 @@ type PendingReq struct {
 	// SessionID: owning session (multi-session clients filter pending on
 	// switch/resume; absent on very old hosts).
 	SessionID string `json:"sessionId,omitempty"`
+	// ReceivedAt: unix ms when the host took the request off the agent
+	// pipe. The same stamp rides the live client_request broadcast and the
+	// pendingRequests snapshot, so every tab / device / reconnect counts the
+	// ask_user_question (and permission) budget from ONE origin instead of
+	// from whenever it happened to first see the request.
+	ReceivedAt int64 `json:"receivedAt,omitempty"`
 }
 
 // SessionInfoDetail — POST /api/session-info response: authoritative live
