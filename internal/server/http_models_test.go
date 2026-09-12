@@ -67,6 +67,34 @@ func TestSetDefaultModelEndpointRejectsEmptyModel(t *testing.T) {
 	}
 }
 
+// 不带 sessionId 的默认模型写入只落盘：改模型列表（改名重指默认）不该牵动
+// 任何会话当前的模型——host 侧有 active 会话也不许被切。
+func TestSetDefaultModelWithoutSessionPersistsOnly(t *testing.T) {
+	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
+	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
+	s, _, path := newFakeAgentServerWithGrokHome(t)
+	createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/set-default-model", `{"modelId":"m1","reasoningEffort":"max"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["reloaded"] != true {
+		t.Errorf("reloaded = %v, want true (config write must refresh the catalog)", m["reloaded"])
+	}
+	out := readFileStr(t, path)
+	for _, want := range []string{`default = "m1"`, `default_reasoning_effort = "max"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config.toml missing %q:\n%s", want, out)
+		}
+	}
+	for _, m := range readRecordedRequests(t, recordPath) {
+		if m["method"] == "session/set_model" {
+			t.Fatalf("no sessionId must not touch any session: %v", m)
+		}
+	}
+}
+
 func TestCustomModelsEndpoints(t *testing.T) {
 	s, b, path := newFakeAgentServerWithGrokHome(t)
 

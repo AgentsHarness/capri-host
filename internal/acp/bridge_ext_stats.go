@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // ── 单会话聚合统计（composer 状态条数据源）────────────────────────────
@@ -27,14 +28,14 @@ import (
 //     回合起点（user_message 的 agentTimestampMs，_meta.turnStartMs 优先）。
 //     不含 thought 整包生成时间；缺 streamStartMs 的回合跳过；
 //   - tokensPerSec     纯生成吞吐 = Σ outputTokens / Σ 生成窗口 × 1000。带
-//     streamStartMs 的流窗口 = 最后一个可见输出 chunk − streamStartMs，
-//     覆盖 Grok 首包批量生成的时间；缺 streamStartMs 时才回退为首包 →
-//     末包。同流先无 ss 后出现 streamStartMs 时并入当前流，不拆成两条。
-//     工具执行、回合间等待和 API 总耗时不进入分母。窗口与 usage
-//     按回合配对（pending，见 accumulateUsage）——进行中回合不进分母。
-//     单 chunk 只要有 streamStartMs 也可计算；完全没有可观测窗口时不返回
-//     指标，不再用 apiDurationMs 冒充纯生成时间。分子使用 agent 回合终态
-//     提供的真实 outputTokens。
+//     streamStartMs 的流窗口 = 最后一个输出 chunk − streamStartMs，覆盖
+//     Grok 首包批量生成的时间；缺 streamStartMs 时才回退为首包 → 末包。
+//     同流先无 ss 后出现 streamStartMs 时并入当前流，不拆成两条。工具
+//     执行、回合间等待和 API 总耗时不进入分母。整条只有空白占位 chunk
+//     （agent 1.0.25 起每个推理步骤先发一个）的流不是生成，不占窗口槽。
+//     窗口与 usage 按回合配对：观测不到窗口的回合从分子分母一起跳过，
+//     而不是让一个坏回合废掉整个会话。全部回合都观测不到时退回
+//     llmDurationMs 兜底，保证有数据就出数。
 //   - cacheHitRate     Σ cachedReadTokens / Σ inputTokens（钳制 [0,1]）；
 //   - inputTokens / outputTokens / totalTokens / cachedReadTokens /
 //     modelCalls：Σ usage（与 usage-report 同源同口径）。
@@ -74,14 +75,17 @@ type sessionStatsAccumulator struct {
 
 	// 纯生成窗口（ms）：已与 usage 配对提交的分母。
 	genDurationMs int64
-	// 当前回合每条可观测流的生成窗口。usage 到达时，只有所有可观测流
-	// 都有正窗口，才保留纯生成速度；无法观测到完整流时不输出速度。
+	// 参与计算的 outputTokens：只累加真正配到窗口的回合，保证分子
+	// 分母取自同一批回合。
+	genOutputTokens int64
+	// 当前回合每条可计量流的生成窗口。usage 到达时，所有流都有正窗口
+	// 才用纯生成窗口计量该回合；否则该回合分子分母一起跳过。
 	turnStreamWindows []int64
 	currentStream     int
 
-	// 只要有一个已完成回合无法把 outputTokens 与正的纯生成窗口配对，
-	// 整个 tokensPerSec 就保持省略，避免用部分数据制造精确假象。
-	pureSpeedValid bool
+	// 当前流是否出现过真实内容（非空白）。整条流只有空白占位 chunk
+	// 时不占窗口槽——agent 1.0.25 起每个推理步骤先发一个空占位。
+	streamRealContent bool
 
 	// 当前回合已封口、尚未随 usage 提交的窗口。新用户消息若尚未见到
 	// usage 则丢弃（打断的回合没有分子可配对）。
@@ -122,9 +126,8 @@ func (b *Bridge) SessionStats(ctx context.Context, cwd, sessionID string) (*Sess
 	defer f.Close()
 
 	acc := &sessionStatsAccumulator{
-		toolStarts:     make(map[string]int64),
-		currentStream:  -1,
-		pureSpeedValid: true,
+		toolStarts:    make(map[string]int64),
+		currentStream: -1,
 	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
@@ -238,7 +241,14 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 		}
 	case "agent_thought_chunk", "agent_message_chunk":
 		var content any
-		visible := json.Unmarshal(upd["content"], &content) == nil && contentText(content) != ""
+		text := ""
+		if json.Unmarshal(upd["content"], &content) == nil {
+			text = contentText(content)
+		}
+		// 空串是内部事件（不入时间线）；纯空白是 agent 1.0.25 起的步骤
+		// 占位——它算该流的时间点，但整条流只有占位时不构成生成窗口。
+		visible := text != ""
+		real := strings.TrimSpace(text) != ""
 		// 首 token 只看 streamStart，空占位 chunk 仍算流起点。
 		// 缺 streamStartMs 则等后续同回合 chunk，不把可见字时间当成流起点。
 		if !a.turnFirstChunkSeen && a.turnStartMs > 0 && streamStartMs > 0 && streamStartMs >= a.turnStartMs {
@@ -256,17 +266,17 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 				// 同流晚到尾巴：重开，保留已记的首包与已提交窗口。
 				a.streamOpen = true
 			}
-			if visible {
-				a.noteChunk(agentTsMs)
-			}
-		} else if a.streamOpen {
-			if visible {
-				a.noteChunk(agentTsMs)
-			}
-		} else if visible && agentTsMs > 0 {
+		} else if visible && !a.streamOpen && agentTsMs > 0 {
 			// 无 streamStartMs：先记临时流，≥2 个可见 chunk 才有正窗口。
 			a.openStream(0)
-			a.noteChunk(agentTsMs)
+		}
+		if a.streamOpen {
+			if real {
+				a.markStreamReal()
+			}
+			if visible {
+				a.noteChunk(agentTsMs)
+			}
 		}
 	case "turn_completed", "response_completed":
 		a.closeStream()
@@ -279,6 +289,18 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 			return
 		}
 		a.accumulateUsage(usage)
+	}
+}
+
+// markStreamReal 标记当前流含真实内容（非纯空白），使它占一个窗口槽。
+func (a *sessionStatsAccumulator) markStreamReal() {
+	if a.streamRealContent {
+		return
+	}
+	a.streamRealContent = true
+	if a.currentStream < 0 {
+		a.turnStreamWindows = append(a.turnStreamWindows, 0)
+		a.currentStream = len(a.turnStreamWindows) - 1
 	}
 }
 
@@ -295,8 +317,9 @@ func (a *sessionStatsAccumulator) noteChunk(agentTsMs int64) {
 	}
 }
 
-// accumulateUsage 把一次回合终态 usage 累加进统计，并提交本回合 pending
-// 生成窗口——分子（outputTokens）与分母按回合配对。
+// accumulateUsage 把一次回合终态 usage 累加进统计。纯生成窗口按回合配对：
+// 只有该回合每一条内容流都有正窗口，才把这一回合的 outputTokens 与窗口
+// 一起计入；观测不到窗口的回合分子分母一起跳过，不拖垮其余回合。
 func (a *sessionStatsAccumulator) accumulateUsage(usage map[string]any) {
 	in, out, tot, cr, _, _, mc := usageInts(usage)
 	s := &a.stats
@@ -313,10 +336,9 @@ func (a *sessionStatsAccumulator) accumulateUsage(usage map[string]any) {
 				break
 			}
 		}
-		if !validWindow {
-			a.pureSpeedValid = false
-		} else {
+		if validWindow {
 			a.genDurationMs += a.pendingGenMs
+			a.genOutputTokens += out
 		}
 	}
 	a.pendingGenMs = 0
@@ -344,7 +366,8 @@ func streamGenWindow(first, last, streamStart int64) int64 {
 	return 0
 }
 
-// openStream 开始一条新流。streamStart=0 表示临时无 ss 流。
+// openStream 开始一条新流。streamStart=0 表示临时无 ss 流。窗口槽位由
+// markStreamReal 在该流出现真实内容时申请，纯空白占位流不留槽。
 func (a *sessionStatsAccumulator) openStream(streamStart int64) {
 	a.closeStream()
 	a.streamOpen = true
@@ -352,22 +375,19 @@ func (a *sessionStatsAccumulator) openStream(streamStart int64) {
 	a.streamFirstChunkMs = 0
 	a.streamLastChunkMs = 0
 	a.streamClosedWin = 0
-	a.turnStreamWindows = append(a.turnStreamWindows, 0)
-	a.currentStream = len(a.turnStreamWindows) - 1
+	a.streamRealContent = false
+	a.currentStream = -1
 }
 
-// closeStream 封口当前流：窗口差额计入 pending。幂等。
+// closeStream 封口当前流：含真实内容的流才占窗口槽并计入 pending。幂等。
 func (a *sessionStatsAccumulator) closeStream() {
 	if !a.streamOpen {
 		return
 	}
 	a.streamOpen = false
-	if a.streamFirstChunkMs == 0 && a.streamLastChunkMs == 0 {
-		// 无可见输出（空占位 chunk 开的流）：不占窗口槽。
-		if n := len(a.turnStreamWindows); n > 0 && a.currentStream == n-1 {
-			a.turnStreamWindows = a.turnStreamWindows[:n-1]
-		}
-		a.currentStream = -1
+	if !a.streamRealContent {
+		// 整条流只有空白占位 chunk（agent 1.0.25 起的步骤占位）：不是生成，
+		// 不占窗口槽，其时间也不进入分母。
 		return
 	}
 	win := streamGenWindow(a.streamFirstChunkMs, a.streamLastChunkMs, a.lastStreamStartMs)
@@ -390,8 +410,13 @@ func (a *sessionStatsAccumulator) finish() {
 		}
 		s.CacheHitRate = rate
 	}
-	if a.pureSpeedValid && a.genDurationMs > 0 {
-		s.TokensPerSec = float64(s.OutputTokens) / float64(a.genDurationMs) * 1000
+	if a.genDurationMs > 0 {
+		// 分子只取配到窗口的那批回合，与分母同源。
+		s.TokensPerSec = float64(a.genOutputTokens) / float64(a.genDurationMs) * 1000
+	} else if s.OutputTokens > 0 && s.LLMDurationMs > 0 {
+		// 一个回合都观测不到生成窗口（缺 _meta 的老数据 / 单批送达）：
+		// 退回 API 总耗时兜底，宁可口径粗也不让状态条空着。
+		s.TokensPerSec = float64(s.OutputTokens) / float64(s.LLMDurationMs) * 1000
 	}
 	if a.firstTokenCount > 0 {
 		s.FirstTokenAvgMs = a.firstTokenSumMs / a.firstTokenCount

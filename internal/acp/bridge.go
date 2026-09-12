@@ -239,6 +239,10 @@ type clientRequest struct {
 	outcome      map[string]any // session/request_permission result
 	result       map[string]any // generic x.ai/* request result
 	errMsg       string
+	// receivedAt: unix ms stamped when the forwarder took the request off
+	// the agent pipe — the single timing origin every client counts the
+	// ask-question / approval budget from (broadcast + snapshot).
+	receivedAt int64
 	// meta: ACP response `_meta` for session/request_permission replies —
 	// the bash scope (BashCommandSelectedTerms: command_parts/is_glob) or
 	// the followup_message the client attached, serialized exactly like the
@@ -755,10 +759,11 @@ func (b *Bridge) Snapshot() Status {
 	b.clientReqs.Range(func(key, value any) bool {
 		cr := value.(*clientRequest)
 		pending = append(pending, PendingReq{
-			RequestID: key.(string),
-			Method:    cr.Method,
-			Params:    cr.Params,
-			SessionID: cr.SessionID,
+			RequestID:  key.(string),
+			Method:     cr.Method,
+			Params:     cr.Params,
+			SessionID:  cr.SessionID,
+			ReceivedAt: cr.receivedAt,
 		})
 		return true
 	})
@@ -2526,15 +2531,17 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 		Params:       params,
 		done:         make(chan struct{}),
 		isPermission: true,
+		receivedAt:   time.Now().UnixMilli(),
 	}
 	b.clientReqs.Store(reqID, cr)
 	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
-		kType:       "client_request",
-		"requestId": reqID,
-		kMethod:     method,
-		kParams:     params,
-		kSessionID:  cr.SessionID,
+		kType:        "client_request",
+		"requestId":  reqID,
+		kMethod:      method,
+		kParams:      params,
+		kSessionID:   cr.SessionID,
+		"receivedAt": cr.receivedAt,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -2547,20 +2554,22 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any) {
 	reqID := fmt.Sprintf("acp_cr_%d", b.nextClientReqID.Add(1))
 	cr := &clientRequest{
-		AgentID:   id,
-		SessionID: b.sessionIdFrom(params),
-		Method:    method,
-		Params:    params,
-		done:      make(chan struct{}),
+		AgentID:    id,
+		SessionID:  b.sessionIdFrom(params),
+		Method:     method,
+		Params:     params,
+		done:       make(chan struct{}),
+		receivedAt: time.Now().UnixMilli(),
 	}
 	b.clientReqs.Store(reqID, cr)
 	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
-		kType:       "client_request",
-		"requestId": reqID,
-		kMethod:     method,
-		kParams:     params,
-		kSessionID:  cr.SessionID,
+		kType:        "client_request",
+		"requestId":  reqID,
+		kMethod:      method,
+		kParams:      params,
+		kSessionID:   cr.SessionID,
+		"receivedAt": cr.receivedAt,
 	})
 
 	go b.waitClientResolution(reqID, cr)
