@@ -67,14 +67,17 @@ func TestSessionNewForwardsMetaToAgent(t *testing.T) {
 	if !ok {
 		t.Fatalf("session/new params carry no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true, "autoMode": false}) {
-		t.Errorf("_meta = %v, want yoloMode:true autoMode:false", meta)
+	// seeds 原样透传；会话级回显开关（clientUserMessageEcho）无条件带上。
+	if !reflect.DeepEqual(meta, map[string]any{
+		"yoloMode": true, "autoMode": false, "clientUserMessageEcho": true,
+	}) {
+		t.Errorf("_meta = %v, want yoloMode:true autoMode:false + echo", meta)
 	}
 }
 
-// Without meta the session/new request shape must stay byte-identical to
-// the pre-meta era (no `_meta` key, exactly the three original params).
-func TestSessionNewOmitsMetaWhenAbsent(t *testing.T) {
+// Without meta the session/new request still carries the echo switch —
+// 缺了它 agent 只落盘不活推 user_message_chunk（正文 + 附图），实时看不见图。
+func TestSessionNewSendsEchoMetaWithoutSeeds(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
 	s, _ := newFakeAgentServer(t)
@@ -86,13 +89,18 @@ func TestSessionNewOmitsMetaWhenAbsent(t *testing.T) {
 
 	req := findRequest(t, readRecordedRequests(t, recordPath), "session/new")
 	params, _ := req["params"].(map[string]any)
-	if _, ok := params["_meta"]; ok {
-		t.Errorf("session/new params must not carry _meta: %v", params)
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/new params must carry _meta: %v", params)
+	}
+	if !reflect.DeepEqual(meta, map[string]any{"clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {clientUserMessageEcho:true}", meta)
 	}
 	want := map[string]any{
 		"cwd":                   "/ws",
 		"additionalDirectories": []any{},
 		"mcpServers":            []any{},
+		"_meta":                 map[string]any{"clientUserMessageEcho": true},
 	}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("params = %v, want %v", params, want)
@@ -118,14 +126,16 @@ func TestSessionLoadForwardsMetaToAgent(t *testing.T) {
 	if !ok {
 		t.Fatalf("session/load params carry no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": false, "autoMode": true}) {
-		t.Errorf("_meta = %v, want yoloMode:false autoMode:true", meta)
+	// load 出来的会话同样要带回显开关（否则实时看不到用户附图）。
+	if !reflect.DeepEqual(meta, map[string]any{
+		"yoloMode": false, "autoMode": true, "clientUserMessageEcho": true,
+	}) {
+		t.Errorf("_meta = %v, want yoloMode:false autoMode:true + echo", meta)
 	}
 }
 
-// Without meta the session/load request shape stays identical to the
-// pre-meta era (no `_meta` key).
-func TestSessionLoadOmitsMetaWhenAbsent(t *testing.T) {
+// Without meta the session/load request still carries the echo switch.
+func TestSessionLoadSendsEchoMetaWithoutMeta(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
 	s, _ := newFakeAgentServer(t)
@@ -137,13 +147,18 @@ func TestSessionLoadOmitsMetaWhenAbsent(t *testing.T) {
 
 	req := findRequest(t, readRecordedRequests(t, recordPath), "session/load")
 	params, _ := req["params"].(map[string]any)
-	if _, ok := params["_meta"]; ok {
-		t.Errorf("session/load params must not carry _meta: %v", params)
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/load params must carry _meta: %v", params)
+	}
+	if !reflect.DeepEqual(meta, map[string]any{"clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {clientUserMessageEcho:true}", meta)
 	}
 	want := map[string]any{
 		"sessionId":  "hist-1",
 		"cwd":        "/ws",
 		"mcpServers": []any{},
+		"_meta":      map[string]any{"clientUserMessageEcho": true},
 	}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("params = %v, want %v", params, want)

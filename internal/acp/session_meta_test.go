@@ -81,12 +81,17 @@ func TestCreateSessionForwardsMeta(t *testing.T) {
 	if !ok {
 		t.Fatalf("params has no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true, "autoMode": false}) {
-		t.Errorf("_meta = %v, want yoloMode:true autoMode:false", meta)
+	// seeds 原样透传；回显开关是本端无条件加的（clientUserMessageEcho）。
+	if !reflect.DeepEqual(meta, map[string]any{
+		"yoloMode": true, "autoMode": false, "clientUserMessageEcho": true,
+	}) {
+		t.Errorf("_meta = %v, want yoloMode:true autoMode:false + echo", meta)
 	}
 }
 
-func TestCreateSessionOmitsMetaWhenAbsent(t *testing.T) {
+// 没有客户端 seeds 时 `_meta` 仍要带会话级回显开关（见 clientUserMessageEchoMeta）：
+// 缺了它 agent 只落盘不活推 user_message_chunk（正文 + 附图），实时看不见图。
+func TestCreateSessionSendsEchoMetaWithoutSeeds(t *testing.T) {
 	b, w := metaReadyBridge(t)
 	ctx := context.Background()
 
@@ -95,15 +100,18 @@ func TestCreateSessionOmitsMetaWhenAbsent(t *testing.T) {
 	})
 
 	_, params := lastRequestParams(t, w)
-	if _, ok := params["_meta"]; ok {
-		t.Errorf("params must not carry _meta when Meta is absent: %v", params)
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("params must carry _meta (echo switch): %v", params)
 	}
-	// Request shape stays identical to the pre-meta era: exactly the
-	// three original keys.
+	if !reflect.DeepEqual(meta, map[string]any{"clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {clientUserMessageEcho:true}", meta)
+	}
 	want := map[string]any{
 		"cwd":                   "/ws",
 		"additionalDirectories": []any{},
 		"mcpServers":            []any{},
+		"_meta":                 map[string]any{"clientUserMessageEcho": true},
 	}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("params = %v, want %v", params, want)
@@ -174,12 +182,16 @@ func TestLoadSessionForwardsMeta(t *testing.T) {
 	if !ok {
 		t.Fatalf("params has no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": false, "autoMode": true}) {
-		t.Errorf("_meta = %v, want yoloMode:false autoMode:true", meta)
+	// load 出来的会话同样要带回显开关（否则实时看不到用户附图）。
+	if !reflect.DeepEqual(meta, map[string]any{
+		"yoloMode": false, "autoMode": true, "clientUserMessageEcho": true,
+	}) {
+		t.Errorf("_meta = %v, want yoloMode:false autoMode:true + echo", meta)
 	}
 }
 
-func TestLoadSessionOmitsMetaWhenAbsent(t *testing.T) {
+// 同 session/new：没有调用方 meta 时也要带 clientUserMessageEcho。
+func TestLoadSessionSendsEchoMetaWithoutMeta(t *testing.T) {
 	b, w := metaReadyBridge(t)
 	ctx := context.Background()
 
@@ -189,13 +201,18 @@ func TestLoadSessionOmitsMetaWhenAbsent(t *testing.T) {
 	})
 
 	_, params := lastRequestParams(t, w)
-	if _, ok := params["_meta"]; ok {
-		t.Errorf("params must not carry _meta when meta is absent: %v", params)
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("params must carry _meta (echo switch): %v", params)
+	}
+	if !reflect.DeepEqual(meta, map[string]any{"clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {clientUserMessageEcho:true}", meta)
 	}
 	want := map[string]any{
 		"sessionId":  "hist-1",
 		"cwd":        "/ws",
 		"mcpServers": []any{},
+		"_meta":      map[string]any{"clientUserMessageEcho": true},
 	}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("params = %v, want %v", params, want)

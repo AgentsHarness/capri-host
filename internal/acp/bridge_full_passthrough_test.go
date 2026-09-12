@@ -264,6 +264,8 @@ func TestResumeSessionWireAndRoster(t *testing.T) {
 		"cwd":                   "/ws",
 		"mcpServers":            []any{},
 		"additionalDirectories": []any{},
+		// 会话级回显开关：resume 出来的会话同样要带（见 clientUserMessageEchoMeta）。
+		"_meta": map[string]any{"clientUserMessageEcho": true},
 	}
 	gotParams, _ := msg["params"].(map[string]any)
 	if !reflect.DeepEqual(gotParams, wantParams) {

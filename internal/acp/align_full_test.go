@@ -70,6 +70,9 @@ func TestInitCapabilitiesMeta(t *testing.T) {
 		"x.ai/bashOutputNoColor":     true,
 		"x.ai/gitHeadChanged":        true,
 		"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
+		// 用户 prompt 实时回显（正文 + 附图各一块）：不带它 agent 只落盘不活推，
+		// 发出的图实时看不见（TUI 恒带，见 session/user_echo.rs）。
+		"x.ai/userMessageEcho": true,
 	}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("initCapabilitiesMeta = %v, want %v (opt-in keys absent by default)", meta, want)
@@ -147,8 +150,8 @@ func TestResumeSessionForwardsMeta(t *testing.T) {
 	if !ok {
 		t.Fatalf("session/resume params carry no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true}) {
-		t.Errorf("_meta = %v, want {yoloMode:true}", meta)
+	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true, "clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {yoloMode:true, clientUserMessageEcho:true}", meta)
 	}
 	// additionalDirectories stays [] (never extended).
 	if _, ok := params["additionalDirectories"].([]any); !ok {

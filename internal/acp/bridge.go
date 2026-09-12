@@ -1066,15 +1066,22 @@ func initMetaSeeds() map[string]any {
 	return meta
 }
 
-// initCapabilitiesMeta builds the clientCapabilities.meta object: the four
+// initCapabilitiesMeta builds the clientCapabilities.meta object: the five
 // always-on TUI capabilities plus env-opt-in codeNavigation / folderTrust /
 // fs_notify (absent = off, matching the TUI where those keys are absent).
+//
+// x.ai/userMessageEcho 是「用户 prompt 的实时回显」开关（grok-shell
+// session/user_echo.rs，TUI 恒带该键）：不带它，agent 把 user_message_chunk
+// ——正文和附图各一块——只落盘、不活推（session/acp_session_impl/updates.rs
+// 的 suppress_live_user_echo），于是发出的图只在回放/历史里出现，实时
+// transcript 没有。这里对齐 TUI。
 func initCapabilitiesMeta() map[string]any {
 	meta := map[string]any{
 		"x.ai/incrementalBashOutput": true,
 		"x.ai/bashOutputNoColor":     true,
 		"x.ai/gitHeadChanged":        true,
 		"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
+		"x.ai/userMessageEcho":       true,
 	}
 	if boolEnv("ACP_CAP_CODE_NAVIGATION") {
 		// Agent reads meta["x.ai/codeNavigation"]["enabled"] (code_nav.rs:9).
@@ -1122,6 +1129,29 @@ func jsonEnv(name string) map[string]any {
 	return v
 }
 
+// clientUserMessageEchoMeta 是**会话级**的「用户 prompt 实时回显」开关
+// （grok-shell session/user_echo.rs 的 CLIENT_USER_MESSAGE_ECHO_META）。agent
+// 在 session/new | session/load | session/resume 的 `_meta` 上读它；没有它，
+// prompt 的 user_message_chunk（正文一块 + 每张附图一块）只落盘不活推——
+// 表现就是「发出去的图实时看不见，回放里全都有」。
+//
+// 实机验证（grok 1.0.30，直连 `grok agent stdio` 探测）：initialize 的
+// clientCapabilities.meta["x.ai/userMessageEcho"] 单独**不足以**打开回显，
+// 会话 meta 才有效（两者都带最稳）。TUI 也是这条路径——leader 把 client
+// 能力翻译成会话 meta 注入（xai-grok-shell/src/leader/server.rs）。
+const clientUserMessageEchoMeta = "clientUserMessageEcho"
+
+// withUserMessageEcho returns meta with the echo switch forced on. A copy:
+// the caller's map may be reused by the HTTP layer (request body / seeds).
+func withUserMessageEcho(meta map[string]any) map[string]any {
+	out := make(map[string]any, len(meta)+1)
+	for k, v := range meta {
+		out[k] = v
+	}
+	out[clientUserMessageEchoMeta] = true
+	return out
+}
+
 // createSession calls session/new and registers the session in the roster.
 func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	cwd := sc.Cwd
@@ -1143,11 +1173,9 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 		"mcpServers":            mcp,
 	}
 	// Client-supplied session seeds (permission mode flags etc.) ride the
-	// params `_meta`, exactly like the TUI's SessionFlags.to_meta() —
-	// absent key ≠ off, so only send when the client provided seeds.
-	if len(sc.Meta) > 0 {
-		params[kMeta] = sc.Meta
-	}
+	// params `_meta`, exactly like the TUI's SessionFlags.to_meta().
+	// 回显开关（clientUserMessageEcho）无条件带上，与 seeds 合并。
+	params[kMeta] = withUserMessageEcho(sc.Meta)
 
 	sessRes, err := b.request(ctx, "session/new", params, bootTimeout)
 	if err != nil {
@@ -3943,7 +3971,11 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		"mcpServers": []any{},
 	}
 	if len(meta) > 0 && len(meta[0]) > 0 {
-		params[kMeta] = meta[0]
+		params[kMeta] = withUserMessageEcho(meta[0])
+	} else {
+		// 回显开关走会话 meta（见 clientUserMessageEchoMeta）：load 出来的
+		// 会话也要能实时回显用户附图，客户端没给 meta 时也要带上。
+		params[kMeta] = withUserMessageEcho(nil)
 	}
 	// Multi-tab: agent session/load REPLAYS the full conversation as
 	// session/update over the shared SSE bus. The tab that called
@@ -4151,7 +4183,10 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		"additionalDirectories": []any{},
 	}
 	if len(meta) > 0 && len(meta[0]) > 0 {
-		params[kMeta] = meta[0]
+		params[kMeta] = withUserMessageEcho(meta[0])
+	} else {
+		// 同 session/load：回显开关必须随会话请求带上。
+		params[kMeta] = withUserMessageEcho(nil)
 	}
 	sessRes, err := b.request(ctx, "session/resume", params, bootTimeout)
 	if err != nil {

@@ -53,7 +53,7 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 		t.Errorf("_meta mcpApps = %v, want true", meta["mcpApps"])
 	}
 
-	// clientCapabilities.meta：既有 4 键 + env-opt-in 键。
+	// clientCapabilities.meta：既有 5 键 + env-opt-in 键。
 	caps, _ := params["clientCapabilities"].(map[string]any)
 	cmeta, ok := caps["meta"].(map[string]any)
 	if !ok {
@@ -61,7 +61,7 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 	}
 	for _, k := range []string{
 		"x.ai/incrementalBashOutput", "x.ai/bashOutputNoColor",
-		"x.ai/gitHeadChanged", "x.ai/hunkTracker",
+		"x.ai/gitHeadChanged", "x.ai/hunkTracker", "x.ai/userMessageEcho",
 		"x.ai/codeNavigation", "x.ai/fs_notify",
 	} {
 		if _, has := cmeta[k]; !has {
@@ -252,15 +252,16 @@ func TestSessionResumeForwardsMeta(t *testing.T) {
 	if !ok {
 		t.Fatalf("session/resume params carry no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true}) {
-		t.Errorf("_meta = %v, want {yoloMode:true}", meta)
+	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true, "clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {yoloMode:true, clientUserMessageEcho:true}", meta)
 	}
 	if _, ok := params["additionalDirectories"].([]any); !ok {
 		t.Errorf("additionalDirectories = %v, want []", params["additionalDirectories"])
 	}
 }
 
-func TestSessionResumeOmitsMetaWhenAbsent(t *testing.T) {
+// 没有调用方 meta 时也要带会话级回显开关（见 clientUserMessageEchoMeta）。
+func TestSessionResumeSendsEchoMetaWithoutMeta(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
 	s, _ := newFakeAgentServer(t)
@@ -271,14 +272,19 @@ func TestSessionResumeOmitsMetaWhenAbsent(t *testing.T) {
 	}
 	req := findRequest(t, readRecordedRequests(t, recordPath), "session/resume")
 	params, _ := req["params"].(map[string]any)
-	if _, ok := params["_meta"]; ok {
-		t.Errorf("session/resume must not carry _meta when absent: %v", params)
+	meta, ok := params["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/resume must carry _meta (echo switch): %v", params)
+	}
+	if !reflect.DeepEqual(meta, map[string]any{"clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {clientUserMessageEcho:true}", meta)
 	}
 	want := map[string]any{
 		"sessionId":             "hist-1",
 		"cwd":                   "/ws",
 		"mcpServers":            []any{},
 		"additionalDirectories": []any{},
+		"_meta":                 map[string]any{"clientUserMessageEcho": true},
 	}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("params = %v, want %v", params, want)
