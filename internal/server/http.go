@@ -99,6 +99,9 @@ func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/session-load", s.handleSessionLoad)
 	mux.HandleFunc("POST /api/set-mode", s.handleSetMode)
 	mux.HandleFunc("POST /api/set-model", s.handleSetModel)
+	mux.HandleFunc("POST /api/session/config-option", s.handleSetConfigOption)
+	mux.HandleFunc("POST /api/session/set-config-option", s.handleSetConfigOption)
+	mux.HandleFunc("POST /api/config-option", s.handleSetConfigOption)
 	mux.HandleFunc("POST /api/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/session-state", s.handleSessionState)
 	mux.HandleFunc("POST /api/session-updates", s.handleSessionUpdates)
@@ -110,6 +113,8 @@ func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/session-info", s.handleSessionInfo)
 	mux.HandleFunc("POST /api/session-plan", s.handleSessionPlan)
 	mux.HandleFunc("POST /api/subagent-cancel", s.handleSubagentCancel)
+	mux.HandleFunc("POST /api/subagent/message", s.handleSubagentMessage)
+	mux.HandleFunc("POST /api/subagent-message", s.handleSubagentMessage)
 	mux.HandleFunc("POST /api/task-kill", s.handleTaskKill)
 	mux.HandleFunc("POST /api/task-list", s.handleTaskList)
 	mux.HandleFunc("POST /api/task-output", s.handleTaskOutput)
@@ -762,6 +767,28 @@ func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+type setConfigOptionBody struct {
+	SessionID string `json:"sessionId,omitempty"`
+	ConfigID  string `json:"configId"`
+	Value     string `json:"value"`
+}
+
+// handleSetConfigOption — POST /api/session/config-option {sessionId?, configId, value}
+// 调用官方 ACP session/set_config_option 端点。支持 configId="model" 或 "reasoning_effort"。
+func (s *Server) handleSetConfigOption(w http.ResponseWriter, r *http.Request) {
+	var body setConfigOptionBody
+	if err := readJSON(r, &body); err != nil || body.ConfigID == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 configId"})
+		return
+	}
+	res, err := s.bridge.SetConfigOption(r.Context(), body.SessionID, body.ConfigID, body.Value)
+	if err != nil {
+		writeAgentError(w, "session/set_config_option", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
 // listSessionsBody — POST /api/sessions. cwd/cursor/meta are OPTIONAL
 // official session/list fields forwarded on the wire when present (absent
 // = the existing `{}` request exactly); the response keeps the existing
@@ -1148,6 +1175,52 @@ func (s *Server) handleSubagentCancel(w http.ResponseWriter, r *http.Request) {
 	res, err := s.bridge.SubagentCancel(r.Context(), body.SessionID, body.SubagentID)
 	if err != nil {
 		writeAgentError(w, "x.ai/subagent/cancel", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleSubagentMessage sends a steering or queued message to an active child subagent
+// via x.ai/subagent/message ({sessionId?, agentAddress/subagentId, text/content, queue?}).
+func (s *Server) handleSubagentMessage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID    string `json:"sessionId,omitempty"`
+		AgentAddress string `json:"agentAddress,omitempty"`
+		SubagentID   string `json:"subagentId,omitempty"`
+		Text         string `json:"text,omitempty"`
+		Content      []any  `json:"content,omitempty"`
+		Queue        bool   `json:"queue,omitempty"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "请求体 JSON 格式错误"})
+		return
+	}
+	addr := body.AgentAddress
+	if addr == "" {
+		addr = body.SubagentID
+	}
+	if addr == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 agentAddress 或 subagentId"})
+		return
+	}
+	var content []any
+	if len(body.Content) > 0 {
+		content = body.Content
+	} else if body.Text != "" {
+		content = []any{
+			map[string]any{
+				"type": "text",
+				"text": body.Text,
+			},
+		}
+	} else {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 text 或 content"})
+		return
+	}
+
+	res, err := s.bridge.SubagentMessage(r.Context(), body.SessionID, addr, body.Queue, content)
+	if err != nil {
+		writeAgentError(w, "x.ai/subagent/message", err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})

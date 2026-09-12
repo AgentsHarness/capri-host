@@ -542,13 +542,14 @@ func (s *Server) handleWorktreeResumeSession(w http.ResponseWriter, r *http.Requ
 }
 
 // handleWorktreeList — POST /api/git/worktree/list {repo?, type?,
-// includeAll?} → x.ai/git/worktree/list（grok 的 ListWorktreeRequest：
-// repo? / type?（小写数组键）/ includeAll?；空体 = 无参请求）。
+// includeAll?} → x.ai/git/worktree/list（grok 的 WorktreeListReq：
+// repo? / type?（小写数组键）/ include_all?；双发 include_all 与 includeAll）。
 func (s *Server) handleWorktreeList(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Repo       string   `json:"repo,omitempty"`
 		Types      []string `json:"type,omitempty"`
 		IncludeAll bool     `json:"includeAll,omitempty"`
+		IncludeSnake bool   `json:"include_all,omitempty"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -560,7 +561,8 @@ func (s *Server) handleWorktreeList(w http.ResponseWriter, r *http.Request) {
 	if len(body.Types) > 0 {
 		params["type"] = body.Types
 	}
-	if body.IncludeAll {
+	if body.IncludeAll || body.IncludeSnake {
+		params["include_all"] = true
 		params["includeAll"] = true
 	}
 	s.xaiCall(w, r, "x.ai/git/worktree/list", params)
@@ -580,6 +582,65 @@ func (s *Server) handleWorktreeShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.xaiCall(w, r, "x.ai/git/worktree/show", map[string]any{"idOrPath": body.IDOrPath})
+}
+
+// handleWorktreeDetach — POST /api/git/worktree/detach {idOrPath, allowCopy?}
+// → x.ai/git/worktree/detach {idOrPath, allowCopy?}。
+func (s *Server) handleWorktreeDetach(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDOrPath  string `json:"idOrPath"`
+		AllowCopy bool   `json:"allowCopy,omitempty"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.IDOrPath == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 idOrPath"})
+		return
+	}
+	params := map[string]any{"idOrPath": body.IDOrPath}
+	if body.AllowCopy {
+		params["allowCopy"] = true
+	}
+	s.xaiCall(w, r, "x.ai/git/worktree/detach", params)
+}
+
+// handleWorktreeSalvage — POST /api/git/worktree/salvage {idOrPath, out}
+// → x.ai/git/worktree/salvage {idOrPath, out}。
+func (s *Server) handleWorktreeSalvage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDOrPath string `json:"idOrPath"`
+		Out      string `json:"out"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.IDOrPath == "" || body.Out == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 idOrPath 和 out"})
+		return
+	}
+	s.xaiCall(w, r, "x.ai/git/worktree/salvage", map[string]any{
+		"idOrPath": body.IDOrPath,
+		"out":      body.Out,
+	})
+}
+
+// handleWorktreeCleanArtifacts — POST /api/git/worktree/clean-artifacts {idOrPath}
+// → x.ai/git/worktree/clean-artifacts {idOrPath}。
+func (s *Server) handleWorktreeCleanArtifacts(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDOrPath string `json:"idOrPath"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.IDOrPath == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 idOrPath"})
+		return
+	}
+	s.xaiCall(w, r, "x.ai/git/worktree/clean-artifacts", map[string]any{
+		"idOrPath": body.IDOrPath,
+	})
 }
 
 // handleWorktreeGc — POST /api/git/worktree/gc {dryRun?, maxAge?, force?} →
@@ -1072,6 +1133,9 @@ func (s *Server) registerExtGitRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/git/worktree/resume-session", s.handleWorktreeResumeSession)
 	mux.HandleFunc("POST /api/git/worktree/list", s.handleWorktreeList)
 	mux.HandleFunc("POST /api/git/worktree/show", s.handleWorktreeShow)
+	mux.HandleFunc("POST /api/git/worktree/detach", s.handleWorktreeDetach)
+	mux.HandleFunc("POST /api/git/worktree/salvage", s.handleWorktreeSalvage)
+	mux.HandleFunc("POST /api/git/worktree/clean-artifacts", s.handleWorktreeCleanArtifacts)
 	mux.HandleFunc("POST /api/git/worktree/gc", s.handleWorktreeGc)
 	mux.HandleFunc("POST /api/git/worktree/db/stats", s.handleWorktreeDbStats)
 	mux.HandleFunc("POST /api/git/worktree/db/rebuild", s.handleWorktreeDbRebuild)

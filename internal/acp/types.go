@@ -118,6 +118,10 @@ type SessionState struct {
 	gitWorktree bool
 	gitMainRepo string
 
+	// backgroundTasks: latest snapshot from SessionUpdate::BackgroundTasks;
+	// authoritative replacement for on-disk file scanning / lsof probe.
+	backgroundTasks []any
+
 	// busyCount: session/prompt turns currently in flight for this session.
 	// Concurrent prompts are forwarded — the agent (xai-grok-shell) queues
 	// mid-turn turns in its own pending_inputs — so several turns can be in

@@ -407,7 +407,7 @@ func TestExtWireKeys(t *testing.T) {
 	}
 
 	params = recordedParams(t, s, recordPath, "/api/git/worktree/list", `{"repo":"/repo","type":["linked"],"includeAll":true}`, "_x.ai/git/worktree/list")
-	want = map[string]any{"repo": "/repo", "type": []any{"linked"}, "includeAll": true}
+	want = map[string]any{"repo": "/repo", "type": []any{"linked"}, "includeAll": true, "include_all": true}
 	if !reflect.DeepEqual(params, want) {
 		t.Errorf("worktree/list params = %v, want %v", params, want)
 	}

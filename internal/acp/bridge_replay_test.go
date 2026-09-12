@@ -19,10 +19,9 @@ func drainEvents(ch chan Event) []Event {
 		select {
 		case ev := <-ch:
 			out = append(out, ev)
-			continue
-		default:
+		case <-time.After(20 * time.Millisecond):
+			return out
 		}
-		return out
 	}
 }
 

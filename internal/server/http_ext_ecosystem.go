@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"os"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 )
@@ -17,10 +18,16 @@ func (s *Server) handleSkillsList(w http.ResponseWriter, r *http.Request) {
 	if !readBody(w, r, &body) {
 		return
 	}
-	params := map[string]any{}
-	if body.Cwd != "" {
-		params["cwd"] = body.Cwd
+	cwd := body.Cwd
+	if cwd == "" {
+		cwd = s.bridge.Snapshot().Cwd
 	}
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+	params := map[string]any{"cwd": cwd}
 	s.xaiCall(w, r, "x.ai/skills/list", params)
 }
 
@@ -44,16 +51,30 @@ func (s *Server) handleSkillsToggle(w http.ResponseWriter, r *http.Request) {
 	s.xaiCall(w, r, "x.ai/skills/toggle", params)
 }
 
-// handleSkillsAdd — {path?, cwd?} 原样透传（grok 侧 SkillsAddRequest）。
+// handleSkillsAdd — {path?, name?, cwd?}：grok 侧 SkillsAddRequest 要求必须有 path。
+// 客户端如果只传 name，支持映射为 path；无 path 或 name 时返回 400。
 func (s *Server) handleSkillsAdd(w http.ResponseWriter, r *http.Request) {
-	var body map[string]any
+	var body struct {
+		Path string `json:"path"`
+		Name string `json:"name"`
+		Cwd  string `json:"cwd"`
+	}
 	if !readBody(w, r, &body) {
 		return
 	}
-	if body == nil {
-		body = map[string]any{}
+	pathVal := body.Path
+	if pathVal == "" && body.Name != "" {
+		pathVal = body.Name
 	}
-	s.xaiCall(w, r, "x.ai/skills/add", body)
+	if pathVal == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 path 或 name"})
+		return
+	}
+	params := map[string]any{"path": pathVal}
+	if body.Cwd != "" {
+		params["cwd"] = body.Cwd
+	}
+	s.xaiCall(w, r, "x.ai/skills/add", params)
 }
 
 // handleSkillsRemove — {name}；grok 侧 SkillsRemoveRequest 的 wire 键为 path，

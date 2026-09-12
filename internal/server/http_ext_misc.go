@@ -4,20 +4,7 @@ import (
 	"net/http"
 )
 
-// http_ext_misc.go — 能力声明、目录信任与 debug 端点。
-
-// handleCapabilities — x.ai/capabilities。grok 侧无对应请求分支（该能力经
-// initialize meta 宣告），真实 agent 会回 -32601 → writeAgentError 降级
-// 200 {ok:false}。
-func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
-	s.xaiCall(w, r, "x.ai/capabilities", map[string]any{})
-}
-
-// handleFolderTrustRequest — x.ai/folder_trust/request。grok 侧该方法是
-// agent → 客户端的反向请求，客户端 → agent 调用会回 -32601 → 降级 200 {ok:false}。
-func (s *Server) handleFolderTrustRequest(w http.ResponseWriter, r *http.Request) {
-	s.xaiCall(w, r, "x.ai/folder_trust/request", map[string]any{})
-}
+// http_ext_misc.go — debug 与杂项端点。
 
 // handleDebugTriggerFeedback — POST /api/debug/trigger-feedback {sessionId?,
 // tier?, mode?} → x.ai/debug/trigger_feedback（tier: tier1|tier2|tier3；
@@ -67,8 +54,6 @@ func (s *Server) handleDebugAgent(w http.ResponseWriter, r *http.Request) {
 
 // registerExtMiscRoutes 注册本域路由（路由与实现同址）。
 func (s *Server) registerExtMiscRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/capabilities", s.handleCapabilities)
-	mux.HandleFunc("POST /api/folder-trust-request", s.handleFolderTrustRequest)
 	mux.HandleFunc("POST /api/debug/trigger-feedback", s.handleDebugTriggerFeedback)
 	mux.HandleFunc("POST /api/debug/arm-auto-compact", s.handleDebugArmAutoCompact)
 	mux.HandleFunc("POST /api/debug/agent", s.handleDebugAgent)
