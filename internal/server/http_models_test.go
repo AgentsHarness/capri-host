@@ -67,6 +67,34 @@ func TestSetDefaultModelEndpointRejectsEmptyModel(t *testing.T) {
 	}
 }
 
+// 不带 sessionId 的默认模型写入只落盘：改模型列表（改名重指默认）不该牵动
+// 任何会话当前的模型——host 侧有 active 会话也不许被切。
+func TestSetDefaultModelWithoutSessionPersistsOnly(t *testing.T) {
+	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
+	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
+	s, _, path := newFakeAgentServerWithGrokHome(t)
+	createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/set-default-model", `{"modelId":"m1","reasoningEffort":"max"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["reloaded"] != true {
+		t.Errorf("reloaded = %v, want true (config write must refresh the catalog)", m["reloaded"])
+	}
+	out := readFileStr(t, path)
+	for _, want := range []string{`default = "m1"`, `default_reasoning_effort = "max"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config.toml missing %q:\n%s", want, out)
+		}
+	}
+	for _, m := range readRecordedRequests(t, recordPath) {
+		if m["method"] == "session/set_model" || m["method"] == "session/set_config_option" {
+			t.Fatalf("no sessionId must not touch any session: %v", m)
+		}
+	}
+}
+
 func TestCustomModelsEndpoints(t *testing.T) {
 	s, b, path := newFakeAgentServerWithGrokHome(t)
 
@@ -160,13 +188,13 @@ func TestSetModelRejectsMissingSessionID(t *testing.T) {
 	// 绝不能转发给 agent：createActiveSession 只留了 session/new 一行。
 	lines := readRecordedRequests(t, recordPath)
 	for _, m := range lines {
-		if m["method"] == "session/set_model" {
+		if m["method"] == "session/set_model" || m["method"] == "session/set_config_option" {
 			t.Fatalf("missing sessionId must not reach the agent: %v", m)
 		}
 	}
 }
 
-// 带 sessionId 的切模型请求按原样转发 session/set_model（含 effort _meta）。
+// 带 sessionId 的切模型请求规范转发 session/set_config_option。
 func TestSetModelForwardsSessionID(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
@@ -180,17 +208,31 @@ func TestSetModelForwardsSessionID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/api/set-model status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	req := findRequest(t, readRecordedRequests(t, recordPath), "session/set_model")
-	params, _ := req["params"].(map[string]any)
-	if params["sessionId"] != sid {
-		t.Errorf("sessionId = %v, want %s", params["sessionId"], sid)
+	reqs := readRecordedRequests(t, recordPath)
+	var reqModel, reqEffort map[string]any
+	for _, r := range reqs {
+		if r["method"] == "session/set_config_option" {
+			p, _ := r["params"].(map[string]any)
+			if p["configId"] == "model" {
+				reqModel = r
+			} else if p["configId"] == "reasoning_effort" {
+				reqEffort = r
+			}
+		}
 	}
-	if params["modelId"] != "grok-4" {
-		t.Errorf("modelId = %v, want grok-4", params["modelId"])
+	if reqModel == nil {
+		t.Fatalf("no recorded session/set_config_option for model in %v", reqs)
 	}
-	meta, _ := params["_meta"].(map[string]any)
-	if meta["reasoningEffort"] != "high" {
-		t.Errorf("_meta = %v, want reasoningEffort high", params["_meta"])
+	pModel, _ := reqModel["params"].(map[string]any)
+	if pModel["sessionId"] != sid || pModel["value"] != "grok-4" {
+		t.Errorf("model config option = %v, want grok-4 on %s", pModel, sid)
+	}
+	if reqEffort == nil {
+		t.Fatalf("no recorded session/set_config_option for reasoning_effort in %v", reqs)
+	}
+	pEffort, _ := reqEffort["params"].(map[string]any)
+	if pEffort["sessionId"] != sid || pEffort["value"] != "high" {
+		t.Errorf("effort config option = %v, want high on %s", pEffort, sid)
 	}
 
 	// 验证广播事件中包含 sessions_changed
