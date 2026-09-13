@@ -52,6 +52,7 @@ type sessionAPI interface {
 	SessionUpdates(ctx context.Context, sessionID, cwd string, opts ...acp.SessionUpdatesOpts) (acp.UpdatesPage, error)
 	SessionRunningTasks(sessionID, cwd string) ([]acp.TaskEvent, error)
 	DetachedRunningTasks(ctx context.Context, sessionID, cwd string) []acp.TaskEvent
+	SubagentMessage(ctx context.Context, sessionID, agentAddress string, queue bool, content []any) (map[string]any, error)
 	CompactConversation(ctx context.Context, sessionID, note string) (map[string]any, error)
 	Recap(ctx context.Context, sessionID string, auto bool) (map[string]any, error)
 	RewindPoints(ctx context.Context, sessionID string) (map[string]any, error)
@@ -70,6 +71,7 @@ type permissionAPI interface {
 // modelAPI：模型/模式选择与自定义模型配置。
 type modelAPI interface {
 	SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) error
+	SetConfigOption(ctx context.Context, sessionID, configID, value string) (any, error)
 	SetMode(ctx context.Context, sessionID, modeID string) (map[string]any, error)
 	TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error)
 	SetDefaultModelConfig(modelID, effort string) error
