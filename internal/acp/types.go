@@ -118,6 +118,10 @@ type SessionState struct {
 	gitWorktree bool
 	gitMainRepo string
 
+	// backgroundTasks: latest snapshot from SessionUpdate::BackgroundTasks;
+	// authoritative replacement for on-disk file scanning / lsof probe.
+	backgroundTasks []any
+
 	// busyCount: session/prompt turns currently in flight for this session.
 	// Concurrent prompts are forwarded — the agent (xai-grok-shell) queues
 	// mid-turn turns in its own pending_inputs — so several turns can be in
@@ -189,6 +193,12 @@ type PendingReq struct {
 	// SessionID: owning session (multi-session clients filter pending on
 	// switch/resume; absent on very old hosts).
 	SessionID string `json:"sessionId,omitempty"`
+	// ReceivedAt: unix ms when the host took the request off the agent
+	// pipe. The same stamp rides the live client_request broadcast and the
+	// pendingRequests snapshot, so every tab / device / reconnect counts the
+	// ask_user_question (and permission) budget from ONE origin instead of
+	// from whenever it happened to first see the request.
+	ReceivedAt int64 `json:"receivedAt,omitempty"`
 }
 
 // SessionInfoDetail — POST /api/session-info response: authoritative live
