@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // align_full_test.go — A/B 对齐：initialize/authenticate meta 种子、
@@ -69,6 +70,9 @@ func TestInitCapabilitiesMeta(t *testing.T) {
 		"x.ai/bashOutputNoColor":     true,
 		"x.ai/gitHeadChanged":        true,
 		"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
+		// 用户 prompt 实时回显（正文 + 附图各一块）：不带它 agent 只落盘不活推，
+		// 发出的图实时看不见（TUI 恒带，见 session/user_echo.rs）。
+		"x.ai/userMessageEcho": true,
 	}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("initCapabilitiesMeta = %v, want %v (opt-in keys absent by default)", meta, want)
@@ -146,8 +150,8 @@ func TestResumeSessionForwardsMeta(t *testing.T) {
 	if !ok {
 		t.Fatalf("session/resume params carry no _meta: %v", params)
 	}
-	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true}) {
-		t.Errorf("_meta = %v, want {yoloMode:true}", meta)
+	if !reflect.DeepEqual(meta, map[string]any{"yoloMode": true, "clientUserMessageEcho": true}) {
+		t.Errorf("_meta = %v, want {yoloMode:true, clientUserMessageEcho:true}", meta)
 	}
 	// additionalDirectories stays [] (never extended).
 	if _, ok := params["additionalDirectories"].([]any); !ok {
@@ -589,3 +593,56 @@ func TestSnapshotConcurrentModelMutation(t *testing.T) {
 	}
 	<-done
 }
+
+// TestClientRequestCarriesReceivedAt 验证 client_request 广播与 Snapshot
+// 的 PendingRequests 均打上相同的 receivedAt 时间戳，使所有标签页和设备
+// 共享同一个倒计时起点。
+func TestClientRequestCarriesReceivedAt(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	t0 := time.Now().UnixMilli()
+	b.forwardXaiRequest(1, "x.ai/ask_user_question", map[string]any{
+		"sessionId": "s1",
+		"questions": []any{
+			map[string]any{"question": "Q?"},
+		},
+	})
+	t1 := time.Now().UnixMilli()
+
+	var ev Event
+	deadline := time.After(2 * time.Second)
+loop:
+	for {
+		select {
+		case msg := <-ch:
+			if msg["type"] == "client_request" {
+				ev = msg
+				break loop
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for client_request event")
+		}
+	}
+	recv, ok := ev["receivedAt"].(int64)
+	if !ok || recv < t0 || recv > t1 {
+		t.Fatalf("broadcast receivedAt = %v, want between %d and %d", ev["receivedAt"], t0, t1)
+	}
+
+	snap := b.Snapshot()
+	var found *PendingReq
+	for i := range snap.PendingRequests {
+		if snap.PendingRequests[i].Method == "x.ai/ask_user_question" {
+			found = &snap.PendingRequests[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("PendingRequests missing x.ai/ask_user_question: %v", snap.PendingRequests)
+	}
+	if found.ReceivedAt != recv {
+		t.Errorf("snapshot ReceivedAt = %d, want matching broadcast receivedAt = %d", found.ReceivedAt, recv)
+	}
+}
+

@@ -183,6 +183,120 @@ func TestLoadSessionClearsUnloaded(t *testing.T) {
 	}
 }
 
+func TestQueueHoldsWork(t *testing.T) {
+	cases := []struct {
+		name string
+		q    map[string]any
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty map", map[string]any{}, false},
+		{"post-turn empty entries", map[string]any{"sessionId": "s", "entries": []any{}}, false},
+		{"nil running id", map[string]any{"entries": []any{}, "running_prompt_id": nil}, false},
+		{"empty runningPromptId", map[string]any{"entries": []any{}, "runningPromptId": ""}, false},
+		{"pending entry", map[string]any{"entries": []any{map[string]any{"id": "q1"}}}, true},
+		{"runningPromptId", map[string]any{"entries": []any{}, "runningPromptId": "p1"}, true},
+		{"running_prompt_id", map[string]any{"entries": []any{}, "running_prompt_id": "p1"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := queueHoldsWork(tc.q); got != tc.want {
+				t.Fatalf("queueHoldsWork(%v) = %v, want %v", tc.q, got, tc.want)
+			}
+		})
+	}
+}
+
+// 空 {entries:[], sessionId} 是回合结束后的常态广播，不得把会话钉在
+// grok 里（现网曾因此 25h 只卸掉 2 个）。有 pending entries 或
+// runningPromptId 的才 pin。
+func TestSweepIdleUnloadEmptyQueueSnapshotDoesNotPin(t *testing.T) {
+	b, w := idleUnloadBridge(t, 1)
+	addIdle(b, "empty-q", 10, 1)
+	addIdle(b, "keep", 20, 1)
+	b.mu.Lock()
+	b.activeSessionID = "keep"
+	b.lastSessionID = "keep"
+	b.queueSnapshots = map[string]map[string]any{
+		"empty-q": {"sessionId": "empty-q", "entries": []any{}},
+		"keep":    {"sessionId": "keep", "entries": []any{}},
+	}
+	b.mu.Unlock()
+
+	ctx := context.Background()
+	done := make(chan int, 1)
+	go func() { done <- b.SweepIdleUnload(ctx) }()
+	waitLineCount(t, w, 1)
+	resolveNext(t, b, w, map[string]any{"ok": true})
+	if n := <-done; n != 1 {
+		t.Fatalf("unloaded %d, want 1 (empty queue snapshot must not pin)", n)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.sessions["empty-q"].unloaded {
+		t.Fatal("empty-q should be unloaded")
+	}
+	if b.sessions["keep"].unloaded {
+		t.Fatal("focused keep must stay resident")
+	}
+}
+
+func TestSweepIdleUnloadPendingQueuePins(t *testing.T) {
+	b, w := idleUnloadBridge(t, 1)
+	addIdle(b, "queued", 10, 1)
+	addIdle(b, "idle", 5, 1)
+	b.mu.Lock()
+	b.queueSnapshots = map[string]map[string]any{
+		"queued": {"sessionId": "queued", "entries": []any{map[string]any{"id": "q1", "text": "hi"}}},
+	}
+	b.mu.Unlock()
+
+	ctx := context.Background()
+	done := make(chan int, 1)
+	go func() { done <- b.SweepIdleUnload(ctx) }()
+	waitLineCount(t, w, 1)
+	resolveNext(t, b, w, map[string]any{"ok": true})
+	if n := <-done; n != 1 {
+		t.Fatalf("unloaded %d, want 1 (idle goes, queued stays)", n)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.sessions["idle"].unloaded {
+		t.Fatal("idle session should be unloaded")
+	}
+	if b.sessions["queued"].unloaded {
+		t.Fatal("session with pending queue entries must stay resident")
+	}
+}
+
+func TestSweepIdleUnloadRunningPromptQueuePins(t *testing.T) {
+	b, w := idleUnloadBridge(t, 1)
+	addIdle(b, "running", 10, 1)
+	addIdle(b, "idle", 5, 1)
+	b.mu.Lock()
+	b.queueSnapshots = map[string]map[string]any{
+		"running": {"sessionId": "running", "entries": []any{}, "runningPromptId": "p1"},
+	}
+	b.mu.Unlock()
+
+	ctx := context.Background()
+	done := make(chan int, 1)
+	go func() { done <- b.SweepIdleUnload(ctx) }()
+	waitLineCount(t, w, 1)
+	resolveNext(t, b, w, map[string]any{"ok": true})
+	if n := <-done; n != 1 {
+		t.Fatalf("unloaded %d, want 1 (idle goes, running stays)", n)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.sessions["idle"].unloaded {
+		t.Fatal("idle session should be unloaded")
+	}
+	if b.sessions["running"].unloaded {
+		t.Fatal("session with runningPromptId must stay resident")
+	}
+}
+
 func TestPromptRehydratesUnloadedSession(t *testing.T) {
 	b, w := idleUnloadBridge(t, 4)
 	addIdle(b, "s1", 1, 1)
