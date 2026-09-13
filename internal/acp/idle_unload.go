@@ -134,7 +134,7 @@ func (b *Bridge) pinnedGoalSessionID() string {
 
 // idleUnloadPoolLocked returns the current grok-resident count and the
 // sessions that are eligible to close (not busy / awaiting / focused /
-// last-session / goal). Caller holds b.mu.
+// last-session / goal / a queue that still holds work). Caller holds b.mu.
 func (b *Bridge) idleUnloadPoolLocked(goalSID string) (resident int, unpinned []unloadCandidate) {
 	for id, s := range b.sessions {
 		if s == nil || s.unloaded {
@@ -171,8 +171,30 @@ func (b *Bridge) sessionPinnedLocked(id string, s *SessionState, goalSID string)
 	if goalSID != "" && id == goalSID {
 		return true
 	}
-	if q := b.queueSnapshots[id]; len(q) > 0 {
+	if queueHoldsWork(b.queueSnapshots[id]) {
 		return true
+	}
+	return false
+}
+
+// queueHoldsWork reports whether a cached x.ai/queue/changed snapshot still
+// has work that must stay grok-resident: pending entries, or a running
+// prompt id. A post-turn empty snapshot ({entries:[], sessionId}) has
+// keys, so len(q)>0 would pin every session that ever prompted — that is
+// not work.
+func queueHoldsWork(q map[string]any) bool {
+	if len(q) == 0 {
+		return false
+	}
+	for _, k := range []string{"runningPromptId", "running_prompt_id"} {
+		if s, ok := q[k].(string); ok && s != "" {
+			return true
+		}
+	}
+	for _, k := range []string{"entries", "items"} {
+		if arr, ok := q[k].([]any); ok && len(arr) > 0 {
+			return true
+		}
 	}
 	return false
 }
