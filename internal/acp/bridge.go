@@ -100,6 +100,10 @@ type Bridge struct {
 	// usage 事件的值去重：同一值反复到达只广播一次，见 handleSessionUpdate）。
 	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
 	usageLastUsed map[string]int64
+	// ledger 是用量落盘台账（~/.capri-host/usage-ledger.jsonl）。它把回合
+	// 用量在源文件被删之前抄一份，使历史用量不随 agent 的 30 天会话清理
+	// 消失；见 usage_ledger.go。非 nil（关闭时内部判空跳过）。
+	ledger *usageLedger
 	// liveTools 是 per-session 的实时工具事件合成 ID 注入器（与历史主路径
 	// 同一套 synth:call:<ts>:<k>；首次非重放事件用历史视图做种子）。b.mu 保护。
 	liveTools map[string]*liveToolResolver
@@ -181,6 +185,14 @@ type GrokConfig struct {
 	// GrokHome overrides the grok data dir (~/.grok) used to locate
 	// session updates files (task timeline / [bg] badge scans).
 	GrokHome string
+	// UsageLedgerFile overrides the default ~/.capri-host/usage-ledger.jsonl
+	// so tests can inject a temp path without touching the real home.
+	UsageLedgerFile string
+	// UsageLedgerOn turns the usage ledger on. It is explicit opt-in on
+	// purpose: the ledger scans the real ~/.grok and writes to the user's
+	// ~/.capri-host, so a Bridge built without a GrokHome override (tests,
+	// embedders) must not do that by accident. cmd/capri-host sets it.
+	UsageLedgerOn bool
 	// ResidentCap bounds how many sessions stay loaded in the grok
 	// process. Zero = DefaultResidentCap (4). Negative = disable the
 	// idle-unload supervisor (tests, or RESIDENT_CAP=0).
@@ -229,6 +241,10 @@ type clientRequest struct {
 	outcome      map[string]any // session/request_permission result
 	result       map[string]any // generic x.ai/* request result
 	errMsg       string
+	// receivedAt: unix ms stamped when the forwarder took the request off
+	// the agent pipe — the single timing origin every client counts the
+	// ask-question / approval budget from (broadcast + snapshot).
+	receivedAt int64
 	// meta: ACP response `_meta` for session/request_permission replies —
 	// the bash scope (BashCommandSelectedTerms: command_parts/is_glob) or
 	// the followup_message the client attached, serialized exactly like the
@@ -262,6 +278,7 @@ func NewBridge(cfg GrokConfig) *Bridge {
 		usageLastUsed: make(map[string]int64),
 		liveTools:     make(map[string]*liveToolResolver),
 	}
+	b.ledger = newUsageLedger(b.usageLedgerPath())
 	b.bus.init()
 	b.nextAgentID.Store(1)
 	b.nextClientReqID.Store(1)
@@ -756,10 +773,11 @@ func (b *Bridge) Snapshot() Status {
 	b.clientReqs.Range(func(key, value any) bool {
 		cr := value.(*clientRequest)
 		pending = append(pending, PendingReq{
-			RequestID: key.(string),
-			Method:    cr.Method,
-			Params:    cr.Params,
-			SessionID: cr.SessionID,
+			RequestID:  key.(string),
+			Method:     cr.Method,
+			Params:     cr.Params,
+			SessionID:  cr.SessionID,
+			ReceivedAt: cr.receivedAt,
 		})
 		return true
 	})
@@ -1062,15 +1080,22 @@ func initMetaSeeds() map[string]any {
 	return meta
 }
 
-// initCapabilitiesMeta builds the clientCapabilities.meta object: the four
+// initCapabilitiesMeta builds the clientCapabilities.meta object: the five
 // always-on TUI capabilities plus env-opt-in codeNavigation / folderTrust /
 // fs_notify (absent = off, matching the TUI where those keys are absent).
+//
+// x.ai/userMessageEcho 是「用户 prompt 的实时回显」开关（grok-shell
+// session/user_echo.rs，TUI 恒带该键）：不带它，agent 把 user_message_chunk
+// ——正文和附图各一块——只落盘、不活推（session/acp_session_impl/updates.rs
+// 的 suppress_live_user_echo），于是发出的图只在回放/历史里出现，实时
+// transcript 没有。这里对齐 TUI。
 func initCapabilitiesMeta() map[string]any {
 	meta := map[string]any{
 		"x.ai/incrementalBashOutput": true,
 		"x.ai/bashOutputNoColor":     true,
 		"x.ai/gitHeadChanged":        true,
 		"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
+		"x.ai/userMessageEcho":       true,
 	}
 	if boolEnv("ACP_CAP_CODE_NAVIGATION") {
 		// Agent reads meta["x.ai/codeNavigation"]["enabled"] (code_nav.rs:9).
@@ -1118,6 +1143,29 @@ func jsonEnv(name string) map[string]any {
 	return v
 }
 
+// clientUserMessageEchoMeta 是**会话级**的「用户 prompt 实时回显」开关
+// （grok-shell session/user_echo.rs 的 CLIENT_USER_MESSAGE_ECHO_META）。agent
+// 在 session/new | session/load | session/resume 的 `_meta` 上读它；没有它，
+// prompt 的 user_message_chunk（正文一块 + 每张附图一块）只落盘不活推——
+// 表现就是「发出去的图实时看不见，回放里全都有」。
+//
+// 实机验证（grok 1.0.30，直连 `grok agent stdio` 探测）：initialize 的
+// clientCapabilities.meta["x.ai/userMessageEcho"] 单独**不足以**打开回显，
+// 会话 meta 才有效（两者都带最稳）。TUI 也是这条路径——leader 把 client
+// 能力翻译成会话 meta 注入（xai-grok-shell/src/leader/server.rs）。
+const clientUserMessageEchoMeta = "clientUserMessageEcho"
+
+// withUserMessageEcho returns meta with the echo switch forced on. A copy:
+// the caller's map may be reused by the HTTP layer (request body / seeds).
+func withUserMessageEcho(meta map[string]any) map[string]any {
+	out := make(map[string]any, len(meta)+1)
+	for k, v := range meta {
+		out[k] = v
+	}
+	out[clientUserMessageEchoMeta] = true
+	return out
+}
+
 // createSession calls session/new and registers the session in the roster.
 func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 	cwd := sc.Cwd
@@ -1139,11 +1187,9 @@ func (b *Bridge) createSession(ctx context.Context, sc SessionConfig) error {
 		"mcpServers":            mcp,
 	}
 	// Client-supplied session seeds (permission mode flags etc.) ride the
-	// params `_meta`, exactly like the TUI's SessionFlags.to_meta() —
-	// absent key ≠ off, so only send when the client provided seeds.
-	if len(sc.Meta) > 0 {
-		params[kMeta] = sc.Meta
-	}
+	// params `_meta`, exactly like the TUI's SessionFlags.to_meta().
+	// 回显开关（clientUserMessageEcho）无条件带上，与 seeds 合并。
+	params[kMeta] = withUserMessageEcho(sc.Meta)
 
 	sessRes, err := b.request(ctx, "session/new", params, bootTimeout)
 	if err != nil {
@@ -1950,6 +1996,28 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	case "scheduled_task_deleted":
 		b.broadcastScheduledTaskDeleted(sid, params, tag)
 		return true
+	case "background_tasks":
+		// SessionUpdate::BackgroundTasks 原生全量快照：
+		// 权威替换原 updates.jsonl 扫描与 lsof 探测。
+		var rawTasks []any
+		if t, ok := update["tasks"].([]any); ok {
+			rawTasks = t
+		}
+		b.mu.Lock()
+		if s := b.sessions[sid]; s != nil {
+			s.backgroundTasks = rawTasks
+		}
+		b.mu.Unlock()
+		ev := Event{
+			kType:      "background_tasks",
+			"tasks":    rawTasks,
+			"truncated": update["truncated"],
+		}
+		if kindMeta != nil {
+			ev[kMetaOut] = kindMeta
+		}
+		b.Broadcast(tag(ev))
+		return true
 	case "task_backgrounded", "task_completed", "monitor_event":
 		// 形状与其它 kind typed 事件统一：{type, update, sessionId}
 		// （update = 原始 update 对象）。x.ai standalone 通知通道
@@ -2002,8 +2070,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		"memory_dream_completed", "memory_session_saved", "memory_files",
 		"feedback_request", "relay_sync_status", "auto_recovery_started",
 		"auto_recovery_exhausted", "hook_annotation", "hook_execution",
-		"hooks_changed", "plugins_changed", "plugin_updates_installed",
-		"session_summary_generated", "session_recap", "session_recap_unavailable",
+		"hook_run_started", "hooks_changed", "plugins_changed", "plugin_updates_installed",
+		"session_status", "session_summary_generated", "session_recap", "session_recap_unavailable",
 		"last_turn_summary", "subagent_spawned", "subagent_progress",
 		"subagent_finished",
 		"scheduled_task_fired", "tool_call_delta_chunk", "image_compressed",
@@ -2531,15 +2599,17 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 		Params:       params,
 		done:         make(chan struct{}),
 		isPermission: true,
+		receivedAt:   time.Now().UnixMilli(),
 	}
 	b.clientReqs.Store(reqID, cr)
 	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
-		kType:       "client_request",
-		"requestId": reqID,
-		kMethod:     method,
-		kParams:     params,
-		kSessionID:  cr.SessionID,
+		kType:        "client_request",
+		"requestId":  reqID,
+		kMethod:      method,
+		kParams:      params,
+		kSessionID:   cr.SessionID,
+		"receivedAt": cr.receivedAt,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -2552,20 +2622,22 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any) {
 	reqID := fmt.Sprintf("acp_cr_%d", b.nextClientReqID.Add(1))
 	cr := &clientRequest{
-		AgentID:   id,
-		SessionID: b.sessionIdFrom(params),
-		Method:    method,
-		Params:    params,
-		done:      make(chan struct{}),
+		AgentID:    id,
+		SessionID:  b.sessionIdFrom(params),
+		Method:     method,
+		Params:     params,
+		done:       make(chan struct{}),
+		receivedAt: time.Now().UnixMilli(),
 	}
 	b.clientReqs.Store(reqID, cr)
 	b.setSessionAwaiting(cr.SessionID, true)
 	b.Broadcast(Event{
-		kType:       "client_request",
-		"requestId": reqID,
-		kMethod:     method,
-		kParams:     params,
-		kSessionID:  cr.SessionID,
+		kType:        "client_request",
+		"requestId":  reqID,
+		kMethod:      method,
+		kParams:      params,
+		kSessionID:   cr.SessionID,
+		"receivedAt": cr.receivedAt,
 	})
 
 	go b.waitClientResolution(reqID, cr)
@@ -3365,11 +3437,93 @@ func (b *Bridge) SetMode(ctx context.Context, sessionID, modeID string) (map[str
 	return res, nil
 }
 
-// SetModel calls session/set_model (grok's /model switch; the wire method
-// is snake_case per the ACP method table). An optional reasoningEffort is
-// forwarded in _meta, matching how the TUI applies --effort. Empty
-// sessionId resolves to the active session; the cache patch targets the
-// resolved session.
+// SetConfigOption calls the official ACP session/set_config_option method.
+// Supports configId="model" (value=modelId) and configId="reasoning_effort" (value=effort).
+// Returns the updated configOptions array/object from the agent.
+func (b *Bridge) SetConfigOption(ctx context.Context, sessionID, configID, value string) (any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID == "" {
+		return nil, &HTTPError{Code: 400, Msg: "需要 sessionId"}
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, errors.New("没有活跃会话")
+	}
+	params := map[string]any{
+		kSessionID: sessionID,
+		"configId":  configID,
+		"value":     value,
+	}
+	resp, err := b.request(ctx, "session/set_config_option", params, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update cached configOptions and models for the session
+	var configOpts any
+	if resp != nil {
+		if co, ok := resp[kConfigOptions]; ok {
+			configOpts = co
+		} else if co, ok := resp["options"]; ok {
+			configOpts = co
+		}
+	}
+
+	b.mu.Lock()
+	var models any
+	var name string
+	var modelID string
+	var effort string
+	if act := b.sessions[sessionID]; act != nil {
+		if configOpts != nil {
+			act.configOpts = configOpts
+		}
+		if m, ok := act.models.(map[string]any); ok {
+			if cm, ok := m["currentModelId"].(string); ok {
+				modelID = cm
+			}
+			if re, ok := m["reasoningEffort"].(string); ok {
+				effort = re
+			}
+		}
+		if configID == "model" {
+			modelID = value
+			b.patchSessionModels(act, modelID, effort)
+		} else if configID == "reasoning_effort" {
+			effort = value
+			b.patchSessionModels(act, modelID, effort)
+		}
+		models = act.models
+		name = modelDisplayName(models, modelID)
+	}
+	b.mu.Unlock()
+
+	if configOpts != nil {
+		b.Broadcast(Event{
+			kType:          "config_options_update",
+			kConfigOptions: configOpts,
+			kSessionID:     sessionID,
+		})
+	}
+	if models != nil {
+		b.Broadcast(Event{kType: "models_update", kParams: models, kSessionID: sessionID})
+	}
+	if modelID != "" {
+		b.Broadcast(Event{
+			kType:             "model",
+			"modelId":         modelID,
+			"modelName":       name,
+			"reasoningEffort": effort,
+			kSessionID:        sessionID,
+		})
+	}
+	b.broadcastRosterChange()
+	return resp, nil
+}
+
+// SetModel calls session/set_config_option (or falls back to session/set_model)
+// to switch the session's model and optional reasoningEffort.
 func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) error {
 	if err := b.Boot(ctx); err != nil {
 		return err
@@ -3383,6 +3537,17 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
 		return errors.New("没有活跃会话")
 	}
+
+	// 优先尝试官方 session/set_config_option 端点规范切换
+	_, optErr := b.SetConfigOption(ctx, sessionID, "model", modelID)
+	if optErr == nil {
+		if reasoningEffort != "" {
+			_, _ = b.SetConfigOption(ctx, sessionID, "reasoning_effort", reasoningEffort)
+		}
+		return nil
+	}
+
+	// 若 agent 尚未支持 session/set_config_option（如返回 -32601），回退到旧版 session/set_model
 	params := map[string]any{
 		kSessionID: sessionID,
 		"modelId":  modelID,
@@ -3939,7 +4104,11 @@ func (b *Bridge) LoadSession(ctx context.Context, sessionID, cwd string, meta ..
 		"mcpServers": []any{},
 	}
 	if len(meta) > 0 && len(meta[0]) > 0 {
-		params[kMeta] = meta[0]
+		params[kMeta] = withUserMessageEcho(meta[0])
+	} else {
+		// 回显开关走会话 meta（见 clientUserMessageEchoMeta）：load 出来的
+		// 会话也要能实时回显用户附图，客户端没给 meta 时也要带上。
+		params[kMeta] = withUserMessageEcho(nil)
 	}
 	// Multi-tab: agent session/load REPLAYS the full conversation as
 	// session/update over the shared SSE bus. The tab that called
@@ -4147,7 +4316,10 @@ func (b *Bridge) ResumeSession(ctx context.Context, sessionID, cwd string, meta 
 		"additionalDirectories": []any{},
 	}
 	if len(meta) > 0 && len(meta[0]) > 0 {
-		params[kMeta] = meta[0]
+		params[kMeta] = withUserMessageEcho(meta[0])
+	} else {
+		// 同 session/load：回显开关必须随会话请求带上。
+		params[kMeta] = withUserMessageEcho(nil)
 	}
 	sessRes, err := b.request(ctx, "session/resume", params, bootTimeout)
 	if err != nil {
@@ -4796,6 +4968,25 @@ func (b *Bridge) SubagentCancel(ctx context.Context, sessionID, subagentID strin
 	}, 30*time.Second)
 }
 
+// SubagentMessage calls x.ai/subagent/message: {sessionId, agentAddress, queue, content}
+// to steer or queue text to an active child subagent.
+func (b *Bridge) SubagentMessage(ctx context.Context, sessionID, agentAddress string, queue bool, content []any) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	sid := b.resolveSessionID(sessionID)
+	if sid == "" {
+		return nil, errors.New("没有活跃会话")
+	}
+	params := map[string]any{
+		kSessionID:     sid,
+		"agentAddress": agentAddress,
+		"queue":        queue,
+		"content":      content,
+	}
+	return b.request(ctx, "_x.ai/subagent/message", params, 30*time.Second)
+}
+
 // TaskKill calls x.ai/task/kill: {sessionId, taskId, source?} (empty sessionId
 // resolves to the active one; unknown id → agent 404).
 //
@@ -5297,6 +5488,12 @@ func (b *Bridge) Shutdown() {
 		b.cancelRd()
 	}
 	b.mu.Unlock()
+
+	// Flush the usage ledger so the process's last turns are persisted even
+	// if the periodic sync has not fired yet.
+	if err := b.syncUsageLedger(); err != nil {
+		log.Printf("[capri-host] 退出前用量台账落盘失败: %v", err)
+	}
 
 	// Stop the goal loop: a continuation turn can be blocked on a
 	// 30-minute prompt or waiting for the session to go idle, and must
