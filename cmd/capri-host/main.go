@@ -149,7 +149,7 @@ func main() {
 		// Same reason as LastSessionFile above: keep every piece of
 		// per-install state under one relocatable directory. The
 		// default resolves to ~/.capri-host/hub.json, which is the
-		path the client would have chosen on its own.
+		// path the client would have chosen on its own.
 		StateFile: filepath.Join(config.AppDir(), "hub.json"),
 		// Optional: bypass proxy/fake-ip DNS for the QUIC transport
 		// (e.g. HUB_QUIC_HOST=203.0.113.10).
