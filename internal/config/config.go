@@ -36,6 +36,19 @@ type Config struct {
 	// semantics as the hub's FE_TOKEN — deploy the same value so the
 	// browser gate and the host port share one credential.
 	AccessToken string
+	// OpenBrowser opens the local web UI once the server is listening.
+	// Default true — it replaces the launcher script's final step, which is
+	// the only reason a double-clicked exe shows anything at all.
+	OpenBrowser bool
+	// EnableTray runs the system tray (Windows only). Default true.
+	EnableTray bool
+	// ConfigSource is the settings file that was read, empty when none was
+	// found. Recorded for the startup log so a misplaced config is visible.
+	ConfigSource string
+	// ConfigError is a malformed settings file, surfaced by the caller
+	// rather than swallowed here — Load has no way to report it otherwise
+	// and a silently ignored config is indistinguishable from a broken host.
+	ConfigError error
 	// ResidentCap is passed to the grok bridge idle-unload supervisor.
 	// 0 = use the bridge default (4). Negative = disable (RESIDENT_CAP=0).
 	ResidentCap int
@@ -47,31 +60,73 @@ type Config struct {
 	UsageLedger string
 }
 
+// DefaultHostID and DefaultHostName are the compiled-in identity used when
+// nothing else supplies one. Exported so a caller can tell "the user never
+// chose an identity" from "the user chose this one" — the hub keys its host
+// table by id, so leaving every unconfigured host on the same default makes
+// two of them displace each other on the same hub.
+const (
+	DefaultHostID   = "local"
+	DefaultHostName = "Local Host"
+)
+
 func Load() Config {
-	port := 8765
+	c := Config{
+		Port:        8765,
+		GrokBin:     "grok",
+		HostID:      DefaultHostID,
+		HostName:    DefaultHostName,
+		OpenBrowser: true,
+		EnableTray:  true,
+	}
+
+	// Settings file first, environment second: env wins so shell and service
+	// launches behave exactly as before this file existed.
+	path := ConfigPath()
+	fc, err := loadFile(path)
+	if err != nil {
+		c.ConfigError = err
+	} else if fc != nil {
+		fc.apply(&c)
+		c.ConfigSource = path
+	}
+
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			port = n
+			c.Port = n
 		}
 	}
-	bin := os.Getenv("GROK_BIN")
-	if bin == "" {
-		bin = "grok"
+	if v := strings.TrimSpace(os.Getenv("GROK_BIN")); v != "" {
+		c.GrokBin = v
 	}
-	return Config{
-		Port:        port,
-		BindAddr:    bindAddr(),
-		GrokBin:     bin,
-		HubURL:      os.Getenv("HUB_URL"),
-		HubPairCode: os.Getenv("HUB_PAIR_CODE"),
-		HostToken:   os.Getenv("HOST_TOKEN"),
-		HostID:      envOr("HOST_ID", "local"),
-		HostName:    envOr("HOST_NAME", "Local Host"),
-		HubQUICPin:  strings.TrimSpace(os.Getenv("HUB_QUIC_PIN")),
-		AccessToken: envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")),
-		ResidentCap: envResidentCap(),
-		UsageLedger: strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
+	envSet(&c.HubURL, "HUB_URL")
+	envSet(&c.HubPairCode, "HUB_PAIR_CODE")
+	envSet(&c.HostToken, "HOST_TOKEN")
+	envSet(&c.HostID, "HOST_ID")
+	envSet(&c.HostName, "HOST_NAME")
+	envSet(&c.HubQUICPin, "HUB_QUIC_PIN")
+	if v := envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")); v != "" {
+		c.AccessToken = v
 	}
+	envBool(&c.OpenBrowser, "CAPRI_OPEN_BROWSER")
+	envBool(&c.EnableTray, "CAPRI_TRAY")
+	// BIND / HOST_BIND: upstream default is loopback-only; env always wins here.
+	c.BindAddr = bindAddr()
+	c.ResidentCap = envResidentCap()
+	c.UsageLedger = strings.TrimSpace(os.Getenv("USAGE_LEDGER"))
+
+	return c
+}
+
+// UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the
+// ledger off ("0" / "off" / "false" / "no"). Unset means enabled: the
+// ledger is what keeps /usage history past the agent's 30-day cleanup.
+func (c Config) UsageLedgerDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(c.UsageLedger)) {
+	case "0", "off", "false", "no", "disable", "disabled":
+		return true
+	}
+	return false
 }
 
 // UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the
@@ -97,6 +152,23 @@ func envResidentCap() int {
 		return -1
 	}
 	return n
+}
+
+// envSet overwrites dst when the named variable is set and non-empty.
+func envSet(dst *string, key string) {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		*dst = v
+	}
+}
+
+// envBool accepts 1/0, true/false, yes/no. Anything else leaves dst alone.
+func envBool(dst *bool, key string) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		*dst = true
+	case "0", "false", "no", "off":
+		*dst = false
+	}
 }
 
 func envOr(k, def string) string {
