@@ -129,6 +129,17 @@ func (c Config) UsageLedgerDisabled() bool {
 	return false
 }
 
+// UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the
+// ledger off ("0" / "off" / "false" / "no"). Unset means enabled: the
+// ledger is what keeps /usage history past the agent's 30-day cleanup.
+func (c Config) UsageLedgerDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(c.UsageLedger)) {
+	case "0", "off", "false", "no", "disable", "disabled":
+		return true
+	}
+	return false
+}
+
 // envResidentCap reads RESIDENT_CAP. Unset → 0 (bridge default of 4).
 // 0 or a non-positive / unparsable value → -1 (disable idle-unload).
 func envResidentCap() int {
