@@ -77,6 +77,16 @@ type UsageReport struct {
 	Sessions int                       `json:"sessions"`
 	Total    TokenUsageStat            `json:"total"`
 	ByModel  map[string]TokenUsageStat `json:"byModel,omitempty"`
+	// CoverageFrom/CoverageTo 是本次聚合实际覆盖到的数据区间（unix 秒），
+	// 即统计到的回合事件里最早/最晚的时刻。与 From/To 不同：窗口是「用户
+	// 要的范围」，覆盖是「数据实际存在到哪」，两者不一致时 FE 需要如实
+	// 标注，否则「全部」会被误读为真的有全部历史。
+	CoverageFrom int64 `json:"coverageFrom,omitempty"`
+	CoverageTo   int64 `json:"coverageTo,omitempty"`
+
+	// eventKeys 是本次计入的事件键（usageEventKey），仅扫描路径内部使用：
+	// 台账合并时据此跳过盘上已计入的同一条消费。不序列化。
+	eventKeys []string
 }
 
 // unknownModel 承接无 modelUsage 事件的键（以及 modelUsage 与顶层的差额）。
@@ -96,14 +106,39 @@ var (
 // 扫描范围（都为空 = 全部会话；仅 cwd = 该工作区所有会话；sessionId 给
 // 定时 cwd 必填）。from/to 为 unix 秒（兼容毫秒，自动识别；to<=0 = 当前
 // 时刻，from<=0 = 不设下限）。
+//
+// 两个数据源合并，缺一不可：
+//   - 落盘台账（~/.capri-host/usage-ledger.jsonl）：包含已经被 agent 的
+//     30 天清理删掉源文件的回合，是历史回溯的唯一依据；同一会话在盘上
+//     的已有事件会被台账覆盖（台账是超集），不会双算；
+//   - 盘上 updates.jsonl：台账还没抄到的最临近回合（同步周期内的新事件）。
 func (b *Bridge) UsageReport(ctx context.Context, cwd, sessionID string, from, to int64) (*UsageReport, error) {
 	from, to = normalizeUsageWindow(from, to)
+	rep := &UsageReport{From: from, To: to, ByModel: make(map[string]TokenUsageStat)}
+
+	// 盘上直扫（权威：当前盘上真实存在的事件），同时收集事件键供台账去重。
 	paths, err := usageFiles(b.grokHome(), cwd, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	rep := &UsageReport{From: from, To: to, ByModel: make(map[string]TokenUsageStat)}
-	scanUsageFiles(ctx, paths, rep, from, to)
+	scanned := make(map[string]struct{})
+	// 会话集合由两条路径共同填充后统一计数：同一次会话可能既有盘上事件
+	// （台账尚未抄到的新回合）又有台账独有事件（rewind 截断后已从盘上消失
+	// 的死分支），各加一次会把会话数算重。
+	sessions := make(map[string]struct{})
+	scanUsageFiles(ctx, paths, rep, from, to, scanned, sessions)
+
+	// 台账补盘上缺口：已删源文件的旧回合只能从台账拿到；盘上仍存在的
+	// 同一条按 scanned 跳过，不双算。
+	if b.ledgerOn() {
+		if err := b.ensureUsageLedger(); err == nil {
+			b.ledger.mu.Lock()
+			b.ledger.aggregate(rep, cwd, sessionID, from, to, scanned, sessions)
+			b.ledger.mu.Unlock()
+		}
+	}
+	rep.Sessions = len(sessions)
+
 	finalizeUsageStats(rep)
 	return rep, nil
 }
@@ -174,7 +209,13 @@ func updatesUnder(dir string) ([]string, error) {
 // 顺序合并；ctx 取消时提前退出。from>0 时先按 mtime 预过滤：最后写入
 // 早于窗口起点的文件整文件跳过（事件 timestamp 与 mtime 同源，mtime ≥
 // 任一事件 timestamp，故跳过必然无窗口内事件）。
-func scanUsageFiles(ctx context.Context, paths []string, rep *UsageReport, from, to int64) {
+//
+// scanned 可选：非 nil 时收集窗口内已计入事件的事件键（usageEventKey），
+// 供台账路径去重——同一条消费只允许被盘上或台账之一计入。
+//
+// sessions 可选：非 nil 时把「窗口内有事件的会话」并进去（由调用方在两条
+// 路径都跑完后统一取基数，避免跨源重复计数）。
+func scanUsageFiles(ctx context.Context, paths []string, rep *UsageReport, from, to int64, scanned, sessions map[string]struct{}) {
 	if len(paths) == 0 {
 		return
 	}
@@ -197,12 +238,20 @@ func scanUsageFiles(ctx context.Context, paths []string, rep *UsageReport, from,
 		workers = len(paths)
 	}
 	ch := make(chan string)
-	locals := make([]*UsageReport, workers)
+	type scanResult struct {
+		rep      *UsageReport
+		keys     []string
+		sessions map[string]struct{}
+	}
+	locals := make([]*scanResult, workers)
 	var wg sync.WaitGroup
 	for i := range locals {
-		locals[i] = &UsageReport{ByModel: make(map[string]TokenUsageStat)}
+		locals[i] = &scanResult{
+			rep:      &UsageReport{ByModel: make(map[string]TokenUsageStat)},
+			sessions: make(map[string]struct{}),
+		}
 		wg.Add(1)
-		go func(local *UsageReport) {
+		go func(local *scanResult) {
 			defer wg.Done()
 			for p := range ch {
 				select {
@@ -210,9 +259,16 @@ func scanUsageFiles(ctx context.Context, paths []string, rep *UsageReport, from,
 					return
 				default:
 				}
-				if lr, err := scanUsageFile(p, from, to); err == nil && lr.Total.Turns > 0 {
-					mergeUsageReport(local, lr)
-					local.Sessions++
+				lr, err := scanUsageFile(p, from, to)
+				if err != nil || lr.Total.Turns == 0 {
+					continue
+				}
+				mergeUsageReport(local.rep, lr)
+				local.rep.Sessions++
+				// 会话 ID = 会话目录名（<cwd>/<sessionId>/updates.jsonl）。
+				local.sessions[filepath.Base(filepath.Dir(p))] = struct{}{}
+				for _, k := range lr.eventKeys {
+					local.keys = append(local.keys, k)
 				}
 			}
 		}(locals[i])
@@ -232,7 +288,17 @@ func scanUsageFiles(ctx context.Context, paths []string, rep *UsageReport, from,
 	wg.Wait()
 
 	for _, l := range locals {
-		mergeUsageReport(rep, l)
+		mergeUsageReport(rep, l.rep)
+		if sessions != nil {
+			for id := range l.sessions {
+				sessions[id] = struct{}{}
+			}
+		}
+		if scanned != nil {
+			for _, k := range l.keys {
+				scanned[k] = struct{}{}
+			}
+		}
 	}
 }
 
@@ -242,6 +308,12 @@ func mergeUsageReport(dst, src *UsageReport) {
 	addStat(&dst.Total, src.Total)
 	for model, st := range src.ByModel {
 		addStatToModel(dst, model, st)
+	}
+	if src.CoverageFrom != 0 && (dst.CoverageFrom == 0 || src.CoverageFrom < dst.CoverageFrom) {
+		dst.CoverageFrom = src.CoverageFrom
+	}
+	if src.CoverageTo > dst.CoverageTo {
+		dst.CoverageTo = src.CoverageTo
 	}
 }
 
@@ -278,7 +350,7 @@ func scanUsageFile(path string, from, to int64) (*UsageReport, error) {
 	defer f.Close()
 
 	local := &UsageReport{ByModel: make(map[string]TokenUsageStat)}
-	acc := &usageAccumulator{rep: local, from: from, to: to}
+	acc := newUsageAccumulator(local, path, from, to)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), maxUsageLineBytes)
 	for sc.Scan() {
@@ -290,6 +362,7 @@ func scanUsageFile(path string, from, to int64) (*UsageReport, error) {
 		}
 		return scanUsageFileReadAll(path, from, to)
 	}
+	acc.finish()
 	return local, nil
 }
 
@@ -301,48 +374,107 @@ func scanUsageFileReadAll(path string, from, to int64) (*UsageReport, error) {
 		return nil, err
 	}
 	local := &UsageReport{ByModel: make(map[string]TokenUsageStat)}
-	acc := &usageAccumulator{rep: local, from: from, to: to}
+	acc := newUsageAccumulator(local, path, from, to)
 	for _, line := range strings.Split(string(raw), "\n") {
 		acc.line([]byte(line))
 	}
+	acc.finish()
 	return local, nil
+}
+
+// storedUsageEnvelope 是 updates.jsonl 存储信封里本模块需要的字段。
+type storedUsageEnvelope struct {
+	Timestamp int64 `json:"timestamp"`
+	Params    struct {
+		Update map[string]json.RawMessage `json:"update"`
+	} `json:"params"`
+}
+
+// parseStoredUsageEvent 解析一行存储信封，命中回合终态 usage 时返回信封与
+// 解码后的 usage 对象。直扫路径与台账路径共用同一个解析器，两条路径的
+// 口径不可能分叉。
+func parseStoredUsageEvent(l []byte) (*storedUsageEnvelope, map[string]any, bool) {
+	if !bytes.Contains(l, tagTurnCompletedB) && !bytes.Contains(l, tagResponseCompletedB) {
+		return nil, nil, false
+	}
+	var env storedUsageEnvelope
+	if json.Unmarshal(l, &env) != nil {
+		return nil, nil, false
+	}
+	rawUsage, ok := env.Params.Update["usage"]
+	if !ok {
+		return nil, nil, false
+	}
+	var usage map[string]any
+	if json.Unmarshal(rawUsage, &usage) != nil || len(usage) == 0 {
+		return nil, nil, false
+	}
+	return &env, usage, true
 }
 
 // usageAccumulator 是单个文件的逐行聚合器（worker 本地，无锁）。
 type usageAccumulator struct {
-	rep  *UsageReport
-	from int64
-	to   int64
+	rep       *UsageReport
+	sessionID string
+	from      int64
+	to        int64
+	// ordinal 是该文件内的用量事件序号（与窗口无关，只随文件推进），
+	// 供 prompt_id 缺失时派生幂等键；台账路径用同一规则，两条路径对齐。
+	ordinal int
+	// coverage 是本文件窗口内已计入事件的最早/最晚时刻。
+	haveCov bool
+	covFrom int64
+	covTo   int64
 }
 
-// line 处理一行存储信封：tag 预过滤后解析，命中窗口内的回合终态 usage
-// 事件则累加进 rep。返回该行是否贡献了一个事件。
+func newUsageAccumulator(rep *UsageReport, path string, from, to int64) *usageAccumulator {
+	return &usageAccumulator{
+		rep:       rep,
+		sessionID: filepath.Base(filepath.Dir(path)),
+		from:      from,
+		to:        to,
+	}
+}
+
+// line 处理一行存储信封：命中回合终态 usage 事件则累加进 rep（窗口外的
+// 事件不计入，但序号照常推进以保持键稳定）。返回该行是否贡献了一个事件。
 func (a *usageAccumulator) line(l []byte) bool {
-	if !bytes.Contains(l, tagTurnCompletedB) && !bytes.Contains(l, tagResponseCompletedB) {
-		return false
-	}
-	var env struct {
-		Timestamp int64 `json:"timestamp"`
-		Params    struct {
-			Update map[string]json.RawMessage `json:"update"`
-		} `json:"params"`
-	}
-	if json.Unmarshal(l, &env) != nil {
-		return false
-	}
-	if env.Timestamp < a.from || env.Timestamp > a.to {
-		return false
-	}
-	rawUsage, ok := env.Params.Update["usage"]
+	env, usage, ok := parseStoredUsageEvent(l)
 	if !ok {
 		return false
 	}
-	var usage map[string]any
-	if json.Unmarshal(rawUsage, &usage) != nil || len(usage) == 0 {
+	ordinal := a.ordinal
+	a.ordinal++
+	if env.Timestamp < a.from || env.Timestamp > a.to {
 		return false
+	}
+	a.rep.eventKeys = append(a.rep.eventKeys,
+		usageEventKey(a.sessionID, updateString(env, "prompt_id"), ordinal))
+	if !a.haveCov {
+		a.haveCov, a.covFrom, a.covTo = true, env.Timestamp, env.Timestamp
+	} else {
+		if env.Timestamp < a.covFrom {
+			a.covFrom = env.Timestamp
+		}
+		if env.Timestamp > a.covTo {
+			a.covTo = env.Timestamp
+		}
 	}
 	accumulateUsage(a.rep, usage)
 	return true
+}
+
+// finish 把本文件的覆盖区间并入报告。
+func (a *usageAccumulator) finish() {
+	if !a.haveCov {
+		return
+	}
+	if a.rep.CoverageFrom == 0 || a.covFrom < a.rep.CoverageFrom {
+		a.rep.CoverageFrom = a.covFrom
+	}
+	if a.covTo > a.rep.CoverageTo {
+		a.rep.CoverageTo = a.covTo
+	}
 }
 
 // accumulateUsage 把一次回合终态 usage 累加进报告：顶层字段进 Total，
@@ -424,6 +556,20 @@ func usageInt(u map[string]any, keys ...string) int64 {
 		}
 	}
 	return 0
+}
+
+// usageCostTicks 提取 agent 自报的本轮成本与「只是下界」标记。1 tick =
+// 1e-10 USD（USD_TICKS_PER_USD），上游未提供时为 0。这是 updates.jsonl
+// 里唯一比 token 更贴近账单的字段，台账原样留存，避免将来看成本视图时
+// 需要重扫已经不存在的源文件。
+func usageCostTicks(u map[string]any) (ticks int64, partial bool) {
+	ticks = usageInt(u, "costUsdTicks", "cost_usd_ticks")
+	if v, ok := u["costIsPartial"].(bool); ok {
+		partial = v
+	} else if v, ok := u["cost_is_partial"].(bool); ok {
+		partial = v
+	}
+	return ticks, partial
 }
 
 // finalizeUsageStats 为总计与每个模型条目计算派生命中率。

@@ -19,11 +19,15 @@ type setDefaultModelBody struct {
 }
 
 // handleSetDefaultModel persists `[models].default` (+ optional
-// `default_reasoning_effort`) AND switches the current session to the model
-// — the TUI `/model <name> [effort]` double-action (session switch + next
-// session default), so a single FE call covers both. Session switch runs
-// first (TUI parity: the switch is the primary action, persistence is the
-// preference side-effect).
+// `default_reasoning_effort`) AND, when a sessionId is given, switches that
+// session to the model — the TUI `/model <name> [effort]` double-action
+// (session switch + next session default), so a single FE call covers both.
+// Session switch runs first (TUI parity: the switch is the primary action,
+// persistence is the preference side-effect).
+//
+// sessionId 可选：改模型列表（自定义模型增删改名后重指默认）只需要把偏好
+// 写进 config.toml，本就不该牵动任何会话当前的模型，所以缺 sid 时只落盘、
+// 不切任何会话（旧行为是直接 400，面板的改名重指默认因此一直静默失败）。
 //
 // 用户选择优先（TUI persist_models_default 语义）：写 config.toml 前先把
 // 触及 models.default 的活动 campaign 加入 dismissed_ids——否则新建会话仍
@@ -38,9 +42,11 @@ func (s *Server) handleSetDefaultModel(w http.ResponseWriter, r *http.Request) {
 	if err := s.bridge.DismissModelDefaultCampaigns(r.Context()); err != nil {
 		log.Printf("[capri-host] campaign dismiss 失败（配置仍会写入，活动可能继续覆盖默认模型）: %v", err)
 	}
-	if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
-		writeAgentError(w, "session/set-model", err)
-		return
+	if body.SessionID != "" {
+		if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
+			writeAgentError(w, "session/set-model", err)
+			return
+		}
 	}
 	if err := s.bridge.SetDefaultModelConfig(body.ModelID, body.ReasoningEffort); err != nil {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
@@ -111,8 +117,15 @@ func (s *Server) reloadModels(r *http.Request) bool {
 	return true
 }
 
+// handleModelsList — POST /api/models/list → x.ai/models/list（主动拉取 agent 模型目录）。
+func (s *Server) handleModelsList(w http.ResponseWriter, r *http.Request) {
+	s.xaiCall(w, r, "x.ai/models/list", map[string]any{})
+}
+
 // registerModelRoutes 注册本域路由（路由与实现同址）。
 func (s *Server) registerModelRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/models/list", s.handleModelsList)
+	mux.HandleFunc("POST /api/models", s.handleModelsList)
 	mux.HandleFunc("POST /api/set-default-model", s.handleSetDefaultModel)
 	mux.HandleFunc("POST /api/custom-models", s.handleCustomModels)
 	mux.HandleFunc("POST /api/custom-model", s.handleCustomModelUpsert)

@@ -121,6 +121,7 @@ func main() {
 		// already lived — existing installs see no change.
 		LastSessionFile: filepath.Join(config.AppDir(), "last-session.json"),
 		ResidentCap:     cfg.ResidentCap,
+		UsageLedgerOn:   !cfg.UsageLedgerDisabled(),
 	})
 	srv := server.New(cfg, bridge)
 
@@ -194,6 +195,11 @@ func main() {
 	// grok 在 stdio 客户端不断开时不会自己 idle-unload；host 按 resident
 	// 上限把空闲会话 session/close 掉，名册仍留给 FE 列表/再 load。
 	bridge.StartIdleUnload(ctx)
+
+	// 用量台账：在 agent 的 30 天会话清理删掉源文件之前把回合用量抄一份到
+	// ~/.capri-host/，让 /usage 的历史回溯不再受清理期限限制。启动先跑一轮
+	// 对账（首次把现存会话全部入账），之后周期增量同步。
+	bridge.StartUsageLedgerSync(ctx)
 
 	// A bind failure is the one startup error a tray user must be told about:
 	// nothing else in the UI would ever appear, and the log is not somewhere

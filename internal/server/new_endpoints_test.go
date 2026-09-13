@@ -381,3 +381,48 @@ func TestShellCwdDefaultsToActiveSession(t *testing.T) {
 		t.Fatalf("resp = %s, want stdout '/\\n'", rec3.Body.String())
 	}
 }
+
+func TestNewWorktreeAndModelsEndpoints(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/models/list", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/models/list status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = postJSON(t, s, "/api/git/worktree/clean-artifacts", `{"idOrPath":"wt-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/git/worktree/clean-artifacts status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = postJSON(t, s, "/api/git/worktree/detach", `{"idOrPath":"wt-1","allowCopy":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/git/worktree/detach status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = postJSON(t, s, "/api/git/worktree/salvage", `{"idOrPath":"wt-1","out":"/tmp/out"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/git/worktree/salvage status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetConfigOptionEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	sid := createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/session/config-option", `{"sessionId":"`+sid+`","configId":"reasoning_effort","value":"high"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/session/config-option status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSubagentMessageEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	sid := createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/subagent/message", `{"sessionId":"`+sid+`","agentAddress":"sa-123","text":"hello subagent"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/subagent/message status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
