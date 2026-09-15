@@ -601,3 +601,88 @@ func TestSessionStatsValidationAndMissing(t *testing.T) {
 		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
 	}
 }
+
+// 工具调用密集的真实形态：模型的每一次工具调用都带本流的 streamStartMs，
+// 工具执行结果（tool_call_update）不带。分母必须覆盖这些「只产出 tool_call、
+// 没有可见文本」的流——它们的 outputTokens 都算在回合终态里，漏掉会把吞吐
+// 放大一个数量级（真实会话实测 1429 tok/s，正确值 204 tok/s）。
+func TestSessionStatsToolCallStreamsCountTowardThroughput(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	// 流 A：ss=2000，只有一条空串内部 chunk @2100，随后 tool_call @3000
+	//（同流）→ 窗口 1000ms。
+	// 流 B：ss=10000，只有 tool_call @13000 → 窗口 3000ms。
+	// 两流都没有可见文本，但都是模型生成，必须入账：
+	// out=400 / 4000ms = 100 tok/s。
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": ""}},
+			map[string]any{"agentTimestampMs": float64(2100), "streamStartMs": float64(2000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "grep"},
+			map[string]any{"agentTimestampMs": float64(3000), "streamStartMs": float64(2000), "turnStartMs": float64(1000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"},
+			map[string]any{"agentTimestampMs": float64(3500)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t2", "title": "list_dir"},
+			map[string]any{"agentTimestampMs": float64(13000), "streamStartMs": float64(10000), "turnStartMs": float64(1000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 1000, "outputTokens": 400, "totalTokens": 1400,
+				"modelCalls": 2, "apiDurationMs": 20000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	if got, _ := stats["tokensPerSec"].(float64); got != 100 {
+		t.Errorf("tokensPerSec = %v, want 100（无可见文本的 tool_call 流必须入账：400/4000ms）", got)
+	}
+	// 首 token 取本回合第一条流（ss=2000）− 用户发出 1000 = 1000，
+	// 即使该流的第一条 chunk 文本为空。
+	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1000 {
+		t.Errorf("firstTokenAvgMs = %v, want 1000（首条流起点，不看文本是否可见）", got)
+	}
+}
+
+// 首 token 落在 tool_call 上：首个带 streamStartMs 的事件就是 tool_call 时，
+// 它同样是本回合首条流的起点，不得等到后面出现文本 chunk 才记。
+func TestSessionStatsFirstTokenFromToolCall(t *testing.T) {
+	home := t.TempDir()
+	sid := "s1"
+	lines := []string{
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "user_message_chunk", "content": map[string]any{"type": "text", "text": "hi"}},
+			map[string]any{"agentTimestampMs": float64(1000), "promptId": "p1"}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "grep"},
+			map[string]any{"agentTimestampMs": float64(3000), "streamStartMs": float64(2000), "turnStartMs": float64(1000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "done"}},
+			map[string]any{"agentTimestampMs": float64(9000), "streamStartMs": float64(8000)}),
+		statsSessionLine(sid,
+			map[string]any{"sessionUpdate": "turn_completed", "usage": map[string]any{
+				"inputTokens": 100, "outputTokens": 100, "totalTokens": 200,
+				"modelCalls": 2, "apiDurationMs": 9000,
+			}}, nil),
+	}
+	writeUsageSession(t, home, "/ws", sid, strings.Join(lines, "\n"))
+	s := usageServer(t, home)
+	rec := postJSON(t, s, "/api/session-stats", `{"cwd":"/ws","sessionId":"s1"}`)
+	m := decodeBody(t, rec)
+	stats, _ := m["stats"].(map[string]any)
+	// 首 token = 2000 − 1000 = 1000，不是 8000 − 1000 = 7000。
+	if got, _ := stats["firstTokenAvgMs"].(float64); got != 1000 {
+		t.Errorf("firstTokenAvgMs = %v, want 1000（首条流起点落在 tool_call 上）", got)
+	}
+	// 窗口 = (3000−2000) + (9000−8000) = 2000ms → 100/2 = 50 tok/s。
+	if got, _ := stats["tokensPerSec"].(float64); got != 50 {
+		t.Errorf("tokensPerSec = %v, want 50", got)
+	}
+}

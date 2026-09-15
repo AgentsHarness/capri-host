@@ -24,18 +24,22 @@ import (
 //     _meta.agentTimestampMs − 对应 tool_call 的 agentTimestampMs)。
 //     老数据无 _meta → 该工具跳过；全无则省略；
 //   - firstTokenAvgMs  用户发出 → 本回合第一条 LLM 流起点，每回合只计一次：
-//     首个带 streamStartMs 的 thought/message chunk 的 streamStartMs −
-//     回合起点（user_message 的 agentTimestampMs，_meta.turnStartMs 优先）。
-//     不含 thought 整包生成时间；缺 streamStartMs 的回合跳过；
+//     本回合第一条流的 streamStartMs − 回合起点（user_message 的
+//     agentTimestampMs，_meta.turnStartMs 优先）。流起点可由该流的任意
+//     事件提供，包括空串内部 chunk 与 tool_call——真实会话里首条流的
+//     起点常落在它们上面，只看「有可见文本的 chunk」会把首 token 算到
+//     十几条推理步骤之后。缺 streamStartMs 的回合跳过；
 //   - tokensPerSec     纯生成吞吐 = Σ outputTokens / Σ 生成窗口 × 1000。带
-//     streamStartMs 的流窗口 = 最后一个输出 chunk − streamStartMs，覆盖
+//     streamStartMs 的流窗口 = 最后一个生成侧事件 − streamStartMs，覆盖
 //     Grok 首包批量生成的时间；缺 streamStartMs 时才回退为首包 → 末包。
-//     同流先无 ss 后出现 streamStartMs 时并入当前流，不拆成两条。工具
-//     执行、回合间等待和 API 总耗时不进入分母。整条只有空白占位 chunk
-//     （agent 1.0.25 起每个推理步骤先发一个）的流不是生成，不占窗口槽。
-//     窗口与 usage 按回合配对：观测不到窗口的回合从分子分母一起跳过，
-//     而不是让一个坏回合废掉整个会话。全部回合都观测不到时退回
-//     llmDurationMs 兜底，保证有数据就出数。
+//     模型的产物都算生成侧时间点：message/thought chunk（含空串内部
+//     事件）与 tool_call（工具名与参数由模型产出）；只有工具的执行与
+//     等待（tool_call_update）不进分母。同流先无 ss 后出现 streamStartMs
+//     时并入当前流，不拆成两条。整条只有空白占位 chunk（agent 1.0.25 起
+//     每个推理步骤先发一个）的流不是生成，不占窗口槽。窗口与 usage 按
+//     回合配对：观测不到窗口的回合从分子分母一起跳过，而不是让一个坏
+//     回合废掉整个会话。全部回合都观测不到时退回 llmDurationMs 兜底，
+//     保证有数据就出数。
 //   - cacheHitRate     Σ cachedReadTokens / Σ inputTokens（钳制 [0,1]）；
 //   - inputTokens / outputTokens / totalTokens / cachedReadTokens /
 //     modelCalls：Σ usage（与 usage-report 同源同口径）。
@@ -222,8 +226,18 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 			a.turnFirstChunkSeen = false
 		}
 	case "tool_call":
-		// 工具执行等待不计入生成窗口。
-		a.closeStream()
+		// tool_call 是模型生成侧的产物（工具名与参数由模型产出），带本流
+		// streamStartMs 时并入该流，其时间点算作生成；只有工具的执行与
+		// 等待（tool_call_update）不进窗口。无流起点（老数据）或换了流
+		// 时，模型这一步到此为止，封口。
+		if streamStartMs > 0 {
+			a.noteFirstToken(streamStartMs)
+			a.noteStreamStart(streamStartMs)
+			a.markStreamReal()
+			a.noteChunk(agentTsMs)
+		} else {
+			a.closeStream()
+		}
 		a.stats.Steps++
 		if agentTsMs > 0 {
 			if id := jsonStr(upd["toolCallId"]); id != "" {
@@ -249,23 +263,9 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 		// 占位——它算该流的时间点，但整条流只有占位时不构成生成窗口。
 		visible := text != ""
 		real := strings.TrimSpace(text) != ""
-		// 首 token 只看 streamStart，空占位 chunk 仍算流起点。
-		// 缺 streamStartMs 则等后续同回合 chunk，不把可见字时间当成流起点。
-		if !a.turnFirstChunkSeen && a.turnStartMs > 0 && streamStartMs > 0 && streamStartMs >= a.turnStartMs {
-			a.firstTokenSumMs += streamStartMs - a.turnStartMs
-			a.firstTokenCount++
-			a.turnFirstChunkSeen = true
-		}
+		a.noteFirstToken(streamStartMs)
 		if streamStartMs > 0 {
-			if a.streamOpen && a.lastStreamStartMs == 0 {
-				// 临时无 ss 流等到了 streamStart：并入当前流。
-				a.lastStreamStartMs = streamStartMs
-			} else if streamStartMs != a.lastStreamStartMs {
-				a.openStream(streamStartMs)
-			} else if !a.streamOpen {
-				// 同流晚到尾巴：重开，保留已记的首包与已提交窗口。
-				a.streamOpen = true
-			}
+			a.noteStreamStart(streamStartMs)
 		} else if visible && !a.streamOpen && agentTsMs > 0 {
 			// 无 streamStartMs：先记临时流，≥2 个可见 chunk 才有正窗口。
 			a.openStream(0)
@@ -274,9 +274,7 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 			if real {
 				a.markStreamReal()
 			}
-			if visible {
-				a.noteChunk(agentTsMs)
-			}
+			a.noteChunk(agentTsMs)
 		}
 	case "turn_completed", "response_completed":
 		a.closeStream()
@@ -292,7 +290,8 @@ func (a *sessionStatsAccumulator) line(l []byte) {
 	}
 }
 
-// markStreamReal 标记当前流含真实内容（非纯空白），使它占一个窗口槽。
+// markStreamReal 让当前流占一个窗口槽（幂等）。流只要有生成侧时间点就
+// 该占槽；真实内容只用于区分「整条都是空白占位」的流。
 func (a *sessionStatsAccumulator) markStreamReal() {
 	if a.streamRealContent {
 		return
@@ -301,6 +300,33 @@ func (a *sessionStatsAccumulator) markStreamReal() {
 	if a.currentStream < 0 {
 		a.turnStreamWindows = append(a.turnStreamWindows, 0)
 		a.currentStream = len(a.turnStreamWindows) - 1
+	}
+}
+
+// noteFirstToken 记本回合的首 token 延迟（每回合只记第一条流）。流起点
+// 由任意生成侧事件提供——真实会话里首条流的起点常落在空串内部 chunk 或
+// tool_call 上，因此不看文本是否可见；缺 streamStartMs 时不记，等后续
+// 同回合事件，不拿可见字时间冒充流起点。
+func (a *sessionStatsAccumulator) noteFirstToken(streamStartMs int64) {
+	if a.turnFirstChunkSeen || a.turnStartMs <= 0 || streamStartMs <= 0 || streamStartMs < a.turnStartMs {
+		return
+	}
+	a.firstTokenSumMs += streamStartMs - a.turnStartMs
+	a.firstTokenCount++
+	a.turnFirstChunkSeen = true
+}
+
+// noteStreamStart 按 streamStartMs 维护「当前流」：同一流继续，换流则
+// 开新流；临时无 ss 流等到 streamStart 时并入当前流，不拆成两条。
+func (a *sessionStatsAccumulator) noteStreamStart(streamStartMs int64) {
+	switch {
+	case a.streamOpen && a.lastStreamStartMs == 0:
+		a.lastStreamStartMs = streamStartMs
+	case streamStartMs != a.lastStreamStartMs:
+		a.openStream(streamStartMs)
+	case !a.streamOpen:
+		// 同流晚到尾巴：重开，保留已记的首包与已提交窗口。
+		a.streamOpen = true
 	}
 }
 
