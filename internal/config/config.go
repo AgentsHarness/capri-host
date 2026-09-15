@@ -48,27 +48,37 @@ type Config struct {
 }
 
 func Load() Config {
+	file, _ := LoadFile()
+	return merge(file)
+}
+
+// merge 叠三层：内置默认 < config.json < 环境变量。环境变量仍是
+// launchd / 脚本部署的最高优先级，GUI 写入的文件不会盖掉它们。
+func merge(file File) Config {
 	port := 8765
+	if file.Port > 0 {
+		port = file.Port
+	}
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			port = n
 		}
 	}
-	bin := os.Getenv("GROK_BIN")
-	if bin == "" {
-		bin = "grok"
+	bin := strings.TrimSpace(file.GrokBin)
+	if v := os.Getenv("GROK_BIN"); v != "" {
+		bin = v
 	}
 	return Config{
 		Port:        port,
-		BindAddr:    bindAddr(),
-		GrokBin:     bin,
-		HubURL:      os.Getenv("HUB_URL"),
-		HubPairCode: os.Getenv("HUB_PAIR_CODE"),
+		BindAddr:    bindAddr(file.Bind),
+		GrokBin:     resolveGrokBin(bin),
+		HubURL:      envOr("HUB_URL", strings.TrimSpace(file.HubURL)),
+		HubPairCode: envOr("HUB_PAIR_CODE", strings.TrimSpace(file.HubPairCode)),
 		HostToken:   os.Getenv("HOST_TOKEN"),
-		HostID:      envOr("HOST_ID", "local"),
-		HostName:    envOr("HOST_NAME", "Local Host"),
-		HubQUICPin:  strings.TrimSpace(os.Getenv("HUB_QUIC_PIN")),
-		AccessToken: envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")),
+		HostID:      envOr("HOST_ID", strOr(strings.TrimSpace(file.HostID), "local")),
+		HostName:    envOr("HOST_NAME", strOr(strings.TrimSpace(file.HostName), "Local Host")),
+		HubQUICPin:  strings.TrimSpace(envOr("HUB_QUIC_PIN", strings.TrimSpace(file.HubQUICPin))),
+		AccessToken: firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
 		ResidentCap: envResidentCap(),
 		UsageLedger: strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
 	}
@@ -106,11 +116,30 @@ func envOr(k, def string) string {
 	return def
 }
 
-// bindAddr reads BIND (alias HOST_BIND), defaulting to loopback.
-func bindAddr() string {
+func strOr(v, def string) string {
+	if v != "" {
+		return v
+	}
+	return def
+}
+
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// bindAddr reads BIND (alias HOST_BIND), then config.json, then loopback.
+func bindAddr(fileBind string) string {
 	v := strings.TrimSpace(os.Getenv("BIND"))
 	if v == "" {
 		v = strings.TrimSpace(os.Getenv("HOST_BIND"))
+	}
+	if v == "" {
+		v = strings.TrimSpace(fileBind)
 	}
 	if v == "" {
 		return DefaultBindAddr
