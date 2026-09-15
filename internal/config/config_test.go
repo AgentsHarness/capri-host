@@ -4,8 +4,18 @@ import (
 	"testing"
 )
 
+func isolateConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv(HomeEnv, dir)
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	return dir
+}
+
 // 默认只听回环；BIND / HOST_BIND 显式改写。
 func TestLoadBindAddr(t *testing.T) {
+	isolateConfig(t)
 	t.Setenv("BIND", "")
 	t.Setenv("HOST_BIND", "")
 	if got := Load().BindAddr; got != DefaultBindAddr {
@@ -76,6 +86,7 @@ func TestCheckBindPolicy(t *testing.T) {
 }
 
 func TestEnvResidentCap(t *testing.T) {
+	isolateConfig(t)
 	t.Setenv("RESIDENT_CAP", "")
 	if got := envResidentCap(); got != 0 {
 		t.Fatalf("unset → %d, want 0 (bridge default)", got)
