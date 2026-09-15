@@ -3,6 +3,7 @@ package acp
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -267,5 +268,109 @@ func TestUsageLedgerKeyFallsBackWithoutPromptID(t *testing.T) {
 	// 无 modelUsage → 归 unknown。
 	if _, ok := rep.ByModel[unknownModel]; !ok {
 		t.Fatalf("无 modelUsage 应归 unknown，实际 byModel=%v", rep.ByModel)
+	}
+}
+
+// 增量优化验证：未同步的新回合与新会话直接在查询时被感知，且未变动文件由台账直接提供。
+func TestUsageReportPicksUpLiveChangesWithoutSync(t *testing.T) {
+	home := t.TempDir()
+	writeSessionFile(t, home, "/ws", "s1", []string{
+		ledgerLine(100, "p1", 1000, 100, 800),
+	})
+	writeSessionFile(t, home, "/ws", "s2", []string{
+		ledgerLine(150, "p2", 500, 50, 400),
+	})
+	b := ledgerBridge(t, home)
+	if err := b.syncUsageLedger(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep1, err := b.UsageReport(t.Context(), "/ws", "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep1.Total.Turns != 2 || rep1.Total.InputTokens != 1500 || rep1.Sessions != 2 {
+		t.Fatalf("初始台账状态不符合预期: turns=%d input=%d sessions=%d",
+			rep1.Total.Turns, rep1.Total.InputTokens, rep1.Sessions)
+	}
+
+	// 1) 追加新回合到 s1（不触发 syncUsageLedger）
+	writeSessionFile(t, home, "/ws", "s1", []string{
+		ledgerLine(100, "p1", 1000, 100, 800),
+		ledgerLine(200, "p3", 2000, 200, 1600),
+	})
+
+	rep2, err := b.UsageReport(t.Context(), "/ws", "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep2.Total.Turns != 3 || rep2.Total.InputTokens != 3500 || rep2.Sessions != 2 {
+		t.Fatalf("追加回合后即时查询不正确: turns=%d input=%d sessions=%d, want 3/3500/2",
+			rep2.Total.Turns, rep2.Total.InputTokens, rep2.Sessions)
+	}
+
+	// 2) 新增会话 s3（不触发 syncUsageLedger）
+	writeSessionFile(t, home, "/ws", "s3", []string{
+		ledgerLine(300, "p4", 800, 80, 600),
+	})
+
+	rep3, err := b.UsageReport(t.Context(), "/ws", "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep3.Total.Turns != 4 || rep3.Total.InputTokens != 4300 || rep3.Sessions != 3 {
+		t.Fatalf("新增会话后即时查询不正确: turns=%d input=%d sessions=%d, want 4/4300/3",
+			rep3.Total.Turns, rep3.Total.InputTokens, rep3.Sessions)
+	}
+}
+
+// 增量优化验证：多文件并发同步与僵尸游标清理 (GC)。
+func TestUsageLedgerParallelSyncAndGC(t *testing.T) {
+	home := t.TempDir()
+	for i := 1; i <= 5; i++ {
+		sid := "s" + strconv.Itoa(i)
+		writeSessionFile(t, home, "/ws", sid, []string{
+			ledgerLine(int64(100*i), "p"+sid, int64(1000*i), 100, 500),
+		})
+	}
+	b := ledgerBridge(t, home)
+	if err := b.syncUsageLedger(); err != nil {
+		t.Fatal(err)
+	}
+
+	b.ledger.mu.Lock()
+	if len(b.ledger.cursors) != 5 {
+		t.Fatalf("初始同步后 cursors 数量=%d, want 5", len(b.ledger.cursors))
+	}
+	b.ledger.mu.Unlock()
+
+	// 删除 s5 文件，模拟 agent 的 30 天清理
+	s5Path := sessionUpdatesFile(home, "/ws", "s5")
+	if err := os.Remove(s5Path); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再次触发同步，s5 的 cursor 应被 GC，但其 entry 保留在台账中
+	if err := b.syncUsageLedger(); err != nil {
+		t.Fatal(err)
+	}
+
+	b.ledger.mu.Lock()
+	if _, exists := b.ledger.cursors[s5Path]; exists {
+		t.Fatalf("已删除文件的 cursor 应当被清理，但依然存在: %s", s5Path)
+	}
+	if len(b.ledger.cursors) != 4 {
+		t.Fatalf("GC 后 cursors 数量=%d, want 4", len(b.ledger.cursors))
+	}
+	b.ledger.mu.Unlock()
+
+	// 查询时依然能查出全部 5 个会话的用量
+	rep, err := b.UsageReport(t.Context(), "/ws", "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Sessions != 5 || rep.Total.Turns != 5 {
+		t.Fatalf("GC 游标后历史用量应当由台账完整保留: sessions=%d turns=%d, want 5/5",
+			rep.Sessions, rep.Total.Turns)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -103,8 +104,9 @@ type ledgerCursor struct {
 	Size  int64 `json:"size"`
 }
 
-// usageLedger 是落盘台账的进程内视图。mu 串行化同步（后台）与查询（HTTP）。
+// usageLedger 是落盘台账的进程内视图。syncMu 串行化后台同步；mu 保护 entries/cursors 读写。
 type usageLedger struct {
+	syncMu  sync.Mutex
 	mu      sync.Mutex
 	path    string
 	entries map[string]*usageLedgerEntry
@@ -164,45 +166,106 @@ func (l *usageLedger) load() {
 	}
 }
 
-// save 整表落盘：先 entries 后 meta（见 ledgerMeta 的顺序约束）。
-// 调用方持锁。
-func (l *usageLedger) save() error {
+// snapshotForSaveLocked 在持锁状态下提取条目切片与游标快照，
+// 供锁外执行排序、序列化与原子写盘，并将 dirty 置 false。
+func (l *usageLedger) snapshotForSaveLocked() ([]*usageLedgerEntry, ledgerMeta, bool) {
+	if !l.dirty {
+		return nil, ledgerMeta{}, false
+	}
+	entries := make([]*usageLedgerEntry, 0, len(l.entries))
+	for _, e := range l.entries {
+		entries = append(entries, e)
+	}
+	cursorsCopy := make(map[string]ledgerCursor, len(l.cursors))
+	for k, v := range l.cursors {
+		cursorsCopy[k] = v
+	}
+	l.dirty = false
+	return entries, ledgerMeta{Version: usageLedgerVersion, Cursors: cursorsCopy}, true
+}
+
+// saveSnapshot 在锁外执行整表落盘：先 entries 后 meta（见 ledgerMeta 的顺序约束）。
+func (l *usageLedger) saveSnapshot(entries []*usageLedgerEntry, meta ledgerMeta) error {
 	if l.path == "" {
 		return errors.New("用量台账路径为空")
 	}
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
 		return err
 	}
-	keys := make([]string, 0, len(l.entries))
-	for k := range l.entries {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := l.entries[keys[i]], l.entries[keys[j]]
-		if a.TS != b.TS {
-			return a.TS < b.TS
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].TS != entries[j].TS {
+			return entries[i].TS < entries[j].TS
 		}
-		if a.SessionID != b.SessionID {
-			return a.SessionID < b.SessionID
+		if entries[i].SessionID != entries[j].SessionID {
+			return entries[i].SessionID < entries[j].SessionID
 		}
-		return a.PromptID < b.PromptID
+		return entries[i].PromptID < entries[j].PromptID
 	})
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	for _, k := range keys {
-		if err := enc.Encode(l.entries[k]); err != nil {
+	for _, e := range entries {
+		if err := enc.Encode(e); err != nil {
 			return err
 		}
 	}
 	if err := writeFileAtomic(l.path, buf.Bytes(), 0o600); err != nil {
 		return err
 	}
-	meta := ledgerMeta{Version: usageLedgerVersion, Cursors: l.cursors}
 	raw, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
 	return writeFileAtomic(l.metaPath(), raw, 0o600)
+}
+
+// save 整表落盘：在锁内复制快照，在锁外执行排序、序列化与原子写盘，
+// 避免长时间持有互斥锁阻塞并发查询。
+func (l *usageLedger) save() error {
+	l.mu.Lock()
+	entries, meta, needSave := l.snapshotForSaveLocked()
+	l.mu.Unlock()
+	if !needSave {
+		return nil
+	}
+	if err := l.saveSnapshot(entries, meta); err != nil {
+		l.mu.Lock()
+		l.dirty = true
+		l.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// filterUnindexedPaths 筛选出尚未入账或内容发生变化（mtime/size 与游标不一致）的文件。
+// 未发生变化的文件其所有事件已在台账内存中，查询路径无需再次扫盘。
+func (l *usageLedger) filterUnindexedPaths(paths []string) []string {
+	if l == nil {
+		return paths
+	}
+	l.mu.Lock()
+	if !l.synced {
+		l.mu.Unlock()
+		return paths
+	}
+	cursorsCopy := make(map[string]ledgerCursor, len(l.cursors))
+	for k, v := range l.cursors {
+		cursorsCopy[k] = v
+	}
+	l.mu.Unlock()
+
+	var changed []string
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		cur := ledgerCursor{Mtime: st.ModTime().UnixNano(), Size: st.Size()}
+		prev, seen := cursorsCopy[p]
+		if !seen || prev != cur {
+			changed = append(changed, p)
+		}
+	}
+	return changed
 }
 
 // usageEventKey 是用量事件的幂等键，直扫路径与台账路径共用同一套派生规则，
@@ -505,57 +568,139 @@ func (b *Bridge) ledgerOn() bool {
 
 // syncUsageLedger 把尚未入账的 updates.jsonl 回合用量抄进台账。按 mtime/size
 // 跳过已入账的文件，因此常态调用只解析变动的少数文件；首次调用（或台账被
-// 删）会全量重建。ctx 取消时提前返回，已入账部分照常落盘。
+// 删）多 Worker 并发重建。同步完成后自动剔除已被 agent 清理的僵尸游标 (GC)。
 func (b *Bridge) syncUsageLedger() error {
 	if !b.ledgerOn() || b.ledger == nil {
 		return nil
 	}
 	led := b.ledger
+	led.syncMu.Lock()
+	defer led.syncMu.Unlock()
+
 	led.mu.Lock()
 	led.load()
+	cursorsCopy := make(map[string]ledgerCursor, len(led.cursors))
+	for k, v := range led.cursors {
+		cursorsCopy[k] = v
+	}
 	led.mu.Unlock()
 
 	paths, err := usageFiles(b.grokHome(), "", "")
 	if err != nil {
 		return err
 	}
-	changed := false
+
+	type fileToScan struct {
+		path   string
+		cursor ledgerCursor
+	}
+	var toScan []fileToScan
+	pathSet := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
+		pathSet[p] = struct{}{}
 		st, err := os.Stat(p)
 		if err != nil {
 			continue
 		}
 		cur := ledgerCursor{Mtime: st.ModTime().UnixNano(), Size: st.Size()}
+		if prev, seen := cursorsCopy[p]; seen && prev == cur {
+			continue
+		}
+		toScan = append(toScan, fileToScan{path: p, cursor: cur})
+	}
+
+	// 僵尸游标清理 (GC)：源文件被 30 天清理机制删除后，从 cursors 中剔除
+	var stalePaths []string
+	for oldPath := range cursorsCopy {
+		if _, ok := pathSet[oldPath]; !ok {
+			stalePaths = append(stalePaths, oldPath)
+		}
+	}
+
+	if len(toScan) == 0 && len(stalePaths) == 0 {
 		led.mu.Lock()
-		prev, seen := led.cursors[p]
+		led.synced = true
+		dirty := led.dirty
 		led.mu.Unlock()
-		if seen && prev == cur {
+		if !dirty {
+			return nil
+		}
+		return led.save()
+	}
+
+	// 变动文件扫描：单文件直接扫，多文件并发 worker 扫描（初次建账显著加速）
+	type scanResult struct {
+		idx     int
+		entries []*usageLedgerEntry
+	}
+	results := make([]scanResult, len(toScan))
+	if len(toScan) == 1 {
+		ents, err := scanLedgerFile(toScan[0].path)
+		if err == nil {
+			results[0] = scanResult{idx: 0, entries: ents}
+		}
+	} else if len(toScan) > 1 {
+		workers := runtime.NumCPU()
+		if workers > len(toScan) {
+			workers = len(toScan)
+		}
+		ch := make(chan int)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range ch {
+					ents, err := scanLedgerFile(toScan[idx].path)
+					if err == nil {
+						results[idx] = scanResult{idx: idx, entries: ents}
+					}
+				}
+			}()
+		}
+		for i := range toScan {
+			ch <- i
+		}
+		close(ch)
+		wg.Wait()
+	}
+
+	// 汇总入账并落盘
+	led.mu.Lock()
+	changed := false
+	for _, res := range results {
+		if res.entries == nil && len(toScan) > 0 && toScan[res.idx].path != "" {
+			// 扫描失败的文件不推进游标，留待下次同步重试
 			continue
 		}
-		entries, err := scanLedgerFile(p)
-		if err != nil {
-			continue
-		}
-		led.mu.Lock()
-		for _, e := range entries {
+		for _, e := range res.entries {
 			if led.merge(e) {
 				changed = true
 			}
 		}
-		led.cursors[p] = cur
+		led.cursors[toScan[res.idx].path] = toScan[res.idx].cursor
 		led.dirty = true
-		led.mu.Unlock()
 	}
-	led.mu.Lock()
-	defer led.mu.Unlock()
+	for _, sp := range stalePaths {
+		delete(led.cursors, sp)
+		led.dirty = true
+		changed = true
+	}
 	led.synced = true
-	if !changed && !led.dirty {
+	entriesSnap, metaSnap, needSave := led.snapshotForSaveLocked()
+	led.mu.Unlock()
+
+	if !changed && !needSave {
 		return nil
 	}
-	if err := led.save(); err != nil {
-		return err
+	if needSave {
+		if err := led.saveSnapshot(entriesSnap, metaSnap); err != nil {
+			led.mu.Lock()
+			led.dirty = true
+			led.mu.Unlock()
+			return err
+		}
 	}
-	led.dirty = false
 	return nil
 }
 
