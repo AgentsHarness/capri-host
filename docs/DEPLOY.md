@@ -144,9 +144,32 @@ cp -R dist ../capri-host/internal/server/web/dist
 
 然后重新编译 / 重启 Host。
 
+## 配置文件
+
+`capri-host` 读三层配置，后者覆盖前者：内置默认 < `~/.capri-host/config.json` < 环境变量。菜单栏应用只写这个 JSON，命令行 / launchd 仍可按环境变量覆盖。
+
+```json
+{
+  "bind": "127.0.0.1",
+  "port": 8765,
+  "host_id": "mba",
+  "host_name": "MacBook Air",
+  "hub_url": "https://agents.example.com",
+  "fe_token": "",
+  "grok_bin": "",
+  "hub_pair_code": ""
+}
+```
+
+`GROK_BIN` 为空时会按 `~/.local/bin/grok`、`~/.grok/bin/grok`、Homebrew 路径依次探测。测试或便携安装可设 `CAPRI_HOME` 改配置目录。
+
+macOS 13+ 菜单栏应用 `Capri.app`（SwiftUI 原生菜单 + 设置窗）用这份文件启停 host，不必再手写环境变量。打包见仓库 `packaging/macos/make-app.sh`。登录启动走系统「登录项」（SMAppService）。
+
 ## 开机自启
 
-macOS `~/Library/LaunchAgents/com.capri.host.plist`：
+macOS 用 `Capri.app` 菜单里的「登录时启动」即可（写入 `~/Library/LaunchAgents/com.agentsharness.capri.plist`）。
+
+只跑无界面二进制时，macOS `~/Library/LaunchAgents/com.capri.host.plist`：
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>

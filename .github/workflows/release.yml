@@ -100,9 +100,44 @@ jobs:
           path: dist/capri-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
           if-no-files-found: error
 
+  macos-app:
+    name: macOS app
+    needs: frontend
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install frontend dist into embed dir
+        uses: actions/download-artifact@v7
+        with:
+          name: capri-fe-dist
+          path: internal/server/web/dist
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build Capri.app
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: bash packaging/macos/make-app.sh --universal
+
+      - name: Build dmg
+        run: bash packaging/macos/make-dmg.sh
+
+      - name: Upload app zip
+        uses: actions/upload-artifact@v6
+        with:
+          name: capri-macos-app
+          path: |
+            dist/Capri-macos.zip
+            dist/Capri-macos.dmg
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, macos-app]
     runs-on: ubuntu-latest
     steps:
       # 只下载编译出的二进制，不要包含前端 dist（capri-fe-dist）
@@ -113,6 +148,12 @@ jobs:
           path: dist
           pattern: capri-host-*
           merge-multiple: true
+
+      - name: Download macOS app
+        uses: actions/download-artifact@v7
+        with:
+          name: capri-macos-app
+          path: dist
 
       - name: Show built files
         run: find dist -type f | sort
