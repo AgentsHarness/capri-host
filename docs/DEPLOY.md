@@ -138,7 +138,7 @@ HUB_URL=https://hub.example.com HUB_QUIC_PIN=dfd749…7c91 \
 Host 二进制里嵌着 capri-fe 的构建产物。要换新界面：
 
 ```bash
-cd ../capri-fe && npm run build
+cd ../capri-fe && pnpm run build
 cp -R dist ../capri-host/internal/server/web/dist
 ```
 

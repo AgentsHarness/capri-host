@@ -26,19 +26,25 @@ jobs:
           ref: ${{ inputs.fe_ref || 'main' }}
           path: capri-fe
 
+      # capri-fe 的 package.json 声明了 packageManager: pnpm@<版本>，
+      # action-setup 会自动读取该字段，无需在此重复固定版本。
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: capri-fe/package.json
+
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-          cache: npm
-          cache-dependency-path: capri-fe/package-lock.json
+          cache: pnpm
+          cache-dependency-path: capri-fe/pnpm-lock.yaml
 
       - name: Install deps
         working-directory: capri-fe
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build frontend
         working-directory: capri-fe
-        run: npm run build
+        run: pnpm run build
 
       - name: Upload dist
         uses: actions/upload-artifact@v6

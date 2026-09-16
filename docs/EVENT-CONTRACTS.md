@@ -84,6 +84,19 @@ host 进程重启后 seq 从 1 重新计数，而 hub 可能仍持有上一进�
   处理（等待用户输入的除外），避免丢掉的终态事件把会话永久钉在 running。
   只有执行类 kind 算证据：标题 / 模式 / 配置 / 命令表 / 模型切换等会话元
   数据，以及 `usage_update`、后台任务与 monitor 轨，都不张开回合。
+  收尾类 / 面板状态类 kind 同样不算证据——它们会在 `turn_completed`
+  **之后**到达（实测：`memory_flush_*` 是回合收尾的内务，`workflow_updated`
+  是每个运行状态的重复广播、滞后可达数天，`retry_state` 的 `failed` /
+  `exhausted` 是那次尝试的终态），收进来就等于把刚合上的观察腿重新张开，
+  而它们再没有终态事件，会话只能空转到 30 分钟过期。`retry_state` 的
+  `retrying` 例外：它证明一次推理尝试正在飞，照常张开回合。
+- 客户端请求（权限 / 提问）的 host 侧等待预算：权限用 host 常量
+  `approvalTimeout`（15 分钟）；`x.ai/ask_user_question` 用
+  `[toolset.ask_user_question]` 的 `timeout_secs`——与 agent 的
+  RESPONSE_TIMEOUT、FE 卡片倒计时同源（默认 1800s）。`timeout_enabled =
+  false` 时 host 不设截止时间，等待只由浏览器答复或 agent 自己的超时结束。
+  提问超时的响应文案是「提问超时」（权限仍是「审批超时」），过期都会广播
+  `client_request_resolved` 并清掉该会话的 awaiting-input。
 - 回合错误的上报口径（`reportPromptFailure`）：agent 用 JSON-RPC error 拒绝
   回合、以及 host 因浏览器断连主动取消，一律上事件流；纯传输失败要先看
   观察腿——回合仍在输出（最近 `turnLivenessWindow` 内有 update）时，

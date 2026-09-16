@@ -42,6 +42,17 @@ const (
 	turnLivenessWindow = 5 * time.Minute
 )
 
+// askUserQuestionTimeoutDefault is the host-side wait budget for an
+// x.ai/ask_user_question when [toolset.ask_user_question] carries no
+// timeout_secs: the agent's own RESPONSE_TIMEOUT (30 min), which is also
+// the countdown the FE draws for the question card.
+const askUserQuestionTimeoutDefault = 30 * time.Minute
+
+// methodAskUserQuestion is the agent → client extension request that opens
+// the question card. It is the one client request whose budget is
+// user-configurable rather than a host constant (see clientRequestBudget).
+const methodAskUserQuestion = "x.ai/ask_user_question"
+
 var (
 	// promptStallTimeout 是发出 prompt 后整个会话持续无任何 update 活动的熔断上限。
 	// 正常情况下 agent 在进入模型推理前（1~2ms）就会发出 user_message_chunk 或 queue 广播。
@@ -61,10 +72,13 @@ var ErrPromptStalled = errors.New("session/prompt 启动超时: agent 进程无�
 type Bridge struct {
 	cfg GrokConfig
 
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	cancelRd context.CancelFunc
+	// Lock order: agentMessageMu → clientReqMu → mu.
+	agentMessageMu sync.Mutex // serializes old stdout delivery with process reset
+	clientReqMu    sync.Mutex // serializes client request completion and retirement
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	cancelRd       context.CancelFunc
 
 	ready   bool
 	booting bool
@@ -127,7 +141,7 @@ type Bridge struct {
 
 	// turns is the agent-observed turn state per session, keyed by
 	// sessionId: the update stream says "a turn is in flight for this
-	// session" until turn_completed / response_completed says otherwise.
+	// session" until turn_completed says otherwise.
 	// It is the second leg of SessionState.Busy — busyCount alone only
 	// counts session/prompt calls this host process made and stops
 	// counting when that RPC dies (the 30-minute promptTimeout among
@@ -226,6 +240,8 @@ type RPCError struct {
 func (e *RPCError) Error() string { return e.Msg }
 
 type clientRequest struct {
+	stdin     io.WriteCloser // bound to the originating process, never the replacement
+	retired   bool           // protected by clientReqMu
 	AgentID   any
 	SessionID string // originating session (dashboard awaiting-input state)
 	Method    string
@@ -239,6 +255,7 @@ type clientRequest struct {
 	outcome      map[string]any // session/request_permission result
 	result       map[string]any // generic x.ai/* request result
 	errMsg       string
+	errCode      int
 	// receivedAt: unix ms stamped when the forwarder took the request off
 	// the agent pipe — the single timing origin every client counts the
 	// ask-question / approval budget from (broadcast + snapshot).
@@ -481,7 +498,7 @@ func (b *Bridge) noteTurnActivity(sid string) {
 }
 
 // noteTurnEnd clears the agent-observed turn for sid (the agent reported
-// turn_completed / response_completed, or a turn the host drove came to a
+// turn_completed, or a turn the host drove came to a
 // definitive end) and re-projects Busy. See noteTurnActivity for the
 // broadcast discipline.
 func (b *Bridge) noteTurnEnd(sid string) {
@@ -535,7 +552,7 @@ func (b *Bridge) settleTurnsLocked(now int64) bool {
 
 // turnEvidenceKinds are the sessionUpdate kinds that prove the agent is
 // executing a turn: they arm the observed leg of Busy, which
-// turn_completed / response_completed then clears.
+// turn_completed then clears.
 //
 // Deliberately a whitelist rather than "everything except the terminal
 // kinds": a false "active" is sticky (only a terminal update or the
@@ -545,8 +562,19 @@ func (b *Bridge) settleTurnsLocked(now int64) bool {
 // commands / model switches — those fire while a session sits idle),
 // usage_update (it also rides along at turn end), the background-task and
 // monitor rails (a backgrounded shell can finish long after its turn did),
-// and subagent_finished (a detached subagent can report after its parent
-// turn ended).
+// subagent_finished (a detached subagent can report after its parent
+// turn ended), the memory system (memory_flush_started /
+// memory_flush_completed run as turn-end housekeeping and arrive AFTER
+// the turn_completed that closed the turn, so admitting them re-arms a
+// turn nothing will ever close again — the session reports "active"
+// until the turnStaleAfter expiry), and workflow_updated (the workflow
+// panel's state is re-broadcast after the parent turn ended, and can
+// arrive days later for a run that finished long ago; measured over the
+// local session history it never once opened a turn, while it re-armed
+// finished ones in nine sessions).
+//
+// retry_state is the one kind whose evidence depends on its payload, so it
+// is handled in observeUpdateKind rather than this map.
 var turnEvidenceKinds = map[string]bool{
 	"agent_message_chunk":     true,
 	"agent_thought_chunk":     true,
@@ -557,14 +585,12 @@ var turnEvidenceKinds = map[string]bool{
 	"plan":                    true,
 	"plan_update":             true,
 	"diff_review":             true,
-	"retry_state":             true,
 	"response_started":        true,
 	"reasoning_completed":     true,
 	"pending_interaction":     true,
 	"interaction_resolved":    true,
 	"subagent_spawned":        true,
 	"subagent_progress":       true,
-	"workflow_updated":        true,
 	"goal_updated":            true,
 	"scheduled_task_fired":    true,
 	"auto_compact_started":    true,
@@ -572,18 +598,34 @@ var turnEvidenceKinds = map[string]bool{
 	"auto_compact_failed":     true,
 	"auto_compact_cancelled":  true,
 	"auto_continue_completed": true,
-	"memory_flush_started":    true,
-	"memory_flush_completed":  true,
+}
+
+// retryStateIsEvidence reports whether one retry_state update proves the
+// agent is executing a turn. `retrying` means an inference attempt is in
+// flight (the agent is retrying the very request a turn is waiting on), so
+// it opens the observed turn like the streaming kinds do. `failed` and
+// `exhausted` are terminal for the attempt — the agent emits them while
+// unwinding a turn that already ended, and admitting them re-armed finished
+// sessions (measured: 33 turns in the local history carried a terminal
+// retry_state after their own turn_completed, the last one 69s late).
+func retryStateIsEvidence(update map[string]any) bool {
+	t, _ := update[kType].(string)
+	return t != "failed" && t != "exhausted"
 }
 
 // observeUpdateKind maintains the observed turn from one sessionUpdate kind:
 // execution evidence opens it, a terminal kind closes it. Unknown/unmodelled
 // kinds are ignored — a future kind does not get to decide session state
-// until it is classified here.
-func (b *Bridge) observeUpdateKind(sid, kind string) {
+// until it is classified here. The update payload is needed for the kinds
+// whose evidence depends on their own fields (see retryStateIsEvidence).
+func (b *Bridge) observeUpdateKind(sid, kind string, update map[string]any) {
 	switch kind {
-	case "turn_completed", "response_completed":
+	case "turn_completed":
 		b.noteTurnEnd(sid)
+	case "retry_state":
+		if retryStateIsEvidence(update) {
+			b.noteTurnActivity(sid)
+		}
 	default:
 		if turnEvidenceKinds[kind] {
 			b.noteTurnActivity(sid)
@@ -940,7 +982,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 			// it as plain text), git head changes are notified, hunk tracking
 			// stays agent-side. codeNavigation / folderTrust / fs_notify are
 			// env-opt-in (absent = off, same as the TUI).
-			kMetaOut: initCapabilitiesMeta(),
+			kMeta: initCapabilitiesMeta(),
 		},
 		"clientInfo": map[string]any{
 			"name":    "capri-host",
@@ -1405,7 +1447,7 @@ func (b *Bridge) waitProcess(cmd *exec.Cmd) {
 		}
 		return
 	}
-	lastID, _ := b.resetRoster("process-exit")
+	lastID, _ := b.resetProcessRoster("process-exit", cmd)
 	log.Printf("[capri-host] grok process exited (code=%d), lastSession=%s", code, lastID)
 	b.Broadcast(Event{
 		kType:    "status",
@@ -1454,7 +1496,7 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 			// EOF 且该行有内容：处理完最后一行再退出（Scanner 对无
 			// 尾随换行的最后一行同样会返回）。
 			if len(line) > 0 && err == io.EOF {
-				b.handleStdoutLine(line)
+				b.handleStdoutLineContext(ctx, line)
 			}
 			if err != io.EOF {
 				log.Printf("[capri-host] stdout 扫描错误: %v — agent 输出通道已损坏", err)
@@ -1467,11 +1509,20 @@ func (b *Bridge) readStdout(ctx context.Context, r io.Reader) {
 			}
 			return
 		}
-		b.handleStdoutLine(line)
+		b.handleStdoutLineContext(ctx, line)
 	}
 }
 
 func (b *Bridge) handleStdoutLine(line []byte) {
+	b.handleStdoutLineContext(context.Background(), line)
+}
+
+func (b *Bridge) handleStdoutLineContext(ctx context.Context, line []byte) {
+	b.agentMessageMu.Lock()
+	defer b.agentMessageMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
 		return
@@ -1484,7 +1535,7 @@ func (b *Bridge) handleStdoutLine(line []byte) {
 }
 
 func (b *Bridge) onAgentMessage(msg map[string]any) {
-	if method, _ := msg[kMethod].(string); method == "session/update" {
+	if method, _ := msg[kMethod].(string); method == "session/update" && msg[kID] == nil {
 		params, _ := msg[kParams].(map[string]any)
 		b.handleSessionUpdate(params)
 		return
@@ -1510,6 +1561,29 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 	id := msg[kID]
 	if id == nil {
 		return
+	}
+
+	// A method identifies an incoming request or notification, never a response.
+	if rawMethod, hasMethod := msg[kMethod]; hasMethod {
+		method, _ := rawMethod.(string)
+		if method != "" {
+			params, _ := msg[kParams].(map[string]any)
+			if params == nil {
+				params = map[string]any{}
+			}
+			b.handleAgentRequest(id, method, params)
+		}
+		return
+	}
+	_, hasResult := msg[kResult]
+	errValue, hasError := msg[kError]
+	if hasResult == hasError {
+		return
+	}
+	if hasError {
+		if errObj, ok := errValue.(map[string]any); !ok || errObj == nil {
+			return
+		}
 	}
 
 	// Response to our request?
@@ -1552,15 +1626,6 @@ func (b *Bridge) onAgentMessage(msg map[string]any) {
 		}
 		return
 	}
-
-	// Agent → client request
-	if method, _ := msg[kMethod].(string); method != "" {
-		params, _ := msg[kParams].(map[string]any)
-		if params == nil {
-			params = map[string]any{}
-		}
-		b.handleAgentRequest(id, method, params)
-	}
 }
 
 func idKey(id any) string {
@@ -1600,11 +1665,10 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// source, "Accumulated token count across the session"). Surface it
 	// as a usage event so clients can render live context usage — this
 	// is the field x.ai extension notifications do NOT carry.
-	// turn_completed / response_completed 跳过此顶部广播：回合终态的
-	// usage 提取（下方）会广播同 `used` 的终态事件，此处再发就是
-	// 严格重复。其余 kind 值去重：实测流水期 _meta.totalTokens 在一段
-	// 输出内恒定（同一 used 连续 70+ 条），只广播值变化——上下文计数
-	// 器无需逐条刷新。
+	// turn_completed / response_completed 的 usage 由下方统一提取，
+	// 此处跳过以避免重复广播。其余 kind 值去重：实测流水期
+	// _meta.totalTokens 在一段输出内恒定（同一 used 连续 70+ 条），
+	// 只广播值变化——上下文计数器无需逐条刷新。
 	if k, _ := update[kSessionUpdate].(string); k != "turn_completed" && k != "response_completed" {
 		if meta, ok := params[kMeta].(map[string]any); ok {
 			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
@@ -1780,7 +1844,7 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 	kind, _ := update[kSessionUpdate].(string)
 	// 回合观察（Busy 的观察腿）：两个载体（官方 session/update 与
 	// x.ai/session_notification）都经过这里，是唯一收口点。
-	b.observeUpdateKind(sid, kind)
+	b.observeUpdateKind(sid, kind, update)
 	// meta 保全：params._meta 非空时随 typed kind 事件携带。
 	var kindMeta any
 	if m, ok := params[kMeta].(map[string]any); ok && len(m) > 0 {
@@ -1991,8 +2055,8 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		}
 		b.mu.Unlock()
 		ev := Event{
-			kType:      "background_tasks",
-			"tasks":    rawTasks,
+			kType:       "background_tasks",
+			"tasks":     rawTasks,
 			"truncated": update["truncated"],
 		}
 		if kindMeta != nil {
@@ -2019,19 +2083,14 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		b.handleModelSwitchKind(sid, update, tag)
 		return true
 	case "turn_completed", "response_completed":
-		// 回合终态：复位段状态并广播 active:false（不带 rate）——前端
-		// 清除速率显示（只在输出过程中显示，无回合末冻结值）。
+		// Both boundaries end a generation segment; only turn_completed
+		// ends the tool loop and the frontend turn.
 		b.genRate.reset(sid)
-		b.liveToolResolve(sid, "turn_completed", nil, params, replay)
 		b.Broadcast(tag(Event{kType: "gen_rate", kActive: false}))
-		// response_completed 不广播 typed 事件：agent 实测从不发该
-		// kind（updates.jsonl 3383/3383 回合终态均为 turn_completed），
-		// FE 对 typed response_completed 无消费（turnEnd.ts 无 case，
-		// events.ts 重写回 generic 后 notifApps 显式忽略）。保留副作用
-		// （gen_rate 复位 / 调用方 usage 提取），省掉整份 update 白传。
 		if kind == "response_completed" {
 			return true
 		}
+		b.liveToolResolve(sid, "turn_completed", nil, params, replay)
 		// typed 事件是 FE 回合封口语义（update 原样含 stop_reason /
 		// prompt_id / usage 等字段）；usage 提取保留在两个载体
 		// （handleSessionUpdate / handleXaiNotification）。
@@ -2573,8 +2632,14 @@ func (b *Bridge) handleAgentRequest(id any, method string, params map[string]any
 }
 
 func (b *Bridge) forwardPermission(id any, method string, params map[string]any) {
+	b.clientReqMu.Lock()
+	defer b.clientReqMu.Unlock()
+	b.mu.Lock()
+	stdin := b.stdin
+	b.mu.Unlock()
 	reqID := fmt.Sprintf("acp_cr_%d", b.nextClientReqID.Add(1))
 	cr := &clientRequest{
+		stdin:        stdin,
 		AgentID:      id,
 		SessionID:    b.sessionIdFrom(params),
 		Method:       method,
@@ -2602,8 +2667,14 @@ func (b *Bridge) forwardPermission(id any, method string, params map[string]any)
 // the browser as a generic client_request; the browser's response is passed
 // back verbatim as the JSON-RPC result.
 func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any) {
+	b.clientReqMu.Lock()
+	defer b.clientReqMu.Unlock()
+	b.mu.Lock()
+	stdin := b.stdin
+	b.mu.Unlock()
 	reqID := fmt.Sprintf("acp_cr_%d", b.nextClientReqID.Add(1))
 	cr := &clientRequest{
+		stdin:      stdin,
 		AgentID:    id,
 		SessionID:  b.sessionIdFrom(params),
 		Method:     method,
@@ -2626,48 +2697,85 @@ func (b *Bridge) forwardXaiRequest(id any, method string, params map[string]any)
 }
 
 // waitClientResolution blocks until the browser resolves the request,
-// the approval timeout elapses, or the agent connection dies, then writes
-// the JSON-RPC response back to the agent.
+// the request's own budget elapses, or the agent connection dies, then
+// writes the JSON-RPC response back to the agent.
 func (b *Bridge) waitClientResolution(reqID string, cr *clientRequest) {
-	// Whatever happens (resolve / cancel / timeout), the session is no
-	// longer waiting on input.
-	defer b.setSessionAwaiting(cr.SessionID, false)
-	// Multi-tab: every connected client received client_request. Once this
-	// request is settled (any path), broadcast so other tabs drop the card
-	// — without this the answering tab clears locally but siblings keep a
-	// zombie permission / question UI until reload.
-	defer b.broadcastClientRequestResolved(reqID, cr)
-	timer := time.NewTimer(approvalTimeout)
-	defer timer.Stop()
-	// Peek first: the user's answer may have landed at the same instant
-	// the approval timer fired. A plain select would pick randomly and
-	// could reply "cancelled" to a just-confirmed approval; the answer
-	// must always win.
-	select {
-	case <-cr.done:
+	budget, deadline := b.clientRequestBudget(cr)
+	if !deadline {
+		// No host-side deadline: only the browser or the agent's own
+		// timeout can end this request.
+		<-cr.done
 		b.resolveClientRequest(reqID, cr)
 		return
-	default:
 	}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
 	select {
 	case <-cr.done:
 		b.resolveClientRequest(reqID, cr)
 	case <-timer.C:
-		// Re-check once more: an answer arriving while the timer fired
-		// must not be lost to the timeout path.
-		select {
-		case <-cr.done:
-			b.resolveClientRequest(reqID, cr)
-			return
-		default:
-		}
-		b.clientReqs.Delete(reqID)
+		b.expireClientRequest(reqID, cr)
+	}
+}
+
+// clientRequestBudget is how long the host holds a forwarded request open
+// waiting for the browser, and whether it has a host-side deadline at all.
+// A permission prompt uses approvalTimeout (the host's own constant). An
+// x.ai/ask_user_question uses the budget the user configured for it —
+// [toolset.ask_user_question] timeout_secs, the same value the agent
+// enforces and the question card counts down from — because expiring it
+// early closes a card the user is still looking at (with the FE default of
+// 1800s the host's 900s would cut every long question in half).
+// timeout_enabled=false means no host-side deadline: the agent still owns
+// its own budget, so the host waits rather than inventing one.
+func (b *Bridge) clientRequestBudget(cr *clientRequest) (time.Duration, bool) {
+	if cr == nil || cr.Method != methodAskUserQuestion {
+		return approvalTimeout, true
+	}
+	return b.askUserQuestionBudget()
+}
+
+// askUserQuestionBudget reads [toolset.ask_user_question] from config.toml.
+// The file is re-read per question (questions are rare and the settings
+// pane writes it live); anything unusable — unreadable file, missing key,
+// non-positive value — falls back to the agent's own default.
+func (b *Bridge) askUserQuestionBudget() (time.Duration, bool) {
+	path, err := b.ConfigTOMLPath()
+	if err != nil {
+		return askUserQuestionTimeoutDefault, true
+	}
+	table, err := readConfigTable(path)
+	if err != nil {
+		return askUserQuestionTimeoutDefault, true
+	}
+	ask, _ := readConfigSection(table, "toolset", "ask_user_question")
+	if enabled, ok := ask["timeout_enabled"].(bool); ok && !enabled {
+		return 0, false
+	}
+	secs, ok := asInt(ask["timeout_secs"])
+	if !ok || secs <= 0 {
+		return askUserQuestionTimeoutDefault, true
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
+func (b *Bridge) expireClientRequest(reqID string, cr *clientRequest) {
+	b.clientReqMu.Lock()
+	select {
+	case <-cr.done: // An accepted answer wins over the timer.
+	default:
 		cr.errMsg = "审批超时"
-		if cr.isPermission {
-			b.respond(cr.AgentID, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
-		} else {
-			b.respondError(cr.AgentID, cr.errMsg, -32002)
+		cr.errCode = -32002
+		if cr.Method == methodAskUserQuestion {
+			cr.errMsg = "提问超时"
 		}
+		cr.cancel = cr.isPermission
+		close(cr.done)
+	}
+	msg := b.resolveClientRequestLocked(reqID, cr)
+	b.clientReqMu.Unlock()
+	if msg != nil {
+		_ = writeAgentMessage(cr.stdin, msg)
 	}
 }
 
@@ -2711,25 +2819,50 @@ func (b *Bridge) broadcastClientRequestResolved(reqID string, cr *clientRequest)
 // the browser resolved before the approval timeout (cancel / error /
 // permission outcome / raw result).
 func (b *Bridge) resolveClientRequest(reqID string, cr *clientRequest) {
-	b.clientReqs.Delete(reqID)
-	id := cr.AgentID
-	if cr.cancel {
-		if cr.isPermission {
-			b.respond(id, permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta))
-		} else {
-			b.respondError(id, "已取消", -32800)
+	b.clientReqMu.Lock()
+	msg := b.resolveClientRequestLocked(reqID, cr)
+	b.clientReqMu.Unlock()
+	if msg != nil {
+		_ = writeAgentMessage(cr.stdin, msg)
+	}
+}
+
+// Bookkeeping finishes before I/O: a blocked old pipe must not block restart.
+func (b *Bridge) resolveClientRequestLocked(reqID string, cr *clientRequest) map[string]any {
+	if !b.clientReqs.CompareAndDelete(reqID, cr) {
+		return nil
+	}
+	defer b.broadcastClientRequestResolved(reqID, cr)
+	// Another request in the same session may still be awaiting input.
+	awaiting := false
+	b.clientReqs.Range(func(_, value any) bool {
+		if value.(*clientRequest).SessionID == cr.SessionID {
+			awaiting = true
 		}
-		return
+		return !awaiting
+	})
+	b.setSessionAwaiting(cr.SessionID, awaiting)
+	if cr.retired {
+		return nil
 	}
-	if cr.errMsg != "" {
-		b.respondError(id, cr.errMsg, -32001)
-		return
+	msg := map[string]any{kJSONRPC: "2.0", kID: cr.AgentID}
+	switch {
+	case cr.cancel && cr.isPermission:
+		msg[kResult] = permissionResult(map[string]any{"outcome": "cancelled"}, cr.meta)
+	case cr.cancel:
+		msg[kError] = map[string]any{"code": -32800, "message": "已取消"}
+	case cr.errMsg != "":
+		code := cr.errCode
+		if code == 0 {
+			code = -32001
+		}
+		msg[kError] = map[string]any{"code": code, "message": cr.errMsg}
+	case cr.isPermission:
+		msg[kResult] = permissionResult(cr.outcome, cr.meta)
+	default:
+		msg[kResult] = cr.result
 	}
-	if cr.isPermission {
-		b.respond(id, permissionResult(cr.outcome, cr.meta))
-		return
-	}
-	b.respond(id, cr.result)
+	return msg
 }
 
 // permissionResult wraps an ACP permission outcome with the optional
@@ -2761,11 +2894,18 @@ func permissionResult(outcome map[string]any, meta map[string]any) map[string]an
 //
 // Both fields are optional; with none set the response carries no `_meta`.
 func (b *Bridge) RespondPermissionWithMeta(requestID, optionID string, cancelled bool, scope *PermissionScope, followupMessage string) error {
-	v, ok := b.clientReqs.LoadAndDelete(requestID)
+	b.clientReqMu.Lock()
+	defer b.clientReqMu.Unlock()
+	v, ok := b.clientReqs.Load(requestID)
 	if !ok {
 		return errors.New("审批请求不存在或已过期")
 	}
 	cr := v.(*clientRequest)
+	select {
+	case <-cr.done:
+		return errors.New("审批请求不存在或已过期")
+	default:
+	}
 	if cancelled {
 		if msg := strings.TrimSpace(followupMessage); msg != "" {
 			if rejectOnce := rejectOnceOptionID(cr.Params); rejectOnce != "" {
@@ -2820,11 +2960,18 @@ func rejectOnceOptionID(params map[string]any) string {
 // raw result object (passed through as the JSON-RPC result) or an error
 // message.
 func (b *Bridge) RespondClientRequest(requestID string, result map[string]any, errMsg string) error {
-	v, ok := b.clientReqs.LoadAndDelete(requestID)
+	b.clientReqMu.Lock()
+	defer b.clientReqMu.Unlock()
+	v, ok := b.clientReqs.Load(requestID)
 	if !ok {
 		return errors.New("审批请求不存在或已过期")
 	}
 	cr := v.(*clientRequest)
+	select {
+	case <-cr.done:
+		return errors.New("审批请求不存在或已过期")
+	default:
+	}
 	if errMsg != "" {
 		cr.errMsg = errMsg
 	} else {
@@ -2838,6 +2985,10 @@ func (b *Bridge) write(msg map[string]any) error {
 	b.mu.Lock()
 	stdin := b.stdin
 	b.mu.Unlock()
+	return writeAgentMessage(stdin, msg)
+}
+
+func writeAgentMessage(stdin io.Writer, msg map[string]any) error {
 	if stdin == nil {
 		return errors.New("grok 进程未运行")
 	}
@@ -3277,6 +3428,7 @@ func (b *Bridge) Cancel(sessionID string) {
 // from that meta (mvp_agent/acp_agent.rs:2079-2108); an empty meta keeps
 // the wire byte-identical to Cancel.
 func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
+	b.clientReqMu.Lock()
 	b.mu.Lock()
 	if sessionID == "" {
 		sessionID = b.activeSessionID
@@ -3286,33 +3438,41 @@ func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 	if s != nil {
 		sid = s.SessionID
 	}
+	stdin := b.stdin
 	b.mu.Unlock()
-	if sid != "" {
-		params := map[string]any{kSessionID: sid}
-		if len(meta) > 0 {
-			params[kMeta] = meta
-		}
-		_ = b.write(map[string]any{
-			kJSONRPC: "2.0",
-			kMethod:  "session/cancel",
-			kParams:  params,
-		})
+	if sid == "" {
+		b.clientReqMu.Unlock()
+		return
 	}
+	var responses []map[string]any
 	b.clientReqs.Range(func(key, value any) bool {
 		cr := value.(*clientRequest)
-		if sid != "" && cr.SessionID != sid {
-			return true // not this session's request
+		if cr.SessionID != sid {
+			return true
 		}
-		b.clientReqs.Delete(key)
-		cr.cancel = true
 		select {
 		case <-cr.done:
 		default:
+			cr.cancel = true
 			close(cr.done)
+		}
+		if msg := b.resolveClientRequestLocked(key.(string), cr); msg != nil {
+			responses = append(responses, msg)
 		}
 		return true
 	})
 	b.Broadcast(Event{kType: "cancelled", kSessionID: sid})
+	b.clientReqMu.Unlock()
+	params := map[string]any{kSessionID: sid}
+	if len(meta) > 0 {
+		params[kMeta] = meta
+	}
+	_ = writeAgentMessage(stdin, map[string]any{
+		kJSONRPC: "2.0", kMethod: "session/cancel", kParams: params,
+	})
+	for _, msg := range responses {
+		_ = writeAgentMessage(stdin, msg)
+	}
 }
 
 // resetRoster 清理 agent 进程死亡后的 in-memory 状态：清空 roster 与
@@ -3321,6 +3481,32 @@ func (b *Bridge) CancelWithMeta(sessionID string, meta map[string]any) {
 // 生命周期完全交给外部，host 只在进程退出后把状态收拾干净并报错。
 // 返回清理前快照的 lastSession（active 优先），供调用方打日志。
 func (b *Bridge) resetRoster(reason string) (string, string) {
+	return b.resetProcessRoster(reason, nil)
+}
+
+func (b *Bridge) resetProcessRoster(reason string, expected *exec.Cmd) (string, string) {
+	b.agentMessageMu.Lock()
+	defer b.agentMessageMu.Unlock()
+	b.mu.Lock()
+	superseded := expected != nil && b.cmd != expected
+	b.mu.Unlock()
+	if superseded {
+		return "", ""
+	}
+	b.clientReqMu.Lock()
+	defer b.clientReqMu.Unlock()
+	b.clientReqs.Range(func(key, value any) bool {
+		cr := value.(*clientRequest)
+		cr.retired = true
+		cr.cancel = true
+		select {
+		case <-cr.done:
+		default:
+			close(cr.done)
+		}
+		b.resolveClientRequestLocked(key.(string), cr)
+		return true
+	})
 	b.mu.Lock()
 	if act := b.activeSessionLocked(); act != nil {
 		b.rememberSessionLocked(act.SessionID, act.Cwd)
@@ -3434,8 +3620,8 @@ func (b *Bridge) SetConfigOption(ctx context.Context, sessionID, configID, value
 	}
 	params := map[string]any{
 		kSessionID: sessionID,
-		"configId":  configID,
-		"value":     value,
+		"configId": configID,
+		"value":    value,
 	}
 	resp, err := b.request(ctx, "session/set_config_option", params, 30*time.Second)
 	if err != nil {

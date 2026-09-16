@@ -13,7 +13,7 @@ import (
 // session/updates + suggest + workspaces/list 可选字段。全部经 fake agent
 // 录制 host→agent 请求逐键核对。
 
-// ── A1: initialize `_meta` / clientCapabilities.meta 上 wire ────────
+// ── A1: initialize `_meta` / clientCapabilities._meta 上 wire ────────
 
 func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
@@ -53,11 +53,11 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 		t.Errorf("_meta mcpApps = %v, want true", meta["mcpApps"])
 	}
 
-	// clientCapabilities.meta：既有 5 键 + env-opt-in 键。
+	// clientCapabilities._meta：既有 5 键 + env-opt-in 键。
 	caps, _ := params["clientCapabilities"].(map[string]any)
-	cmeta, ok := caps["meta"].(map[string]any)
+	cmeta, ok := caps["_meta"].(map[string]any)
 	if !ok {
-		t.Fatalf("clientCapabilities.meta missing: %v", caps)
+		t.Fatalf("clientCapabilities._meta missing: %v", caps)
 	}
 	for _, k := range []string{
 		"x.ai/incrementalBashOutput", "x.ai/bashOutputNoColor",
@@ -65,7 +65,7 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 		"x.ai/codeNavigation", "x.ai/fs_notify",
 	} {
 		if _, has := cmeta[k]; !has {
-			t.Errorf("clientCapabilities.meta missing %s: %v", k, cmeta)
+			t.Errorf("clientCapabilities._meta missing %s: %v", k, cmeta)
 		}
 	}
 	if v, ok := cmeta["x.ai/codeNavigation"].(map[string]any); !ok || v["enabled"] != true {
@@ -104,7 +104,7 @@ func TestInitializeOmitsEnvSeedsWhenAbsent(t *testing.T) {
 	cmeta, _ := caps["meta"].(map[string]any)
 	for _, k := range []string{"x.ai/codeNavigation", "x.ai/folderTrust", "x.ai/fs_notify"} {
 		if _, has := cmeta[k]; has {
-			t.Errorf("clientCapabilities.meta must omit %s by default: %v", k, cmeta)
+			t.Errorf("clientCapabilities._meta must omit %s by default: %v", k, cmeta)
 		}
 	}
 }
