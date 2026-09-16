@@ -61,13 +61,8 @@ func TestSessionUpdateFullPassthrough(t *testing.T) {
 	}
 }
 
-// turn_completed / response_completed 都是回合终态 kind：usage 提取一致
-// （_meta.totalTokens + update.usage，handleXaiNotification parity），但只有
-// turn_completed 发 typed 事件（FE 回合封口语义, update verbatim）。
-// response_completed 实测从不被 agent 发出（updates.jsonl 3383/3383 回合
-// 终态均为 turn_completed），FE 也无消费（turnEnd.ts 无 case，events.ts
-// 重写回 generic 后 notifApps.ts 显式忽略）——只保留副作用（gen_rate
-// active:false、usage 提取）。Modeled → 均无 generic session_notification。
+// 两种完成边界都提取 usage 并复位生成速率，但 response_completed
+// 只结束单次模型响应。仅 turn_completed 广播前端回合终态事件。
 func TestTurnCompletedSessionUpdateTypedAndUsage(t *testing.T) {
 	t.Run("turn_completed", func(t *testing.T) {
 		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})

@@ -152,7 +152,8 @@ func (s *Server) handleBtw(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInterject(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Text string `json:"text"`
+		SessionID string `json:"sessionId"`
+		Text      string `json:"text"`
 	}
 	if !readBody(w, r, &body) {
 		return
@@ -161,7 +162,9 @@ func (s *Server) handleInterject(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 text"})
 		return
 	}
-	s.xaiCall(w, r, "x.ai/interject", map[string]any{"sessionId": "", "text": body.Text})
+	params := sessionKey(acp.WireSessionID, body.SessionID)
+	params["text"] = body.Text
+	s.xaiCall(w, r, "x.ai/interject", params)
 }
 
 func (s *Server) handleWorkspacesList(w http.ResponseWriter, r *http.Request) {

@@ -113,6 +113,21 @@ func configSection(table map[string]any, key string) map[string]any {
 	return m
 }
 
+// readConfigSection walks nested tables without creating anything: it is
+// the read-only counterpart to configSection, for callers that must not
+// mutate the parsed config (asking whether a key exists, not seeding one).
+func readConfigSection(table map[string]any, keys ...string) (map[string]any, bool) {
+	cur := table
+	for _, key := range keys {
+		next, ok := cur[key].(map[string]any)
+		if !ok {
+			return map[string]any{}, false
+		}
+		cur = next
+	}
+	return cur, true
+}
+
 // SetDefaultModelConfig persists `[models].default` and, when effort is
 // non-empty, `[models].default_reasoning_effort`. Other `[models]` keys and
 // every other section survive untouched.

@@ -20,15 +20,26 @@ import (
 // parsing path (the same entry the agent reader goroutine uses).
 func feedUpdate(t *testing.T, b *Bridge, sid, kind string) {
 	t.Helper()
+	feedUpdateFields(t, b, sid, kind, nil)
+}
+
+// feedUpdateFields is feedUpdate with extra `update` payload fields, for the
+// kinds whose evidence depends on their own content (retry_state's `type`).
+func feedUpdateFields(t *testing.T, b *Bridge, sid, kind string, fields map[string]any) {
+	t.Helper()
+	update := map[string]any{
+		kSessionUpdate: kind,
+		kContent:       map[string]any{kType: "text", "text": "x"},
+	}
+	for k, v := range fields {
+		update[k] = v
+	}
 	msg := map[string]any{
 		kJSONRPC: "2.0",
 		kMethod:  "session/update",
 		kParams: map[string]any{
 			kSessionID: sid,
-			kUpdate: map[string]any{
-				kSessionUpdate: kind,
-				kContent:       map[string]any{kType: "text", "text": "x"},
-			},
+			kUpdate:    update,
 		},
 	}
 	raw, err := json.Marshal(msg)
@@ -146,12 +157,17 @@ func TestReleaseWithTurnEndedClearsObserved(t *testing.T) {
 // 只有执行类 kind 算回合证据。会话元数据（改模型、标题、可用命令）与
 // usage_update（也在回合末尾出现）都不得把空闲会话点成 running——假 busy
 // 需要终态事件或过期才能消，代价比假 idle 高。
+//
+// memory_flush_* 与 workflow_updated 是回合收尾 / 面板状态的回放：实测都会
+// 在 turn_completed 之后到达（workflow_updated 甚至滞后数天），收进来就等于
+// 把刚合上的观察腿重新张开，而它们再没有终态事件，会话只能等 30 分钟过期。
 func TestObservedTurnKindGating(t *testing.T) {
 	b, _ := metaReadyBridge(t)
 
 	for _, kind := range []string{
 		"config_option_update", "current_mode_update", "available_commands_update",
 		"session_info_update", "usage_update", "task_completed", "model_changed",
+		"memory_flush_started", "memory_flush_completed", "workflow_updated",
 		"some_future_unmodelled_kind",
 	} {
 		feedUpdate(t, b, "s1", kind)
@@ -176,6 +192,100 @@ func TestObservedTurnKindGating(t *testing.T) {
 		if !busy {
 			t.Errorf("kind %q did not arm the observed turn — want active", kind)
 		}
+	}
+}
+
+// 事故复刻：一轮正常结束（turn_completed 已经合上观察腿）之后，agent 还会
+// 补一条回合收尾的记忆刷新。刷新不是执行证据，不得把会话重新点成 active。
+func TestMemoryFlushAfterTurnEndStaysIdle(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+
+	feedUpdate(t, b, "s1", "tool_call")
+	feedUpdate(t, b, "s1", "turn_completed")
+
+	b.mu.Lock()
+	turnedIdle := !b.sessions["s1"].Busy
+	b.mu.Unlock()
+	if !turnedIdle {
+		t.Fatal("turn_completed did not close the observed turn — fixture is broken")
+	}
+
+	feedUpdate(t, b, "s1", "memory_flush_started")
+	feedUpdate(t, b, "s1", "memory_flush_completed")
+
+	b.mu.Lock()
+	s := b.sessions["s1"]
+	busy, state := s.Busy, s.State()
+	open := b.turns["s1"] != nil && b.turns["s1"].open
+	b.mu.Unlock()
+	if busy || state != "idle" || open {
+		t.Errorf("memory flush after turn end: busy=%v state=%s observedTurnOpen=%v, want idle", busy, state, open)
+	}
+}
+
+// workflow_updated 是每个运行的状态回放：同一个 run 的 complete/cancelled
+// 会被重复广播，实测有滞后数天才到达的。回合结束后再来一条不得重开观察腿
+// （打开就等于把面板状态当成执行证据，会话要空转 30 分钟）。
+func TestWorkflowUpdatedAfterTurnEndStaysIdle(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+
+	feedUpdate(t, b, "s1", "tool_call")
+	feedUpdate(t, b, "s1", "turn_completed")
+
+	feedUpdateFields(t, b, "s1", "workflow_updated", map[string]any{
+		"run_id": "wf_1", "name": "review", "status": "complete",
+	})
+
+	b.mu.Lock()
+	s := b.sessions["s1"]
+	busy, state := s.Busy, s.State()
+	open := b.turns["s1"] != nil && b.turns["s1"].open
+	b.mu.Unlock()
+	if busy || state != "idle" || open {
+		t.Errorf("workflow replay after turn end: busy=%v state=%s observedTurnOpen=%v, want idle", busy, state, open)
+	}
+}
+
+// retry_state 的证据价值取决于它自己的 type：retrying 表示一次推理尝试
+// 正在飞（回合在跑），failed / exhausted 是这次尝试的终态——agent 在回合
+// 已经结束之后补发它们（实测 33 个回合如此），不得重开观察腿。
+func TestRetryStateEvidenceDependsOnType(t *testing.T) {
+	for _, tc := range []struct {
+		typ  string
+		arms bool
+	}{
+		{"retrying", true},
+		{"failed", false},
+		{"exhausted", false},
+		// 未知/缺省形态不是"已终结"的证据，保持原行为（也张开回合）；将来
+		// 若出现新的终结型 type，要像 failed/exhausted 一样列进排除项。
+		{"", true},
+	} {
+		t.Run("type="+tc.typ, func(t *testing.T) {
+			b, _ := metaReadyBridge(t)
+			feedUpdateFields(t, b, "s1", "retry_state", map[string]any{kType: tc.typ})
+			b.mu.Lock()
+			busy := b.sessions["s1"].Busy
+			b.mu.Unlock()
+			if busy != tc.arms {
+				t.Errorf("retry_state type=%q armed=%v, want %v", tc.typ, busy, tc.arms)
+			}
+		})
+	}
+
+	// 复刻现场：终态 retry_state 出现在 turn_completed 之后。
+	b, _ := metaReadyBridge(t)
+	feedUpdate(t, b, "s1", "tool_call")
+	feedUpdate(t, b, "s1", "turn_completed")
+	feedUpdateFields(t, b, "s1", "retry_state", map[string]any{
+		kType: "failed", "errorType": "serialization", "message": "missing field `id`",
+	})
+	b.mu.Lock()
+	s := b.sessions["s1"]
+	busy, state := s.Busy, s.State()
+	b.mu.Unlock()
+	if busy || state != "idle" {
+		t.Errorf("terminal retry_state after turn end: busy=%v state=%s, want idle", busy, state)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 // 从 ../capri-fe/dist 复制而来。嵌入二进制后 host 一个进程一个端口同时
 // 提供 API 与 TUI Web 界面 —— 部署无需 nginx / 静态服务器。
 //
-// 更新方式：cd capri-fe && npm run build && cp -R dist ../capri-host/internal/server/web/dist
+// 更新方式：cd capri-fe && pnpm run build && cp -R dist ../capri-host/internal/server/web/dist
 //
 //go:embed web/dist
 var webDist embed.FS
