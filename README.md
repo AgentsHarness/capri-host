@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/brand/capri.png" alt="Capri mark" width="88" />
+  <img src="docs/brand/banner.png" alt="Capri" />
 </p>
 
 <h1 align="center">Capri Host</h1>
@@ -22,7 +22,7 @@
 
 **Capri**（Capricorn）是 [Grok Build](https://x.ai/cli) 的具体适配项目，我们基于 ACP 协议，搭配 capri-fe、capri-hub 实现远程 Agent 控制。
 
-一个进程、一个端口，同时提供 **Web 界面** 和接口。Windows 上还内置**系统托盘**——
+一个进程、一个端口，同时提供 **Web 界面** 和接口。Windows 上还内置**系统托盘**；macOS 上还提供一个菜单栏应用，把启停和配置收进图形界面。
 
 ```
 浏览器  ──本机──▶  capri-host :8765  ──▶  grok
@@ -39,18 +39,35 @@
 
 2、从 [Releases](https://github.com/AgentsHarness/capri-host/releases) 选你的平台。
 
-**Windows**：首次运行 SmartScreen 可能拦一次，点「更多信息 → 仍要运行」。
+**Windows**：首次运行 SmartScreen 可能拦一次，点「更多信息 → 仍要运行」。双击即可；托盘是主要入口。
 
+### macOS 应用（推荐，13+）
 
-**macOS / Linux**：
+下载 `Capri-macos.zip`（或 `Capri-macos.dmg`），把 `Capri.app` 拖进「应用程序」后打开。
+
+1、菜单栏会出现摩羯图标。
+2、首次使用点击摩羯图标，前往设置，配置好后点击保存并启动。
+3、按钮左侧会提示 Host 已在 :8765 启动。
+4、点击菜单按钮，点击打开界面即可跳转本地 Web UI。
+
+首次打开若被系统拦下，右键点「打开」，或：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Capri.app
+```
+
+### 命令行二进制
+
+从 Releases 下对应平台的 `capri-host-*`：
 
 ```bash
 chmod +x capri-host   # 按实际文件名
-# 参考环境变量进行自定义设置
 ./capri-host
 ```
 
-**或者从源码构建：**
+可以只用环境变量配置，适合脚本、launchd、systemd，以及在服务器上跑。
+
+### 从源码构建
 
 ```bash
 git clone https://github.com/AgentsHarness/capri-host.git
@@ -140,11 +157,12 @@ hub_url  = 'https://hub.example.com'
 
 在一台能被访问的服务器上先起 [capri-hub](https://github.com/AgentsHarness/capri-hub)，
 并部署 capri-fe。配对码由 **hub** 生成（6 位、15 分钟有效、过期自动轮换），host
-只负责拿码去换 token：hub 侧 `capri-hub paircode` 或前端左上角「添加 Host」都能看到
-当前有效的码。
+只负责拿码去换 token：hub 侧 `capri-hub paircode` 或前端左上角「添加 Host」都能看到。
 
-**Windows：托盘 → 配对 hub…**，依次填 hub 地址和配对码，成功后地址自动写回
+**Windows**：托盘里选「配对 hub…」，填地址和配对码即可；成功后会写进
 `config.toml`。
+
+**macOS**：应用在设置窗里填 Hub URL 和配对码即可，配对成功后地址会留在 `config.json`。
 
 **其他平台**（或想用环境变量的话）：
 
@@ -189,6 +207,17 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | `CAPRI_HOST_DIR`      | `~/.capri-host` | 设置、日志、token 的存放目录                                                                                                         |
 | `CAPRI_TRAY`          | `1`             | 设为 `0` 不启动托盘                                                                                                                  |
 | `CAPRI_OPEN_BROWSER`  | `1`             | 设为 `0` 启动时不打开浏览器                                                                                                          |
+
+## 配置文件
+
+两处可配，**环境变量优先于文件**：
+
+1. `~/.capri-host/config.toml`——Windows 托盘 / 单 exe 路径读写；
+2. `~/.capri-host/config.json`——macOS 应用写的是这份，也可以手写；
+3. 环境变量——命令行、launchd、systemd 用这套，会覆盖文件里的同名项。
+
+也可用 `CAPRI_HOME`（config.json）或 `CAPRI_HOST_DIR`（config.toml / 日志）覆盖配置目录。
+
 
 ## 两把 `FE_TOKEN`
 

@@ -112,30 +112,36 @@ var (
 //     30 天清理删掉源文件的回合，是历史回溯的唯一依据；同一会话在盘上
 //     的已有事件会被台账覆盖（台账是超集），不会双算；
 //   - 盘上 updates.jsonl：台账还没抄到的最临近回合（同步周期内的新事件）。
+//     台账已同步且未变动的文件直接利用内存台账聚合，大幅避免无谓重复扫盘。
 func (b *Bridge) UsageReport(ctx context.Context, cwd, sessionID string, from, to int64) (*UsageReport, error) {
 	from, to = normalizeUsageWindow(from, to)
 	rep := &UsageReport{From: from, To: to, ByModel: make(map[string]TokenUsageStat)}
 
-	// 盘上直扫（权威：当前盘上真实存在的事件），同时收集事件键供台账去重。
 	paths, err := usageFiles(b.grokHome(), cwd, sessionID)
 	if err != nil {
 		return nil, err
 	}
+
+	pathsToScan := paths
+	if b.ledgerOn() {
+		if err := b.ensureUsageLedger(); err == nil {
+			pathsToScan = b.ledger.filterUnindexedPaths(paths)
+		}
+	}
+
 	scanned := make(map[string]struct{})
 	// 会话集合由两条路径共同填充后统一计数：同一次会话可能既有盘上事件
 	// （台账尚未抄到的新回合）又有台账独有事件（rewind 截断后已从盘上消失
 	// 的死分支），各加一次会把会话数算重。
 	sessions := make(map[string]struct{})
-	scanUsageFiles(ctx, paths, rep, from, to, scanned, sessions)
+	scanUsageFiles(ctx, pathsToScan, rep, from, to, scanned, sessions)
 
-	// 台账补盘上缺口：已删源文件的旧回合只能从台账拿到；盘上仍存在的
-	// 同一条按 scanned 跳过，不双算。
-	if b.ledgerOn() {
-		if err := b.ensureUsageLedger(); err == nil {
-			b.ledger.mu.Lock()
-			b.ledger.aggregate(rep, cwd, sessionID, from, to, scanned, sessions)
-			b.ledger.mu.Unlock()
-		}
+	// 台账补盘上缺口：已删源文件的旧回合以及已同步但未重新扫盘的未变动文件，
+	// 均由台账内存高效聚合；盘上重新扫到的同一条按 scanned 跳过，不双算。
+	if b.ledgerOn() && b.ledger != nil {
+		b.ledger.mu.Lock()
+		b.ledger.aggregate(rep, cwd, sessionID, from, to, scanned, sessions)
+		b.ledger.mu.Unlock()
 	}
 	rep.Sessions = len(sessions)
 

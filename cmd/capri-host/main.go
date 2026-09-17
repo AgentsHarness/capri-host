@@ -67,6 +67,10 @@ func main() {
 	} else if cfg.ConfigSource != "" {
 		log.Printf("[capri-host] 已读取配置 %s", cfg.ConfigSource)
 	}
+	// Upstream macOS Capri.app uses ~/.capri-host/config.json (config.Path).
+	if _, err := os.Stat(config.Path()); err == nil {
+		log.Printf("[capri-host] config.json %s", config.Path())
+	}
 
 	// Adopt a per-machine identity BEFORE anything that can pair. The hub
 	// keys its host table by host id, so a first pairing against the

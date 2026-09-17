@@ -786,7 +786,7 @@ func normalizeSyntheticToolCallsInSlice(updates []any) {
 			continue
 		}
 		su, _ := upd["sessionUpdate"].(string)
-		if su == "turn_completed" || su == "response_completed" {
+		if su == "turn_completed" {
 			open = nil
 			continue
 		}
@@ -871,7 +871,7 @@ func (r *liveToolResolver) takeSeededStart(tm *toolLineMeta, tsMs int64) (string
 }
 
 func (r *liveToolResolver) handleLive(sessionUpdate string, update map[string]any, tsMs int64, eventID string) {
-	if sessionUpdate == "turn_completed" || sessionUpdate == "response_completed" {
+	if sessionUpdate == "turn_completed" {
 		r.openCalls = nil
 		r.pendingStarts = nil
 		return

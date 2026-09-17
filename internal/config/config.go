@@ -80,8 +80,7 @@ func Load() Config {
 		EnableTray:  true,
 	}
 
-	// Settings file first, environment second: env wins so shell and service
-	// launches behave exactly as before this file existed.
+	// Layer 1: config.toml (Windows tray / single-exe path).
 	path := ConfigPath()
 	fc, err := loadFile(path)
 	if err != nil {
@@ -91,6 +90,15 @@ func Load() Config {
 		c.ConfigSource = path
 	}
 
+	// Layer 2: config.json (macOS Capri.app / upstream). Fills empty fields
+	// only so a hand-written toml still wins over the JSON defaults.
+	jf, jerr := LoadFile()
+	if jerr != nil && c.ConfigError == nil {
+		c.ConfigError = jerr
+	}
+	applyJSONFile(&c, jf)
+
+	// Layer 3: environment (highest priority).
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.Port = n
@@ -105,28 +113,52 @@ func Load() Config {
 	envSet(&c.HostID, "HOST_ID")
 	envSet(&c.HostName, "HOST_NAME")
 	envSet(&c.HubQUICPin, "HUB_QUIC_PIN")
-	if v := envOr("FE_TOKEN", os.Getenv("ACCESS_TOKEN")); v != "" {
+	if v := firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN")); v != "" {
 		c.AccessToken = v
 	}
 	envBool(&c.OpenBrowser, "CAPRI_OPEN_BROWSER")
 	envBool(&c.EnableTray, "CAPRI_TRAY")
-	// BIND / HOST_BIND: upstream default is loopback-only; env always wins here.
-	c.BindAddr = bindAddr()
+	// BIND / HOST_BIND: env wins; else config.json bind; else loopback.
+	c.BindAddr = bindAddr(jf.Bind)
 	c.ResidentCap = envResidentCap()
 	c.UsageLedger = strings.TrimSpace(os.Getenv("USAGE_LEDGER"))
+	c.GrokBin = resolveGrokBin(c.GrokBin)
 
 	return c
 }
 
-// UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the
-// ledger off ("0" / "off" / "false" / "no"). Unset means enabled: the
-// ledger is what keeps /usage history past the agent's 30-day cleanup.
-func (c Config) UsageLedgerDisabled() bool {
-	switch strings.ToLower(strings.TrimSpace(c.UsageLedger)) {
-	case "0", "off", "false", "no", "disable", "disabled":
-		return true
+// applyJSONFile overlays upstream config.json onto c for fields still at
+// compiled defaults / empty, so Capri.app settings are visible to the host.
+func applyJSONFile(c *Config, f File) {
+	if f.Port > 0 && c.Port == 8765 {
+		c.Port = f.Port
 	}
-	return false
+	if v := strings.TrimSpace(f.GrokBin); v != "" && (c.GrokBin == "" || c.GrokBin == "grok") {
+		c.GrokBin = v
+	}
+	if v := strings.TrimSpace(f.HostID); v != "" && c.HostID == DefaultHostID {
+		c.HostID = v
+	}
+	if v := strings.TrimSpace(f.HostName); v != "" && c.HostName == DefaultHostName {
+		c.HostName = v
+	}
+	if v := strings.TrimSpace(f.HubURL); v != "" && c.HubURL == "" {
+		c.HubURL = v
+	}
+	if v := strings.TrimSpace(f.HubPairCode); v != "" && c.HubPairCode == "" {
+		c.HubPairCode = v
+	}
+	if v := strings.TrimSpace(f.FEToken); v != "" && c.AccessToken == "" {
+		c.AccessToken = v
+	}
+	if v := strings.TrimSpace(f.HubQUICPin); v != "" && c.HubQUICPin == "" {
+		c.HubQUICPin = v
+	}
+	if c.ConfigSource == "" {
+		if _, err := os.Stat(Path()); err == nil {
+			c.ConfigSource = Path()
+		}
+	}
 }
 
 // UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the
@@ -178,11 +210,30 @@ func envOr(k, def string) string {
 	return def
 }
 
-// bindAddr reads BIND (alias HOST_BIND), defaulting to loopback.
-func bindAddr() string {
+func strOr(v, def string) string {
+	if v != "" {
+		return v
+	}
+	return def
+}
+
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// bindAddr reads BIND (alias HOST_BIND), then config.json, then loopback.
+func bindAddr(fileBind string) string {
 	v := strings.TrimSpace(os.Getenv("BIND"))
 	if v == "" {
 		v = strings.TrimSpace(os.Getenv("HOST_BIND"))
+	}
+	if v == "" {
+		v = strings.TrimSpace(fileBind)
 	}
 	if v == "" {
 		return DefaultBindAddr
