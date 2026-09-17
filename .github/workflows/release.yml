@@ -30,8 +30,10 @@ jobs:
 
       # capri-fe 的 package.json 声明了 packageManager: pnpm@<版本>，
       # action-setup 会自动读取该字段，无需在此重复固定版本。
+      # Explicit version: fork's capri-fe may lack packageManager field.
       - uses: pnpm/action-setup@v4
         with:
+          version: 11.22.0
           package_json_file: capri-fe/package.json
 
       - uses: actions/setup-node@v5
