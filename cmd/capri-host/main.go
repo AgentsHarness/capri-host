@@ -26,7 +26,8 @@ func main() {
 	}
 	cfg := config.Load()
 	// 代理要在任何出网客户端之前落地：hub 中继、agent 探测都读环境变量。
-	// 无代理配置时是 no-op，父进程原有的 HTTPS_PROXY 保持不变。
+	// 配置留空则改用 macOS 系统网络设置；系统也没开才是直连。
+	cfg = cfg.WithSystemProxy()
 	cfg.ApplyProxyEnv()
 	if desc := cfg.ProxyDescription(); desc != "" {
 		log.Printf("[capri-host] proxy %s", desc)

@@ -46,11 +46,13 @@ type Config struct {
 	// updates.jsonl, so /usage history outlives that cleanup.
 	UsageLedger string
 	// Proxy is the HTTP(S) proxy exported to this process and to the grok
-	// agent child as HTTPS_PROXY/HTTP_PROXY/ALL_PROXY. Empty = no proxy
-	// env is set, so the child keeps whatever the parent shell had.
+	// agent child as HTTPS_PROXY/HTTP_PROXY/ALL_PROXY. Empty before
+	// WithSystemProxy means "use macOS system proxy if enabled".
 	Proxy string
 	// NoProxy is NO_PROXY: the comma-separated hosts that bypass Proxy.
 	NoProxy string
+	// proxyFromSystem 表示 Proxy 来自 macOS 系统网络设置，只给日志用。
+	proxyFromSystem bool
 }
 
 func Load() Config {

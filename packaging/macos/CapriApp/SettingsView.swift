@@ -57,7 +57,7 @@ struct SettingsView: View {
                 Section("代理") {
                     TextField("代理地址", text: $model.proxy, prompt: Text("http://127.0.0.1:7890"))
                     TextField("排除地址", text: $model.noProxy, prompt: Text("localhost,127.0.0.1"))
-                    Text("留空则沿用系统原有的代理设置；排除地址中的主机直连、不走代理。")
+                    Text("留空则使用系统网络设置里的代理；系统未开代理时直连。排除地址中的主机不走代理。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
