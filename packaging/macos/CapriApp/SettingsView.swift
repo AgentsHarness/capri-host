@@ -55,9 +55,9 @@ struct SettingsView: View {
                     Button("探测 grok") { model.detectGrok() }
                 }
                 Section("代理") {
-                    TextField("出网代理", text: $model.proxy, prompt: Text("http://127.0.0.1:7890"))
-                    TextField("不走代理", text: $model.noProxy, prompt: Text("localhost,127.0.0.1"))
-                    Text("留空表示不使用代理（沿用系统原有的代理设置）。")
+                    TextField("代理地址", text: $model.proxy, prompt: Text("http://127.0.0.1:7890"))
+                    TextField("排除地址", text: $model.noProxy, prompt: Text("localhost,127.0.0.1"))
+                    Text("留空则沿用系统原有的代理设置；排除地址中的主机直连、不走代理。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
