@@ -45,6 +45,12 @@ type Config struct {
 	// before the agent's 30-day session cleanup can delete the source
 	// updates.jsonl, so /usage history outlives that cleanup.
 	UsageLedger string
+	// Proxy is the HTTP(S) proxy exported to this process and to the grok
+	// agent child as HTTPS_PROXY/HTTP_PROXY/ALL_PROXY. Empty = no proxy
+	// env is set, so the child keeps whatever the parent shell had.
+	Proxy string
+	// NoProxy is NO_PROXY: the comma-separated hosts that bypass Proxy.
+	NoProxy string
 }
 
 func Load() Config {
@@ -81,7 +87,25 @@ func merge(file File) Config {
 		AccessToken: firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
 		ResidentCap: envResidentCap(),
 		UsageLedger: strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
+		Proxy:       proxyURL(os.Getenv("PROXY"), file.Proxy),
+		NoProxy:     envOr("NO_PROXY", strings.TrimSpace(file.NoProxy)),
 	}
+}
+
+// proxyURL 归一化代理地址：文件里可以只写 host:port，这里补上 http://
+// 前缀，让 net/http 与 grok 都能直接当 URL 用。
+func proxyURL(envVal, fileVal string) string {
+	v := strings.TrimSpace(envVal)
+	if v == "" {
+		v = strings.TrimSpace(fileVal)
+	}
+	if v == "" {
+		return ""
+	}
+	if !strings.Contains(v, "://") {
+		v = "http://" + v
+	}
+	return v
 }
 
 // UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the

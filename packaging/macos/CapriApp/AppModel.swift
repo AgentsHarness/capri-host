@@ -19,6 +19,8 @@ final class AppModel: ObservableObject {
     @Published var hubURL = ""
     @Published var pairCode = ""
     @Published var grokBin = ""
+    @Published var proxy = ""
+    @Published var noProxy = ""
     @Published var startHostOnLaunch = true
     @Published var hubTokenReady = false
     @Published var hubTokenCaption = ""
@@ -62,6 +64,8 @@ final class AppModel: ObservableObject {
         feToken = f.feToken ?? ""
         hubURL = f.hubURL?.nilIfEmpty ?? HubState.load()?.url ?? ""
         grokBin = f.grokBin ?? ""
+        proxy = f.proxy ?? ""
+        noProxy = f.noProxy ?? ""
         startHostOnLaunch = f.shouldStartHostOnLaunch
         startAtLogin = f.shouldStartAtLogin || Autostart.isEnabled
         hint = ""
@@ -241,6 +245,8 @@ final class AppModel: ObservableObject {
         }
         f.feToken = feToken
         f.grokBin = grokBin.trimmingCharacters(in: .whitespacesAndNewlines)
+        f.proxy = proxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        f.noProxy = noProxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         f.startHostOnLaunch = startHostOnLaunch
         f.startAtLogin = startAtLogin
         if let err = f.bindPolicyError() {

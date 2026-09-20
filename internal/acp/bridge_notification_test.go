@@ -82,6 +82,60 @@ func TestUnknownXaiNotificationStillExtNotification(t *testing.T) {
 	}
 }
 
+// x.ai/session/setup（session/new 的阶段进度）是唯一一个 sessionId 可能为
+// **显式 null** 的轨道：会话 id 铸造前的阶段不该被错标到新建之前那个活动会话
+// 上。有 id 时照常盖章。
+func TestSessionSetupNotificationSessionTagging(t *testing.T) {
+	mk := func() (*Bridge, chan Event, func()) {
+		b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+		b.mu.Lock()
+		b.sessions["old"] = &SessionState{SessionID: "old", Cwd: "/ws"}
+		b.activeSessionID = "old"
+		b.mu.Unlock()
+		ch, unsub := b.Subscribe()
+		return b, ch, unsub
+	}
+
+	t.Run("explicit null stays untagged", func(t *testing.T) {
+		b, ch, unsub := mk()
+		defer unsub()
+		params := map[string]any{"method": "session/new", "phase": "auth", "sessionId": nil}
+		b.handleXaiNotification("x.ai/session/setup", params)
+		ev := <-ch
+		if ev["type"] != "ext_notification" || ev["method"] != "x.ai/session/setup" {
+			t.Fatalf("event = %v, want the generic passthrough", ev)
+		}
+		if _, ok := ev["sessionId"]; ok {
+			t.Errorf("sessionId = %v, want absent (must not inherit the previous active session)", ev["sessionId"])
+		}
+		if !reflect.DeepEqual(ev["params"], params) {
+			t.Errorf("params = %v, want verbatim %v", ev["params"], params)
+		}
+	})
+
+	t.Run("minted id is tagged", func(t *testing.T) {
+		b, ch, unsub := mk()
+		defer unsub()
+		b.handleXaiNotification("x.ai/session/setup", map[string]any{
+			"method": "session/new", "phase": "finalize_response", "sessionId": "new-1",
+		})
+		ev := <-ch
+		if ev["sessionId"] != "new-1" {
+			t.Errorf("sessionId = %v, want new-1", ev["sessionId"])
+		}
+	})
+
+	t.Run("absent id does not fall back either", func(t *testing.T) {
+		b, ch, unsub := mk()
+		defer unsub()
+		b.handleXaiNotification("x.ai/session/setup", map[string]any{"method": "session/new", "phase": "auth"})
+		ev := <-ch
+		if _, ok := ev["sessionId"]; ok {
+			t.Errorf("sessionId = %v, want absent", ev["sessionId"])
+		}
+	})
+}
+
 // ── Part 2: sessionUpdate kind 语义化（官方载体） ───────────────────
 
 // 官方 session/update 载体：每个 modeled kind 单发 typed 事件

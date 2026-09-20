@@ -10,6 +10,8 @@ struct ConfigFile: Codable, Equatable {
     var feToken: String?
     var grokBin: String?
     var hubQUICPin: String?
+    var proxy: String?
+    var noProxy: String?
     var startHostOnLaunch: Bool?
     var startAtLogin: Bool?
 
@@ -22,6 +24,8 @@ struct ConfigFile: Codable, Equatable {
         case feToken = "fe_token"
         case grokBin = "grok_bin"
         case hubQUICPin = "hub_quic_pin"
+        case proxy
+        case noProxy = "no_proxy"
         case startHostOnLaunch = "start_host_on_launch"
         case startAtLogin = "start_at_login"
     }

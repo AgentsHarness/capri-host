@@ -113,7 +113,9 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
   "hub_url": "https://agents.example.com",
   "fe_token": "",
   "grok_bin": "",
-  "hub_pair_code": ""
+  "hub_pair_code": "",
+  "proxy": "",
+  "no_proxy": ""
 }
 ```
 
@@ -132,6 +134,9 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | `HUB_URL`       | —           | 设置后连上 Hub                                                                                                                       |
 | `HUB_PAIR_CODE` | —           | 一次性配对码                                                                                                                         |
 | `FE_TOKEN`      | —           | 本机接口的访问密钥（`/api/*`、`/events`）。与 Hub 的 `FE_TOKEN` **是两把独立的钥匙**，见下                                            |
+| `HUB_QUIC_PIN`  | —           | 自签 hub 的 QUIC 证书指纹（见 `docs/DEPLOY.md`）                                                                                     |
+| `PROXY`         | —           | 出网代理，可只写 `host:port`（自动补 `http://`）。设置后 host 进程与它拉起的 grok agent 都走代理                                       |
+| `NO_PROXY`      | —           | 不走代理的地址列表，逗号分隔                                                                                                          |
 | `CAPRI_HOME`    | `~/.capri-host` | 配置目录（`config.json`、`hub.json` 都在这下面）                                                                                 |
 
 ## 两把 `FE_TOKEN`

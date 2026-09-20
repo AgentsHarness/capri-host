@@ -2354,6 +2354,19 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		}
 		return ev
 	}
+	// withExplicitSid 是 withSid 的严格变体：只在 params 里**显式**带了非空
+	// sessionId 时才盖章，不回退到活动会话。给"null 表示尚无会话"的轨道用
+	// （见 x.ai/session/setup）：sessionIdFrom 的活动会话回退会把它们错标到
+	// 上一个会话。
+	withExplicitSid := func(ev Event) Event {
+		if explicit := sessionIdExplicit(params); explicit != "" {
+			ev[kSessionID] = explicit
+		}
+		if replay {
+			ev[kReplayInternal] = true
+		}
+		return ev
+	}
 	switch method {
 	case "x.ai/session_notification", "x.ai/session/update":
 		// Kind 分发（含 session_info 的 title/updatedAt roster 跟踪）在
@@ -2535,6 +2548,15 @@ func (b *Bridge) handleXaiNotification(method string, params map[string]any) {
 		// leader 重连信号（xai-grok-pager-bin/src/main.rs:1354 等，
 		// params 可为空）。
 		b.Broadcast(withSid(Event{kType: "leader_reconnected", kParams: params}))
+	case "x.ai/session/setup":
+		// 新建会话的阻塞步骤进度（grok session_setup.rs：session/new 期间
+		// 每个阶段一条，{method:"session/new", phase, sessionId?}）。会话 id
+		// 铸造**之前**的阶段（Auth / ResolveWorkspace / FolderTrust /
+		// LocalWorkspace）sessionId 是显式 null——必须用 withExplicitSid，否则
+		// 这些阶段会被错标到新建之前那个活动会话上。TUI 客户端同口径
+		// （xai-grok-pager acp_handler/mod.rs 要求 sessionId 非空才处理）。
+		// 载体保持 generic：host 未建模阶段 UI，typed 事件留给 FE 有渲染需求时。
+		b.Broadcast(withExplicitSid(Event{kType: "ext_notification", kMethod: method, kParams: params}))
 	default:
 		b.Broadcast(withSid(Event{kType: "ext_notification", kMethod: method, kParams: params}))
 	}
@@ -3692,27 +3714,39 @@ func (b *Bridge) SetConfigOption(ctx context.Context, sessionID, configID, value
 
 // SetModel calls session/set_config_option (or falls back to session/set_model)
 // to switch the session's model and optional reasoningEffort.
-func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) error {
+//
+// The returned string is a non-fatal warning (empty when there is nothing to
+// report): the model switch succeeded but the effort did not apply. Callers
+// must surface it — reporting a clean success would let the client caption an
+// effort the agent never adopted.
+func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) (string, error) {
 	if err := b.Boot(ctx); err != nil {
-		return err
+		return "", err
 	}
 	// 无 sessionId 直接拒绝，绝不回退到 active 会话：FE 空状态（未锚定）
 	// 下发的切换请求落到别的会话上就失去了会话隔离（同 handleSetDefaultModel
 	// 的双动作语义）。
 	if sessionID == "" {
-		return &HTTPError{Code: 400, Msg: "需要 sessionId"}
+		return "", &HTTPError{Code: 400, Msg: "需要 sessionId"}
 	}
 	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
-		return errors.New("没有活跃会话")
+		return "", errors.New("没有活跃会话")
 	}
 
 	// 优先尝试官方 session/set_config_option 端点规范切换
 	_, optErr := b.SetConfigOption(ctx, sessionID, "model", modelID)
 	if optErr == nil {
-		if reasoningEffort != "" {
-			_, _ = b.SetConfigOption(ctx, sessionID, "reasoning_effort", reasoningEffort)
+		if reasoningEffort == "" {
+			return "", nil
 		}
-		return nil
+		// 模型已切换成功、档位被拒（如 unknown reasoning_effort value）不能
+		// 吞掉：前端只会看到 200 并把档位写进 caption，而 agent 保留的是切换
+		// 模型时重新校验过的档位。降级为非致命 warning 上抛。
+		effortID, _ := b.resolveEffortToken(sessionID, reasoningEffort)
+		if _, err := b.SetConfigOption(ctx, sessionID, "reasoning_effort", effortID); err != nil {
+			return fmt.Sprintf("模型已切换，但推理档位 %s 未生效：%s", reasoningEffort, err.Error()), nil
+		}
+		return "", nil
 	}
 
 	// 若 agent 尚未支持 session/set_config_option（如返回 -32601），回退到旧版 session/set_model
@@ -3721,10 +3755,12 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		"modelId":  modelID,
 	}
 	if reasoningEffort != "" {
-		params[kMeta] = map[string]any{"reasoningEffort": reasoningEffort}
+		// 这条 rail 的 `_meta.reasoningEffort` 只认 canonical value。
+		_, effortValue := b.resolveEffortToken(sessionID, reasoningEffort)
+		params[kMeta] = map[string]any{"reasoningEffort": effortValue}
 	}
 	if _, err := b.request(ctx, "session/set_model", params, 30*time.Second); err != nil {
-		return err
+		return "", err
 	}
 	// The agent does not push a model_changed notification for set_model,
 	// so the cached SessionModelState (hello / ready / status snapshot)
@@ -3750,7 +3786,76 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		kSessionID:        sessionID,
 	})
 	b.broadcastRosterChange()
-	return nil
+	return "", nil
+}
+
+// resolveEffortToken maps a client-supplied reasoning effort to the two
+// spellings the agent's two rails expect, using the session's cached model
+// catalog (each `_meta.reasoningEfforts` entry carries both).
+//
+// The rails disagree on purpose:
+//   - session/set_config_option (configId="reasoning_effort") resolves the
+//     wire value as an option **id** (agent_ops.rs
+//     resolve_reasoning_effort_value);
+//   - session/set_model `_meta.reasoningEffort` parses the canonical
+//     **value** (sampling-types parse_reasoning_effort_meta).
+//
+// Clients send the canonical value (what the caption shows), so rail 1 needs
+// the id. For every catalog seen so far id == value and both calls are
+// identity; a catalog that spells them differently (e.g. {id:"med",
+// value:"medium"}) is why this translation exists.
+//
+// The token is matched against either spelling, so callers may pass whichever
+// they hold. Unknown tokens pass through unchanged — the agent rejects them
+// and that error is reported rather than silently rewritten.
+func (b *Bridge) resolveEffortToken(sessionID, token string) (id, value string) {
+	if token == "" {
+		return "", ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	act := b.sessions[sessionID]
+	if act == nil {
+		return token, token
+	}
+	models, _ := act.models.(map[string]any)
+	avail, _ := models["availableModels"].([]any)
+	cur, _ := models["currentModelId"].(string)
+	// Prefer the current model's menu; fall back to scanning all of them so a
+	// switch in flight still resolves.
+	for _, pass := range []bool{true, false} {
+		for _, raw := range avail {
+			mm, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if pass {
+				if mid, _ := mm["modelId"].(string); mid != cur {
+					continue
+				}
+			}
+			meta, _ := mm[kMeta].(map[string]any)
+			if meta == nil {
+				meta, _ = mm["meta"].(map[string]any)
+			}
+			list, _ := meta["reasoningEfforts"].([]any)
+			for _, e := range list {
+				eo, ok := e.(map[string]any)
+				if !ok {
+					continue
+				}
+				eid, _ := eo["id"].(string)
+				eval, _ := eo["value"].(string)
+				if eid == "" || eval == "" {
+					continue
+				}
+				if token == eid || token == eval {
+					return eid, eval
+				}
+			}
+		}
+	}
+	return token, token
 }
 
 // patchSessionModels updates a session's cached SessionModelState after a
@@ -5412,6 +5517,76 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 		kSessionID:       sessionID,
 		"rawText":        rawText,
 		"contextSummary": contextSummary,
+	}, 30*time.Second)
+}
+
+// MemoryList calls x.ai/memory/list: {sessionId} → the /memory modal's
+// listing ({files, enabled, disabled_reason?, capture_enabled, dream_enabled}).
+// The agent's request struct is camelCase here — unlike flush/dream — so the
+// host must send `sessionId`, not `session_id`.
+func (b *Bridge) MemoryList(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/memory/list", map[string]any{
+		kSessionID: sessionID,
+	}, 30*time.Second)
+}
+
+// MemoryToggle calls x.ai/memory/toggle: {sessionId, enabled} — flips the
+// session's memory without running a prompt turn. `enabled` is mandatory in
+// the agent's request struct (a missing key is an invalid-params error, not
+// a default), so it is a plain bool here and the HTTP layer rejects a body
+// that omits it.
+func (b *Bridge) MemoryToggle(ctx context.Context, sessionID string, enabled bool) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/memory/toggle", map[string]any{
+		kSessionID: sessionID,
+		"enabled":  enabled,
+	}, 30*time.Second)
+}
+
+// MemoryDream calls x.ai/memory/dream: {session_id} — runs memory
+// consolidation and returns {disposition, observation_count,
+// topics_affected}. The agent reuses the flush request struct, so this one is
+// snake_case (`session_id`) while list/toggle above are camelCase.
+func (b *Bridge) MemoryDream(ctx context.Context, sessionID string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/memory/dream", map[string]any{
+		kSessionIDS: sessionID,
+	}, 30*time.Second)
+}
+
+// MemoryForget calls x.ai/memory/forget: {sessionId, path, expectedContentHash}
+// — deletes one note listed by MemoryList. The hash is the client's evidence of
+// what it previewed (BLAKE3 hex): the store refuses to delete bytes that no
+// longer match, so the caller must hash exactly the text it showed the user
+// (the pager does the same in views/memory_modal.rs). camelCase, unlike
+// flush/dream.
+func (b *Bridge) MemoryForget(ctx context.Context, sessionID, path, expectedContentHash string) (map[string]any, error) {
+	if err := b.Boot(ctx); err != nil {
+		return nil, err
+	}
+	if sessionID = b.resolveSessionID(sessionID); sessionID == "" {
+		return nil, &HTTPError{Code: 404, Msg: "暂无活动会话"}
+	}
+	return b.request(ctx, "_x.ai/memory/forget", map[string]any{
+		kSessionID:            sessionID,
+		"path":                path,
+		"expectedContentHash": expectedContentHash,
 	}, 30*time.Second)
 }
 

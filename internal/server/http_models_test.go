@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -247,5 +248,53 @@ func TestSetModelForwardsSessionID(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("timed out waiting for sessions_changed after set-model")
 		}
+	}
+}
+
+// 模型切换成功但档位被 agent 拒绝：HTTP 仍是 200（模型确实切了），但 body
+// 必须带 warning，前端据此弹 toast 并回滚 optimistic 档位——静默成功会让
+// caption 显示一个 agent 根本没采用的档位。
+func TestSetModelReportsEffortWarning(t *testing.T) {
+	t.Setenv(ACPHostFakeAgentRejectEffort, "1")
+	s, _ := newFakeAgentServer(t)
+	sid := createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/set-model",
+		fmt.Sprintf(`{"modelId":"grok-4","reasoningEffort":"high","sessionId":%q}`, sid))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/set-model status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body decode: %v (%s)", err, rec.Body.String())
+	}
+	if body["ok"] != true {
+		t.Fatalf("ok = %v, want true (the model switch itself succeeded)", body["ok"])
+	}
+	warning, _ := body["warning"].(string)
+	if warning == "" {
+		t.Fatalf("warning missing; body = %s", rec.Body.String())
+	}
+	if !strings.Contains(warning, "high") || !strings.Contains(warning, "未生效") {
+		t.Errorf("warning = %q, want it to name the effort and say it did not apply", warning)
+	}
+}
+
+// 档位正常的切模型请求不带 warning（不能给成功路径加噪音）。
+func TestSetModelNoWarningOnCleanSwitch(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	sid := createActiveSession(t, s)
+
+	rec := postJSON(t, s, "/api/set-model",
+		fmt.Sprintf(`{"modelId":"grok-4","reasoningEffort":"high","sessionId":%q}`, sid))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/set-model status = %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	if _, present := body["warning"]; present {
+		t.Errorf("warning must be absent on a clean switch, got %v", body["warning"])
 	}
 }

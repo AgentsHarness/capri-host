@@ -220,6 +220,10 @@ func TestExtensionMethodsNoActiveSession(t *testing.T) {
 		{"billing", func() error { _, err := b.Billing(ctx, ""); return err }},
 		{"memory/flush", func() error { _, err := b.MemoryFlush(ctx, ""); return err }},
 		{"memory/rewrite", func() error { _, err := b.MemoryRewrite(ctx, "", "t", "s"); return err }},
+		{"memory/list", func() error { _, err := b.MemoryList(ctx, ""); return err }},
+		{"memory/toggle", func() error { _, err := b.MemoryToggle(ctx, "", true); return err }},
+		{"memory/dream", func() error { _, err := b.MemoryDream(ctx, ""); return err }},
+		{"memory/forget", func() error { _, err := b.MemoryForget(ctx, "", "/ws/n.md", "h"); return err }},
 		{"toggle_plan_mode", func() error { _, err := b.TogglePlanMode(ctx, ""); return err }},
 		{"permissions/reset", func() error { _, err := b.PermissionsReset(ctx, ""); return err }},
 		{"mcp/toggle", func() error { _, err := b.MCPToggle(ctx, "fs", true); return err }},
@@ -273,6 +277,42 @@ func TestAdminExtensionMethodsWirePayloads(t *testing.T) {
 			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryRewrite(ctx, "", "new memory", "ctx summary") },
 			method: "_x.ai/memory/rewrite",
 			params: map[string]any{"sessionId": "s1", "rawText": "new memory", "contextSummary": "ctx summary"},
+		},
+		{
+			// The /memory modal methods are camelCase on the agent side, while
+			// flush/dream reuse the snake_case struct — the regression this
+			// guards is exactly a mixed-up key, which the agent answers with
+			// invalid params.
+			name:   "memory/list camelCase sessionId",
+			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryList(ctx, "") },
+			method: "_x.ai/memory/list",
+			params: map[string]any{"sessionId": "s1"},
+		},
+		{
+			name:   "memory/toggle carries enabled",
+			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryToggle(ctx, "", false) },
+			method: "_x.ai/memory/toggle",
+			params: map[string]any{"sessionId": "s1", "enabled": false},
+		},
+		{
+			name:   "memory/dream snake_case session_id",
+			call:   func(b *Bridge) (map[string]any, error) { return b.MemoryDream(ctx, "") },
+			method: "_x.ai/memory/dream",
+			params: map[string]any{"session_id": "s1"},
+		},
+		{
+			// The digest is the caller's evidence of the previewed bytes; it
+			// must reach the agent untouched or the store refuses the delete.
+			name: "memory/forget carries the preview digest",
+			call: func(b *Bridge) (map[string]any, error) {
+				return b.MemoryForget(ctx, "", "/ws/.grok/memory/topics/t.md", "abc123")
+			},
+			method: "_x.ai/memory/forget",
+			params: map[string]any{
+				"sessionId":           "s1",
+				"path":                "/ws/.grok/memory/topics/t.md",
+				"expectedContentHash": "abc123",
+			},
 		},
 		{
 			name:   "mcp/list injects active sessionId",
