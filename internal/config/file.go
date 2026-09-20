@@ -31,8 +31,8 @@ type File struct {
 	HubQUICPin  string `json:"hub_quic_pin,omitempty"`
 
 	// Proxy / NoProxy 是出网代理：host 启动时导出成 HTTPS_PROXY 等标准
-	// 变量，hub 中继与本机拉起的 grok agent 都跟着走，菜单栏应用启动的
-	// host 因此不必依赖登录 shell 里的代理设置。
+	// 变量，hub 中继与本机拉起的 grok agent 都跟着走。留空时 macOS 上
+	// 改读系统网络设置里的 HTTP/HTTPS/SOCKS 代理；系统也没开才是直连。
 	Proxy   string `json:"proxy,omitempty"`
 	NoProxy string `json:"no_proxy,omitempty"`
 

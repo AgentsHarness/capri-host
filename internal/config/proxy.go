@@ -16,9 +16,9 @@ var proxyEnvKeys = []string{
 // ApplyProxyEnv 把配置里的代理导出成标准环境变量，让本进程（hub 的
 // WebSocket / HTTP 中继）以及它拉起的 grok agent 都走代理。
 //
-// Proxy 为空时是 no-op：不动环境，父进程（shell / launchd）原有的
-// HTTPS_PROXY 等继续生效——配置文件只是给菜单栏应用这种没有 shell
-// 环境的启动方式补一条通道。
+// Proxy 为空时是 no-op：不写环境变量。菜单栏启动请先 WithSystemProxy，
+// 把系统网络设置填进 Proxy；命令行 / launchd 已经设过 HTTPS_PROXY 的，
+// 系统也没开代理时不会被覆盖。
 func (c Config) ApplyProxyEnv() {
 	p := strings.TrimSpace(c.Proxy)
 	if p == "" {
@@ -33,6 +33,24 @@ func (c Config) ApplyProxyEnv() {
 	}
 }
 
+// WithSystemProxy 在 Proxy 未手写时，用 macOS 系统网络设置里的
+// HTTP/HTTPS/SOCKS 代理填上（PAC 自动配置不支持）。系统也没开则原样返回。
+func (c Config) WithSystemProxy() Config {
+	if strings.TrimSpace(c.Proxy) != "" {
+		return c
+	}
+	p, np := lookupSystemProxy()
+	if p == "" {
+		return c
+	}
+	c.Proxy = p
+	c.proxyFromSystem = true
+	if strings.TrimSpace(c.NoProxy) == "" {
+		c.NoProxy = np
+	}
+	return c
+}
+
 // ProxyDescription 是给日志用的一行摘要：回显代理地址（带凭据时只保留
 // 用户名，密码打码，日志可能被贴出去），无代理返回空串。
 func (c Config) ProxyDescription() string {
@@ -41,10 +59,17 @@ func (c Config) ProxyDescription() string {
 		return ""
 	}
 	p := redactProxy(raw)
-	if np := strings.TrimSpace(c.NoProxy); np != "" {
-		return p + "（NO_PROXY=" + np + "）"
+	var extra []string
+	if c.proxyFromSystem {
+		extra = append(extra, "系统网络设置")
 	}
-	return p
+	if np := strings.TrimSpace(c.NoProxy); np != "" {
+		extra = append(extra, "NO_PROXY="+np)
+	}
+	if len(extra) == 0 {
+		return p
+	}
+	return p + "（" + strings.Join(extra, "；") + "）"
 }
 
 // redactProxy 把 user:password@ 里的密码换成 ***，其余原样保留（用字符串

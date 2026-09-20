@@ -40,7 +40,8 @@ func TestLoadProxyFromFile(t *testing.T) {
 	}
 }
 
-// 没有代理配置时不动环境：父进程（shell / launchd）原有的代理设置要留着。
+// 没有代理配置时不动环境：不写代理变量（菜单栏启动因此是直连），
+// 父进程已经有的 HTTPS_PROXY 也不会被清掉。
 func TestApplyProxyEnvNoopWhenUnset(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://from-parent:1")
 	t.Setenv("https_proxy", "")
@@ -86,5 +87,9 @@ func TestProxyDescriptionRedactsPassword(t *testing.T) {
 	}
 	if got := (Config{Proxy: "http://p:1", NoProxy: "localhost"}).ProxyDescription(); got != "http://p:1（NO_PROXY=localhost）" {
 		t.Fatalf("ProxyDescription with NO_PROXY = %q", got)
+	}
+	sys := Config{Proxy: "http://p:1", NoProxy: "localhost", proxyFromSystem: true}
+	if got := sys.ProxyDescription(); got != "http://p:1（系统网络设置；NO_PROXY=localhost）" {
+		t.Fatalf("ProxyDescription from system = %q", got)
 	}
 }
