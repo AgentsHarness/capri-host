@@ -54,6 +54,13 @@ struct SettingsView: View {
                     TextField("grok 路径", text: $model.grokBin, prompt: Text("自动探测"))
                     Button("探测 grok") { model.detectGrok() }
                 }
+                Section("代理") {
+                    TextField("出网代理", text: $model.proxy, prompt: Text("http://127.0.0.1:7890"))
+                    TextField("不走代理", text: $model.noProxy, prompt: Text("localhost,127.0.0.1"))
+                    Text("留空表示不使用代理（沿用系统原有的代理设置）。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Section("启动") {
                     Toggle("打开应用时启动 Host", isOn: $model.startHostOnLaunch)
                     Toggle("登录时启动 Capri", isOn: $model.startAtLogin)
@@ -78,7 +85,7 @@ struct SettingsView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
         }
-        .frame(minWidth: 460, minHeight: 560)
+        .frame(minWidth: 460, minHeight: 620)
         .onAppear { model.loadForm() }
     }
 }

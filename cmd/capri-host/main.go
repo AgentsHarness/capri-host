@@ -25,6 +25,12 @@ func main() {
 		log.Printf("[capri-host] config %s", config.Path())
 	}
 	cfg := config.Load()
+	// 代理要在任何出网客户端之前落地：hub 中继、agent 探测都读环境变量。
+	// 无代理配置时是 no-op，父进程原有的 HTTPS_PROXY 保持不变。
+	cfg.ApplyProxyEnv()
+	if desc := cfg.ProxyDescription(); desc != "" {
+		log.Printf("[capri-host] proxy %s", desc)
+	}
 	// 非回环监听必须配入站钥匙：withAuth 在 FE_TOKEN 为空时是刻意开放的
 	// （本机可信），那句话只在回环 socket 上成立。
 	if err := config.CheckBindPolicy(cfg); err != nil {
