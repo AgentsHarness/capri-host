@@ -83,7 +83,23 @@ const (
 	// initialize 响应的 `_meta`（如 agentInfo._meta.modelState 模型目录），
 	// 便于无会话 boot 状态下让 FE 拿到模型列表做 UI 验证。
 	ACPHostFakeAgentInitMeta = "ACP_HOST_FAKE_AGENT_INIT_META"
+	// ACPHostFakeAgentMemoryDisabled=1 boots the fake agent with memory off
+	// (the listing reports enabled=false / reason session_toggle), so the
+	// modal's disabled state and the toggle-on path are browser-verifiable.
+	ACPHostFakeAgentMemoryDisabled = "ACP_HOST_FAKE_AGENT_MEMORY_DISABLED"
+	// ACPHostFakeAgentRejectEffort=1 makes the fake agent answer
+	// session/set_config_option with configId=reasoning_effort as an
+	// invalid-params error while still accepting the model switch — the
+	// "model switched, effort refused" half-success the host must report as
+	// a non-fatal warning instead of a clean 200.
+	ACPHostFakeAgentRejectEffort = "ACP_HOST_FAKE_AGENT_REJECT_EFFORT"
 )
+
+// fakeMemoryForgetHash is the only x.ai/memory/forget digest the fake agent
+// accepts — the BLAKE3 hex of fakeMemoryTopicBody, which is what a client
+// computes when it previews that note. Any other digest is answered as the
+// store's "changed" rejection, so tests can exercise both outcomes.
+const fakeMemoryForgetHash = "5c339095542cf5238f913672ac16d70d6f56864d03b702f5c3242201120cf5fa"
 
 // fakeAgentMeta parses an env var as a JSON object for the canned `_meta`
 // response; nil when unset or invalid.
@@ -113,6 +129,65 @@ func fakeAgentSessionRows() []any {
 	}}
 }
 
+// fakeMemoryTopicBody is the canned body of the topic note the /memory modal
+// previews. Deleting that note requires the BLAKE3 hex of exactly these bytes
+// (fakeMemoryForgetHash).
+const fakeMemoryTopicBody = "# 部署约定\n\n- 生产环境固定使用 eu-west 集群\n- 发布前必须跑 pnpm run build\n"
+
+// fakeMemorySessionLogBody is the canned body of the legacy session log.
+const fakeMemorySessionLogBody = "# Session 2026-09-18\n\n- 排查了前端构建失败\n"
+
+// fakeMemoryBodies maps the paths listed by fakeMemoryFiles to preview bodies.
+// The inbox observation is absent on purpose: an unreadable note must render as
+// a read failure (and lose its delete evidence) instead of an empty preview.
+var fakeMemoryBodies = map[string]string{
+	"/ws/.grok/memory/topics/deploy-conventions.md":   fakeMemoryTopicBody,
+	"/home/benin/.grok/memory/sessions/2026-09-18.md": fakeMemorySessionLogBody,
+	"/home/benin/.grok/memory/MEMORY.md":              "# Memory index\n\n- [部署约定](topics/deploy-conventions.md)\n",
+	"/ws/.grok/memory/MEMORY.md":                      "# Memory index\n\n- (no notes yet)\n",
+}
+
+// readFilePath extracts params.path from a recorded x.ai/fs/read_file request.
+func readFilePath(msg map[string]any) string {
+	p, _ := msg["params"].(map[string]any)
+	path, _ := p["path"].(string)
+	return path
+}
+
+// fakeMemoryFiles is the canned x.ai/memory/list file set: generated indexes for
+// both scopes, a v2 topic note, a v2 inbox observation (its label comes from the
+// `__t…-…__n…` key shape) and a legacy session log. The paths carry the parent
+// directories the deletability rule keys on (`topics` / `observations/_inbox`,
+// or source `session`), so the modal's delete gating is exercisable end to end.
+func fakeMemoryFiles() []any {
+	now := time.Now().Unix()
+	return []any{
+		map[string]any{
+			"path": "/home/benin/.grok/memory/MEMORY.md", "source": "global",
+			"size_bytes": 62, "modified_epoch_secs": now - 7200, "generated": true,
+		},
+		map[string]any{
+			"path": "/ws/.grok/memory/MEMORY.md", "source": "workspace",
+			"size_bytes": 40, "modified_epoch_secs": now - 300, "generated": true,
+		},
+		map[string]any{
+			"path": "/ws/.grok/memory/topics/deploy-conventions.md", "source": "workspace",
+			"size_bytes": len(fakeMemoryTopicBody), "modified_epoch_secs": now - 300,
+			"generated": false, "title": "部署约定",
+		},
+		map[string]any{
+			"path":   "/ws/.grok/memory/observations/_inbox/01a0b305-5618-7202__t000003-000005__n000.md",
+			"source": "workspace", "size_bytes": 268, "modified_epoch_secs": now - 1800,
+			"generated": false,
+		},
+		map[string]any{
+			"path": "/home/benin/.grok/memory/sessions/2026-09-18.md", "source": "session",
+			"size_bytes": len(fakeMemorySessionLogBody), "modified_epoch_secs": now - 600,
+			"generated": false,
+		},
+	}
+}
+
 // fakeAgentPermissionID is the JSON-RPC id the fake agent stamps on its
 // emitted permission request.
 const fakeAgentPermissionID float64 = 99
@@ -131,6 +206,11 @@ func runFakeAgent() {
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	out := bufio.NewWriter(os.Stdout)
+	// Memory state kept across requests so the /memory modal round-trips
+	// realistically: the listing reflects the last toggle, and a note the
+	// store accepted for deletion stays gone (the real store tombstones it).
+	memoryEnabled := os.Getenv(ACPHostFakeAgentMemoryDisabled) != "1"
+	forgottenNotes := map[string]bool{}
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -173,6 +253,24 @@ func runFakeAgent() {
 			out.WriteByte('\n')
 			out.Flush()
 			continue
+		}
+		// Half-success injection: accept the model switch, refuse the effort.
+		if method == "session/set_config_option" && os.Getenv(ACPHostFakeAgentRejectEffort) == "1" {
+			req, _ := msg["params"].(map[string]any)
+			if cid, _ := req["configId"].(string); cid == "reasoning_effort" {
+				resp, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"error": map[string]any{
+						"code":    -32602,
+						"message": "unknown reasoning_effort value",
+					},
+				})
+				out.Write(resp)
+				out.WriteByte('\n')
+				out.Flush()
+				continue
+			}
 		}
 		var result map[string]any
 		switch method {
@@ -283,6 +381,84 @@ func runFakeAgent() {
 			result = map[string]any{"ok": true}
 		case "_x.ai/memory/rewrite":
 			result = map[string]any{"ok": true}
+		case "_x.ai/memory/list":
+			// MemoryListing: camelCase request, snake_case response keys.
+			files := []any{}
+			for _, f := range fakeMemoryFiles() {
+				if entry, ok := f.(map[string]any); ok && forgottenNotes[entry["path"].(string)] {
+					continue
+				}
+				files = append(files, f)
+			}
+			result = map[string]any{
+				"files":           files,
+				"enabled":         memoryEnabled,
+				"capture_enabled": true,
+				"dream_enabled":   true,
+			}
+			if !memoryEnabled {
+				result["disabled_reason"] = "session_toggle"
+			}
+		case "_x.ai/memory/toggle":
+			// Flip the in-process state and answer with the new one (TUI
+			// apply_toggle_result: the reply's flags are authoritative, a
+			// refusal leaves memory where it was).
+			want := true
+			if p, ok := msg["params"].(map[string]any); ok {
+				if v, ok := p["enabled"].(bool); ok {
+					want = v
+				}
+			}
+			memoryEnabled = want
+			result = map[string]any{
+				"message": "记忆已开启",
+				"enabled": memoryEnabled,
+			}
+			if !memoryEnabled {
+				result["message"] = "记忆已关闭"
+				result["disabled_reason"] = "session_toggle"
+			}
+		case "_x.ai/fs/read_file":
+			body, ok := fakeMemoryBodies[readFilePath(msg)]
+			if !ok {
+				result = map[string]any{
+					"error":   "not found",
+					"message": "no canned body for this path",
+				}
+				break
+			}
+			result = map[string]any{
+				"content":    body,
+				"size":       len(body),
+				"line_count": strings.Count(body, "\n"),
+				"type":       "text",
+			}
+		case "_x.ai/memory/dream":
+			result = map[string]any{
+				"disposition":       "completed",
+				"observation_count": 2,
+				"topics_affected":   1,
+			}
+		case "_x.ai/memory/forget":
+			// The store's evidence check in miniature: the fake accepts the
+			// digest the host forwarded under a canned value and rejects
+			// anything else, so tests can exercise both outcomes.
+			params := map[string]any{}
+			if p, ok := msg["params"].(map[string]any); ok {
+				params = p
+			}
+			if params["expectedContentHash"] == fakeMemoryForgetHash {
+				path, _ := params["path"].(string)
+				wasAlready := forgottenNotes[path]
+				forgottenNotes[path] = true
+				result = map[string]any{"outcome": "forgotten", "was_already_forgotten": wasAlready}
+			} else {
+				result = map[string]any{
+					"outcome": "rejected",
+					"reason":  "changed",
+					"message": "This note changed since you opened it.",
+				}
+			}
 		case "_x.ai/toggle_plan_mode":
 			// planMode nested in the result envelope.
 			result = map[string]any{"result": map[string]any{"planMode": true}}

@@ -190,13 +190,30 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 
 更完整的部署说明（后台、开机自启、防火墙）见 [docs/DEPLOY.md](docs/DEPLOY.md)。事件语义契约（seq / 双路去重 / 分级背压）见 [docs/EVENT-CONTRACTS.md](docs/EVENT-CONTRACTS.md)。
 
+所以装了应用之后依然可以临时 `PORT=9000 ./capri-host`。
+
+```json
+{
+  "bind": "127.0.0.1",
+  "port": 8765,
+  "host_id": "mba",
+  "host_name": "MacBook Air",
+  "hub_url": "https://agents.example.com",
+  "fe_token": "",
+  "grok_bin": "",
+  "hub_pair_code": "",
+  "proxy": "",
+  "no_proxy": ""
+}
+```
+
 ## 常用变量
 
 | 变量                  | 默认            | 说明                                                                                                                                 |
 | --------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `PORT`                | `8765`          | HTTP 端口（界面 + 接口）                                                                                                             |
 | `BIND`                | `127.0.0.1`     | 监听地址。默认只听回环，只有本机能够直连；要让手机等同网段设备访问，显式设 `BIND=0.0.0.0`——那**必须**同时设 `FE_TOKEN`，否则拒绝启动 |
-| `GROK_BIN`            | `grok`          | grok 可执行文件                                                                                                                      |
+| `GROK_BIN`            | `grok`          | grok 可执行文件；留空则按常见路径探测                                                                                                |
 | `HOST_ID`             | `local`         | 多机时用来区分，同 hub 内需唯一                                                                                                      |
 | `HOST_NAME`           | `Local Host`    | 界面上的名字                                                                                                                         |
 | `XAI_API_KEY`         | —               | 可选；否则用 `grok login`                                                                                                            |
@@ -204,7 +221,11 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 | `HUB_PAIR_CODE`       | —               | 配对码，也可从托盘输入                                                                                                               |
 | `FE_TOKEN`            | —               | 本机接口的访问密钥（`/api/*`、`/events`）。与 Hub 的 `FE_TOKEN` **是两把独立的钥匙**，见下                                            |
 | `HOST_TOKEN`          | —               | 直接给配对 token，跳过配对                                                                                                           |
+| `HUB_QUIC_PIN`        | —               | 自签 hub 的 QUIC 证书指纹（见 `docs/DEPLOY.md`）                                                                                     |
+| `PROXY`               | —               | 出网代理，可只写 `host:port`（自动补 `http://`）。留空则 macOS 读取系统网络设置里的代理；系统未开时直连                                 |
+| `NO_PROXY`            | —               | 不走代理的地址列表，逗号分隔。留空则沿用系统网络设置里的排除列表                                                                      |
 | `CAPRI_HOST_DIR`      | `~/.capri-host` | 设置、日志、token 的存放目录                                                                                                         |
+| `CAPRI_HOME`          | `~/.capri-host` | 配置目录（`config.json`、`hub.json` 都在这下面）                                                                                     |
 | `CAPRI_TRAY`          | `1`             | 设为 `0` 不启动托盘                                                                                                                  |
 | `CAPRI_OPEN_BROWSER`  | `1`             | 设为 `0` 启动时不打开浏览器                                                                                                          |
 

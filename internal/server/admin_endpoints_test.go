@@ -90,6 +90,155 @@ func TestMemoryRewriteEndpoint(t *testing.T) {
 	}
 }
 
+// ── POST /api/memory-list ───────────────────────────────────────────
+
+func TestMemoryListEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/memory-list", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	// The listing reaches the caller unmangled (snake_case keys, verbatim).
+	res, _ := m["result"].(map[string]any)
+	if res["enabled"] != true || res["capture_enabled"] != true || res["dream_enabled"] != true {
+		t.Fatalf("result = %v, want the MemoryListing passthrough", m["result"])
+	}
+	files, _ := res["files"].([]any)
+	if len(files) != 5 {
+		t.Fatalf("files = %v, want the canned fixture's five entries", res["files"])
+	}
+	// `title` (new in the shell) and `generated` survive the passthrough — the
+	// modal labels and gates deletion on both.
+	byPath := map[string]map[string]any{}
+	for _, f := range files {
+		e, _ := f.(map[string]any)
+		p, _ := e["path"].(string)
+		byPath[p] = e
+	}
+	topic := byPath["/ws/.grok/memory/topics/deploy-conventions.md"]
+	if topic == nil || topic["title"] != "部署约定" || topic["generated"] != false {
+		t.Fatalf("topic entry = %v, want the title/generated passthrough", topic)
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/memory-list", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/memory-toggle ─────────────────────────────────────────
+
+func TestMemoryToggleEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/memory-toggle", `{"sessionId":"sess-1","enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	// The fake echoes the requested state back, so this also proves the
+	// host forwarded `enabled:false` rather than defaulting it.
+	res, _ := m["result"].(map[string]any)
+	if res["enabled"] != false {
+		t.Fatalf("result = %v, want enabled:false forwarded", m["result"])
+	}
+
+	// enabled is required by the agent contract — a body without it must not
+	// be read as "off".
+	recMissing := postJSON(t, s, "/api/memory-toggle", `{"sessionId":"sess-1"}`)
+	if recMissing.Code != http.StatusBadRequest {
+		t.Fatalf("missing-enabled status = %d, body=%s", recMissing.Code, recMissing.Body.String())
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/memory-toggle", `{"enabled":true}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/memory-dream ──────────────────────────────────────────
+
+func TestMemoryDreamEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	rec := postJSON(t, s, "/api/memory-dream", `{"sessionId":"sess-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("resp = %s, want ok:true", rec.Body.String())
+	}
+	res, _ := m["result"].(map[string]any)
+	if res["disposition"] != "completed" {
+		t.Fatalf("result = %v, want the dream disposition passthrough", m["result"])
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/memory-dream", `{}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// ── POST /api/memory-forget ─────────────────────────────────────────
+
+func TestMemoryForgetEndpoint(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	// The store accepts only the digest of the bytes the client previewed: the
+	// fake agent's canned accept-digest stands in for that check.
+	body := `{"sessionId":"sess-1","path":"/ws/.grok/memory/topics/deploy-conventions.md","expectedContentHash":"` + fakeMemoryForgetHash + `"}`
+	rec := postJSON(t, s, "/api/memory-forget", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	res, _ := m["result"].(map[string]any)
+	if res["outcome"] != "forgotten" {
+		t.Fatalf("result = %v, want outcome:forgotten", m["result"])
+	}
+
+	// A stale digest is reported as the store's own rejection, not swallowed.
+	stale := `{"sessionId":"sess-1","path":"/ws/.grok/memory/topics/deploy-conventions.md","expectedContentHash":"` + strings.Repeat("0", 64) + `"}`
+	recStale := postJSON(t, s, "/api/memory-forget", stale)
+	if recStale.Code != http.StatusOK {
+		t.Fatalf("stale status = %d, body=%s", recStale.Code, recStale.Body.String())
+	}
+	if res := decodeBody(t, recStale)["result"].(map[string]any); res["outcome"] != "rejected" || res["reason"] != "changed" {
+		t.Fatalf("stale result = %v, want the changed rejection", res)
+	}
+
+	// path is required, and the digest must be a BLAKE3 hex — a body without
+	// either never reaches the agent.
+	for name, bad := range map[string]string{
+		"missing path": `{"sessionId":"sess-1","expectedContentHash":"` + fakeMemoryForgetHash + `"}`,
+		"missing hash": `{"sessionId":"sess-1","path":"/ws/note.md"}`,
+		"short hash":   `{"sessionId":"sess-1","path":"/ws/note.md","expectedContentHash":"abc123"}`,
+		"non-hex hash": `{"sessionId":"sess-1","path":"/ws/note.md","expectedContentHash":"` + strings.Repeat("z", 64) + `"}`,
+	} {
+		if rec := postJSON(t, s, "/api/memory-forget", bad); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, body=%s", name, rec.Code, rec.Body.String())
+		}
+	}
+
+	// No sessionId and no active session → 404.
+	rec2 := postJSON(t, s, "/api/memory-forget", `{"path":"/ws/note.md","expectedContentHash":"`+fakeMemoryForgetHash+`"}`)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("no-session status = %d, body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
 // ── POST /api/toggle-plan-mode ──────────────────────────────────────
 
 func TestTogglePlanModeEndpoint(t *testing.T) {

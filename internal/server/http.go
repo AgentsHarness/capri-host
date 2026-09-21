@@ -140,6 +140,10 @@ func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/billing", s.handleBilling)
 	mux.HandleFunc("POST /api/memory-flush", s.handleMemoryFlush)
 	mux.HandleFunc("POST /api/memory-rewrite", s.handleMemoryRewrite)
+	mux.HandleFunc("POST /api/memory-list", s.handleMemoryList)
+	mux.HandleFunc("POST /api/memory-toggle", s.handleMemoryToggle)
+	mux.HandleFunc("POST /api/memory-dream", s.handleMemoryDream)
+	mux.HandleFunc("POST /api/memory-forget", s.handleMemoryForget)
 	mux.HandleFunc("POST /api/toggle-plan-mode", s.handleTogglePlanMode)
 	mux.HandleFunc("POST /api/permissions-reset", s.handlePermissionsReset)
 	mux.HandleFunc("GET /api/mcp/list", s.handleMCPList)
@@ -779,11 +783,18 @@ func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modelId"})
 		return
 	}
-	if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
+	warning, err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort)
+	if err != nil {
 		writeAgentError(w, "session/set-model", err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	// warning：模型已切换但档位未生效（非致命）。HTTP 仍 200，靠 body 里的
+	// warning 让前端弹 toast 并回滚 caption 上的档位，而不是静默显示成功。
+	out := map[string]any{"ok": true}
+	if warning != "" {
+		out["warning"] = warning
+	}
+	writeJSON(w, 200, out)
 }
 
 type setConfigOptionBody struct {
@@ -1843,6 +1854,118 @@ func (s *Server) handleMemoryRewrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMemoryList — POST /api/memory-list {sessionId?} → _x.ai/memory/list.
+// Returns the /memory modal's listing; the agent requires a resident session
+// (a session it has not loaded answers "session not found" as invalid params).
+func (s *Server) handleMemoryList(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.MemoryList(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/memory/list", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMemoryToggle — POST /api/memory-toggle {sessionId?, enabled} →
+// _x.ai/memory/toggle. `enabled` is required by the agent's request contract,
+// so a body without it is a 400 rather than a silent false (which would read
+// as "turn memory off").
+func (s *Server) handleMemoryToggle(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Enabled   *bool  `json:"enabled"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.Enabled == nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 enabled"})
+		return
+	}
+	res, err := s.bridge.MemoryToggle(r.Context(), body.SessionID, *body.Enabled)
+	if err != nil {
+		writeAgentError(w, "_x.ai/memory/toggle", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMemoryDream — POST /api/memory-dream {sessionId?} → _x.ai/memory/dream
+// (manual consolidation, the /dream command). The result carries a
+// disposition the caller renders; the host does not interpret it.
+func (s *Server) handleMemoryDream(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	res, err := s.bridge.MemoryDream(r.Context(), body.SessionID)
+	if err != nil {
+		writeAgentError(w, "_x.ai/memory/dream", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// handleMemoryForget — POST /api/memory-forget {sessionId?, path,
+// expectedContentHash} → _x.ai/memory/forget. `expectedContentHash` is the
+// BLAKE3 hex the CALLER computed over the note text it previewed; the host
+// forwards it verbatim (it never reads the file itself — the agent owns file
+// access). The agent refuses on a mismatch ("changed"), which is what keeps a
+// note edited after the preview from being deleted unnoticed.
+func (s *Server) handleMemoryForget(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID           string `json:"sessionId"`
+		Path                string `json:"path"`
+		ExpectedContentHash string `json:"expectedContentHash"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if body.Path == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 path"})
+		return
+	}
+	if !isBlake3Hex(body.ExpectedContentHash) {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 expectedContentHash（BLAKE3 十六进制）"})
+		return
+	}
+	res, err := s.bridge.MemoryForget(r.Context(), body.SessionID, body.Path, body.ExpectedContentHash)
+	if err != nil {
+		writeAgentError(w, "_x.ai/memory/forget", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// isBlake3Hex reports whether s is a 32-byte BLAKE3 digest in hex — the only
+// form the memory store compares against. Case-insensitive: `blake3::Hash::to_hex`
+// emits lowercase, but rejecting an uppercase digest would be a needless 400.
+func isBlake3Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // handleTogglePlanMode — POST /api/toggle-plan-mode {sessionId?} →

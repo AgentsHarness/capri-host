@@ -58,6 +58,14 @@ type Config struct {
 	// before the agent's 30-day session cleanup can delete the source
 	// updates.jsonl, so /usage history outlives that cleanup.
 	UsageLedger string
+	// Proxy is the HTTP(S) proxy exported to this process and to the grok
+	// agent child as HTTPS_PROXY/HTTP_PROXY/ALL_PROXY. Empty before
+	// WithSystemProxy means "use macOS system proxy if enabled".
+	Proxy string
+	// NoProxy is NO_PROXY: the comma-separated hosts that bypass Proxy.
+	NoProxy string
+	// proxyFromSystem 表示 Proxy 来自 macOS 系统网络设置，只给日志用。
+	proxyFromSystem bool
 }
 
 // DefaultHostID and DefaultHostName are the compiled-in identity used when
@@ -123,6 +131,11 @@ func Load() Config {
 	c.ResidentCap = envResidentCap()
 	c.UsageLedger = strings.TrimSpace(os.Getenv("USAGE_LEDGER"))
 	c.GrokBin = resolveGrokBin(c.GrokBin)
+	// PROXY / NO_PROXY: env wins over config.json (filled earlier when empty).
+	c.Proxy = proxyURL(os.Getenv("PROXY"), c.Proxy)
+	if v := strings.TrimSpace(os.Getenv("NO_PROXY")); v != "" {
+		c.NoProxy = v
+	}
 
 	return c
 }
@@ -154,11 +167,33 @@ func applyJSONFile(c *Config, f File) {
 	if v := strings.TrimSpace(f.HubQUICPin); v != "" && c.HubQUICPin == "" {
 		c.HubQUICPin = v
 	}
+	if c.Proxy == "" {
+		c.Proxy = proxyURL("", f.Proxy)
+	}
+	if v := strings.TrimSpace(f.NoProxy); v != "" && c.NoProxy == "" {
+		c.NoProxy = v
+	}
 	if c.ConfigSource == "" {
 		if _, err := os.Stat(Path()); err == nil {
 			c.ConfigSource = Path()
 		}
 	}
+}
+
+// proxyURL 归一化代理地址：文件里可以只写 host:port，这里补上 http://
+// 前缀，让 net/http 与 grok 都能直接当 URL 用。
+func proxyURL(envVal, fileVal string) string {
+	v := strings.TrimSpace(envVal)
+	if v == "" {
+		v = strings.TrimSpace(fileVal)
+	}
+	if v == "" {
+		return ""
+	}
+	if !strings.Contains(v, "://") {
+		v = "http://" + v
+	}
+	return v
 }
 
 // UsageLedgerDisabled reports whether USAGE_LEDGER explicitly turns the

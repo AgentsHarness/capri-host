@@ -56,7 +56,7 @@ enum SettingsWindow {
             w.title = "Capri 设置"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false
-            w.setContentSize(NSSize(width: 480, height: 640))
+            w.setContentSize(NSSize(width: 480, height: 700))
             w.center()
             window = w
         }

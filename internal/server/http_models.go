@@ -43,9 +43,13 @@ func (s *Server) handleSetDefaultModel(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[capri-host] campaign dismiss 失败（配置仍会写入，活动可能继续覆盖默认模型）: %v", err)
 	}
 	if body.SessionID != "" {
-		if err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
+		// warning：模型已切换但档位未生效。非致命——会话已经切过去了，
+		// 不能因为档位失败就让整次「设为默认」返回错误（偏好仍要落盘）。
+		if warning, err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
 			writeAgentError(w, "session/set-model", err)
 			return
+		} else if warning != "" {
+			log.Printf("[capri-host] %s", warning)
 		}
 	}
 	if err := s.bridge.SetDefaultModelConfig(body.ModelID, body.ReasoningEffort); err != nil {

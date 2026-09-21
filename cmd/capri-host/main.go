@@ -37,6 +37,7 @@ func main() {
 
 	cfg := config.Load()
 
+
 	// Logging comes second, but before anything that can fail in an
 	// interesting way. A Windows GUI binary has no stderr, so until this runs
 	// every log line in the process is written into a void.
@@ -107,6 +108,14 @@ func main() {
 
 	// The launcher used to put grok's directory on PATH before exec'ing us.
 	config.EnsureGrokOnPath(cfg.GrokBin)
+
+	// 代理要在任何出网客户端之前落地：hub 中继、agent 探测都读环境变量。
+	// 配置留空则改用 macOS 系统网络设置；系统也没开才是直连。
+	cfg = cfg.WithSystemProxy()
+	cfg.ApplyProxyEnv()
+	if desc := cfg.ProxyDescription(); desc != "" {
+		log.Printf("[capri-host] proxy %s", desc)
+	}
 
 	// 非回环监听必须配入站钥匙：withAuth 在 FE_TOKEN 为空时是刻意开放的
 	// （本机可信），那句话只在回环 socket 上成立。

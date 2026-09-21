@@ -101,6 +101,8 @@ HOST_ID=macbook HOST_NAME="办公室 Mac" \
 | `HUB_QUIC_HOST` | — | 强制 QUIC 拨号地址（域名经代理丢 UDP 时用） |
 | `HUB_QUIC_INSECURE` | — | 设为 `1` 跳过 QUIC 证书校验（仅限可信网络上的自签 hub；生产用 `HUB_QUIC_PIN` 代替） |
 | `HUB_QUIC_PIN` | — | 自签 hub 证书的 SPKI 指纹（sha256，hex 或 base64）。设置后跳过系统 CA，改为比对证书公钥指纹，不匹配即握手失败。见下方[自签证书指纹校验](#自签证书指纹校验hub_quic_pin) |
+| `PROXY` | — | 出网代理，可只写 `host:port`。留空则 macOS 读取系统网络设置；系统未开时直连。同时导出给 grok agent |
+| `NO_PROXY` | — | 不走代理的地址列表。留空则沿用系统排除列表 |
 
 ### capri-hub
 
@@ -157,11 +159,22 @@ cp -R dist ../capri-host/internal/server/web/dist
   "hub_url": "https://agents.example.com",
   "fe_token": "",
   "grok_bin": "",
-  "hub_pair_code": ""
+  "hub_pair_code": "",
+  "proxy": "",
+  "no_proxy": ""
 }
 ```
 
 `GROK_BIN` 为空时会按 `~/.local/bin/grok`、`~/.grok/bin/grok`、Homebrew 路径依次探测。测试或便携安装可设 `CAPRI_HOME` 改配置目录。
+
+`proxy` 是出网代理，可以只写 `host:port`（host 启动时补成 `http://host:port`），也可以带凭据
+`http://user:pass@proxy:8080`；host 启动时把它导出为 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+（大小写各一套），`no_proxy` 导出为 `NO_PROXY`。这样菜单栏应用这种没有登录 shell 环境的启动方式
+也能让 host 中继和它拉起的 grok agent 走代理——agent 请求模型 API 走的就是这组变量。
+留空时 macOS 上改读系统网络设置（`scutil --proxy` 的 HTTP/HTTPS/SOCKS，不含 PAC 自动配置脚本）；
+系统也没开代理才是直连。命令行已经设过 `HTTPS_PROXY`、同时系统代理也关着的，不会被覆盖。
+系统排除列表会写进 `NO_PROXY`（设置里填了排除地址则以设置为准）。
+代理对回环地址（本机前端的 127.0.0.1 端口）无效，不需要额外加 `no_proxy` 例外。
 
 macOS 13+ 菜单栏应用 `Capri.app`（SwiftUI 原生菜单 + 设置窗）用这份文件启停 host，不必再手写环境变量。打包见仓库 `packaging/macos/make-app.sh`。登录启动走系统「登录项」（SMAppService）。
 
