@@ -25,8 +25,8 @@
 一个进程、一个端口，同时提供 **Web 界面** 和接口。macOS 上还提供一个菜单栏应用，把启停和配置收进图形界面。
 
 ```
-浏览器  ──本机──▶  capri-host :8765  ──▶  grok
-浏览器  ──远程──▶  capri-hub        ──▶  capri-host × N  ──▶  grok
+浏览器  ──本机──▶  Capri-host :8765  ──▶  grok
+浏览器  ──远程──▶  capri-hub        ──▶  Capri-host × N  ──▶  grok
 ```
 
 ## 截图
@@ -54,13 +54,31 @@
 xattr -dr com.apple.quarantine /Applications/Capri.app
 ```
 
-### 命令行二进制
+### Windows 应用（推荐）
 
-从 Releases 下对应平台的 `capri-host-*`：
+下载 `Capri-windows-amd64.zip`（或 `Capri-windows-arm64.zip`，根据系统架构选择），解压后进入 `Capri`
+目录，双击 **`Capri.exe`**。
+
+目录结构：
+
+```
+Capri/
+├── Capri.exe            双击运行的就是它：托盘图标、对话框、Host 进程的启停
+└── bin/
+    └── Capri-host.exe   干活的引擎（HTTP + grok），由 Capri.exe 拉起
+```
+
+**引擎不要单独双击**——它是个控制台程序，双击只会开一个黑窗口。整个目录一起保留，
+`Capri.exe` 按相对位置找 `bin/Capri-host.exe`。
+
+点击托盘菜单的设置进入网页设置界面，配置好即可保存，然后通过托盘菜单启动或重启 Host。
+## 命令行二进制
+
+从 Releases 下对应平台的 `Capri-host-*`：
 
 ```bash
-chmod +x capri-host   # 按实际文件名
-./capri-host
+chmod +x Capri-host   # 按实际文件名
+./Capri-host
 ```
 
 可以只用环境变量配置，适合脚本、launchd、systemd，以及在服务器上跑。
@@ -75,11 +93,20 @@ go run ./cmd/capri-host
 
 浏览器打开 <http://localhost:8765>。
 
+要出 Windows 那套目录（`Capri/Capri.exe` + `Capri/bin/Capri-host.exe`，清单按架构生成）：
+
+```bash
+./packaging/windows/make-exes.sh amd64 arm64
+```
+
+macOS 应用同理：`./packaging/macos/make-app.sh --universal`。
+
 ## 连接到 capri-hub
 
 在一台能被访问的服务器上先起 [capri-hub](https://github.com/AgentsHarness/capri-hub)，并部署 capri-fe，通过前端左上角添加 Host 获得配对码。
 
 macOS 应用在设置窗里填 Hub URL 和配对码即可，配对成功后地址会留在 `config.json`。
+Windows 托盘在设置界面配置，同样落在 `config.json`。
 
 命令行启动则需要提供环境变量：
 
@@ -90,7 +117,7 @@ HUB_PAIR_CODE=XXXXXX
 HOST_ID=pc
 HOST_NAME="家里的 Mac"
 FE_TOKEN=XXXXXX
-nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
+nohup ./Capri-host >> Capri-host.log 2>&1 & echo $! > capri-host.pid
 ```
 
 配对成功后 token 写在 `~/.capri-host/hub.json`，之后只需带 `HUB_URL`、`FE_TOKEN` 重启。浏览器打开独立部署的前端地址，选这台 Host 即可。
@@ -99,10 +126,10 @@ nohup ./capri-host >> capri-host.log 2>&1 & echo $! > capri-host.pid
 
 两处可配，**环境变量优先于文件**：
 
-1. `~/.capri-host/config.json`——macOS 应用写的是这份，也可以手写；
+1. `~/.capri-host/config.json`——macOS 应用和 Windows 托盘读写的是同一份，也可以手写；
 2. 环境变量——命令行、launchd、systemd 用这套，会覆盖文件里的同名字段。
 
-所以装了应用之后依然可以临时 `PORT=9000 ./capri-host`。
+所以装了应用之后依然可以临时 `PORT=9000 ./Capri-host`。
 
 ```json
 {

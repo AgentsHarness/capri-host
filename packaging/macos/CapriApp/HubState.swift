@@ -30,11 +30,29 @@ struct HubState: Codable {
         !(token ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// 与 Go 侧 `st.URL == c.cfg.URL` 对齐：去空白后精确相等。
+    /// Same address after the host's normalization (bare host means https).
     func matches(hubURL: String) -> Bool {
         guard hasToken else { return false }
-        let a = (url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let b = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let a = HubURL.normalize(url ?? "")
+        let b = HubURL.normalize(hubURL)
         return !a.isEmpty && a == b
+    }
+}
+
+enum HubURL {
+    /// Mirrors hubstate.NormalizeURL: trim, default scheme https, keep only the origin.
+    static func normalize(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        if !s.contains("://") { s = "https://" + s }
+        guard var c = URLComponents(string: s),
+              c.scheme == "http" || c.scheme == "https",
+              let host = c.host, !host.isEmpty else { return "" }
+        c.path = ""
+        c.query = nil
+        c.fragment = nil
+        c.user = nil
+        c.password = nil
+        return c.string ?? ""
     }
 }

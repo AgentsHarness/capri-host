@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// DefaultBindAddr 是默认监听地址：capri-host 的 /api/* 能驱动 agent 进程，
+// DefaultBindAddr 是默认监听地址：Capri-host 的 /api/* 能驱动 agent 进程，
 // 默认只对本机开放。要局域网访问（例如手机开内嵌前端）显式设 BIND=0.0.0.0
 // —— 那必须同时设 FE_TOKEN，见 CheckBindPolicy。
 const DefaultBindAddr = "127.0.0.1"
@@ -83,8 +83,8 @@ func merge(file File) Config {
 		HubURL:      envOr("HUB_URL", strings.TrimSpace(file.HubURL)),
 		HubPairCode: envOr("HUB_PAIR_CODE", strings.TrimSpace(file.HubPairCode)),
 		HostToken:   os.Getenv("HOST_TOKEN"),
-		HostID:      envOr("HOST_ID", strOr(strings.TrimSpace(file.HostID), "local")),
-		HostName:    envOr("HOST_NAME", strOr(strings.TrimSpace(file.HostName), "Local Host")),
+		HostID:      envOr("HOST_ID", strOr(strings.TrimSpace(file.HostID), DefaultHostID)),
+		HostName:    envOr("HOST_NAME", strOr(strings.TrimSpace(file.HostName), DefaultHostName)),
 		HubQUICPin:  strings.TrimSpace(envOr("HUB_QUIC_PIN", strings.TrimSpace(file.HubQUICPin))),
 		AccessToken: firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
 		ResidentCap: envResidentCap(),

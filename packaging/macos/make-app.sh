@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 组装 Capri.app：SwiftUI 原生菜单栏 + 内嵌 capri-host。
+# 组装 Capri.app：SwiftUI 原生菜单栏 + 内嵌 Capri-host。
 # 用法：
 #   ./packaging/macos/make-app.sh              # 当前架构
 #   ./packaging/macos/make-app.sh --universal  # arm64+amd64
@@ -55,6 +55,7 @@ build_app() {
     -framework AppKit \
     -framework Foundation \
     -framework ServiceManagement \
+    -framework IOKit \
     -o "$dest" \
     "$tmp_src"/*.swift
 }
@@ -68,16 +69,16 @@ if [[ "$UNIVERSAL" == 1 ]]; then
   build_host arm64 "$TMP/host-arm64"
   build_app amd64 "$TMP/app-amd64"
   build_app arm64 "$TMP/app-arm64"
-  lipo -create -output "$MACOS/capri-host" "$TMP/host-amd64" "$TMP/host-arm64"
+  lipo -create -output "$MACOS/Capri-host" "$TMP/host-amd64" "$TMP/host-arm64"
   lipo -create -output "$MACOS/Capri" "$TMP/app-amd64" "$TMP/app-arm64"
 else
   arch="$(uname -m)"
   [[ "$arch" == "x86_64" ]] && arch="amd64"
   echo "building Capri.app ($VERSION, darwin/$arch)"
-  build_host "$arch" "$MACOS/capri-host"
+  build_host "$arch" "$MACOS/Capri-host"
   build_app "$arch" "$MACOS/Capri"
 fi
-chmod +x "$MACOS/Capri" "$MACOS/capri-host"
+chmod +x "$MACOS/Capri" "$MACOS/Capri-host"
 
 # 图标以 packaging/macos/CapriApp/ 里的 PNG 为准，打包不再覆盖手绘稿。
 ICON_SRC="$ROOT/packaging/macos/CapriApp"

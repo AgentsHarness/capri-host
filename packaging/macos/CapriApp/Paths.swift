@@ -7,8 +7,8 @@ enum Paths {
             .appendingPathComponent("Library/Logs/Capri")
     }
 
-    static func hostLog() -> URL { logDir().appendingPathComponent("capri-host.log") }
-    static func appLog() -> URL { logDir().appendingPathComponent("capri-app.log") }
+    static func hostLog() -> URL { logDir().appendingPathComponent("Capri-host.log") }
+    static func appLog() -> URL { logDir().appendingPathComponent("Capri-app.log") }
 
     static func defaultHostName() -> String {
         Host.current().localizedName ?? Host.current().name ?? "Local Host"
@@ -43,18 +43,18 @@ enum Paths {
         }
         var candidates: [URL] = []
         let bundleMacOS = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/MacOS/capri-host")
+            .appendingPathComponent("Contents/MacOS/Capri-host")
         candidates.append(bundleMacOS)
         if let exe = Bundle.main.executableURL {
-            candidates.append(exe.deletingLastPathComponent().appendingPathComponent("capri-host"))
+            candidates.append(exe.deletingLastPathComponent().appendingPathComponent("Capri-host"))
         }
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        candidates.append(cwd.appendingPathComponent("capri-host"))
-        candidates.append(cwd.appendingPathComponent("bin/capri-host"))
+        candidates.append(cwd.appendingPathComponent("Capri-host"))
+        candidates.append(cwd.appendingPathComponent("bin/Capri-host"))
         for url in candidates {
             if FileManager.default.isExecutableFile(atPath: url.path) { return url }
         }
-        throw AppError("找不到 capri-host（应在 Capri.app/Contents/MacOS/ 里）")
+        throw AppError("找不到 Capri-host（应在 Capri.app/Contents/MacOS/ 里）")
     }
 
     static func discoverGrok() -> String? {

@@ -5,6 +5,8 @@ final class HostProcess {
     private var process: Process?
     private var logHandle: FileHandle?
     private(set) var lastError: String = ""
+    private var boundPort: Int = 0
+    private var boundToken: String = ""
 
     var isRunning: Bool {
         lock.lock()
@@ -12,9 +14,18 @@ final class HostProcess {
         return process?.isRunning == true
     }
 
+    /// Port and token this child was started with. Nil before the first start.
+    func endpoint() -> (port: Int, token: String)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard boundPort > 0 else { return nil }
+        return (boundPort, boundToken)
+    }
+
     func start() throws {
         let cfg = ConfigFile.load()
         let port = cfg.listenPort
+        let token = cfg.feToken ?? ""
         lock.lock()
         defer { lock.unlock() }
         if process?.isRunning == true { return }
@@ -58,6 +69,8 @@ final class HostProcess {
         try proc.run()
         process = proc
         logHandle = handle
+        boundPort = port
+        boundToken = token
         lastError = ""
         appLog("started capri-host pid=\(proc.processIdentifier) bin=\(bin.path)")
     }
@@ -65,10 +78,19 @@ final class HostProcess {
     func stop() {
         lock.lock()
         let proc = process
+        let port = boundPort
+        let token = boundToken
         lock.unlock()
         guard let proc, proc.isRunning else { return }
         appLog("stopping capri-host pid=\(proc.processIdentifier)")
-        proc.terminate()
+
+        // Quit the listener this child bound, not the port now written in the file.
+        if port > 0 {
+            Task {
+                await HostApiClient.quit(port: port, token: token)
+            }
+        }
+
         let deadline = Date().addingTimeInterval(6)
         while Date() < deadline {
             if !proc.isRunning { return }
@@ -81,7 +103,7 @@ final class HostProcess {
     }
 
     func waitUntilListening(timeout: TimeInterval) -> Bool {
-        let port = ConfigFile.load().listenPort
+        let port = endpoint()?.port ?? ConfigFile.load().listenPort
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if Self.isListening(port: port) { return true }
@@ -92,7 +114,7 @@ final class HostProcess {
     }
 
     static func isListening(port: Int) -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/") else { return false }
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/probe") else { return false }
         var req = URLRequest(url: url, timeoutInterval: 0.25)
         req.httpMethod = "GET"
         let sem = DispatchSemaphore(value: 0)

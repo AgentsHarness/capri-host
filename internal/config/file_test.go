@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -148,6 +149,32 @@ func TestDiscoverGrokBinEmpty(t *testing.T) {
 func TestResolveGrokBinKeepsExplicit(t *testing.T) {
 	if got := resolveGrokBin("/opt/custom/grok"); got != "/opt/custom/grok" {
 		t.Fatalf("explicit path = %q", got)
+	}
+}
+
+func TestUpdateFileConcurrentWritersKeepBothKeys(t *testing.T) {
+	isolateConfig(t)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := UpdateFile(func(f *File) { f.HostName = "a" }); err != nil {
+			t.Errorf("host name: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := UpdateFile(func(f *File) { f.Proxy = "http://127.0.0.1:7890" }); err != nil {
+			t.Errorf("proxy: %v", err)
+		}
+	}()
+	wg.Wait()
+	got, err := LoadFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HostName != "a" || got.Proxy != "http://127.0.0.1:7890" {
+		t.Fatalf("merged file = %+v", got)
 	}
 }
 

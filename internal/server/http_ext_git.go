@@ -546,10 +546,10 @@ func (s *Server) handleWorktreeResumeSession(w http.ResponseWriter, r *http.Requ
 // repo? / type?（小写数组键）/ include_all?；双发 include_all 与 includeAll）。
 func (s *Server) handleWorktreeList(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Repo       string   `json:"repo,omitempty"`
-		Types      []string `json:"type,omitempty"`
-		IncludeAll bool     `json:"includeAll,omitempty"`
-		IncludeSnake bool   `json:"include_all,omitempty"`
+		Repo         string   `json:"repo,omitempty"`
+		Types        []string `json:"type,omitempty"`
+		IncludeAll   bool     `json:"includeAll,omitempty"`
+		IncludeSnake bool     `json:"include_all,omitempty"`
 	}
 	if !readBody(w, r, &body) {
 		return

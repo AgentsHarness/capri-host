@@ -727,7 +727,7 @@ func (b *Bridge) StartUsageLedgerSync(ctx context.Context) {
 	}
 	go func() {
 		if err := b.syncUsageLedger(); err != nil {
-			log.Printf("[capri-host] 用量台账首次同步失败: %v", err)
+			log.Printf("[Capri-host] 用量台账首次同步失败: %v", err)
 		}
 		ticker := time.NewTicker(usageLedgerSyncInterval)
 		defer ticker.Stop()
@@ -737,7 +737,7 @@ func (b *Bridge) StartUsageLedgerSync(ctx context.Context) {
 				return
 			case <-ticker.C:
 				if err := b.syncUsageLedger(); err != nil {
-					log.Printf("[capri-host] 用量台账同步失败: %v", err)
+					log.Printf("[Capri-host] 用量台账同步失败: %v", err)
 				}
 			}
 		}
