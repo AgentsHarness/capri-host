@@ -110,27 +110,35 @@ final class AppModel: ObservableObject {
         let port = f.listenPort
         let listen = HostProcess.isListening(port: port)
         let ours = host.isRunning
+        let text: String
+        let title: String
+        let disabled: Bool
         if ours && listen {
-            statusText = f.hubURL?.nilIfEmpty == nil ? "运行中 :\(port)" : "运行中 :\(port) · Hub"
-            toggleTitle = "停止 Host"
-            toggleDisabled = false
+            text = f.hubURL?.nilIfEmpty == nil ? "运行中 :\(port)" : "运行中 :\(port) · Hub"
+            title = "停止 Host"
+            disabled = false
         } else if ours && !listen {
-            statusText = "正在启动…"
-            toggleTitle = "停止 Host"
-            toggleDisabled = false
+            text = "正在启动…"
+            title = "停止 Host"
+            disabled = false
         } else if !ours && listen {
-            statusText = "端口 :\(port) 已被占用"
-            toggleTitle = "启动 Host"
-            toggleDisabled = true
+            text = "端口 :\(port) 已被占用"
+            title = "启动 Host"
+            disabled = true
         } else if !host.lastError.isEmpty {
-            statusText = "启动失败"
-            toggleTitle = "启动 Host"
-            toggleDisabled = false
+            text = "启动失败"
+            title = "启动 Host"
+            disabled = false
         } else {
-            statusText = "已停止"
-            toggleTitle = "启动 Host"
-            toggleDisabled = false
+            text = "已停止"
+            title = "启动 Host"
+            disabled = false
         }
+        // 每秒轮询一次，状态多数时候不变；重复写 @Published 会让 SwiftUI
+        // 每 tick 累积一份观察登记，长期运行会撑到 GB 级，故仅在变化时赋值。
+        if statusText != text { statusText = text }
+        if toggleTitle != title { toggleTitle = title }
+        if toggleDisabled != disabled { toggleDisabled = disabled }
     }
 
     func toggleHost() {
