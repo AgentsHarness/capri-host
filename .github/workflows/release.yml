@@ -67,10 +67,6 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
-          - goos: windows
-            goarch: amd64
-          - goos: windows
-            goarch: arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -88,22 +84,76 @@ jobs:
           go-version: '1.26'
           cache: true
 
-      - name: Build capri-host
+      - name: Build Capri-host
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: |
-          ext=""
-          [ "$GOOS" = "windows" ] && ext=".exe"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/capri-host-${GOOS}-${GOARCH}${ext}" ./cmd/capri-host
+          go build -trimpath -ldflags "-s -w -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/Capri-host-${GOOS}-${GOARCH}" ./cmd/capri-host
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/capri-host-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+          name: Capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/Capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  # Windows ships one folder holding two processes, the same shape as
+  # Capri.app on macOS: Capri.exe is the double-clicked supervisor that owns
+  # the tray icon, the dialogs and the host's lifetime, and bin/Capri-host.exe
+  # is the engine it starts. They travel together because Capri.exe looks for
+  # the engine in its own bin/.
+  windows-exes:
+    name: Windows app (${{ matrix.goarch }})
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch:
+          - amd64
+          - arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install frontend dist into embed dir
+        uses: actions/download-artifact@v7
+        with:
+          name: capri-fe-dist
+          path: internal/server/web/dist
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      # The manifest and file icon are generated here, per architecture, instead
+      # of being committed as a .syso: a checked-in object file only applies to
+      # the arch in its file name, which is exactly how an arm64 build ends up
+      # silently shipping without one.
+      - name: Build Capri.exe + bin/Capri-host.exe (manifest and icon embedded)
+        env:
+          VERSION: ${{ github.ref_name }}
+          OUT: dist/win
+        run: bash packaging/windows/make-exes.sh ${{ matrix.goarch }}
+
+      - name: Package zip
+        run: |
+          # Zip the Capri folder itself, not its contents: unzipping then gives
+          # the user one directory to open rather than loose files wherever
+          # they happened to extract.
+          cd dist/win/${{ matrix.goarch }}
+          zip -r "../../Capri-windows-${{ matrix.goarch }}.zip" Capri
+          cd ../..
+          rm -rf win
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Capri-windows-${{ matrix.goarch }}
+          path: dist/Capri-windows-${{ matrix.goarch }}.zip
           if-no-files-found: error
 
   macos-app:
@@ -135,7 +185,7 @@ jobs:
       - name: Upload app zip
         uses: actions/upload-artifact@v6
         with:
-          name: capri-macos-app
+          name: Capri-macos-app
           path: |
             dist/Capri-macos.zip
             dist/Capri-macos.dmg
@@ -143,7 +193,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build, macos-app]
+    needs: [build, windows-exes, macos-app]
     runs-on: ubuntu-latest
     steps:
       # 只下载编译出的二进制，不要包含前端 dist（capri-fe-dist）
@@ -152,13 +202,20 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           path: dist
-          pattern: capri-host-*
+          pattern: Capri-host-*
+          merge-multiple: true
+
+      - name: Download Windows packages
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: Capri-windows-*
           merge-multiple: true
 
       - name: Download macOS app
         uses: actions/download-artifact@v7
         with:
-          name: capri-macos-app
+          name: Capri-macos-app
           path: dist
 
       - name: Show built files
@@ -167,7 +224,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          name: capri-host ${{ github.ref_name }}
+          name: Capri-host ${{ github.ref_name }}
           draft: false
           generate_release_notes: true
           files: dist/*

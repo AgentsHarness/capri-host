@@ -16,10 +16,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/AgentsHarness/capri-host/internal/config"
+	"github.com/AgentsHarness/capri-host/internal/procattr"
 )
 
 type Server struct {
@@ -33,6 +35,18 @@ type Server struct {
 	// The handler runs it detached from the client connection so a browser
 	// crash mid-turn does not cancel the turn (the grok agent keeps running).
 	promptFn func(ctx context.Context, sessionID string, blocks []acp.ContentBlock) (string, error)
+
+	// hubCtl is the live hub client, injected by main after New (see
+	// SetHubController). nil in local mode and in every test that does not
+	// care about hub state.
+	hubMu  sync.Mutex
+	hubCtl HubController
+
+	// quitFn triggers the same orderly shutdown a SIGINT would, so a
+	// supervisor process can stop this host without hard-killing it and
+	// orphaning the grok child. nil in tests and in any embedder that does
+	// not care (see SetQuitFunc).
+	quitFn func()
 }
 
 func New(cfg config.Config, bridge bridgeAPI) *Server {
@@ -89,6 +103,22 @@ func (s *Server) routes() http.Handler {
 func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /events", s.handleSSE)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
+	// Hub link: read the pairing/connection state, and pair at runtime with
+	// a code read off the hub. See http_hub.go.
+	mux.HandleFunc("GET /api/hub/state", s.handleHubState)
+	mux.HandleFunc("POST /api/hub/pair", s.handleHubPair)
+	// Use a hub this host has already paired with, no code needed.
+	mux.HandleFunc("POST /api/hub/reuse", s.handleHubReuse)
+	// Disconnect from the hub, switching back to local mode.
+	mux.HandleFunc("POST /api/hub/disconnect", s.handleHubDisconnect)
+	// Host identity: the display name lives in the bridge and the hub
+	// registry, so only this process can change it. See http_hub.go.
+	mux.HandleFunc("POST /api/host/rename", s.handleHostRename)
+	// Host configuration read and update.
+	mux.HandleFunc("GET /api/host/config", s.handleGetHostConfig)
+	mux.HandleFunc("POST /api/host/config", s.handlePostHostConfig)
+	// Graceful stop, for the supervisor process that spawned this host.
+	mux.HandleFunc("POST /api/host/quit", s.handleHostQuit)
 	mux.HandleFunc("GET /api/probe", s.handleProbe)
 	mux.HandleFunc("POST /api/prompt", s.handlePrompt)
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
@@ -159,6 +189,26 @@ var sensitiveEndpointPaths = []string{
 	"/api/shell",
 	"/api/api-key-get",
 	"/api/api-key-set",
+	// Pairing is a privileged write (it persists a hub credential). The
+	// request may also carry hubUrl, which retargets this host; handleHubPair
+	// only honours that field from a local origin, so a hub FE can re-pair
+	// the current hub but cannot point us at a different one.
+	"/api/hub/pair",
+	// Reusing a stored credential also changes which hub this host talks to,
+	// which is the decision pairing is gated for.
+	"/api/hub/reuse",
+	// Disconnecting switches the host back to local mode.
+	"/api/hub/disconnect",
+	// Renaming rewrites the host's persisted identity and re-registers it on
+	// the hub. Same reasoning as pairing: a privileged state change that a
+	// local-origin gate costs nothing to guard.
+	"/api/host/rename",
+	// Reading and updating host configuration file.
+	"/api/host/config",
+	// Stopping the host is the supervisor's job and it already holds this
+	// token; keeping the gate uniform means a LAN-bound host cannot be shut
+	// down by anything that can reach the port.
+	"/api/host/quit",
 }
 
 // isSensitiveEndpoint reports whether r targets a sensitive endpoint.
@@ -197,7 +247,7 @@ func isLocalOrigin(r *http.Request) bool {
 }
 
 // allowSensitiveOrigin reports whether r may hit a sensitive endpoint:
-// local origins (Vite / same-host), or the configured HubURL's origin
+// local origins (Vite / same-host), or the live hub URL's origin
 // (deployed FE on the hub talking straight to this host's 127.0.0.1 port).
 func (s *Server) allowSensitiveOrigin(r *http.Request) bool {
 	if isLocalOrigin(r) {
@@ -206,17 +256,23 @@ func (s *Server) allowSensitiveOrigin(r *http.Request) bool {
 	return s.isTrustedHubOrigin(r.Header.Get("Origin"))
 }
 
-// isTrustedHubOrigin is true when origin matches cfg.HubURL's scheme+host
-// (path ignored). Empty HubURL → nothing trusted beyond local origins.
+// isTrustedHubOrigin is true when origin matches the live hub URL's
+// scheme+host (path ignored). Empty hub URL → nothing trusted beyond local
+// origins. Uses hubSnapshot so a runtime pairing is trusted without a restart
+// (s.cfg.HubURL is the startup copy and would stay empty until then).
 func (s *Server) isTrustedHubOrigin(origin string) bool {
-	if origin == "" || s.cfg.HubURL == "" {
+	if origin == "" {
+		return false
+	}
+	hubURL := s.hubSnapshot().HubURL
+	if hubURL == "" {
 		return false
 	}
 	ou, err := url.Parse(origin)
 	if err != nil || ou.Scheme == "" || ou.Host == "" {
 		return false
 	}
-	hu, err := url.Parse(s.cfg.HubURL)
+	hu, err := url.Parse(hubURL)
 	if err != nil || hu.Scheme == "" || hu.Host == "" {
 		return false
 	}
@@ -335,12 +391,12 @@ func tokenEqual(a, b string) bool {
 
 func (s *Server) ListenAndServe() error {
 	addr := net.JoinHostPort(bindAddrOf(s.cfg), strconv.Itoa(s.cfg.Port))
-	log.Printf("[capri-host] listening on http://%s", addr)
+	log.Printf("[Capri-host] listening on http://%s", addr)
 	if !s.cfg.BindIsLoopback() {
-		log.Printf("[capri-host] BIND=%s 非回环：同网段设备可直接访问本机 API", s.cfg.BindAddr)
+		log.Printf("[Capri-host] BIND=%s 非回环：同网段设备可直接访问本机 API", s.cfg.BindAddr)
 	}
-	log.Printf("[capri-host] grok bin=%s hostId=%s name=%q", s.cfg.GrokBin, s.cfg.HostID, s.cfg.HostName)
-	log.Printf("[capri-host] mode=agent-only (no client fs/terminal)")
+	log.Printf("[Capri-host] grok bin=%s hostId=%s name=%q", s.cfg.GrokBin, s.cfg.HostID, s.cfg.HostName)
+	log.Printf("[Capri-host] mode=agent-only (no client fs/terminal)")
 	return s.http.ListenAndServe()
 }
 
@@ -496,12 +552,16 @@ func writeSSEFrame(w http.ResponseWriter, flusher http.Flusher, rc *http.Respons
 	return true
 }
 
-// deployment 是本进程部署形态的唯一判定处：配了 HUB_URL → hub 模式
-// （内嵌前端跨源直连 hub 看全部 host）；否则 local（前端锁定本机）。
-// /api/status 与免鉴权的 /api/hosts 共用它，别再各自复制一份 if。
+// deployment 是 FE 看到的部署形态：有 hub 地址 → hub 模式（内嵌前端跨源
+// 直连 hub 看全部 host）；否则 local（前端锁定本机）。/api/status、
+// /api/probe 与免鉴权的 /api/hosts 共用它。
+//
+// 读 live hubSnapshot，不读启动时的 s.cfg.HubURL：托盘配对改的是
+// manager，不重启进程。托盘自己走 GET /api/hub/state，那条已经是对的；
+// 这里对的是 FE 探测（局域网打开内嵌页靠 /api/hosts 升 hub）。
 func (s *Server) deployment() (mode, hubURL string) {
-	if s.cfg.HubURL != "" {
-		return "hub", s.cfg.HubURL
+	if u := s.hubSnapshot().HubURL; u != "" {
+		return "hub", u
 	}
 	return "local", ""
 }
@@ -519,7 +579,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // cwd / sessionId / roster），塞进启动关键路径既慢又漏信息。
 func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	mode, hubURL := s.deployment()
-	out := map[string]any{"ok": true, "hostId": s.bridge.Snapshot().HostID, "mode": mode}
+	out := map[string]any{"ok": true, "hostId": s.bridge.Snapshot().HostID, "mode": mode, "version": acp.Version}
 	if hubURL != "" {
 		out["hubUrl"] = hubURL
 	}
@@ -1551,6 +1611,9 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "sh", "-c", body.Command)
 		cmd.Dir = cwd
+		// Both streams are captured below, so the child needs no console
+		// window — without this the GUI build flashes a terminal per call.
+		procattr.HideConsole(cmd)
 		// stdout and stderr share the same 16 MiB cap; stderr is folded into
 		// the same truncation accounting, so `truncated` flips when either
 		// stream overflows.

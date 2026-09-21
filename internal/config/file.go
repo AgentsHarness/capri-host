@@ -41,6 +41,16 @@ type File struct {
 	StartHostOnLaunch *bool `json:"start_host_on_launch,omitempty"`
 	// StartAtLogin 由菜单栏应用读取并同步到系统登录项。
 	StartAtLogin *bool `json:"start_at_login,omitempty"`
+	// KeepAwake 由托盘读取：是否阻止系统休眠。
+	KeepAwake *bool `json:"keep_awake,omitempty"`
+}
+
+// ShouldKeepAwake 缺省为 false。
+func (f File) ShouldKeepAwake() bool {
+	if f.KeepAwake == nil {
+		return false
+	}
+	return *f.KeepAwake
 }
 
 // ShouldStartHostOnLaunch 缺省为 true（第一次装上就想用）。
@@ -84,6 +94,15 @@ func Path() string {
 	return filepath.Join(Dir(), FileName)
 }
 
+// HubStatePath 是配对凭证 hub.json 的绝对路径。
+//
+// 三个程序都要碰这个文件：host 启动时读它来免配对码重连，Capri.app 与
+// Capri.exe 读它来分辨「已经配对过」和「需要新配对码」。路径在这里推导
+// 一次，免得三处各写一份再慢慢漂开。
+func HubStatePath() string {
+	return filepath.Join(Dir(), "hub.json")
+}
+
 // LoadFile 读 config.json。文件不存在返回零值 File、nil error。
 func LoadFile() (File, error) {
 	b, err := os.ReadFile(Path())
@@ -100,8 +119,48 @@ func LoadFile() (File, error) {
 	return f, nil
 }
 
+// UpdateFile applies fn to the config.json on disk, creating it when absent.
+//
+// Read-modify-write on purpose: this file is shared. Capri.app owns the
+// start_host_on_launch / start_at_login keys, the user may have hand-edited
+// anything, and the host only ever wants to stamp one key of its own — writing
+// a File built from scratch would silently drop the rest.
+//
+// The lock is cross-process: the host, the tray and Capri.app all write this
+// file, and an in-process mutex would not stop the other two.
+func UpdateFile(fn func(*File)) error {
+	return withFileLock(func() error {
+		f, err := LoadFile()
+		if err != nil {
+			return err
+		}
+		fn(&f)
+		return saveFile(f)
+	})
+}
+
 // SaveFile 原子写入 config.json（目录 0755，文件 0600：里面可能有 FE_TOKEN）。
 func SaveFile(f File) error {
+	return withFileLock(func() error { return saveFile(f) })
+}
+
+func withFileLock(fn func() error) error {
+	if err := os.MkdirAll(Dir(), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(Dir(), FileName+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := flock(f); err != nil {
+		return err
+	}
+	defer funlock(f)
+	return fn()
+}
+
+func saveFile(f File) error {
 	dir := Dir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err

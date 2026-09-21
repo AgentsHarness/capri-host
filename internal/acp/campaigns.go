@@ -24,7 +24,7 @@ import (
 // TUI 的解法（xai-grok-shell util/config/campaigns.rs persist_user_choice）：
 // 用户选择模型时先把触及 models.default 的活动 id 写入
 // $GROK_HOME/campaigns_state.json 的 dismissed_ids（"user pick wins,
-// forever"），再写配置。capri-host 在 /api/set-default-model 复刻同一语义：
+// forever"），再写配置。Capri-host 在 /api/set-default-model 复刻同一语义：
 // 写 config.toml 前 dismiss 活动，agent 下次 reload / 新建会话即按用户
 // 选择解析。
 //
@@ -197,7 +197,7 @@ func (b *Bridge) dismissCampaignIds(ids []string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	log.Printf("[capri-host] 已 dismiss 活动 campaign（models.default 覆盖解除，用户默认生效）: %v", added)
+	log.Printf("[Capri-host] 已 dismiss 活动 campaign（models.default 覆盖解除，用户默认生效）: %v", added)
 	return nil
 }
 

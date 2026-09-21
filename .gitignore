@@ -8,6 +8,7 @@
 /release/
 *.exe
 *.exe~
+*.syso
 *.dll
 *.so
 *.dylib

@@ -9,6 +9,7 @@ struct SettingsView: View {
                 Section("本机") {
                     TextField("显示名", text: $model.hostName)
                     TextField("Host ID", text: $model.hostID)
+                        .disabled(true)
                     TextField("端口", text: $model.port)
                     Picker("访问范围", selection: $model.bindLAN) {
                         Text("仅本机").tag(false)
@@ -24,30 +25,65 @@ struct SettingsView: View {
                 }
                 Section("Hub") {
                     TextField("Hub URL", text: $model.hubURL)
-                        .onChange(of: model.hubURL) { _ in
-                            model.refreshHubTokenState()
+                    if let snap = model.hubSnapshot, snap.configured {
+                        if snap.connected {
+                            Text("已连接 · \(snap.transport?.uppercased() ?? "在线")")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                        } else if let err = snap.lastError?.nilIfEmpty {
+                            Text("未连接 · \(err)")
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        } else {
+                            Text("连接中…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
+                    }
+
                     if model.hubTokenReady && !model.rePairExpanded {
                         Text(model.hubTokenCaption)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Button("更换配对…") {
-                            model.rePairExpanded = true
+                        HStack {
+                            Button("更换配对…") {
+                                model.rePairExpanded = true
+                            }
+                            if model.hubSnapshot?.connected != true && !(model.hubURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+                                Button("立即重连") {
+                                    model.onlineReuse()
+                                }
+                            }
+                            if model.hubSnapshot?.configured == true {
+                                Button("断开 Hub") {
+                                    model.onlineDisconnect()
+                                }
+                            }
                         }
                     } else if model.hubTokenReady && model.rePairExpanded {
                         TextField("配对码", text: $model.pairCode)
-                        Text("填写新码并保存后，会清掉旧 token 再配对。")
+                        Text("保存会清掉旧 token，并把配对码留到下次启动。要现在配对，用「立即配对」。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Button("取消") {
-                            model.rePairExpanded = false
-                            model.pairCode = ""
+                        HStack {
+                            Button("立即配对") {
+                                model.onlinePair()
+                            }
+                            Button("取消") {
+                                model.rePairExpanded = false
+                                model.pairCode = ""
+                            }
                         }
                     } else {
                         TextField("配对码", text: $model.pairCode)
                         Text(model.hubTokenCaption)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if !model.pairCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button("立即配对") {
+                                model.onlinePair()
+                            }
+                        }
                     }
                 }
                 Section("Agent") {
@@ -64,6 +100,7 @@ struct SettingsView: View {
                 Section("启动") {
                     Toggle("打开应用时启动 Host", isOn: $model.startHostOnLaunch)
                     Toggle("登录时启动 Capri", isOn: $model.startAtLogin)
+                    Toggle("阻止电脑休眠", isOn: $model.keepAwake)
                 }
                 Section {
                     LabeledContent("版本", value: capriVersion)

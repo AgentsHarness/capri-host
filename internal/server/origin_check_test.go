@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/AgentsHarness/capri-host/internal/hubstate"
 )
 
 // ── local-origin guard for sensitive endpoints ────────────────────────
@@ -21,6 +23,9 @@ func TestSensitiveEndpointRejectsCrossOrigin(t *testing.T) {
 		"/api/api-key-set",
 		"/api/auth/info",
 		"/api/auth/get-bearer-token",
+		"/api/hub/pair",
+		"/api/host/rename",
+		"/api/host/quit",
 	}
 	for _, path := range paths {
 		for _, origin := range []string{"http://evil.example", "null"} {
@@ -78,6 +83,24 @@ func TestSensitiveEndpointAllowsTrustedHubOrigin(t *testing.T) {
 	s.http.Handler.ServeHTTP(evilRec, evil)
 	if evilRec.Code != http.StatusForbidden {
 		t.Fatalf("untrusted Origin status = %d, want 403", evilRec.Code)
+	}
+}
+
+// A runtime pairing updates the manager, not s.cfg.HubURL. The hub FE origin
+// must still be trusted without a process restart.
+func TestSensitiveEndpointAllowsLiveHubOrigin(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	s.SetHubController(&stubHub{state: hubstate.State{
+		Configured: true,
+		HubURL:     "https://agents.example",
+	}})
+
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/shell", strings.NewReader(`{"command":"echo hi"}`))
+	req.Header.Set("Origin", "https://agents.example")
+	rec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("live hub Origin status = %d, body=%s; want 200", rec.Code, rec.Body.String())
 	}
 }
 

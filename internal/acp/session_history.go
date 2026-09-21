@@ -183,7 +183,7 @@ func logSkippedJSONL(path string, skipped int, lastSkipped bool) {
 		// 典型：agent 正在追加，末行半截。不打日志。
 		return
 	}
-	log.Printf("[capri-host] session history skipped %d unparseable jsonl line(s) in %s (tailIncomplete=%v)", skipped, path, lastSkipped)
+	log.Printf("[Capri-host] session history skipped %d unparseable jsonl line(s) in %s (tailIncomplete=%v)", skipped, path, lastSkipped)
 }
 
 // scanUpdateLineMetaReadAll 是 scanUpdateLineMeta 的整文件兜底（仅当单行
@@ -238,7 +238,7 @@ func buildNormalizedHistory(path string) (*normalizedHistory, error) {
 		return nil, errMissingAgentMeta
 	}
 	if nskip := len(meta) - len(kept); nskip > 0 {
-		log.Printf("[capri-host] session history skipped %d envelope(s) missing agentTimestampMs in %s", nskip, path)
+		log.Printf("[Capri-host] session history skipped %d envelope(s) missing agentTimestampMs in %s", nskip, path)
 	}
 	meta = kept
 	view := &normalizedHistory{lines: meta}

@@ -8,7 +8,7 @@ import (
 )
 
 // DefaultResidentCap is how many sessions stay loaded in grok when
-// GrokConfig.ResidentCap is left at zero. capri-host is a long-lived
+// GrokConfig.ResidentCap is left at zero. Capri-host is a long-lived
 // stdio client, so grok never idle-unloads on disconnect; the host
 // enforces the cap instead.
 const DefaultResidentCap = 4
@@ -48,7 +48,7 @@ func (b *Bridge) StartIdleUnload(ctx context.Context) {
 				return
 			case <-ticker.C:
 				if n := b.SweepIdleUnload(ctx); n > 0 {
-					log.Printf("[capri-host] idle-unload: 卸掉 %d 个空闲会话（grok resident 上限 %d）", n, b.residentCap())
+					log.Printf("[Capri-host] idle-unload: 卸掉 %d 个空闲会话（grok resident 上限 %d）", n, b.residentCap())
 				}
 			}
 		}
@@ -108,7 +108,7 @@ func (b *Bridge) SweepIdleUnload(ctx context.Context) int {
 			break
 		}
 		if err := b.unloadResident(ctx, c.id); err != nil {
-			log.Printf("[capri-host] idle-unload %s: %v", c.id, err)
+			log.Printf("[Capri-host] idle-unload %s: %v", c.id, err)
 			continue
 		}
 		n++

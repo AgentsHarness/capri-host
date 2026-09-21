@@ -12,10 +12,22 @@ struct CapriApp: App {
                 .disabled(true)
             Divider()
             Button("打开界面") { model.openWeb() }
+            if model.lanBound {
+                Button("复制局域网地址") { model.copyLANAddress() }
+            }
+            if let hubURL = model.hubSnapshot?.hubUrl?.nilIfEmpty, model.hubSnapshot?.connected == true {
+                Button("打开 Hub 控制台") {
+                    if let u = URL(string: hubURL) { Paths.open(u) }
+                }
+            }
             Button(model.toggleTitle) { model.toggleHost() }
                 .disabled(model.toggleDisabled)
             Button("设置…") { SettingsWindow.show() }
                 .keyboardShortcut(",", modifiers: .command)
+            Toggle("阻止电脑休眠", isOn: Binding(
+                get: { model.keepAwake },
+                set: { model.setKeepAwake($0) }
+            ))
             Toggle("登录时启动", isOn: Binding(
                 get: { model.startAtLogin },
                 set: { model.setStartAtLogin($0) }

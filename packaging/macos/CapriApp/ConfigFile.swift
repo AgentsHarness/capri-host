@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct ConfigFile: Codable, Equatable {
@@ -14,6 +15,7 @@ struct ConfigFile: Codable, Equatable {
     var noProxy: String?
     var startHostOnLaunch: Bool?
     var startAtLogin: Bool?
+    var keepAwake: Bool?
 
     enum CodingKeys: String, CodingKey {
         case bind, port
@@ -28,6 +30,7 @@ struct ConfigFile: Codable, Equatable {
         case noProxy = "no_proxy"
         case startHostOnLaunch = "start_host_on_launch"
         case startAtLogin = "start_at_login"
+        case keepAwake = "keep_awake"
     }
 
     var listenPort: Int {
@@ -37,6 +40,7 @@ struct ConfigFile: Codable, Equatable {
 
     var shouldStartHostOnLaunch: Bool { startHostOnLaunch ?? true }
     var shouldStartAtLogin: Bool { startAtLogin ?? false }
+    var shouldKeepAwake: Bool { keepAwake ?? false }
 
     var bindAddress: String {
         let v = (bind ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -78,7 +82,23 @@ struct ConfigFile: Codable, Equatable {
         return (try? JSONDecoder().decode(ConfigFile.self, from: data)) ?? ConfigFile()
     }
 
+    /// Load, change the fields this caller owns, write the rest back.
+    /// Holds the same lock file the host uses, so the two writers cannot drop each other's keys.
+    static func update(_ apply: (inout ConfigFile) -> Void) throws {
+        try ConfigLock.withLock {
+            var f = load()
+            apply(&f)
+            try f.writeAtomically()
+        }
+    }
+
     func save() throws {
+        try ConfigLock.withLock {
+            try writeAtomically()
+        }
+    }
+
+    func writeAtomically() throws {
         let dir = ConfigFile.configDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let enc = JSONEncoder()
@@ -90,5 +110,23 @@ struct ConfigFile: Codable, Equatable {
             [.posixPermissions: 0o600],
             ofItemAtPath: ConfigFile.path().path
         )
+    }
+}
+
+enum ConfigLock {
+    static func withLock<T>(_ body: () throws -> T) throws -> T {
+        let dir = ConfigFile.configDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let lockURL = dir.appendingPathComponent("config.json.lock")
+        let fd = open(lockURL.path, O_CREAT | O_RDWR, 0o600)
+        if fd < 0 {
+            throw AppError("无法锁定配置文件")
+        }
+        defer { close(fd) }
+        if flock(fd, LOCK_EX) != 0 {
+            throw AppError("无法锁定配置文件")
+        }
+        defer { flock(fd, LOCK_UN) }
+        return try body()
     }
 }
