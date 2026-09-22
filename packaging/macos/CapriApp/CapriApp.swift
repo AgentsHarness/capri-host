@@ -58,22 +58,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-enum SettingsWindow {
-    private static var window: NSWindow?
+final class SettingsWindow: NSObject, NSWindowDelegate {
+    static let shared = SettingsWindow()
+    private var window: NSWindow?
 
-    static func show() {
+    static func show() { shared.present() }
+
+    private func present() {
         if window == nil {
             let hosting = NSHostingController(rootView: SettingsView(model: AppModel.shared))
             let w = NSWindow(contentViewController: hosting)
             w.title = "Capri 设置"
             w.styleMask = [.titled, .closable, .miniaturizable]
+            // ARC 下不能把 isReleasedWhenClosed 设为 true。关掉时丢掉引用，
+            // 设置页才会释放。
             w.isReleasedWhenClosed = false
+            w.delegate = self
             w.setContentSize(NSSize(width: 480, height: 700))
             w.center()
             window = w
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        let closing = window
+        window = nil
+        // 等这次关闭走完再释放，避免 AppKit 还在用这扇窗口。
+        DispatchQueue.main.async {
+            withExtendedLifetime(closing) {}
+        }
     }
 }
 
