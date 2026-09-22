@@ -1,6 +1,6 @@
 import Foundation
 
-struct HubSnapshot: Codable {
+struct HubSnapshot: Codable, Equatable {
     var configured: Bool
     var hubUrl: String?
     var hostId: String?
@@ -13,6 +13,14 @@ struct HubSnapshot: Codable {
     var lastError: String?
     var storedUrl: String?
     var canReuse: Bool?
+
+    /// 菜单和设置都不显示 uptimeSec，而它每次轮询都 +1。
+    /// 比较前抹掉，避免相同界面状态被当成新快照。
+    func ignoringUptime() -> HubSnapshot {
+        var copy = self
+        copy.uptimeSec = nil
+        return copy
+    }
 
     enum CodingKeys: String, CodingKey {
         case configured

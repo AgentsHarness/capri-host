@@ -96,36 +96,38 @@ final class AppModel: ObservableObject {
         let storedRaw = st?.url?.nilIfEmpty ?? hubSnapshot?.storedUrl?.nilIfEmpty ?? ""
         let stored = HubURL.normalize(storedRaw)
 
+        let nextReady: Bool
+        let nextCaption: String
         if typed.isEmpty {
             if st?.hasToken == true {
-                hubTokenReady = true
-                hubTokenCaption = "已有可用 token（\(stored.isEmpty ? "hub.json" : stored)），启动 Host 会自动连上。"
+                nextReady = true
+                nextCaption = "已有可用 token（\(stored.isEmpty ? "hub.json" : stored)），启动 Host 会自动连上。"
             } else {
-                hubTokenReady = false
-                hubTokenCaption = "一次性配对码。成功后写在 ~/.capri-host/hub.json，之后不用再填。"
+                nextReady = false
+                nextCaption = "一次性配对码。成功后写在 ~/.capri-host/hub.json，之后不用再填。"
             }
-            return
-        }
-        if st?.matches(hubURL: typed) == true {
-            hubTokenReady = true
+        } else if st?.matches(hubURL: typed) == true {
+            nextReady = true
             if host.isRunning, ConfigFile.load().hubURL?.nilIfEmpty != nil {
-                hubTokenCaption = "已有可用 token，Host 会用它连 Hub，不必再填配对码。"
+                nextCaption = "已有可用 token，Host 会用它连 Hub，不必再填配对码。"
             } else {
-                hubTokenCaption = "已有可用凭证（\(stored)），可直接连上或更换配对。"
+                nextCaption = "已有可用凭证（\(stored)），可直接连上或更换配对。"
             }
-            return
-        }
-        hubTokenReady = false
-        if !stored.isEmpty {
-            hubTokenCaption = "hub.json 里的 token 绑定的是 \(stored)，和当前 Hub URL 不一致，需要新配对码。"
         } else {
-            hubTokenCaption = "一次性配对码。成功后写在 ~/.capri-host/hub.json，之后不用再填。"
+            nextReady = false
+            if !stored.isEmpty {
+                nextCaption = "hub.json 里的 token 绑定的是 \(stored)，和当前 Hub URL 不一致，需要新配对码。"
+            } else {
+                nextCaption = "一次性配对码。成功后写在 ~/.capri-host/hub.json，之后不用再填。"
+            }
         }
+        if hubTokenReady != nextReady { hubTokenReady = nextReady }
+        if hubTokenCaption != nextCaption { hubTokenCaption = nextCaption }
     }
 
     func refreshStatus() {
         let f = ConfigFile.load()
-        lanBound = f.isLAN
+        if lanBound != f.isLAN { lanBound = f.isLAN }
         let ours = host.isRunning
         let portNum = (ours ? host.endpoint()?.port : nil) ?? f.listenPort
         let listen = HostProcess.isListening(port: portNum)
@@ -276,7 +278,15 @@ final class AppModel: ObservableObject {
             await MainActor.run {
                 self.hubFetchBusy = false
                 guard gen == self.hubFetchGen else { return }
-                self.hubSnapshot = result
+                // uptimeSec 每秒 +1，菜单和设置都不显示。整份写回 @Published
+                // 会让 MenuBarExtra 每拍再登记一份观察且不释放。
+                if let result {
+                    if self.hubSnapshot?.ignoringUptime() != result.ignoringUptime() {
+                        self.hubSnapshot = result
+                    }
+                } else if self.hubSnapshot != nil {
+                    self.hubSnapshot = nil
+                }
                 self.refreshHubTokenState()
             }
         }
@@ -284,7 +294,7 @@ final class AppModel: ObservableObject {
 
     private func invalidateHubFetch() {
         hubFetchGen += 1
-        hubSnapshot = nil
+        if hubSnapshot != nil { hubSnapshot = nil }
     }
 
     func openLogs() {
