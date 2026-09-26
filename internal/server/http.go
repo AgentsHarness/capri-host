@@ -93,6 +93,7 @@ func (s *Server) routes() http.Handler {
 	s.registerExtFSRoutes(mux)
 	s.registerExtCloudRoutes(mux)
 	s.registerExtMiscRoutes(mux)
+	s.registerAgentRoutes(mux)
 	// 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
 	// 非 API 路径回退 index.html（实现见 web.go）
 	mux.HandleFunc("GET /", s.handleWeb)
