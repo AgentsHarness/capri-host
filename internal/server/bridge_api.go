@@ -10,7 +10,7 @@ import (
 // bridge_api.go — HTTP 层对 *acp.Bridge 的消费者侧窄接口。
 //
 // Go 惯例：接口定义在消费者一侧。server 不再持有具体 *acp.Bridge，而是
-// 声明它实际需要的 66 个方法（按 handler 域分组）；*acp.Bridge 隐式满足，
+// 声明它实际需要的 68 个方法（按 handler 域分组）；*acp.Bridge 隐式满足，
 // main.go 无需适配。收益：
 //
 //   - 依赖面成为显式契约：Bridge 新增方法不会悄悄进入 server 的依赖；
@@ -128,6 +128,8 @@ type miscAPI interface {
 	SetToolsetSettings(patch map[string]any) error
 	DismissModelDefaultCampaigns(ctx context.Context) error
 	ConfigTOMLPath() (string, error)
+	SetConfigAgentName(name string) error
+	SetSubagentToggle(name string, enabled bool) error
 }
 
 // extAPI：x.ai/* 扩展直通（typed 端点与自由透传共用）。
