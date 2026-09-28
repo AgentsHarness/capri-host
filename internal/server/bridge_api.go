@@ -78,6 +78,8 @@ type modelAPI interface {
 	ListCustomModels() ([]map[string]any, error)
 	UpsertCustomModel(id string, values map[string]any) error
 	DeleteCustomModel(id string) (defaultCleared bool, err error)
+	ListModelFilters() (acp.ModelFilters, error)
+	SetModelFilters(filters acp.ModelFilters) error
 	ReloadModels(ctx context.Context) error
 }
 

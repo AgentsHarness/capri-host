@@ -31,6 +31,9 @@ type PermissionScope struct {
 
 // Status is a snapshot for GET /api/status and SSE hello.
 type Status struct {
+	// Ready 表示 agent 可用（agent 进程已 boot 完成、initialize 与
+	// authenticate 已通过），与是否已有活跃会话无关；boot 失败或进程已死
+	// 时为 false（同时 Booting=false、BootError 非空）。
 	Ready     bool   `json:"ready"`
 	Busy      bool   `json:"busy"`
 	Booting   bool   `json:"booting"`

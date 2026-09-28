@@ -121,6 +121,54 @@ func (s *Server) reloadModels(r *http.Request) bool {
 	return true
 }
 
+// handleModelFilters — POST /api/model-filters → `[models]` 的两个目录过滤
+// 名单（hidden_models / disabled_models），FE「目录过滤」区的回填来源。
+func (s *Server) handleModelFilters(w http.ResponseWriter, r *http.Request) {
+	filters, err := s.bridge.ListModelFilters()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "hidden": filters.Hidden, "disabled": filters.Disabled})
+}
+
+type modelFiltersBody struct {
+	// 指针区分「没传」（该名单保持原样）与「传了空数组」（清空该名单）。
+	Hidden   *[]string `json:"hidden"`
+	Disabled *[]string `json:"disabled"`
+}
+
+// handleSetModelFilters — POST /api/set-model-filters 写这两个名单并重载
+// 目录：过滤只在目录重建后生效，只落盘不重载等于没改。
+func (s *Server) handleSetModelFilters(w http.ResponseWriter, r *http.Request) {
+	var body modelFiltersBody
+	if err := readJSON(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "请求体不是合法 JSON"})
+		return
+	}
+	if body.Hidden == nil && body.Disabled == nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 hidden 或 disabled"})
+		return
+	}
+	cur, err := s.bridge.ListModelFilters()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	next := cur
+	if body.Hidden != nil {
+		next.Hidden = *body.Hidden
+	}
+	if body.Disabled != nil {
+		next.Disabled = *body.Disabled
+	}
+	if err := s.bridge.SetModelFilters(next); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "reloaded": s.reloadModels(r)})
+}
+
 // handleModelsList — POST /api/models/list → x.ai/models/list（主动拉取 agent 模型目录）。
 func (s *Server) handleModelsList(w http.ResponseWriter, r *http.Request) {
 	s.xaiCall(w, r, "x.ai/models/list", map[string]any{})
@@ -134,4 +182,6 @@ func (s *Server) registerModelRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/custom-models", s.handleCustomModels)
 	mux.HandleFunc("POST /api/custom-model", s.handleCustomModelUpsert)
 	mux.HandleFunc("POST /api/custom-model-delete", s.handleCustomModelDelete)
+	mux.HandleFunc("POST /api/model-filters", s.handleModelFilters)
+	mux.HandleFunc("POST /api/set-model-filters", s.handleSetModelFilters)
 }
