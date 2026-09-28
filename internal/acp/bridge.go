@@ -865,7 +865,10 @@ func (b *Bridge) Snapshot() Status {
 		authMeta = b.authMeta
 	}
 	return Status{
-		Ready:             b.ready,
+		// ready 对外的含义是「agent 可用」，与 idle_unload 的判据一致。
+		// b.ready 只在会话建立/加载后置位，boot 完成但一台会话都没有时
+		// 恒为 false——只报它会让空机在客户端一直停在「连接中/启动中」。
+		Ready:             b.ready || b.bootOK,
 		Busy:              busy,
 		Booting:           b.booting,
 		SessionID:         sid,
@@ -3063,6 +3066,8 @@ func (b *Bridge) respondError(id any, message string, code int) {
 // request 是标准 JSON-RPC 请求：固定 timeout，不因 agent 活动而顺延。
 // （曾有过按会话活跃度顺延 prompt 截止时刻的设计，2026-08-14 取消：
 // 默认 agent 可靠，超时到点即报错，不做续命式的自愈。）
+// timeout <= 0 表示不设截止（只跟 ctx 走），用于时长由模型调用决定的
+// 命令（memory flush / dream，TUI 侧同样没有截止）。
 // 返回的 result 按对象处理：非对象 result（如裸数组）保持旧行为被
 // 规整为 {}。需要原样拿到任意 JSON 值的调用方用 requestRaw。
 func (b *Bridge) request(ctx context.Context, method string, params map[string]any, timeout time.Duration) (map[string]any, error) {
@@ -3097,7 +3102,10 @@ func (b *Bridge) requestRaw(ctx context.Context, method string, params map[strin
 		return nil, err
 	}
 
-	tctx, cancel := context.WithTimeout(ctx, timeout)
+	tctx, cancel := context.WithCancel(ctx)
+	if timeout > 0 {
+		tctx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 	select {
 	case <-tctx.Done():
@@ -5511,6 +5519,9 @@ func (b *Bridge) Billing(ctx context.Context, sessionID string) (map[string]any,
 // memory (sessionId defaults to the active session). The agent's request
 // struct is plain snake_case (`session_id`), so the host must NOT send the
 // camelCase `sessionId` key it accepts elsewhere.
+// No host deadline: the run is an LLM summary whose length the agent owns, and
+// the pager's own /flush waits for the same reply without a deadline. A 30s
+// cap returned "memory flush 超时" while the flush was still running.
 func (b *Bridge) MemoryFlush(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -5520,13 +5531,15 @@ func (b *Bridge) MemoryFlush(ctx context.Context, sessionID string) (map[string]
 	}
 	return b.request(ctx, "_x.ai/memory/flush", map[string]any{
 		kSessionIDS: sessionID,
-	}, 30*time.Second)
+	}, 0)
 }
 
 // MemoryRewrite calls x.ai/memory/rewrite: {sessionId, rawText, contextSummary}
 // — rewrites the session's memory from the given text. The agent's request
 // struct is camelCase with all three fields required; the host must forward
 // rawText/contextSummary or the call fails with invalid params.
+// No host deadline, same as flush/dream: the rewrite is an LLM call and the
+// pager runs it through the same no-deadline memory command helper.
 func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextSummary string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -5538,7 +5551,7 @@ func (b *Bridge) MemoryRewrite(ctx context.Context, sessionID, rawText, contextS
 		kSessionID:       sessionID,
 		"rawText":        rawText,
 		"contextSummary": contextSummary,
-	}, 30*time.Second)
+	}, 0)
 }
 
 // MemoryList calls x.ai/memory/list: {sessionId} → the /memory modal's
@@ -5579,6 +5592,8 @@ func (b *Bridge) MemoryToggle(ctx context.Context, sessionID string, enabled boo
 // consolidation and returns {disposition, observation_count,
 // topics_affected}. The agent reuses the flush request struct, so this one is
 // snake_case (`session_id`) while list/toggle above are camelCase.
+// No host deadline, same as MemoryFlush: consolidation is model work and the
+// pager waits for it without a cap.
 func (b *Bridge) MemoryDream(ctx context.Context, sessionID string) (map[string]any, error) {
 	if err := b.Boot(ctx); err != nil {
 		return nil, err
@@ -5588,7 +5603,7 @@ func (b *Bridge) MemoryDream(ctx context.Context, sessionID string) (map[string]
 	}
 	return b.request(ctx, "_x.ai/memory/dream", map[string]any{
 		kSessionIDS: sessionID,
-	}, 30*time.Second)
+	}, 0)
 }
 
 // MemoryForget calls x.ai/memory/forget: {sessionId, path, expectedContentHash}

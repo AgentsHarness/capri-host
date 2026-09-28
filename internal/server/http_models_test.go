@@ -172,6 +172,90 @@ func TestCustomModelsEndpoints(t *testing.T) {
 	}
 }
 
+// ── POST /api/model-filters / /api/set-model-filters：目录过滤名单 ──
+
+func TestModelFiltersEndpoints(t *testing.T) {
+	s, b, path := newFakeAgentServerWithGrokHome(t)
+
+	// 初始为空数组而不是 null：FE 侧直接把它当数组渲染。
+	rec := postJSON(t, s, "/api/model-filters", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if hidden, ok := m["hidden"].([]any); !ok || len(hidden) != 0 {
+		t.Errorf("hidden = %#v, want []", m["hidden"])
+	}
+	if disabled, ok := m["disabled"].([]any); !ok || len(disabled) != 0 {
+		t.Errorf("disabled = %#v, want []", m["disabled"])
+	}
+
+	// 写入：落盘（去空白/去重）+ 重载目录，且不动 [models] 其它键。
+	if err := b.SetDefaultModelConfig("cc-ds", ""); err != nil {
+		t.Fatalf("SetDefaultModelConfig: %v", err)
+	}
+	rec = postJSON(t, s, "/api/set-model-filters", `{"hidden":[" grok-* "],"disabled":["grok-4.7","grok-4.7"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["reloaded"] != true {
+		t.Errorf("reloaded = %v, want true（过滤只在目录重建后生效）", m["reloaded"])
+	}
+	out := readFileStr(t, path)
+	for _, want := range []string{
+		`hidden_models = ["grok-*"]`,
+		`disabled_models = ["grok-4.7"]`,
+		`default = "cc-ds"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config.toml missing %q:\n%s", want, out)
+		}
+	}
+
+	// 读回：与刚写入的一致，供 FE 回填。
+	m = decodeBody(t, postJSON(t, s, "/api/model-filters", `{}`))
+	hidden, _ := m["hidden"].([]any)
+	disabled, _ := m["disabled"].([]any)
+	if len(hidden) != 1 || hidden[0] != "grok-*" {
+		t.Errorf("hidden = %#v, want [grok-*]", hidden)
+	}
+	if len(disabled) != 1 || disabled[0] != "grok-4.7" {
+		t.Errorf("disabled = %#v, want [grok-4.7]", disabled)
+	}
+
+	// 只传 hidden=[]：清掉 hidden，没传的 disabled 保持原样（不是整体替换）。
+	rec = postJSON(t, s, "/api/set-model-filters", `{"hidden":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	out = readFileStr(t, path)
+	if strings.Contains(out, "hidden_models") {
+		t.Errorf("清空的 hidden 应删除键:\n%s", out)
+	}
+	if !strings.Contains(out, `disabled_models = ["grok-4.7"]`) {
+		t.Errorf("没传的 disabled 必须保持原样:\n%s", out)
+	}
+}
+
+func TestSetModelFiltersRejectsBadInput(t *testing.T) {
+	s, b, path := newFakeAgentServerWithGrokHome(t)
+	if err := b.SetDefaultModelConfig("cc-ds", ""); err != nil {
+		t.Fatalf("SetDefaultModelConfig: %v", err)
+	}
+	// 两个键都没传：没有要改的东西 → 400，而不是白重载一次。
+	if rec := postJSON(t, s, "/api/set-model-filters", `{}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("empty body status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	// 未闭合的 glob 会让 grok 侧整份名单静默失效，必须挡在写入之前。
+	rec := postJSON(t, s, "/api/set-model-filters", `{"disabled":["grok-4.7["]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad glob status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if out := readFileStr(t, path); strings.Contains(out, "disabled_models") {
+		t.Errorf("非法模式不能落盘:\n%s", out)
+	}
+}
+
 // ── POST /api/set-model: sessionId 隔离 ──────────────────────────────
 
 // 无 sessionId 的切模型请求必须被拒绝——即使 host 侧存在 active 会话：

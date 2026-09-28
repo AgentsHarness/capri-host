@@ -94,6 +94,7 @@ func (s *Server) routes() http.Handler {
 	s.registerExtCloudRoutes(mux)
 	s.registerExtMiscRoutes(mux)
 	s.registerAgentRoutes(mux)
+	s.registerLocalFSRoutes(mux)
 	// 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
 	// 非 API 路径回退 index.html（实现见 web.go）
 	mux.HandleFunc("GET /", s.handleWeb)
@@ -188,6 +189,10 @@ func (s *Server) Handler() http.Handler { return s.handler }
 // random web page. Any /api/auth/* route is sensitive too.
 var sensitiveEndpointPaths = []string{
 	"/api/shell",
+	// 本地目录浏览/新建：读任意路径的目录结构、在任意可写目录里落文件夹。
+	// 与 /api/shell 同级的本地能力，同样只许本机来源或受信 hub 来源。
+	"/api/local/dirs",
+	"/api/local/mkdir",
 	"/api/api-key-get",
 	"/api/api-key-set",
 	// Pairing is a privileged write (it persists a hub credential). The

@@ -275,3 +275,162 @@ func (b *Bridge) ReloadModels(ctx context.Context) error {
 	_, err := b.XaiCall(ctx, "x.ai/internal/reload_models", map[string]any{})
 	return err
 }
+
+// ── [models] 目录过滤：hidden_models / disabled_models ─────────────────
+
+// ModelFilters 是 config.toml `[models]` 下的两个目录过滤名单，语义对齐
+// grok 的 resolve_model_catalog：hidden_models 把命中的条目从模型列表 /
+// 选择器隐藏（仍可用 `-m` 指定），disabled_models 把命中的条目从目录里
+// 整条移除。两者都按「目录键名或模型 id」做 glob 匹配（grok 侧 globset），
+// 所以条目既可写 id（grok-4.6），也可写模式（grok-*）——内置默认与官方
+// 拉取的模型不在 config.toml 里，只有这种名单能挡掉它们。
+type ModelFilters struct {
+	Hidden   []string
+	Disabled []string
+}
+
+// ListModelFilters 读这两个名单。缺键、缺 [models] 小节都算空名单（返回
+// 非 nil 空切片，JSON 里是 [] 而非 null）；值不是字符串数组则报错，而不
+// 当成空名单——否则 FE 一保存就把用户手写的值冲掉了。
+func (b *Bridge) ListModelFilters() (ModelFilters, error) {
+	path, err := b.ConfigTOMLPath()
+	if err != nil {
+		return ModelFilters{}, err
+	}
+	table, err := readConfigTable(path)
+	if err != nil {
+		return ModelFilters{}, err
+	}
+	models, _ := readConfigSection(table, "models")
+	hidden, err := configStringList(models["hidden_models"], "hidden_models")
+	if err != nil {
+		return ModelFilters{}, err
+	}
+	disabled, err := configStringList(models["disabled_models"], "disabled_models")
+	if err != nil {
+		return ModelFilters{}, err
+	}
+	return ModelFilters{Hidden: hidden, Disabled: disabled}, nil
+}
+
+// SetModelFilters 写这两个名单：非空写入，空则删除键（不留 `hidden_models
+// = []` 的空壳）。只动这两个键，[models] 其它键与其它小节原样保留。grok 侧
+// 没有配置 watcher，写完仍需 ReloadModels 才生效。
+func (b *Bridge) SetModelFilters(filters ModelFilters) error {
+	hidden, err := normalizeFilterPatterns("hidden_models", filters.Hidden)
+	if err != nil {
+		return err
+	}
+	disabled, err := normalizeFilterPatterns("disabled_models", filters.Disabled)
+	if err != nil {
+		return err
+	}
+	path, err := b.ConfigTOMLPath()
+	if err != nil {
+		return err
+	}
+	table, err := readConfigTable(path)
+	if err != nil {
+		return err
+	}
+	models, ok := readConfigSection(table, "models")
+	if !ok {
+		// 键存在但不是表（用户写坏的 `models = 5`）：拒绝覆盖，别用一个空表
+		// 把它冲掉——grok 自己也解析不了这种文件，先修好再改。
+		if raw, exists := table["models"]; exists {
+			return fmt.Errorf("[models] 不是表（当前是 %T），拒绝覆盖", raw)
+		}
+		if len(hidden) == 0 && len(disabled) == 0 {
+			return nil // 两份名单都清空且本来没有 [models]：不凭空建表
+		}
+		models = configSection(table, "models")
+	}
+	applyFilterList(models, "hidden_models", hidden)
+	applyFilterList(models, "disabled_models", disabled)
+	return writeConfigTable(path, table)
+}
+
+func applyFilterList(models map[string]any, key string, patterns []string) {
+	if len(patterns) == 0 {
+		delete(models, key)
+		return
+	}
+	models[key] = patterns
+}
+
+// configStringList 把 `[models]` 里读到的值转成字符串名单。
+func configStringList(value any, key string) ([]string, error) {
+	out := []string{}
+	switch v := value.(type) {
+	case nil:
+		return out, nil
+	case []any:
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s 必须是字符串数组（发现 %T）", key, item)
+			}
+			out = append(out, s)
+		}
+	case []string:
+		out = append(out, v...)
+	default:
+		return nil, fmt.Errorf("%s 必须是字符串数组（发现 %T）", key, value)
+	}
+	return out, nil
+}
+
+// normalizeFilterPatterns 去空白、丢弃空项、按首次出现去重，并在写入前挡掉
+// grok 侧会静默忽略的模式：globset 编译失败时 resolve_model_catalog 的
+// `if let Ok(Some(..))` 会跳过整份名单，用户会以为保存生效了却什么都没发生。
+func normalizeFilterPatterns(key string, in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		pat := strings.TrimSpace(raw)
+		if pat == "" {
+			continue
+		}
+		if strings.ContainsAny(pat, "\n\r") {
+			return nil, fmt.Errorf("%s 的条目不能含换行：%q", key, raw)
+		}
+		if err := checkGlobBalanced(pat); err != nil {
+			return nil, fmt.Errorf("%s 的模式 %q %w", key, pat, err)
+		}
+		if seen[pat] {
+			continue
+		}
+		seen[pat] = true
+		out = append(out, pat)
+	}
+	return out, nil
+}
+
+// checkGlobBalanced 只拦「开了没关」的字符类 / 花括号（`grok[4.6`、`{a,b`）。
+// 只比较未转义的开启数是否多于闭合数：`[]]` 这类合法写法（类内首个 ] 是字面
+// 量）闭合数更多，不会被误拒。
+func checkGlobBalanced(pat string) error {
+	for _, pair := range [][2]byte{{'[', ']'}, {'{', '}'}} {
+		opens, closes := 0, 0
+		escaped := false
+		for i := 0; i < len(pat); i++ {
+			c := pat[i]
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case pair[0]:
+				opens++
+			case pair[1]:
+				closes++
+			}
+		}
+		if opens > closes {
+			return fmt.Errorf("缺少配对的 %q", string(pair[1]))
+		}
+	}
+	return nil
+}

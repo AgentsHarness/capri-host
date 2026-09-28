@@ -3,6 +3,7 @@ package acp
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -288,4 +289,125 @@ func TestCustomModelsWritesIntegerLiterals(t *testing.T) {
 	if strings.Contains(out, "1e+06") {
 		t.Errorf("config.toml must not contain float exponent literal:\n%s", out)
 	}
+}
+
+// ── [models] 目录过滤（hidden_models / disabled_models）──
+
+func TestModelFiltersRoundTrip(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	writeTestConfig(t, path, `
+[models]
+default = "cc-ds"
+
+[ui]
+theme = "groknight"
+`)
+	// 去空白 + 去重（同一份名单里重复的内层条目在 grok 侧无意义）。
+	if err := b.SetModelFilters(ModelFilters{
+		Hidden:   []string{" grok-* ", "", "grok-4.5", "grok-4.5"},
+		Disabled: []string{"grok-4.7"},
+	}); err != nil {
+		t.Fatalf("SetModelFilters: %v", err)
+	}
+	out := readTestConfig(t, path)
+	for _, want := range []string{
+		`hidden_models = ["grok-*", "grok-4.5"]`,
+		`disabled_models = ["grok-4.7"]`,
+		`default = "cc-ds"`,   // [models] 其它键保留
+		`theme = "groknight"`, // 其它 section 保留
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config.toml missing %q:\n%s", want, out)
+		}
+	}
+
+	got, err := b.ListModelFilters()
+	if err != nil {
+		t.Fatalf("ListModelFilters: %v", err)
+	}
+	if !reflect.DeepEqual(got.Hidden, []string{"grok-*", "grok-4.5"}) {
+		t.Errorf("hidden = %#v, want [grok-* grok-4.5]", got.Hidden)
+	}
+	if !reflect.DeepEqual(got.Disabled, []string{"grok-4.7"}) {
+		t.Errorf("disabled = %#v, want [grok-4.7]", got.Disabled)
+	}
+
+	// 清空一份名单：删除键，而不是留 `hidden_models = []` 的空壳。
+	if err := b.SetModelFilters(ModelFilters{Disabled: []string{"grok-4.7"}}); err != nil {
+		t.Fatalf("SetModelFilters (clear hidden): %v", err)
+	}
+	if out = readTestConfig(t, path); strings.Contains(out, "hidden_models") {
+		t.Errorf("清空的名单应删除键:\n%s", out)
+	}
+}
+
+func TestListModelFiltersEmptyWhenUnset(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	writeTestConfig(t, path, "[models]\ndefault = \"cc-ds\"\n")
+	got, err := b.ListModelFilters()
+	if err != nil {
+		t.Fatalf("ListModelFilters: %v", err)
+	}
+	// 空而非 nil：FE 侧直接当数组用，JSON 里必须是 []。
+	if got.Hidden == nil || len(got.Hidden) != 0 {
+		t.Errorf("hidden = %#v, want 非 nil 空切片", got.Hidden)
+	}
+	if got.Disabled == nil || len(got.Disabled) != 0 {
+		t.Errorf("disabled = %#v, want 非 nil 空切片", got.Disabled)
+	}
+}
+
+func TestListModelFiltersRejectsNonStringEntries(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	writeTestConfig(t, path, "[models]\nhidden_models = [1, 2]\n")
+	// 报错而不是当空名单：否则 FE 保存时会把用户手写的值冲掉。
+	if _, err := b.ListModelFilters(); err == nil {
+		t.Fatal("want error for non-string entries")
+	}
+}
+
+func TestSetModelFiltersRejectsUnbalancedGlob(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	writeTestConfig(t, path, "[models]\ndefault = \"cc-ds\"\n")
+	if err := b.SetModelFilters(ModelFilters{Hidden: []string{"grok-4.5["}}); err == nil {
+		t.Fatal("want error for unclosed character class")
+	}
+	if strings.Contains(readTestConfig(t, path), "hidden_models") {
+		t.Errorf("非法模式不能落盘:\n%s", readTestConfig(t, path))
+	}
+	// `[]]`（类内首个 ] 是字面量）与 `{a,b}` 都是合法 glob，不能被误拒。
+	if err := b.SetModelFilters(ModelFilters{Hidden: []string{"x[]]y", "a{b,c}"}}); err != nil {
+		t.Fatalf("合法模式被拒: %v", err)
+	}
+}
+
+func TestSetModelFiltersEmptyWithoutModelsTableWritesNothing(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	if err := b.SetModelFilters(ModelFilters{}); err != nil {
+		t.Fatalf("SetModelFilters: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("两份空名单不该创建 config.toml（stat err = %v）", err)
+	}
+}
+
+func TestSetModelFiltersRefusesNonTableModels(t *testing.T) {
+	b, path := tempGrokBridge(t)
+	writeTestConfig(t, path, "models = 5\n")
+	// 用户写坏的 `models = 5` 不能被一个空表冲掉。
+	if err := b.SetModelFilters(ModelFilters{Hidden: []string{"grok-*"}}); err == nil {
+		t.Fatal("want error when [models] is not a table")
+	}
+	if out := readTestConfig(t, path); out != "models = 5\n" {
+		t.Errorf("文件被改写：%q", out)
+	}
+}
+
+func readTestConfig(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(raw)
 }

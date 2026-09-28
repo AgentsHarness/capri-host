@@ -19,6 +19,8 @@ func TestSensitiveEndpointRejectsCrossOrigin(t *testing.T) {
 
 	paths := []string{
 		"/api/shell",
+		"/api/local/dirs",
+		"/api/local/mkdir",
 		"/api/api-key-get",
 		"/api/api-key-set",
 		"/api/auth/info",
