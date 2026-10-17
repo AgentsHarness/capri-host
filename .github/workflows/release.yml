@@ -174,10 +174,21 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      # 有签名密钥就用证书签名（见 packaging/macos/README.md）：
+      # 证书签名的设计要求是 identifier + 证书指纹，跨版本恒定；ad-hoc 的是
+      # cdhash，每次发版都变，用户已授权的屏幕录制等权限会失配并反复弹提示。
+      # 密钥未配置时脚本自动退回 ad-hoc，发版流程不会因此中断。
+      - name: Import signing certificate
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: bash packaging/macos/import-cert.sh
+
       - name: Build Capri.app
         env:
           VERSION: ${{ github.ref_name }}
-        run: bash packaging/macos/make-app.sh --universal
+          CAPRI_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        run: bash packaging/macos/make-app.sh
 
       - name: Build dmg
         run: bash packaging/macos/make-dmg.sh

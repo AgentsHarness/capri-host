@@ -41,7 +41,7 @@
 
 ### macOS 应用（推荐，13+）
 
-下载 `Capri-macos.zip`（或 `Capri-macos.dmg`），把 `Capri.app` 拖进「应用程序」后打开。
+下载 `Capri-macos.zip`（或 `Capri-macos.dmg`），把 `Capri.app` 拖进「应用程序」后打开。应用只提供 Apple Silicon（arm64）版本；Intel Mac 请从 Releases 取命令行二进制。
 
 1、菜单栏会出现摩羯图标。
 2、首次使用点击摩羯图标，前往设置，配置好后点击保存并启动。
@@ -99,7 +99,12 @@ go run ./cmd/capri-host
 ./packaging/windows/make-exes.sh amd64 arm64
 ```
 
-macOS 应用同理：`./packaging/macos/make-app.sh --universal`。
+macOS 应用同理：`./packaging/macos/make-app.sh`（arm64，macOS 13+）。
+
+打包脚本会用 Keychain 里的签名身份签 app（优先 `Capri Dev`，`CAPRI_CODESIGN_IDENTITY` 可指定；
+没有可用身份时退回 ad-hoc）。这一点对权限有实际影响：ad-hoc 签名的代码身份是 cdhash，
+源码或版本一变，系统里已授权的屏幕录制等权限就失配，表现为反复弹权限提示。用证书签名则身份恒定，
+授权一次即可。首次使用先跑一次 `./packaging/macos/make-cert.sh` 创建本地自签证书。
 
 ## 连接到 capri-hub
 
