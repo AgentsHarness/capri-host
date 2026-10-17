@@ -63,6 +63,12 @@ const ACPHostFakeAgentPromptDelayMs = "ACP_HOST_FAKE_AGENT_PROMPT_DELAY_MS"
 // hot-reload).
 const ACPHostFakeAgentModelsUpdate = "ACP_HOST_FAKE_AGENT_MODELS_UPDATE"
 
+// ACPHostFakeAgentLoadNotif, when set (a JSON SessionNotification payload),
+// makes the fake agent emit it as an x.ai/session_notification right before
+// answering session/load — the real agent's shape for model_auto_switched,
+// which fires during restore (before the load response).
+const ACPHostFakeAgentLoadNotif = "ACP_HOST_FAKE_AGENT_LOAD_NOTIF"
+
 // ACPHostFakeAgentPromptMeta / SessionNewMeta / SessionListCursor /
 // SessionListMeta / AuthMeta: JSON strings injected into the fake agent's
 // canned responses (`_meta` / pagination cursor) so tests can assert the
@@ -271,10 +277,15 @@ func runFakeAgent() {
 			if os.Getenv(ACPHostFakeAgentEmitPermission) == "1" {
 				emitPermissionRequest(out)
 			}
-		case "session/load":
+		case "session/load", "session/resume":
 			// 恢复历史会话（浏览器端 continueSession / 重启回锚）。真实
 			// agent 会重放整段会话，fake agent 只回模型快照——历史内容由
 			// FE 经 /api/session-updates 自行拉取。
+			// 恢复期的模型下线通知（model_auto_switched）先于响应发出，与
+			// 真实 agent 的 restore_persisted_model 顺序一致。
+			if n := fakeAgentMeta(ACPHostFakeAgentLoadNotif); n != nil {
+				emitNotification(out, "x.ai/session_notification", n)
+			}
 			result = map[string]any{"busy": false}
 			if m := fakeAgentMeta(ACPHostFakeAgentInitMeta); m != nil {
 				if ms, ok := m["modelState"]; ok {

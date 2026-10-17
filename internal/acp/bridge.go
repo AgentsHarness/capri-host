@@ -2102,6 +2102,19 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		// 事件，见 handleModelSwitchKind）；kind modeled → 无 generic，
 		// FE 改用 typed 消费。
 		b.handleModelSwitchKind(sid, update, tag)
+		// model_auto_switched 额外发一条 typed 事件：两个其它事件只换
+		// caption / 目录，不带 previous_model_id / reason，web 端无法据此
+		// 说明「原模型已下线」。FE 的唯一提示行消费点（notifMemory.ts）走
+		// session_notification 通道，缺这条就只剩静默改名。new_model_id
+		// 为空（同族也无兜底、prompt 被拦）时同样要发——那种情况下
+		// handleModelSwitchKind 提前返回，只能靠 reason 告知用户。
+		if kind == "model_auto_switched" {
+			ev := Event{kType: kind, kUpdate: update}
+			if kindMeta != nil {
+				ev[kMetaOut] = kindMeta
+			}
+			b.Broadcast(tag(ev))
+		}
 		return true
 	case "turn_completed", "response_completed":
 		// Both boundaries end a generation segment; only turn_completed

@@ -416,7 +416,8 @@ func TestModelChangedKindCarriesContextWindow(t *testing.T) {
 // model_auto_switched kind（previous_model_id/new_model_id/reason）：
 // currentModelId 更新；无 reasoningEffort 时保留原 effort（
 // patchSessionModels 语义）。model 事件不带 reasoningEffort 键。
-// kind modeled → 无 generic session_notification。
+// kind modeled → 无 generic session_notification；另发一条 typed
+// `model_auto_switched`（FE 提示行的唯一来源，见 HandleModelSwitchKind）。
 func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 	b, _ := metaReadyBridge(t)
 	b.mu.Lock()
@@ -438,7 +439,7 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 		"reason":            "grok-3 不可用",
 	}
 	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
-	var sawModelsUpdate, sawModel bool
+	var sawModelsUpdate, sawModel, sawAutoSwitched bool
 	var events []Event
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -448,6 +449,14 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 			switch ev["type"] {
 			case "session_notification":
 				t.Errorf("unexpected generic session_notification for modeled kind model_auto_switched: %v", ev)
+			case "model_auto_switched":
+				sawAutoSwitched = true
+				if !reflect.DeepEqual(ev["update"], update) {
+					t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
+				}
+				if ev["sessionId"] != "s1" {
+					t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+				}
 			case "models_update":
 				sawModelsUpdate = true
 				models, _ := ev["params"].(map[string]any)
@@ -472,6 +481,9 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 	if !sawModelsUpdate || !sawModel {
 		t.Errorf("sawModelsUpdate=%v sawModel=%v", sawModelsUpdate, sawModel)
 	}
+	if !sawAutoSwitched {
+		t.Error("model_auto_switched kind must broadcast a typed event (the FE notice's only source)")
+	}
 	b.mu.Lock()
 	models, _ := b.sessions["s1"].models.(map[string]any)
 	b.mu.Unlock()
@@ -480,8 +492,45 @@ func TestModelAutoSwitchedKindUpdatesRoster(t *testing.T) {
 	}
 }
 
-// turn_completed：typed 事件是 FE 回合封口语义（update 原样含
-// stop_reason / prompt_id / usage 等字段），params._meta 非空时带 meta；
+// model_auto_switched 无同族兜底时 new_model_id 为空：handleModelSwitchKind
+// 提前返回（不 patch 目录、不发 model），typed 事件仍要带上 reason，否则
+// web 端只会看到「消息发出去、没有回复」。
+func TestModelAutoSwitchedWithoutFallbackStillNotifies(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId":  "gone-model",
+		"availableModels": []any{map[string]any{"modelId": "grok-5", "name": "Grok 5"}},
+	}
+	b.mu.Unlock()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+	update := map[string]any{
+		"sessionUpdate":     "model_auto_switched",
+		"previous_model_id": "gone-model",
+		"new_model_id":      "",
+		"reason":            "Model \"gone-model\" is no longer available. Please start a new session.",
+	}
+	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
+	var sawAutoSwitched bool
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "model_auto_switched" {
+				sawAutoSwitched = true
+				if ev["update"].(map[string]any)["reason"] == "" {
+					t.Errorf("typed update lost reason: %v", ev["update"])
+				}
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !sawAutoSwitched {
+		t.Error("blocked-session auto-switch must still reach the client")
+	}
+}
+
 // kind modeled → 无 generic session_notification。usage 提取照旧
 // （carrier totalTokens + usage 对象）。
 func TestTurnCompletedTypedAndUsage(t *testing.T) {
