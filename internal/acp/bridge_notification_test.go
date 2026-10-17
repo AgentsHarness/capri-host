@@ -303,7 +303,7 @@ func TestScheduledTaskDeletedKindNormalized(t *testing.T) {
 }
 
 // model_changed kind：roster models 缓存更新（currentModelId +
-// reasoningEffort）+ models_update / model 事件广播（typed 语义事件）；
+// reasoningEffort）+ models_update / model / typed model_changed 事件广播；
 // kind modeled → 无 generic session_notification。
 func TestModelChangedKindUpdatesRoster(t *testing.T) {
 	b, _ := metaReadyBridge(t)
@@ -324,7 +324,7 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 		"reasoning_effort": "high",
 	}
 	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": update})
-	var sawModelsUpdate, sawModel bool
+	var sawModelsUpdate, sawModel, sawTyped bool
 	var events []Event
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -334,6 +334,14 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 			switch ev["type"] {
 			case "session_notification":
 				t.Errorf("unexpected generic session_notification for modeled kind model_changed: %v", ev)
+			case "model_changed":
+				sawTyped = true
+				if !reflect.DeepEqual(ev["update"], update) {
+					t.Errorf("typed update = %v, want the original update verbatim", ev["update"])
+				}
+				if ev["sessionId"] != "s1" {
+					t.Errorf("typed sessionId = %v, want s1", ev["sessionId"])
+				}
 			case "models_update":
 				sawModelsUpdate = true
 				models, _ := ev["params"].(map[string]any)
@@ -357,6 +365,9 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 	}
 	if !sawModelsUpdate || !sawModel {
 		t.Errorf("sawModelsUpdate=%v sawModel=%v", sawModelsUpdate, sawModel)
+	}
+	if !sawTyped {
+		t.Error("model_changed kind must broadcast a typed event (the FE scrollback line's only source)")
 	}
 	b.mu.Lock()
 	models, _ := b.sessions["s1"].models.(map[string]any)

@@ -2098,23 +2098,27 @@ func (b *Bridge) dispatchSessionUpdateKind(sid string, params map[string]any, ta
 		b.Broadcast(tag(ev))
 		return true
 	case "model_auto_switched", "model_changed":
+		// 先发原样 typed 事件再改缓存：FE 的提示行（notifMemory.ts /
+		// notifApps.ts）靠「上一个名称 ≠ 新名称」判断要不要落一行，而
+		// models_update / model 会先把 modelName 写成新值——顺序反过来，
+		// prevName 已等于新名称，提示行永远不会出现。
+		//  - model_auto_switched：两个其它事件只换 caption / 目录，不带
+		//    previous_model_id / reason，web 端无法据此说明「原模型已下线」。
+		//    new_model_id 为空（同族也无兜底、prompt 被拦）时同样要发——
+		//    那种情况下 handleModelSwitchKind 提前返回，只能靠 reason 告知
+		//    用户。
+		//  - model_changed：别的客户端切模型时这一端没有「模型已从 X 切换
+		//    到 Y」滚动行；自己的切换有 setModel 的乐观回声行，回合内
+		//    prevName 已等于新名称，同名守卫会去重。
+		ev := Event{kType: kind, kUpdate: update}
+		if kindMeta != nil {
+			ev[kMetaOut] = kindMeta
+		}
+		b.Broadcast(tag(ev))
 		// roster models 缓存更新 + models_update / model 广播（typed 语义
 		// 事件，见 handleModelSwitchKind）；kind modeled → 无 generic，
 		// FE 改用 typed 消费。
 		b.handleModelSwitchKind(sid, update, tag)
-		// model_auto_switched 额外发一条 typed 事件：两个其它事件只换
-		// caption / 目录，不带 previous_model_id / reason，web 端无法据此
-		// 说明「原模型已下线」。FE 的唯一提示行消费点（notifMemory.ts）走
-		// session_notification 通道，缺这条就只剩静默改名。new_model_id
-		// 为空（同族也无兜底、prompt 被拦）时同样要发——那种情况下
-		// handleModelSwitchKind 提前返回，只能靠 reason 告知用户。
-		if kind == "model_auto_switched" {
-			ev := Event{kType: kind, kUpdate: update}
-			if kindMeta != nil {
-				ev[kMetaOut] = kindMeta
-			}
-			b.Broadcast(tag(ev))
-		}
 		return true
 	case "turn_completed", "response_completed":
 		// Both boundaries end a generation segment; only turn_completed
