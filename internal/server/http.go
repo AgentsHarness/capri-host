@@ -821,6 +821,7 @@ func (s *Server) handleSetMode(w http.ResponseWriter, r *http.Request) {
 type setModelBody struct {
 	ModelID         string `json:"modelId"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	ContextWindow   uint64 `json:"contextWindow,omitempty"`
 	SessionID       string `json:"sessionId,omitempty"`
 }
 
@@ -830,7 +831,7 @@ func (s *Server) handleSetModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 modelId"})
 		return
 	}
-	warning, err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort)
+	warning, err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort, body.ContextWindow)
 	if err != nil {
 		writeAgentError(w, "session/set-model", err)
 		return

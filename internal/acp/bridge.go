@@ -2302,6 +2302,16 @@ func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag fu
 			break
 		}
 	}
+	// The session's own window pick (0 = not named, keep the cached one).
+	// `model_changed` carries it as context_window_selection, and the agent
+	// only omits it when the session never picked one.
+	var contextWindow uint64
+	for _, k := range []string{"context_window_selection", "contextWindowSelection"} {
+		if v, ok := update[k].(float64); ok && v > 0 {
+			contextWindow = uint64(v)
+			break
+		}
+	}
 	if id == "" {
 		// 字段缺失/为空：无可应用的状态（kind modeled，无 generic）。
 		return
@@ -2309,7 +2319,7 @@ func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag fu
 	b.mu.Lock()
 	var models any
 	if s := b.sessions[sid]; s != nil {
-		b.patchSessionModels(s, id, effort)
+		b.patchSessionModelsWindow(s, id, effort, contextWindow)
 		models = s.models
 	}
 	b.mu.Unlock()
@@ -2322,6 +2332,9 @@ func (b *Bridge) handleModelSwitchKind(sid string, update map[string]any, tag fu
 	}
 	if effort != "" {
 		ev["reasoningEffort"] = effort
+	}
+	if contextWindow > 0 {
+		ev["contextWindow"] = contextWindow
 	}
 	b.Broadcast(tag(ev))
 }
@@ -3738,14 +3751,16 @@ func (b *Bridge) SetConfigOption(ctx context.Context, sessionID, configID, value
 	return resp, nil
 }
 
-// SetModel calls session/set_config_option (or falls back to session/set_model)
-// to switch the session's model and optional reasoningEffort.
+// SetModel switches the session with the agent's own client call,
+// session/set_model. Reasoning effort and context window ride in `_meta`
+// (`reasoningEffort` is the catalog's canonical value; `contextWindow` is a
+// positive token count). Omitting either leaves the session's current
+// selection in place. contextWindow == 0 means "do not send".
 //
-// The returned string is a non-fatal warning (empty when there is nothing to
-// report): the model switch succeeded but the effort did not apply. Callers
-// must surface it — reporting a clean success would let the client caption an
-// effort the agent never adopted.
-func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) (string, error) {
+// The warning return stays so HTTP callers keep a field for a non-fatal
+// note. This path has nothing to warn about: the agent applies the model
+// and the meta together, and a rejection fails the whole call.
+func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string, contextWindow uint64) (string, error) {
 	if err := b.Boot(ctx); err != nil {
 		return "", err
 	}
@@ -3759,44 +3774,35 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		return "", errors.New("没有活跃会话")
 	}
 
-	// 优先尝试官方 session/set_config_option 端点规范切换
-	_, optErr := b.SetConfigOption(ctx, sessionID, "model", modelID)
-	if optErr == nil {
-		if reasoningEffort == "" {
-			return "", nil
-		}
-		// 模型已切换成功、档位被拒（如 unknown reasoning_effort value）不能
-		// 吞掉：前端只会看到 200 并把档位写进 caption，而 agent 保留的是切换
-		// 模型时重新校验过的档位。降级为非致命 warning 上抛。
-		effortID, _ := b.resolveEffortToken(sessionID, reasoningEffort)
-		if _, err := b.SetConfigOption(ctx, sessionID, "reasoning_effort", effortID); err != nil {
-			return fmt.Sprintf("模型已切换，但推理档位 %s 未生效：%s", reasoningEffort, err.Error()), nil
-		}
-		return "", nil
-	}
-
-	// 若 agent 尚未支持 session/set_config_option（如返回 -32601），回退到旧版 session/set_model
 	params := map[string]any{
 		kSessionID: sessionID,
 		"modelId":  modelID,
 	}
+	meta := map[string]any{}
+	effortValue := reasoningEffort
 	if reasoningEffort != "" {
-		// 这条 rail 的 `_meta.reasoningEffort` 只认 canonical value。
-		_, effortValue := b.resolveEffortToken(sessionID, reasoningEffort)
-		params[kMeta] = map[string]any{"reasoningEffort": effortValue}
+		// `_meta.reasoningEffort` parses the canonical value, not an option id.
+		_, effortValue = b.resolveEffortToken(sessionID, reasoningEffort)
+		meta["reasoningEffort"] = effortValue
+	}
+	if contextWindow > 0 {
+		meta["contextWindow"] = contextWindow
+	}
+	if len(meta) > 0 {
+		params[kMeta] = meta
 	}
 	if _, err := b.request(ctx, "session/set_model", params, 30*time.Second); err != nil {
 		return "", err
 	}
-	// The agent does not push a model_changed notification for set_model,
-	// so the cached SessionModelState (hello / ready / status snapshot)
-	// would stay stale and revert the UI caption on the next reconnect.
-	// Patch the cache and re-broadcast so every client converges.
+	// session/set_model does not reliably refresh the host's cached
+	// SessionModelState (hello / ready / status snapshot). Patch it and
+	// re-broadcast so every client converges without waiting for a later
+	// catalog push.
 	b.mu.Lock()
 	var models any
 	var name string
 	if act := b.sessions[sessionID]; act != nil {
-		b.patchSessionModels(act, modelID, reasoningEffort)
+		b.patchSessionModelsWindow(act, modelID, effortValue, contextWindow)
 		models = act.models
 		name = modelDisplayName(models, modelID)
 	}
@@ -3808,7 +3814,7 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 		kType:             "model",
 		"modelId":         modelID,
 		"modelName":       name,
-		"reasoningEffort": reasoningEffort,
+		"reasoningEffort": effortValue,
 		kSessionID:        sessionID,
 	})
 	b.broadcastRosterChange()
@@ -3819,17 +3825,15 @@ func (b *Bridge) SetModel(ctx context.Context, sessionID, modelID, reasoningEffo
 // spellings the agent's two rails expect, using the session's cached model
 // catalog (each `_meta.reasoningEfforts` entry carries both).
 //
-// The rails disagree on purpose:
-//   - session/set_config_option (configId="reasoning_effort") resolves the
-//     wire value as an option **id** (agent_ops.rs
-//     resolve_reasoning_effort_value);
-//   - session/set_model `_meta.reasoningEffort` parses the canonical
-//     **value** (sampling-types parse_reasoning_effort_meta).
+// session/set_model `_meta.reasoningEffort` parses the canonical **value**
+// (sampling-types parse_reasoning_effort_meta). session/set_config_option
+// with configId="reasoning_effort" resolves an option **id** instead.
+// SetModel sends the value. The id is still returned for a caller that
+// speaks set_config_option directly.
 //
-// Clients send the canonical value (what the caption shows), so rail 1 needs
-// the id. For every catalog seen so far id == value and both calls are
-// identity; a catalog that spells them differently (e.g. {id:"med",
-// value:"medium"}) is why this translation exists.
+// Clients send the canonical value (what the caption shows). For every
+// catalog seen so far id == value; a catalog that spells them differently
+// (e.g. {id:"med", value:"medium"}) is why this translation exists.
 //
 // The token is matched against either spelling, so callers may pass whichever
 // they hold. Unknown tokens pass through unchanged — the agent rejects them
@@ -3889,6 +3893,19 @@ func (b *Bridge) resolveEffortToken(sessionID, token string) (id, value string) 
 // entry's default effort, and (host extension) the top-level reasoning
 // effort the client selected.
 func (b *Bridge) patchSessionModels(s *SessionState, modelID, effort string) {
+	b.patchSessionModelsWindow(s, modelID, effort, 0)
+}
+
+// patchSessionModelsWindow is patchSessionModels plus the session's picked
+// context window. contextWindow == 0 leaves the cached meta's `contextWindow`
+// alone (a switch that did not name a window keeps the previous selection —
+// the agent's SwitchContextWindow::Preserve).
+//
+// The FE offers only the windows a model declares in `_meta.contextWindows`,
+// and `ModelState::get_context_window` prefers the model meta's
+// `contextWindow` over the catalog default, so the two must move together or
+// the picker would show the pre-switch window.
+func (b *Bridge) patchSessionModelsWindow(s *SessionState, modelID, effort string, contextWindow uint64) {
 	models, ok := s.models.(map[string]any)
 	if !ok {
 		return
@@ -3904,8 +3921,13 @@ func (b *Bridge) patchSessionModels(s *SessionState, modelID, effort string) {
 				continue
 			}
 			if id, _ := mm["modelId"].(string); id == modelID {
-				if meta, ok := mm[kMeta].(map[string]any); ok && effort != "" {
-					meta["reasoningEffort"] = effort
+				if meta, ok := mm[kMeta].(map[string]any); ok {
+					if effort != "" {
+						meta["reasoningEffort"] = effort
+					}
+					if contextWindow > 0 {
+						meta["contextWindow"] = contextWindow
+					}
 				}
 			}
 		}

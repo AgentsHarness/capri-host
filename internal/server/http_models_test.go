@@ -279,7 +279,7 @@ func TestSetModelRejectsMissingSessionID(t *testing.T) {
 	}
 }
 
-// 带 sessionId 的切模型请求规范转发 session/set_config_option。
+// 带 sessionId 的切模型请求发一条 session/set_model，档位在 _meta.reasoningEffort。
 func TestSetModelForwardsSessionID(t *testing.T) {
 	recordPath := filepath.Join(t.TempDir(), "requests.jsonl")
 	t.Setenv(ACPHostFakeAgentRecordRequests, recordPath)
@@ -294,30 +294,25 @@ func TestSetModelForwardsSessionID(t *testing.T) {
 		t.Fatalf("/api/set-model status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 	reqs := readRecordedRequests(t, recordPath)
-	var reqModel, reqEffort map[string]any
+	var setModel map[string]any
 	for _, r := range reqs {
+		if r["method"] == "session/set_model" {
+			setModel = r
+		}
 		if r["method"] == "session/set_config_option" {
-			p, _ := r["params"].(map[string]any)
-			if p["configId"] == "model" {
-				reqModel = r
-			} else if p["configId"] == "reasoning_effort" {
-				reqEffort = r
-			}
+			t.Errorf("model switch must not use session/set_config_option: %v", r)
 		}
 	}
-	if reqModel == nil {
-		t.Fatalf("no recorded session/set_config_option for model in %v", reqs)
+	if setModel == nil {
+		t.Fatalf("no recorded session/set_model in %v", reqs)
 	}
-	pModel, _ := reqModel["params"].(map[string]any)
-	if pModel["sessionId"] != sid || pModel["value"] != "grok-4" {
-		t.Errorf("model config option = %v, want grok-4 on %s", pModel, sid)
+	p, _ := setModel["params"].(map[string]any)
+	if p["sessionId"] != sid || p["modelId"] != "grok-4" {
+		t.Errorf("set_model params = %v, want grok-4 on %s", p, sid)
 	}
-	if reqEffort == nil {
-		t.Fatalf("no recorded session/set_config_option for reasoning_effort in %v", reqs)
-	}
-	pEffort, _ := reqEffort["params"].(map[string]any)
-	if pEffort["sessionId"] != sid || pEffort["value"] != "high" {
-		t.Errorf("effort config option = %v, want high on %s", pEffort, sid)
+	meta, _ := p["_meta"].(map[string]any)
+	if meta["reasoningEffort"] != "high" {
+		t.Errorf("_meta = %v, want reasoningEffort high", meta)
 	}
 
 	// 验证广播事件中包含 sessions_changed
@@ -335,32 +330,23 @@ func TestSetModelForwardsSessionID(t *testing.T) {
 	}
 }
 
-// 模型切换成功但档位被 agent 拒绝：HTTP 仍是 200（模型确实切了），但 body
-// 必须带 warning，前端据此弹 toast 并回滚 optimistic 档位——静默成功会让
-// caption 显示一个 agent 根本没采用的档位。
-func TestSetModelReportsEffortWarning(t *testing.T) {
-	t.Setenv(ACPHostFakeAgentRejectEffort, "1")
+// session/set_model 被 agent 拒绝：整次失败，不能回 ok:true 加 warning。
+func TestSetModelAgentErrorIsNotAWarning(t *testing.T) {
+	t.Setenv(ACPHostFakeAgentErrorMethod, "session/set_model")
 	s, _ := newFakeAgentServer(t)
 	sid := createActiveSession(t, s)
 
 	rec := postJSON(t, s, "/api/set-model",
-		fmt.Sprintf(`{"modelId":"grok-4","reasoningEffort":"high","sessionId":%q}`, sid))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/api/set-model status = %d, body=%s", rec.Code, rec.Body.String())
-	}
+		fmt.Sprintf(`{"modelId":"grok-4","reasoningEffort":"high","contextWindow":500000,"sessionId":%q}`, sid))
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("body decode: %v (%s)", err, rec.Body.String())
 	}
-	if body["ok"] != true {
-		t.Fatalf("ok = %v, want true (the model switch itself succeeded)", body["ok"])
+	if body["ok"] != false {
+		t.Fatalf("ok = %v, want false; body = %s", body["ok"], rec.Body.String())
 	}
-	warning, _ := body["warning"].(string)
-	if warning == "" {
-		t.Fatalf("warning missing; body = %s", rec.Body.String())
-	}
-	if !strings.Contains(warning, "high") || !strings.Contains(warning, "未生效") {
-		t.Errorf("warning = %q, want it to name the effort and say it did not apply", warning)
+	if _, present := body["warning"]; present {
+		t.Errorf("rejected set_model must not report a warning: %s", rec.Body.String())
 	}
 }
 

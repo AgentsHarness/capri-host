@@ -70,7 +70,7 @@ type permissionAPI interface {
 
 // modelAPI：模型/模式选择与自定义模型配置。
 type modelAPI interface {
-	SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string) (warning string, err error)
+	SetModel(ctx context.Context, sessionID, modelID, reasoningEffort string, contextWindow uint64) (warning string, err error)
 	SetConfigOption(ctx context.Context, sessionID, configID, value string) (any, error)
 	SetMode(ctx context.Context, sessionID, modeID string) (map[string]any, error)
 	TogglePlanMode(ctx context.Context, sessionID string) (map[string]any, error)

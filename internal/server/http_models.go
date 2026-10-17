@@ -15,6 +15,7 @@ import (
 type setDefaultModelBody struct {
 	ModelID         string `json:"modelId"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	ContextWindow   uint64 `json:"contextWindow,omitempty"`
 	SessionID       string `json:"sessionId,omitempty"`
 }
 
@@ -45,7 +46,7 @@ func (s *Server) handleSetDefaultModel(w http.ResponseWriter, r *http.Request) {
 	if body.SessionID != "" {
 		// warning：模型已切换但档位未生效。非致命——会话已经切过去了，
 		// 不能因为档位失败就让整次「设为默认」返回错误（偏好仍要落盘）。
-		if warning, err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort); err != nil {
+		if warning, err := s.bridge.SetModel(r.Context(), body.SessionID, body.ModelID, body.ReasoningEffort, body.ContextWindow); err != nil {
 			writeAgentError(w, "session/set-model", err)
 			return
 		} else if warning != "" {

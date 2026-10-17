@@ -366,6 +366,53 @@ func TestModelChangedKindUpdatesRoster(t *testing.T) {
 	}
 }
 
+// agent 的 model_changed 携带 context_window_selection（会话自己的窗口选择）
+// 时，缓存目录与 model 事件都要跟上：FE 的窗口 chips 高亮与上下文芯片
+// 都以这份目录为真源。全程没有该字段时不得伪造一个（Preserve 语义）。
+func TestModelChangedKindCarriesContextWindow(t *testing.T) {
+	b, _ := metaReadyBridge(t)
+	b.mu.Lock()
+	b.sessions["s1"].models = map[string]any{
+		"currentModelId": "grok-3",
+		"availableModels": []any{
+			map[string]any{"modelId": "grok-3", "name": "Grok 3"},
+			map[string]any{"modelId": "grok-4", "name": "Grok 4", "_meta": map[string]any{}},
+		},
+	}
+	b.mu.Unlock()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	b.handleSessionUpdate(map[string]any{"sessionId": "s1", "update": map[string]any{
+		"sessionUpdate":            "model_changed",
+		"model_id":                 "grok-4",
+		"context_window_selection": float64(500000),
+	}})
+
+	var sawContextWindow bool
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for !sawContextWindow && time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev["type"] == "model" && ev["contextWindow"] == uint64(500000) {
+				sawContextWindow = true
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !sawContextWindow {
+		t.Error("model event must carry contextWindow from context_window_selection")
+	}
+
+	b.mu.Lock()
+	meta, _ := b.sessions["s1"].models.(map[string]any)["availableModels"].([]any)[1].(map[string]any)["_meta"].(map[string]any)
+	got := meta["contextWindow"]
+	b.mu.Unlock()
+	if got != uint64(500000) {
+		t.Errorf("cached meta contextWindow = %v, want 500000", got)
+	}
+}
+
 // model_auto_switched kind（previous_model_id/new_model_id/reason）：
 // currentModelId 更新；无 reasoningEffort 时保留原 effort（
 // patchSessionModels 语义）。model 事件不带 reasoningEffort 键。

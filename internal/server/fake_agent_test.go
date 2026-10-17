@@ -87,12 +87,6 @@ const (
 	// (the listing reports enabled=false / reason session_toggle), so the
 	// modal's disabled state and the toggle-on path are browser-verifiable.
 	ACPHostFakeAgentMemoryDisabled = "ACP_HOST_FAKE_AGENT_MEMORY_DISABLED"
-	// ACPHostFakeAgentRejectEffort=1 makes the fake agent answer
-	// session/set_config_option with configId=reasoning_effort as an
-	// invalid-params error while still accepting the model switch — the
-	// "model switched, effort refused" half-success the host must report as
-	// a non-fatal warning instead of a clean 200.
-	ACPHostFakeAgentRejectEffort = "ACP_HOST_FAKE_AGENT_REJECT_EFFORT"
 )
 
 // fakeMemoryForgetHash is the only x.ai/memory/forget digest the fake agent
@@ -253,24 +247,6 @@ func runFakeAgent() {
 			out.WriteByte('\n')
 			out.Flush()
 			continue
-		}
-		// Half-success injection: accept the model switch, refuse the effort.
-		if method == "session/set_config_option" && os.Getenv(ACPHostFakeAgentRejectEffort) == "1" {
-			req, _ := msg["params"].(map[string]any)
-			if cid, _ := req["configId"].(string); cid == "reasoning_effort" {
-				resp, _ := json.Marshal(map[string]any{
-					"jsonrpc": "2.0",
-					"id":      id,
-					"error": map[string]any{
-						"code":    -32602,
-						"message": "unknown reasoning_effort value",
-					},
-				})
-				out.Write(resp)
-				out.WriteByte('\n')
-				out.Flush()
-				continue
-			}
 		}
 		var result map[string]any
 		switch method {
