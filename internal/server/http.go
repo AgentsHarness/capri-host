@@ -2175,6 +2175,7 @@ type settingsUpdateBody struct {
 	RememberToolApprovals *bool                `json:"remember_tool_approvals"`
 	PermissionMode        *string              `json:"permission_mode"`
 	FollowUpBehavior      *string              `json:"follow_up_behavior"`
+	ToolCallDensity       *string              `json:"tool_call_density"`
 	Toolset               *settingsToolsetBody `json:"toolset"`
 }
 
@@ -2193,6 +2194,7 @@ func settingsBodyKeyKnown(key string) bool {
 	switch key {
 	case "collapsed_edit_blocks", "page_flip_on_send",
 		"remember_tool_approvals", "permission_mode", "follow_up_behavior",
+		"tool_call_density",
 		"toolset":
 		return true
 	}
@@ -2278,6 +2280,9 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.FollowUpBehavior != nil {
 		patch["follow_up_behavior"] = *body.FollowUpBehavior
+	}
+	if body.ToolCallDensity != nil {
+		patch["tool_call_density"] = *body.ToolCallDensity
 	}
 	toolsetPatch := map[string]any{}
 	if body.Toolset != nil && body.Toolset.AskUserQuestion != nil {

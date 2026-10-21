@@ -14,6 +14,7 @@ var writableUIKeys = map[string]func(any) (any, error){
 	"remember_tool_approvals": requireBool,
 	"permission_mode":         requirePermissionMode,
 	"follow_up_behavior":      requireFollowUpBehavior,
+	"tool_call_density":       requireToolCallDensity,
 }
 
 // FE-consumed [toolset.ask_user_question] scalars that POST /api/settings
@@ -85,6 +86,23 @@ func requireFollowUpBehavior(v any) (any, error) {
 		return s, nil
 	default:
 		return nil, fmt.Errorf("必须是 queue / steer")
+	}
+}
+
+// requireToolCallDensity validates [ui].tool_call_density — the TUI's five
+// transcript density levels, from most to least detailed. The FE renders the
+// same enum and gates its own grouping/edit-expansion defaults on it.
+func requireToolCallDensity(v any) (any, error) {
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("必须是字符串")
+	}
+	switch s {
+	case "detailed", "compact-shells", "compact-ungrouped", "compact-grouped",
+		"compact-all-grouped":
+		return s, nil
+	default:
+		return nil, fmt.Errorf("必须是 detailed / compact-shells / compact-ungrouped / compact-grouped / compact-all-grouped")
 	}
 }
 

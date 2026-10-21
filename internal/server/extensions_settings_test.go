@@ -310,6 +310,61 @@ func TestSettingsUpdateRejectsUnknownAndEmpty(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad follow_up_behavior: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
 	}
+	rec = postJSON(t, s, "/api/settings", `{"tool_call_density":"verbose"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad tool_call_density: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// POST tool_call_density writes [ui].tool_call_density, echoes it in the
+// response and in the next GET (the settings modal's selected level comes
+// from GET /api/settings). The retired keys stay untouched.
+func TestSettingsUpdateToolCallDensity(t *testing.T) {
+	grok := withFakeGrokHome(t)
+	s := newLocalServer(t)
+	path := filepath.Join(grok, "config.toml")
+	os.WriteFile(path, []byte(`
+[ui]
+theme = "dark"
+group_tool_verbs = false
+`), 0o644)
+
+	// A retired key alone is not writable anymore.
+	rec := postJSON(t, s, "/api/settings", `{"group_tool_verbs":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("retired key: status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = postJSON(t, s, "/api/settings", `{"tool_call_density":"compact-grouped"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["ok"] != true {
+		t.Fatalf("ok = %v, body=%s", m["ok"], rec.Body.String())
+	}
+	ui, _ := m["ui"].(map[string]any)
+	if ui["tool_call_density"] != "compact-grouped" ||
+		ui["group_tool_verbs"] != false ||
+		ui["theme"] != "dark" {
+		t.Fatalf("ui = %v, want density set with other keys preserved", m["ui"])
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `tool_call_density = "compact-grouped"`) {
+		t.Errorf("config.toml missing [ui].tool_call_density:\n%s", raw)
+	}
+
+	rec = getJSON(t, s, "/api/settings")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if ui, _ = decodeBody(t, rec)["ui"].(map[string]any); ui["tool_call_density"] != "compact-grouped" {
+		t.Fatalf("GET ui = %v, want tool_call_density compact-grouped", ui)
+	}
 }
 
 // POST follow_up_behavior writes [ui].follow_up_behavior into config.toml,

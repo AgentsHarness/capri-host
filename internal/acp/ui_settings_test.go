@@ -34,6 +34,7 @@ default = "grok-4"
 		"remember_tool_approvals": true,
 		"permission_mode":         "auto",
 		"follow_up_behavior":      "steer",
+		"tool_call_density":       "compact-grouped",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +53,7 @@ default = "grok-4"
 		ui["remember_tool_approvals"] != true ||
 		ui["permission_mode"] != "auto" ||
 		ui["follow_up_behavior"] != "steer" ||
+		ui["tool_call_density"] != "compact-grouped" ||
 		ui["theme"] != "dark" ||
 		ui["yolo"] != true {
 		t.Fatalf("ui = %#v", ui)
@@ -75,6 +77,12 @@ default = "grok-4"
 	}
 	if err := b.SetUiSettings(map[string]any{"follow_up_behavior": 7}); err == nil {
 		t.Fatal("non-string follow_up_behavior must fail")
+	}
+	if err := b.SetUiSettings(map[string]any{"tool_call_density": "verbose"}); err == nil {
+		t.Fatal("bad tool_call_density must fail")
+	}
+	if err := b.SetUiSettings(map[string]any{"tool_call_density": 7}); err == nil {
+		t.Fatal("non-string tool_call_density must fail")
 	}
 }
 
