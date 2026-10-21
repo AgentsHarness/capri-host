@@ -652,6 +652,64 @@ done:
 	}
 }
 
+// available_commands_update 同样盖着 _meta.totalTokens，但 agent 从不把它
+// 落盘——它的值只能来自「模型响应后重新广播命令表」这一时机。把它写进
+// 上下文用量缓存会让 /api/session-info 报出日志里不存在、且可能倒退的
+// 数（实测 0500f：缓存 114884 vs 日志 118007）。这里锁住两件事：缓存不动，
+// 命令表更新照常广播给客户端。
+func TestUsageCacheIgnoresAvailableCommandsUpdate(t *testing.T) {
+	b := NewBridge(GrokConfig{Bin: "/nonexistent/grok"})
+	b.mu.Lock()
+	b.sessions["s1"] = &SessionState{SessionID: "s1"}
+	b.mu.Unlock()
+	ch, unsub := b.Subscribe()
+	defer unsub()
+
+	// 先给一个合法来源（被落盘的 chunk）建立基线。
+	b.handleSessionUpdate(map[string]any{
+		"sessionId": "s1",
+		"_meta":     map[string]any{"totalTokens": float64(118007)},
+		"update":    map[string]any{"sessionUpdate": "agent_message_chunk"},
+	})
+	b.handleSessionUpdate(map[string]any{
+		"sessionId": "s1",
+		"_meta":     map[string]any{"totalTokens": float64(114884)},
+		"update": map[string]any{
+			"sessionUpdate":     "available_commands_update",
+			"availableCommands": []any{map[string]any{"name": "compact"}},
+		},
+	})
+
+	var sawCommands bool
+	var usageValues []int64
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			switch ev["type"] {
+			case "commands_update":
+				sawCommands = true
+			case "usage":
+				if u, ok := asInt(ev["used"]); ok {
+					usageValues = append(usageValues, u)
+				}
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !sawCommands {
+		t.Error("available_commands_update must still reach clients as commands_update")
+	}
+	for _, u := range usageValues {
+		if u == 114884 {
+			t.Errorf("usage event carried ACU's totalTokens (%d); it never lands in updates.jsonl", u)
+		}
+	}
+	if got := b.SessionInfo("s1").ContextUsed; got != 118007 {
+		t.Errorf("ContextUsed = %d, want the last persisted count 118007 (ACU must not overwrite)", got)
+	}
+}
+
 // ── Part 2: sessionUpdate kind 语义化（x.ai 载体） ──────────────────
 
 // x.ai/session_notification 载体：modeled kind 只发 typed（无 generic）；

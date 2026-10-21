@@ -1690,7 +1690,14 @@ func (b *Bridge) handleSessionUpdate(params map[string]any) {
 	// 此处跳过以避免重复广播。其余 kind 值去重：实测流水期
 	// _meta.totalTokens 在一段输出内恒定（同一 used 连续 70+ 条），
 	// 只广播值变化——上下文计数器无需逐条刷新。
-	if k, _ := update[kSessionUpdate].(string); k != "turn_completed" && k != "response_completed" {
+	//
+	// available_commands_update 例外：agent 不把它落盘（updates.jsonl 里
+	// 永远查不到这条），但同样盖着 _meta.totalTokens——它在每轮模型响应
+	// 后退一次（AdvertiseTrigger::UsageMeta）、切模型 / skills 重载时也发。
+	// 拿它喂上下文缓存会让 /api/session-info 报出一个日志与 TUI 都对不上、
+	// 且比真实用量更旧的数（实测 session 0500f：缓存 114884 / 日志 118007）。
+	// 广播照发（FE 的命令表要它），只跳过缓存与 usage 事件。
+	if k, _ := update[kSessionUpdate].(string); k != "turn_completed" && k != "response_completed" && k != "available_commands_update" {
 		if meta, ok := params[kMeta].(map[string]any); ok {
 			if used, ok := asInt(meta["totalTokens"]); ok && used > 0 {
 				b.mu.Lock()
