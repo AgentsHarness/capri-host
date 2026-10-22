@@ -33,6 +33,9 @@ type File struct {
 	// hub_url 解析到 CDN 时必须设置：Cloudflare 只转发 TCP，UDP 会被静默
 	// 丢弃，QUIC 表现为无响应超时并回退 WebSocket。
 	HubQUICHost string `json:"hub_quic_host,omitempty"`
+	// HubQUICDisable 强制走 WebSocket（hub_quic_disable）。用于 UDP 名义可达
+	// 但保不住会话的网络：出口地址漂移时握手能过、随后必被 hub 判无上行。
+	HubQUICDisable bool `json:"hub_quic_disable,omitempty"`
 
 	// Proxy / NoProxy 是出网代理：host 启动时导出成 HTTPS_PROXY 等标准
 	// 变量，hub 中继与本机拉起的 grok agent 都跟着走。留空时 macOS 上

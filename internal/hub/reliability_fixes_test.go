@@ -232,6 +232,42 @@ func TestPingSeqAckRecorded(t *testing.T) {
 	}
 }
 
+// TestQuicFlapBackoff: an established-then-young-death session is not an
+// establishment failure, so the old negative cache reset on every connect and
+// never backed off — exactly the rotating-egress case where the handshake
+// succeeds and the hub drops the flow after 90s of no uplink. quicFlapMax
+// young deaths arm the same cooldown; one long-lived session clears them.
+func TestQuicFlapBackoff(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok"})
+
+	young := 91 * time.Second // the observed drop interval
+	c.noteQuicSessionEnd(true, young)
+	c.noteQuicSessionEnd(true, young)
+	if got := c.pickTransport(); got != "quic" {
+		t.Fatalf("transport after 2 young deaths = %q, want quic (below quicFlapMax)", got)
+	}
+	c.noteQuicSessionEnd(true, young)
+	if got := c.pickTransport(); got != "ws" {
+		t.Fatalf("transport after %d young deaths = %q, want ws (cooldown)", quicFlapMax, got)
+	}
+	if c.quicFails != 0 {
+		t.Fatalf("flapping must not inflate the establishment-failure count: %d", c.quicFails)
+	}
+
+	// A session that lived past quicFlapMin proves the path can hold one.
+	c.quicCooldownUntil = time.Now().Add(-time.Second)
+	c.noteQuicSessionEnd(true, quicFlapMin+time.Second)
+	if c.quicFlapFails != 0 {
+		t.Fatalf("long session must clear the flap count, got %d", c.quicFlapFails)
+	}
+
+	// Establishment failures are the negative cache's business, not this one.
+	c.noteQuicSessionEnd(false, time.Second)
+	if c.quicFlapFails != 0 {
+		t.Fatalf("failed establishment counted as a flap: %d", c.quicFlapFails)
+	}
+}
+
 // TestQuicNegativeCache: quicFailMax consecutive ESTABLISHMENT failures arm
 // the cooldown (pickTransport → "ws" with no dial attempt); an established
 // session resets the failure count; the cooldown lapses on its own so a

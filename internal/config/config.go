@@ -36,6 +36,12 @@ type Config struct {
 	// times out with no reply and every host falls back to WebSocket.
 	// Pointing this at the origin IP restores the QUIC path.
 	HubQUICHost string
+	// HubQUICDisable forces the WebSocket transport (hub_quic_disable /
+	// HUB_QUIC_DISABLE=1). Needed when UDP is nominally reachable but
+	// cannot hold a session: a rotating egress address or a lossy relay
+	// passes the handshake and then dies, which the flapping backoff only
+	// papers over after three failed cycles.
+	HubQUICDisable bool
 	// Inbound access token for this host's own HTTP API (/api/*, /events).
 	// Set FE_TOKEN (or ACCESS_TOKEN) to require it; empty = open (local
 	// trusted default, matching the pre-token behavior). Same secret
@@ -83,21 +89,22 @@ func merge(file File) Config {
 		bin = v
 	}
 	return Config{
-		Port:        port,
-		BindAddr:    bindAddr(file.Bind),
-		GrokBin:     resolveGrokBin(bin),
-		HubURL:      envOr("HUB_URL", strings.TrimSpace(file.HubURL)),
-		HubPairCode: envOr("HUB_PAIR_CODE", strings.TrimSpace(file.HubPairCode)),
-		HostToken:   os.Getenv("HOST_TOKEN"),
-		HostID:      envOr("HOST_ID", strOr(strings.TrimSpace(file.HostID), DefaultHostID)),
-		HostName:    envOr("HOST_NAME", strOr(strings.TrimSpace(file.HostName), DefaultHostName)),
-		HubQUICPin:  strings.TrimSpace(envOr("HUB_QUIC_PIN", strings.TrimSpace(file.HubQUICPin))),
-		HubQUICHost: strings.TrimSpace(envOr("HUB_QUIC_HOST", strings.TrimSpace(file.HubQUICHost))),
-		AccessToken: firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
-		ResidentCap: envResidentCap(),
-		UsageLedger: strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
-		Proxy:       proxyURL(os.Getenv("PROXY"), file.Proxy),
-		NoProxy:     envOr("NO_PROXY", strings.TrimSpace(file.NoProxy)),
+		Port:           port,
+		BindAddr:       bindAddr(file.Bind),
+		GrokBin:        resolveGrokBin(bin),
+		HubURL:         envOr("HUB_URL", strings.TrimSpace(file.HubURL)),
+		HubPairCode:    envOr("HUB_PAIR_CODE", strings.TrimSpace(file.HubPairCode)),
+		HostToken:      os.Getenv("HOST_TOKEN"),
+		HostID:         envOr("HOST_ID", strOr(strings.TrimSpace(file.HostID), DefaultHostID)),
+		HostName:       envOr("HOST_NAME", strOr(strings.TrimSpace(file.HostName), DefaultHostName)),
+		HubQUICPin:     strings.TrimSpace(envOr("HUB_QUIC_PIN", strings.TrimSpace(file.HubQUICPin))),
+		HubQUICHost:    strings.TrimSpace(envOr("HUB_QUIC_HOST", strings.TrimSpace(file.HubQUICHost))),
+		HubQUICDisable: envFlag("HUB_QUIC_DISABLE", file.HubQUICDisable),
+		AccessToken:    firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
+		ResidentCap:    envResidentCap(),
+		UsageLedger:    strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
+		Proxy:          proxyURL(os.Getenv("PROXY"), file.Proxy),
+		NoProxy:        envOr("NO_PROXY", strings.TrimSpace(file.NoProxy)),
 	}
 }
 
@@ -142,6 +149,21 @@ func envResidentCap() int {
 	return n
 }
 
+// envFlag resolves a boolean that may come from the environment or
+// config.json: HUB_QUIC_DISABLE=1 turns it on, =0 explicitly turns it off
+// (so an env var can unset a value hand-written into the file), unset keeps
+// the file value.
+func envFlag(k string, fileVal bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(k))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return fileVal
+}
+
+// envOr is the string twin of envFlag: a non-empty environment value wins.
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v

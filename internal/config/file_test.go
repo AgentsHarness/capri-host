@@ -13,7 +13,7 @@ func clearHostEnv(t *testing.T) {
 	for _, k := range []string{
 		"BIND", "HOST_BIND", "PORT", "GROK_BIN",
 		"HUB_URL", "HUB_PAIR_CODE", "HOST_TOKEN",
-		"HOST_ID", "HOST_NAME", "HUB_QUIC_PIN", "HUB_QUIC_HOST",
+		"HOST_ID", "HOST_NAME", "HUB_QUIC_PIN", "HUB_QUIC_HOST", "HUB_QUIC_DISABLE",
 		"FE_TOKEN", "ACCESS_TOKEN", "RESIDENT_CAP", "USAGE_LEDGER",
 		"PROXY", "NO_PROXY", "no_proxy",
 	} {
@@ -239,5 +239,26 @@ func TestMergeReadsHubQUICKeys(t *testing.T) {
 	t.Setenv("HUB_QUIC_HOST", "198.51.100.7")
 	if got := merge(File{HubQUICHost: "203.0.113.10"}); got.HubQUICHost != "198.51.100.7" {
 		t.Fatalf("env must win: HubQUICHost = %q", got.HubQUICHost)
+	}
+}
+
+// TestMergeHubQUICDisable: HUB_QUIC_DISABLE=1 forces WebSocket, and =0 can
+// turn off a value hand-written into config.json — otherwise the only way
+// back to QUIC would be editing the file.
+func TestMergeHubQUICDisable(t *testing.T) {
+	clearHostEnv(t)
+	if got := merge(File{}); got.HubQUICDisable {
+		t.Fatal("HubQUICDisable must default to false")
+	}
+	if got := merge(File{HubQUICDisable: true}); !got.HubQUICDisable {
+		t.Fatal("config.json value ignored")
+	}
+	t.Setenv("HUB_QUIC_DISABLE", "1")
+	if got := merge(File{}); !got.HubQUICDisable {
+		t.Fatal("HUB_QUIC_DISABLE=1 ignored")
+	}
+	t.Setenv("HUB_QUIC_DISABLE", "0")
+	if got := merge(File{HubQUICDisable: true}); got.HubQUICDisable {
+		t.Fatal("HUB_QUIC_DISABLE=0 must override the file value")
 	}
 }

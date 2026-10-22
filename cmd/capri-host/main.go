@@ -105,6 +105,11 @@ func main() {
 		// menu-bar app can persist it in config.json — a shell env var
 		// never reaches a host launched from the login item.
 		QUICHost: cfg.HubQUICHost,
+		// hub_quic_disable / HUB_QUIC_DISABLE=1: skip QUIC entirely. For a
+		// network where UDP handshakes succeed but sessions keep dying
+		// (rotating egress address), the flapping backoff alone still pays
+		// three failed cycles before it backs off.
+		DisableQUIC: cfg.HubQUICDisable,
 		// Escape hatch for a self-signed hub on a trusted network.
 		// Leave unset in production: the QUIC transport otherwise
 		// verifies the hub certificate whenever HUB_URL is https

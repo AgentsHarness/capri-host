@@ -210,6 +210,16 @@ type Client struct {
 	quicFails         int
 	quicCooldownUntil time.Time
 
+	// QUIC flapping (Run goroutine only): sessions that ESTABLISHED and then
+	// died young. A handshake proves the UDP path exists, so these are not
+	// establishment failures — yet a path that hands out a session and then
+	// loses it (egress IP rotating under the hub's view of the flow, CGNAT
+	// rebinding, a lossy relay) is just as unusable, and the old code reset
+	// the failure count on every connect, so it could never back off at all.
+	// quicFlapFails counts young deaths since the last session that lived
+	// quicFlapMin; at quicFlapMax it arms the same cooldown.
+	quicFlapFails int
+
 	// ── control surface (see control.go) ──────────────────────────────
 	//
 	// connected / transport / connectedAt are the link's observable state.
@@ -411,6 +421,7 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 			// WebSocket dial on the way out.
 			if qerr != nil && !ctxDone(sessCtx) {
 				c.noteQuicOutcome(established)
+				c.noteQuicSessionEnd(established, time.Since(sessionStart))
 				log.Printf("[hub-client] QUIC 连接失败: %v，回退 WebSocket", qerr)
 				err = c.wsSession(sessCtx, bridge)
 			}
@@ -1775,6 +1786,15 @@ const (
 	quicFailCooldown = 5 * time.Minute
 )
 
+// QUIC flapping: a session counts as "young" when it died before
+// quicFlapMin. Three in a row (well inside one reconnect cycle — the hub
+// drops a silent uplink after 90s, so a rotation path produces exactly
+// this pattern every ~91s) arm quicFailCooldown of WebSocket instead.
+const (
+	quicFlapMax = 3
+	quicFlapMin = 2 * time.Minute
+)
+
 // pickTransport chooses this reconnect attempt's transport: "quic" unless
 // disabled or inside the negative-cache cooldown, else "ws". Run goroutine
 // only (guards the quicFails / quicCooldownUntil fields).
@@ -1799,6 +1819,26 @@ func (c *Client) noteQuicOutcome(established bool) {
 		c.quicCooldownUntil = time.Now().Add(quicFailCooldown)
 		log.Printf("[hub-client] QUIC 连续 %d 次建立失败，%.0f 秒内直接使用 WebSocket（跳过每次重连的握手等待）",
 			c.quicFails, quicFailCooldown.Seconds())
+	}
+}
+
+// noteQuicSessionEnd records how long a session lasted, for the flapping
+// heuristic above. Run goroutine only.
+func (c *Client) noteQuicSessionEnd(established bool, lived time.Duration) {
+	if !established {
+		return // an establishment failure is the negative cache's business
+	}
+	if lived >= quicFlapMin {
+		// A session that carried real traffic proves the path can hold one;
+		// forget earlier young deaths.
+		c.quicFlapFails = 0
+		return
+	}
+	c.quicFlapFails++
+	if c.quicFlapFails == quicFlapMax {
+		c.quicCooldownUntil = time.Now().Add(quicFailCooldown)
+		log.Printf("[hub-client] QUIC 连续 %d 次连上即断（每次不足 %.0f 秒），%.0f 秒内改用 WebSocket：握手能通过但会话保不住，通常是出口地址漂移或 UDP 通路丢包",
+			c.quicFlapFails, quicFlapMin.Seconds(), quicFailCooldown.Seconds())
 	}
 }
 

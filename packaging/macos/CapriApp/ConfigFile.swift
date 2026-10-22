@@ -15,6 +15,9 @@ struct ConfigFile: Codable, Equatable {
     /// hub_quic_host 指向源站；自签证书用 hub_quic_pin 固定指纹）。
     var hubQUICPin: String?
     var hubQUICHost: String?
+    /// 后端专用：true 时强制 WebSocket（hub_quic_disable）。同样只为透传，
+    /// 未在此声明的键会在保存设置时被丢掉。
+    var hubQUICDisable: Bool?
     var proxy: String?
     var noProxy: String?
     var startHostOnLaunch: Bool?
@@ -31,6 +34,7 @@ struct ConfigFile: Codable, Equatable {
         case grokBin = "grok_bin"
         case hubQUICPin = "hub_quic_pin"
         case hubQUICHost = "hub_quic_host"
+        case hubQUICDisable = "hub_quic_disable"
         case proxy
         case noProxy = "no_proxy"
         case startHostOnLaunch = "start_host_on_launch"
