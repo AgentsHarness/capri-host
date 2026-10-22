@@ -1,8 +1,11 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -276,5 +279,98 @@ func TestQuicNegativeCache(t *testing.T) {
 	c.cfg.DisableQUIC = true
 	if got := c.pickTransport(); got != "ws" {
 		t.Fatalf("DisableQUIC transport = %q, want ws", got)
+	}
+}
+
+// TestRepairSkippedWhileQueueUnderPressure: a repair must not replay into a
+// queue that is still half full. Doing so refilled the queue, failed the
+// critical enqueue, re-armed needCatchUp and replayed the same batch on the
+// next heartbeat — the amplification loop behind the 2026-10-22 22:14 storm.
+// The flag must stay set so a later heartbeat retries once pressure drops.
+func TestRepairSkippedWhileQueueUnderPressure(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 8)
+
+	evs := make([]acp.Event, 0, 8)
+	for i := 1; i <= 8; i++ {
+		evs = append(evs, acp.Event{"type": "chunk", "text": "x", "seq": uint64(i)})
+	}
+	c.seqAndReplay(evs)
+	c.seqMu.Lock()
+	c.lastSentSeq = 4 // seq 5..8 were dropped
+	c.seqMu.Unlock()
+	c.setBrowserSubscribers(1)
+
+	// Half the queue occupied: over the pressure threshold.
+	for i := 0; i < 4; i++ {
+		c.sendCh <- []byte("backlog")
+	}
+	c.needCatchUp.Store(true)
+	c.repairDroppedEvents()
+
+	if n := len(c.sendCh); n != 4 {
+		t.Fatalf("repair replayed into a half-full queue: len(sendCh) = %d, want the 4 backlog frames only", n)
+	}
+	if !c.needCatchUp.Load() {
+		t.Fatal("skipped repair must leave needCatchUp set for the next heartbeat")
+	}
+
+	// Drain the queue: the next repair goes through.
+	for i := 0; i < 4; i++ {
+		<-c.sendCh
+	}
+	c.repairDroppedEvents()
+	select {
+	case payload := <-c.sendCh:
+		var f struct {
+			Type   string           `json:"type"`
+			Events []map[string]any `json:"events"`
+		}
+		if json.Unmarshal(payload, &f) != nil || f.Type != "events" || len(f.Events) != 4 {
+			t.Fatalf("repair frame = %.80s, want 4 events (seq 5..8)", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("repair never ran after the queue drained")
+	}
+	if c.needCatchUp.Load() {
+		t.Fatal("completed repair must clear needCatchUp")
+	}
+}
+
+// TestQueueDropLogThrottled: under sustained pressure the drop path is
+// entered thousands of times (2.5k identical lines during the Oct 7 DNS
+// outage). Only the first drop per window may log; later drops are counted
+// and summarised when the window rolls over.
+func TestQueueDropLogThrottled(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 1)
+	c.sendCh <- []byte("occupied")
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	for i := 0; i < 200; i++ {
+		c.noteEventDrop("发送队列满", 32)
+		c.noteFrameDrop("发送队列满", 0)
+	}
+	if n := strings.Count(buf.String(), "\n"); n != 1 {
+		t.Fatalf("first window logged %d lines, want 1:\n%s", n, buf.String())
+	}
+
+	c.dropMu.Lock()
+	c.dropWindow = time.Now().Add(-dropLogWindow) // age the window
+	c.dropMu.Unlock()
+	c.noteFrameDrop("发送队列满", 0)
+	out := buf.String()
+	if !strings.Contains(out, "上行队列压力持续") {
+		t.Fatalf("window rollover must summarise suppressed drops:\n%s", out)
+	}
+	if !strings.Contains(out, "200 帧") || !strings.Contains(out, "6400 条事件") {
+		t.Fatalf("summary counts wrong (want 200 frames, 6400 events):\n%s", out)
+	}
+	if n := strings.Count(out, "\n"); n != 3 {
+		t.Fatalf("rollover logged %d lines, want 3 (summary + first drop of new window):\n%s", n, out)
 	}
 }

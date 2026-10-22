@@ -181,6 +181,17 @@ type Client struct {
 	// watermark to close the gap once the pressure passes.
 	needCatchUp atomic.Bool
 
+	// dropMu guards the queue-pressure log throttle. When the uplink is
+	// down or the writer is stalled, the drop paths fire thousands of
+	// times (2.5k identical lines during the Oct 7 DNS outage), burying
+	// everything else in the log. One line per window reports the first
+	// drop; the rest are counted and summarised at window rollover.
+	dropMu     sync.Mutex
+	dropWindow time.Time
+	dropEvents int
+	dropFrames int
+	dropLogged bool
+
 	// deflateOK is armed by the hub's hello echo ("deflate":true) after we
 	// offered compression in the QUIC auth frame / WS handshake. Until then
 	// (or with an old hub) every frame goes out as raw JSON — see
@@ -722,9 +733,18 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 			flush()
 		case <-heartbeat.C:
 			flush()
+			// Neither of these is useful without a live transport: the
+			// uplink queue survives reconnects (drained on the next
+			// session), so frames queued while disconnected are thrown
+			// away anyway — on Oct 7 a DNS outage turned every 15s beat
+			// into "发送队列满，丢弃帧" for two and a half hours.
+			if !c.connected.Load() {
+				continue
+			}
 			c.repairDroppedEvents()
-			// Always heartbeat: keeps hub registry ready flag fresh even
-			// with zero browser subscribers. Control frame, not data-plane seq.
+			// Always heartbeat while connected: keeps hub registry ready
+			// flag fresh even with zero browser subscribers. Control
+			// frame, not data-plane seq.
 			c.enqueueHostStatus(bridge)
 		}
 	}
@@ -737,6 +757,17 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 // burst has passed.
 func (c *Client) repairDroppedEvents() {
 	if !c.needCatchUp.Swap(false) || !c.forwardingEnabled() {
+		return
+	}
+	// Only repair once the queue has actually drained. Replaying into a
+	// still-full queue is self-defeating: the replay's critical enqueue
+	// blocks up to 5s per frame, times out, sets needCatchUp again, and
+	// the next heartbeat repeats the whole batch. That loop is what turned
+	// one oversized burst (2026-10-22 22:14) into thousands of drops.
+	// Putting the flag back keeps the repair pending; nothing is lost
+	// because the events stay in the ring.
+	if c.sendQueuePressure() {
+		c.needCatchUp.Store(true)
 		return
 	}
 	c.seqMu.Lock()
@@ -754,6 +785,17 @@ func (c *Client) repairDroppedEvents() {
 	if last := c.sendReplayAfter(after); last > 0 {
 		log.Printf("[hub-client] 补发被丢弃的事件 seq %d..%d", after+1, last)
 	}
+}
+
+// sendQueuePressure reports whether the uplink queue is too full to accept
+// a repair replay: more than half of sendCh's capacity is still occupied.
+// The writer drains one frame per send, so half-full means the backlog is
+// at least half a round of writes — replaying now would refill it.
+func (c *Client) sendQueuePressure() bool {
+	if c.sendCh == nil {
+		return false
+	}
+	return len(c.sendCh) >= cap(c.sendCh)/2
 }
 
 // eventSeq extracts an event's seq (bridge uint64 / float64 after JSON
@@ -792,7 +834,7 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 	// is safe: needCatchUp's heartbeat repair re-sends it in order.
 	if !c.enqueueMu.TryLock() {
 		c.needCatchUp.Store(true)
-		log.Printf("[hub-client] 重放占用发送通道，丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(evs))
+		c.noteEventDrop("重放占用发送通道", len(evs))
 		return
 	}
 	defer c.enqueueMu.Unlock()
@@ -821,7 +863,7 @@ func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 			// reconnect, leaving the hub missing transcript the whole
 			// session.
 			c.needCatchUp.Store(true)
-			log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(evs))
+			c.noteEventDrop("关键事件帧入队超时（队列满）", len(evs))
 		}
 		return
 	}
@@ -834,7 +876,7 @@ func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 		// heartbeat re-sends from lastSentSeq instead of leaving a hole the
 		// FE can only wait forever on.
 		c.needCatchUp.Store(true)
-		log.Printf("[hub-client] 发送队列满，丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(evs))
+		c.noteEventDrop("发送队列满", len(evs))
 	}
 }
 
@@ -995,7 +1037,7 @@ func (c *Client) enqueueReplayFrameLocked(items []replayItem) {
 		c.noteLastSentSeqItems(items)
 	case <-time.After(5 * time.Second):
 		c.needCatchUp.Store(true)
-		log.Printf("[hub-client] 关键事件帧入队超时（队列满），丢弃 %d 条事件（重放缓冲已保留，稍后补发）", len(items))
+		c.noteEventDrop("关键事件帧入队超时（队列满）", len(items))
 	}
 }
 
@@ -1261,14 +1303,74 @@ func (c *Client) enqueueFrame(payload []byte, critical bool) {
 		select {
 		case c.sendCh <- payload:
 		case <-time.After(5 * time.Second):
-			log.Printf("[hub-client] 关键帧入队超时，丢弃")
+			c.noteFrameDrop("关键帧入队超时（队列满）", 0)
 		}
 		return
 	}
 	select {
 	case c.sendCh <- payload:
 	default:
-		log.Printf("[hub-client] 发送队列满，丢弃帧")
+		c.noteFrameDrop("发送队列满", 0)
+	}
+}
+
+// dropLogWindow is how often the queue-pressure log may emit. One line per
+// window keeps the first drop visible and rolls the rest into a count.
+const dropLogWindow = 30 * time.Second
+
+// noteFrameDrop records a dropped control frame (host_status, pong, a
+// critical timeout) under queue pressure.
+func (c *Client) noteFrameDrop(reason string, evs int) {
+	c.noteDrop(1, evs, reason)
+}
+
+// noteEventDrop records a dropped batch of evs events (one frame's worth)
+// under queue pressure.
+func (c *Client) noteEventDrop(reason string, evs int) {
+	c.noteDrop(0, evs, reason)
+}
+
+// noteDrop counts a suppressed uplink frame/event batch and logs at most
+// one line per dropLogWindow, plus a summary of everything suppressed
+// since the previous window. Without it a disconnected or stalled uplink —
+// where every 50ms flush misses the queue — writes thousands of identical
+// lines and hides the rest of the log (Oct 7: 2.5k lines over a two-hour
+// DNS outage). frames counts control frames; evs counts events in a
+// dropped events frame.
+func (c *Client) noteDrop(frames, evs int, reason string) {
+	c.dropMu.Lock()
+	now := time.Now()
+	var summary string
+	if c.dropWindow.IsZero() {
+		c.dropWindow = now
+	} else if now.Sub(c.dropWindow) >= dropLogWindow {
+		if c.dropFrames > 0 || c.dropEvents > 0 {
+			summary = fmt.Sprintf("[hub-client] 上行队列压力持续：过去 %.0fs 共丢弃 %d 帧、%d 条事件（重放缓冲已保留，稍后补发）",
+				dropLogWindow.Seconds(), c.dropFrames, c.dropEvents)
+		}
+		c.dropWindow = now
+		c.dropFrames, c.dropEvents = 0, 0
+		c.dropLogged = false
+	}
+	c.dropFrames += frames
+	c.dropEvents += evs
+	logNow := !c.dropLogged
+	if logNow {
+		c.dropLogged = true
+	}
+	c.dropMu.Unlock()
+
+	if summary != "" {
+		log.Print(summary)
+	}
+	if !logNow {
+		return
+	}
+	switch {
+	case evs > 0:
+		log.Printf("[hub-client] %s，丢弃 %d 条事件（重放缓冲已保留，稍后补发）", reason, evs)
+	case frames > 0:
+		log.Printf("[hub-client] %s，丢弃帧", reason)
 	}
 }
 
