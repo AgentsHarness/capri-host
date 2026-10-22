@@ -10,7 +10,11 @@ struct ConfigFile: Codable, Equatable {
     var hubPairCode: String?
     var feToken: String?
     var grokBin: String?
+    /// 后端专用，设置界面不暴露：解码出来只为原样写回，不在 UI 里出现，
+    /// 保存设置时也不会丢。这两项决定 QUIC 走不走得通（CDN 丢弃 UDP 时
+    /// hub_quic_host 指向源站；自签证书用 hub_quic_pin 固定指纹）。
     var hubQUICPin: String?
+    var hubQUICHost: String?
     var proxy: String?
     var noProxy: String?
     var startHostOnLaunch: Bool?
@@ -26,6 +30,7 @@ struct ConfigFile: Codable, Equatable {
         case feToken = "fe_token"
         case grokBin = "grok_bin"
         case hubQUICPin = "hub_quic_pin"
+        case hubQUICHost = "hub_quic_host"
         case proxy
         case noProxy = "no_proxy"
         case startHostOnLaunch = "start_host_on_launch"

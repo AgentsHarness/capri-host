@@ -29,6 +29,10 @@ type File struct {
 	FEToken     string `json:"fe_token,omitempty"`
 	GrokBin     string `json:"grok_bin,omitempty"`
 	HubQUICPin  string `json:"hub_quic_pin,omitempty"`
+	// HubQUICHost 覆盖 QUIC 拨号目标（hub_quic_host，host 或 host:port）。
+	// hub_url 解析到 CDN 时必须设置：Cloudflare 只转发 TCP，UDP 会被静默
+	// 丢弃，QUIC 表现为无响应超时并回退 WebSocket。
+	HubQUICHost string `json:"hub_quic_host,omitempty"`
 
 	// Proxy / NoProxy 是出网代理：host 启动时导出成 HTTPS_PROXY 等标准
 	// 变量，hub 中继与本机拉起的 grok agent 都跟着走。留空时 macOS 上

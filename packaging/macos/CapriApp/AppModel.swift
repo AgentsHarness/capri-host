@@ -441,6 +441,9 @@ final class AppModel: ObservableObject {
                 f.grokBin = grokBin.trimmingCharacters(in: .whitespacesAndNewlines)
                 f.proxy = proxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 f.noProxy = noProxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                // 后端专用项，设置界面不暴露。update 在锁内重新从磁盘读取，
+                // 未在此处赋值的键会原样保留；唯独 ConfigFile 里没声明的键会在
+                // 解码阶段就被丢掉，所以 hub_quic_host 必须声明（见 ConfigFile.swift）。
                 f.startHostOnLaunch = startHostOnLaunch
                 f.startAtLogin = startAtLogin
                 f.keepAwake = keepAwake

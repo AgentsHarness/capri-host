@@ -101,8 +101,10 @@ func main() {
 		// so all three derive it from one place.
 		StateFile: config.HubStatePath(),
 		// Optional: bypass proxy/fake-ip DNS for the QUIC transport
-		// (e.g. HUB_QUIC_HOST=203.0.113.10).
-		QUICHost: os.Getenv("HUB_QUIC_HOST"),
+		// (e.g. HUB_QUIC_HOST=203.0.113.10). Read from config so the
+		// menu-bar app can persist it in config.json — a shell env var
+		// never reaches a host launched from the login item.
+		QUICHost: cfg.HubQUICHost,
 		// Escape hatch for a self-signed hub on a trusted network.
 		// Leave unset in production: the QUIC transport otherwise
 		// verifies the hub certificate whenever HUB_URL is https

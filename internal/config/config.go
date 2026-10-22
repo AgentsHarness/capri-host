@@ -30,6 +30,12 @@ type Config struct {
 	// self-signed-hub replacement for disabling verification. See
 	// docs/DEPLOY.md for the openssl one-liner that generates it.
 	HubQUICPin string
+	// HUB_QUIC_HOST overrides the QUIC dial target (host or host:port).
+	// Needed when the hub URL resolves to a CDN: Cloudflare (and any
+	// TCP-only proxy) forwards 80/443 but silently drops UDP, so QUIC
+	// times out with no reply and every host falls back to WebSocket.
+	// Pointing this at the origin IP restores the QUIC path.
+	HubQUICHost string
 	// Inbound access token for this host's own HTTP API (/api/*, /events).
 	// Set FE_TOKEN (or ACCESS_TOKEN) to require it; empty = open (local
 	// trusted default, matching the pre-token behavior). Same secret
@@ -86,6 +92,7 @@ func merge(file File) Config {
 		HostID:      envOr("HOST_ID", strOr(strings.TrimSpace(file.HostID), DefaultHostID)),
 		HostName:    envOr("HOST_NAME", strOr(strings.TrimSpace(file.HostName), DefaultHostName)),
 		HubQUICPin:  strings.TrimSpace(envOr("HUB_QUIC_PIN", strings.TrimSpace(file.HubQUICPin))),
+		HubQUICHost: strings.TrimSpace(envOr("HUB_QUIC_HOST", strings.TrimSpace(file.HubQUICHost))),
 		AccessToken: firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
 		ResidentCap: envResidentCap(),
 		UsageLedger: strings.TrimSpace(os.Getenv("USAGE_LEDGER")),

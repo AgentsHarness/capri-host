@@ -13,7 +13,7 @@ func clearHostEnv(t *testing.T) {
 	for _, k := range []string{
 		"BIND", "HOST_BIND", "PORT", "GROK_BIN",
 		"HUB_URL", "HUB_PAIR_CODE", "HOST_TOKEN",
-		"HOST_ID", "HOST_NAME", "HUB_QUIC_PIN",
+		"HOST_ID", "HOST_NAME", "HUB_QUIC_PIN", "HUB_QUIC_HOST",
 		"FE_TOKEN", "ACCESS_TOKEN", "RESIDENT_CAP", "USAGE_LEDGER",
 		"PROXY", "NO_PROXY", "no_proxy",
 	} {
@@ -183,4 +183,61 @@ func grokName() string {
 		return "grok.exe"
 	}
 	return "grok"
+}
+
+// TestUpdateFileKeepsHubQUICKeys: hub_quic_host / hub_quic_pin are backend-only
+// and absent from the settings UI, so every writer that rebuilds or
+// read-modify-writes the file must leave them alone. Losing hub_quic_host
+// silently sends QUIC back to a CDN name (UDP dropped → WebSocket fallback).
+func TestUpdateFileKeepsHubQUICKeys(t *testing.T) {
+	isolateConfig(t)
+	if err := SaveFile(File{
+		HubURL:      "https://hub.example",
+		HubQUICHost: "203.0.113.10",
+		HubQUICPin:  "005285da3b4a67f79aae27fd2ee3fdbba9dc7b844de4bb77245520430b9d92ee",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A settings-style write that touches unrelated keys.
+	if err := UpdateFile(func(f *File) {
+		f.Bind = "0.0.0.0"
+		f.Port = 9000
+		f.HostName = "mbp"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HubQUICHost != "203.0.113.10" {
+		t.Fatalf("hub_quic_host = %q, want 203.0.113.10", got.HubQUICHost)
+	}
+	if got.HubQUICPin == "" {
+		t.Fatal("hub_quic_pin dropped by an unrelated update")
+	}
+	if got.Bind != "0.0.0.0" || got.Port != 9000 {
+		t.Fatalf("unrelated keys not applied: %+v", got)
+	}
+}
+
+// TestMergeReadsHubQUICKeys: the dial target must come from config.json as
+// well as the environment — a host started from the login item inherits no
+// shell env, which is how the QUIC override got lost the first time.
+func TestMergeReadsHubQUICKeys(t *testing.T) {
+	clearHostEnv(t)
+	cfg := merge(File{HubQUICHost: " 203.0.113.10 ", HubQUICPin: " pin "})
+	if cfg.HubQUICHost != "203.0.113.10" {
+		t.Fatalf("HubQUICHost = %q, want the file value trimmed", cfg.HubQUICHost)
+	}
+	if cfg.HubQUICPin != "pin" {
+		t.Fatalf("HubQUICPin = %q, want pin", cfg.HubQUICPin)
+	}
+
+	t.Setenv("HUB_QUIC_HOST", "198.51.100.7")
+	if got := merge(File{HubQUICHost: "203.0.113.10"}); got.HubQUICHost != "198.51.100.7" {
+		t.Fatalf("env must win: HubQUICHost = %q", got.HubQUICHost)
+	}
 }
