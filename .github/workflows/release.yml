@@ -10,6 +10,10 @@ on:
         description: 'capri-fe 要构建的 ref，默认 main'
         required: false
         default: 'main'
+      hub_ref:
+        description: 'capri-hub 要构建的 ref（wire 子模块），默认 main'
+        required: false
+        default: 'main'
 
 permissions:
   contents: write
@@ -70,6 +74,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Checkout capri-hub (wire submodule)
+        uses: actions/checkout@v5
+        with:
+          repository: AgentsHarness/capri-hub
+          ref: ${{ inputs.hub_ref || 'main' }}
+          path: _deps/capri-hub
+          persist-credentials: false
+
+      # acp-host/go.mod replaces github.com/AgentsHarness/capri-hub/wire with
+      # ../acp-hub/wire. The runner's parent directory is writable, so put the
+      # dependency there instead of changing the module path per job.
+      - name: Link capri-hub beside the workspace
+        run: ln -sfn "$GITHUB_WORKSPACE/_deps/capri-hub" "$GITHUB_WORKSPACE/../acp-hub"
+
 
       # internal/server/web/dist 被 .gitignore 忽略、不在仓库里，
       # 必须先把前端构建产物放进去，go:embed web/dist 才能编译。
@@ -117,6 +135,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Checkout capri-hub (wire submodule)
+        uses: actions/checkout@v5
+        with:
+          repository: AgentsHarness/capri-hub
+          ref: ${{ inputs.hub_ref || 'main' }}
+          path: _deps/capri-hub
+          persist-credentials: false
+
+      # acp-host/go.mod replaces github.com/AgentsHarness/capri-hub/wire with
+      # ../acp-hub/wire. The runner's parent directory is writable, so put the
+      # dependency there instead of changing the module path per job.
+      - name: Link capri-hub beside the workspace
+        run: ln -sfn "$GITHUB_WORKSPACE/_deps/capri-hub" "$GITHUB_WORKSPACE/../acp-hub"
+
 
       - name: Install frontend dist into embed dir
         uses: actions/download-artifact@v7
@@ -162,6 +194,20 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Checkout capri-hub (wire submodule)
+        uses: actions/checkout@v5
+        with:
+          repository: AgentsHarness/capri-hub
+          ref: ${{ inputs.hub_ref || 'main' }}
+          path: _deps/capri-hub
+          persist-credentials: false
+
+      # acp-host/go.mod replaces github.com/AgentsHarness/capri-hub/wire with
+      # ../acp-hub/wire. The runner's parent directory is writable, so put the
+      # dependency there instead of changing the module path per job.
+      - name: Link capri-hub beside the workspace
+        run: ln -sfn "$GITHUB_WORKSPACE/_deps/capri-hub" "$GITHUB_WORKSPACE/../acp-hub"
+
 
       - name: Install frontend dist into embed dir
         uses: actions/download-artifact@v7
