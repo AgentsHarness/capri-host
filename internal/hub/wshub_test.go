@@ -39,10 +39,19 @@ type wsHub struct {
 	// audience is what hello_ack (and every audience a test pushes) starts
 	// with.
 	audience wire.Audience
+	// limits is the hello_ack limits; nil means testLimits().
+	limits *wire.Limits
 	// noAutoAck leaves events unacknowledged.
 	noAutoAck bool
 	// binaryFrames records whether any uplink frame arrived compressed.
 	binary int
+	// blackholeFirst makes the first connection complete the handshake and
+	// then stop answering: it keeps reading (so the host's writes drain) but
+	// never sends another frame. The next connection behaves normally.
+	blackholeFirst bool
+	// eventsConn records the connection index that carried each events
+	// frame, parallel to events.
+	eventsConn []int
 
 	ackUp atomic64
 }
@@ -111,6 +120,8 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 	cc := &wsHubConn{conn: conn, h: h}
 	h.mu.Lock()
 	h.conns++
+	cc.idx = h.conns
+	blackhole := h.blackholeFirst && h.conns == 1
 	h.cur = cc
 	h.mu.Unlock()
 	h.connCh <- cc
@@ -131,7 +142,11 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.helloOf = &hello
 	aud := h.audience
+	limits := h.limits
 	h.mu.Unlock()
+	if limits == nil {
+		limits = testLimits()
+	}
 
 	ack := wire.NewHelloAck(wire.HelloAck{
 		Epoch:    hello.Epoch,
@@ -139,12 +154,49 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 		AckDown:  0,
 		Audience: &aud,
 		Liveness: &h.live,
-		Limits:   testLimits(),
+		Limits:   limits,
 		Caps:     &wire.Caps{Deflate: true},
 	})
 	if err := cc.send(ack); err != nil {
 		return
 	}
+	if blackhole {
+		// Liveness blackhole: keep draining the host's writes so its TCP
+		// buffer never fills, but send nothing back. The host must end the
+		// session on its own idle timer and reconnect.
+		for {
+			if _, err := cc.read(); err != nil {
+				return
+			}
+		}
+	}
+
+	// The real hub sends its own hb every keepalive; the host's idle timer is
+	// driven by received frames, so a test hub without one would look dead.
+	stopHB := make(chan struct{})
+	defer close(stopHB)
+	go func() {
+		interval := time.Duration(h.live.Keepalive) * time.Second
+		if interval <= 0 {
+			return
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHB:
+				return
+			case <-ticker.C:
+				hb, err := wire.NewHeartbeat(h.ackUp.load(), wire.HeartbeatStatus{Ready: true})
+				if err != nil {
+					return
+				}
+				if err := cc.send(hb); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	for {
 		data, err := cc.read()
@@ -161,6 +213,7 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 			last := f.Seq + uint64(len(f.Events)) - 1
 			h.mu.Lock()
 			h.events = append(h.events, f)
+			h.eventsConn = append(h.eventsConn, cc.idx)
 			h.mu.Unlock()
 			h.mu.Lock()
 			noAck := h.noAutoAck
@@ -260,6 +313,35 @@ func (h *wsHub) eventCount() int {
 	return n
 }
 
+// connCount is how many host connections the test hub has accepted.
+func (h *wsHub) connCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.conns
+}
+
+// frameOnConnAfter returns the first events frame recorded at or after index
+// from whose seq is at least minSeq and which arrived on connection connIdx.
+func (h *wsHub) frameOnConnAfter(connIdx int, minSeq uint64, from int) (wire.Frame, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := from; i < len(h.events); i++ {
+		if h.eventsConn[i] != connIdx {
+			continue
+		}
+		if h.events[i].Seq >= minSeq {
+			return h.events[i], true
+		}
+	}
+	return wire.Frame{}, false
+}
+
+func (h *wsHub) recordedFrames() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.events)
+}
+
 func (h *wsHub) waitRespond(t *testing.T, reqID string, timeout time.Duration) wire.Frame {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -278,11 +360,27 @@ func (h *wsHub) waitRespond(t *testing.T, reqID string, timeout time.Duration) w
 	return wire.Frame{}
 }
 
+// respondsFor snapshots the respond frames recorded for reqID, in arrival
+// order (a chunked answer is several frames).
+func (h *wsHub) respondsFor(reqID string) []wire.Frame {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]wire.Frame, 0, 4)
+	for _, f := range h.respond {
+		if f.ReqID == reqID {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // wsHubConn is one live host connection from the hub's side.
 type wsHubConn struct {
 	conn *websocket.Conn
 	h    *wsHub
 	mu   sync.Mutex
+	// idx is the 1-based connection ordinal (see eventsConn).
+	idx int
 }
 
 func (c *wsHubConn) send(f wire.Frame) error {

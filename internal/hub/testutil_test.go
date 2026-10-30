@@ -32,6 +32,10 @@ type fakeTransport struct {
 	deflate     bool
 	keepalive   time.Duration
 	keepaliveCh chan time.Duration
+	// recvErr delivers an injected Recv error, the way a transport reports a
+	// frame it could not decode. A channel so a Recv already parked on the
+	// input wakes up.
+	recvErr chan error
 }
 
 func newFakeTransport() *fakeTransport {
@@ -40,6 +44,7 @@ func newFakeTransport() *fakeTransport {
 		sent:        make(chan []byte, 64),
 		closed:      make(chan struct{}),
 		keepaliveCh: make(chan time.Duration, 4),
+		recvErr:     make(chan error, 1),
 	}
 }
 
@@ -54,11 +59,19 @@ func (f *fakeTransport) Send(payload []byte) error {
 
 func (f *fakeTransport) Recv() ([]byte, error) {
 	select {
+	case err := <-f.recvErr:
+		return nil, err
 	case b := <-f.in:
 		return b, nil
 	case <-f.closed:
 		return nil, io.EOF
 	}
+}
+
+// failRecv makes the next Recv return err, the way a transport reports a
+// frame it could not decode (a corrupt deflate stream, a wrong framing).
+func (f *fakeTransport) failRecv(err error) {
+	f.recvErr <- err
 }
 
 func (f *fakeTransport) Close(r wire.CloseReason) error {

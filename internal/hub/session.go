@@ -59,6 +59,23 @@ func closeReasonFor(err error) wire.CloseReason {
 	return wire.CloseUnreadable
 }
 
+// transportCloseReason maps a transport Recv error onto the session verdict.
+// A transport that could not decode a frame reports it wrapped in
+// wire.ErrUnreadable (corrupt deflate, wrong framing); carrying that verdict
+// into the close is what tells the hub the log must be replayed from its
+// watermark instead of looking like an ordinary disconnect. Anything else is
+// a plain link drop.
+func transportCloseReason(err error) wire.CloseReason {
+	switch {
+	case errors.Is(err, wire.ErrProtocol):
+		return wire.CloseProtocol
+	case errors.Is(err, wire.ErrUnreadable):
+		return wire.CloseUnreadable
+	default:
+		return wire.CloseNormal
+	}
+}
+
 // session is one live host link. Its loop owns every timer and the uplink log
 // cursor; the relay writer and the bridge producer reach it through the
 // outbox mutex, the wake channel and the respond queue.
@@ -192,7 +209,7 @@ func (s *session) run(reader <-chan readResult) (wire.CloseReason, error) {
 			return wire.CloseNormal, errors.New("hub closed the connection during the handshake")
 		}
 		if r.err != nil {
-			return reasonOfError(r.err), r.err
+			return transportCloseReason(r.err), r.err
 		}
 		if reason, err := s.adoptHelloAck(r.data); err != nil {
 			log.Printf("[hub-client] 握手失败: %v", err)
@@ -235,7 +252,7 @@ func (s *session) run(reader <-chan readResult) (wire.CloseReason, error) {
 				return wire.CloseNormal, errors.New("hub closed the connection")
 			}
 			if r.err != nil {
-				return reasonOfError(r.err), r.err
+				return transportCloseReason(r.err), r.err
 			}
 			lastRecv = time.Now()
 			s.ackProgress = false

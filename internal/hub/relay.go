@@ -40,7 +40,7 @@ func (c *Client) serveRelay(s *session, f wire.Frame) {
 		go func() {
 			status, body := c.executeRelay(s, f.Method, f.Path, f.Body)
 			c.memo.finish(e, status, body)
-			s.respond(f.ReqID, status, body)
+			c.deliverRelay(f.ReqID, status, body)
 		}()
 		return
 	}
@@ -53,13 +53,29 @@ func (c *Client) serveRelay(s *session, f wire.Frame) {
 			return
 		}
 		if status, body, ok := c.memo.response(e); ok {
-			s.respond(f.ReqID, status, body)
+			c.deliverRelay(f.ReqID, status, body)
 			return
 		}
-		s.respond(f.ReqID, http.StatusConflict, mustJSON(map[string]any{
+		c.deliverRelay(f.ReqID, http.StatusConflict, mustJSON(map[string]any{
 			"ok": false, "error": "duplicate request",
 		}))
 	}()
+}
+
+// deliverRelay sends one finished answer on the session that is live NOW, not
+// the one that received the request. The execution deliberately outlives its
+// session, and the hub proved delivery of the request frame (it will not
+// retransmit it), so answering the dead link would strand the browser for the
+// whole relay deadline. With no live session the answer is dropped: respond is
+// not in the session seq log and the relay deadline owns its loss (§5.4).
+func (c *Client) deliverRelay(reqID string, status int, body json.RawMessage) bool {
+	s := c.currentSession()
+	if s == nil {
+		log.Printf("[hub-client] 请求已执行但当前无会话，响应丢失 reqId=%s（由中继超时接管）", reqID)
+		return false
+	}
+	s.respond(reqID, status, body)
+	return true
 }
 
 // executeRelay runs one relayed request against the local HTTP API and returns

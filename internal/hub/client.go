@@ -999,19 +999,25 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 		// Trim BEFORE the log so a later replay sends the same placeholders
 		// instead of resurrecting payloads for sessions nobody is watching.
 		c.trimUnwatched(evs)
+		var overflow error
 		for _, ev := range evs {
 			raw, err := json.Marshal(ev)
 			if err != nil {
 				continue
 			}
 			if err := c.out.appendEvent(raw); err != nil {
-				// The critical tail no longer fits: end the session so the
-				// hub replays after the reconnect.
-				if c.endSession(wire.CloseOverflow, err) {
-					log.Printf("[hub-client] %v", err)
+				// The critical tail no longer fits. Keep logging the rest of
+				// the batch — abandoning it would drop a turn terminal that
+				// lands behind the overflow point, and the next append would
+				// replace its seq with a silent placeholder — then end the
+				// session so the hub replays after the reconnect.
+				if overflow == nil {
+					overflow = err
 				}
-				return
 			}
+		}
+		if overflow != nil && c.endSession(wire.CloseOverflow, overflow) {
+			log.Printf("[hub-client] %v", overflow)
 		}
 		c.signal()
 	}

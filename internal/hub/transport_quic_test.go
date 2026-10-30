@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -775,5 +776,91 @@ func TestPinSPKIVerifyUnits(t *testing.T) {
 	}
 	if err := verify(nil, nil); err == nil {
 		t.Fatal("empty certificate chain accepted")
+	}
+}
+
+// injectCorruptControl writes a length prefix flagged as deflate followed by
+// bytes that are not a deflate stream: the host's control-stream decoder must
+// report ErrUnreadable.
+func (h *quicTestHub) injectCorruptControl(ctrl *quic.Stream) error {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	prefix := frameLengthPrefix(6, true)
+	if _, err := ctrl.Write(prefix[:]); err != nil {
+		return err
+	}
+	_, err := ctrl.Write([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	return err
+}
+
+// TestQUICCorruptDownlinkClosesUnreadable: a corrupt deflate stream from the
+// hub ends the host session with `unreadable` (so the reconnect replays from
+// the hub's watermark), never as an ordinary disconnect.
+func TestQUICCorruptDownlinkClosesUnreadable(t *testing.T) {
+	hub := newQUICTestHub(t, watchingAudience(1, "s1"))
+	hub.serve()
+	c := newQUICClient(t, hub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	res := make(chan sessionResult, 1)
+	go func() {
+		_, reason, err := c.quicSession(ctx, newTestBridge())
+		res <- sessionResult{reason: reason, err: err}
+	}()
+	ctrl := hub.control(t)
+	if err := hub.injectCorruptControl(ctrl); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+
+	select {
+	case r := <-res:
+		if r.reason != wire.CloseUnreadable {
+			t.Fatalf("corrupt downlink close = %s, want unreadable", r.reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not end on the corrupt frame")
+	}
+}
+
+// ── compression: bare and compressed uplinks ──────────────────────────
+
+// TestQUICBareAndCompressedFrames: a small frame stays bare (no flag bit, no
+// deflate), a large one is flagged; both decode to the same bytes at the hub.
+func TestQUICBareAndCompressedFrames(t *testing.T) {
+	hub := newQUICTestHub(t, watchingAudience(1, "s1"))
+	hub.serve()
+	c := newQUICClient(t, hub)
+	bridge := newTestBridge()
+	runForwardLoop(t, c, bridge)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _, _ = c.quicSession(ctx, bridge) }()
+	hub.control(t)
+
+	small := "tiny"
+	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": small})
+	first := hub.waitEvent(t, 5*time.Second)
+	var ev struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(first.Events[0], &ev); err != nil || ev.Text != small {
+		t.Fatalf("bare frame event = %s (%v)", first.Events[0], err)
+	}
+	hub.mu.Lock()
+	compressedAfterSmall := hub.binary
+	hub.mu.Unlock()
+	if compressedAfterSmall != 0 {
+		t.Fatalf("a %d-byte event was compressed (binary=%d)", len(small), compressedAfterSmall)
+	}
+
+	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": strings.Repeat("compressible ", 400)})
+	hub.waitEvent(t, 5*time.Second)
+	hub.mu.Lock()
+	compressedAfterBig := hub.binary
+	hub.mu.Unlock()
+	if compressedAfterBig == 0 {
+		t.Fatal("a large frame was not compressed after deflate was negotiated")
 	}
 }

@@ -48,6 +48,10 @@ import (
 const (
 	hubPort  = 18787
 	quicPort = 18788
+	// The WS e2e runs after the QUIC one (or alone); separate ports keep a
+	// lingering listener from the previous test out of the way.
+	wsHubPort  = 18797
+	wsQUICPort = 18798
 )
 
 // genCert writes a self-signed ECDSA cert/key pair and returns the
@@ -371,4 +375,132 @@ func TestE2EHubBinaryHostClientQUIC(t *testing.T) {
 	}
 
 	t.Log("E2E OK: QUIC+pin online, compressed uplink events, 4MB relay on request stream with live control plane")
+}
+
+// TestE2EHubBinaryHostClientWS is the WebSocket half of the cross-repo happy
+// path: the REAL hub binary, a browser /ws/fe subscriber, and the REAL host
+// client forced onto WebSocket. It asserts the v2 handshake surfaces the host
+// as online, the audience gate lets uplink events through, and a relayed
+// request is answered — the same contract the QUIC test pins.
+func TestE2EHubBinaryHostClientWS(t *testing.T) {
+	hubRepo := os.Getenv("CAPRI_E2E_HUB")
+	if hubRepo == "" {
+		t.Skip("CAPRI_E2E_HUB not set — cross-repo e2e disabled")
+	}
+	dir := t.TempDir()
+
+	hubBin := filepath.Join(dir, "capri-hub")
+	build := exec.Command("go", "build", "-o", hubBin, "github.com/AgentsHarness/capri-hub/cmd/capri-hub")
+	build.Dir = hubRepo
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build hub: %v\n%s", err, out)
+	}
+	logFile, _ := os.Create(filepath.Join(dir, "hub.log"))
+	hubProc := exec.Command(hubBin)
+	hubProc.Env = append(os.Environ(),
+		fmt.Sprintf("PORT=%d", wsHubPort),
+		fmt.Sprintf("QUIC_PORT=%d", wsQUICPort),
+	)
+	hubProc.Stdout = logFile
+	hubProc.Stderr = logFile
+	if err := hubProc.Start(); err != nil {
+		t.Fatalf("start hub: %v", err)
+	}
+	defer func() {
+		hubProc.Process.Kill()
+		hubProc.Wait()
+	}()
+	waitHTTP(t, fmt.Sprintf("http://127.0.0.1:%d/health", wsHubPort), 10*time.Second)
+	base := fmt.Sprintf("http://127.0.0.1:%d", wsHubPort)
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true,"via":"ws-e2e","path":"`+r.URL.Path+`"}`)
+	}))
+	defer local.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fe := dialFE(t, ctx, fmt.Sprintf("ws://127.0.0.1:%d/ws/fe?c=1&host=e2e", wsHubPort))
+	defer fe.conn.Close(websocket.StatusNormalClosure, "")
+
+	code, _ := getJSON(t, base+"/api/pairing")["code"].(string)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "e2e", HostName: "E2E"})
+	client := NewClient(Config{
+		URL:         base,
+		HostID:      "e2e",
+		HostName:    "E2E",
+		PairCode:    code,
+		LocalBase:   local.URL,
+		DisableQUIC: true,
+		StateFile:   filepath.Join(dir, "host-state.json"),
+	})
+	go client.Run(ctx, bridge)
+
+	// 1. Handshake + registry: the host is listed online under its hostId.
+	deadline := time.Now().Add(10 * time.Second)
+	online := false
+	for time.Now().Before(deadline) {
+		m := getJSON(t, base+"/api/hosts")
+		hosts, _ := m["hosts"].([]any)
+		for _, raw := range hosts {
+			h, _ := raw.(map[string]any)
+			if h["hostId"] == "e2e" && h["online"] == true {
+				online = true
+			}
+		}
+		if online && m["defaultHostId"] == "e2e" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !online {
+		hubLog, _ := os.ReadFile(filepath.Join(dir, "hub.log"))
+		t.Fatalf("host never came online over WS; hub log:\n%s", hubLog)
+	}
+
+	// 2. Audience: the browser subscriber exists, so the host's uplink is not
+	// paused; its events reach this FE over the compressed path.
+	if m := getJSON(t, base+"/api/subscribers"); m["count"].(float64) < 1 {
+		t.Fatalf("hub reported no browser subscriber: %+v", m)
+	}
+	helloOK := false
+	deadline2 := time.Now().Add(10 * time.Second)
+	for !helloOK && time.Now().Before(deadline2) {
+		bridge.Broadcast(acp.Event{"type": "chunk", "text": "ws e2e hello from host"})
+		select {
+		case ev := <-fe.events:
+			if b, _ := json.Marshal(ev); strings.Contains(string(b), "ws e2e hello") {
+				helloOK = true
+			}
+		case <-time.After(400 * time.Millisecond):
+		}
+	}
+	if !helloOK {
+		hubLog, _ := os.ReadFile(filepath.Join(dir, "hub.log"))
+		t.Fatalf("uplink events never reached the FE over WS; hub log:\n%s", hubLog)
+	}
+
+	// 3. Relay request/response over the multiplexed WS link.
+	resp, err := http.Get(base + "/api/status?host=e2e")
+	if err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var relayed map[string]any
+	if err := json.Unmarshal(body, &relayed); err != nil {
+		t.Fatalf("relay body %q: %v", body, err)
+	}
+	if relayed["via"] != "ws-e2e" || relayed["path"] != "/api/status" {
+		t.Fatalf("relay did not execute against the local API: %s", body)
+	}
+
+	// 4. The session really ran over WebSocket.
+	if tr := client.State().Transport; tr != TransportWS {
+		t.Fatalf("host session transport = %q, want ws", tr)
+	}
+
+	t.Log("E2E OK: WS handshake online, audience-gated uplink events, relayed request/response")
 }
