@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ── 单会话聚合统计（composer 状态条数据源）────────────────────────────
@@ -105,14 +107,41 @@ type sessionStatsAccumulator struct {
 
 // SessionStats 聚合指定会话的统计。cwd/sessionId 必填；文件不存在返回
 // 零值统计（不报错，前端按无数据显示）。
+//
+// 结果按 updates.jsonl 的 (size, mtime) 缓存：一次聚合要把整份文件读三遍
+// （行视图、rewind 过滤、逐行累计），32 MB 的会话实测 0.2 s；而前端只在
+// 回合终态与切换会话时问。源文件没变就不可能产生新答案，直接返回上一次的
+// 结果即可。
 func (b *Bridge) SessionStats(ctx context.Context, cwd, sessionID string) (*SessionStats, error) {
 	p := sessionUpdatesFile(b.grokHome(), cwd, sessionID)
 	if p == "" {
 		return nil, fmt.Errorf("无法解析会话目录 (cwd=%q)", cwd)
 	}
-	if _, err := os.Stat(p); err != nil {
-		return &SessionStats{}, nil
+	st, err := os.Stat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			b.stats.drop(p)
+			return &SessionStats{}, nil
+		}
+		return nil, err
 	}
+	size, mod := st.Size(), st.ModTime()
+	if cached, ok := b.stats.get(p, size, mod); ok {
+		out := *cached
+		return &out, nil
+	}
+
+	stats, err := computeSessionStats(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	b.stats.put(p, size, mod, stats)
+	return stats, nil
+}
+
+// computeSessionStats is the uncached aggregation (three passes over the
+// file: the turn view, the rewind-filtered order, and the accumulator).
+func computeSessionStats(ctx context.Context, p string) (*SessionStats, error) {
 	turnView, err := sessionLineView(p)
 	if err != nil {
 		return nil, err
@@ -157,6 +186,49 @@ func (b *Bridge) SessionStats(ctx context.Context, cwd, sessionID string) (*Sess
 	acc.finish()
 	acc.stats.Turns = int64(len(turnView.promptStarts))
 	return &acc.stats, nil
+}
+
+// sessionStatsEntry is one session's cached aggregation keyed by the source
+// file's (size, mtime).
+type sessionStatsEntry struct {
+	size    int64
+	modTime time.Time
+	stats   *SessionStats
+}
+
+// sessionStatsCache memoizes SessionStats the same way historyCache does for
+// the normalized history view, keyed on the file alone. An entry is dropped
+// when its file disappears (see SessionStats), so a deleted session stops
+// living in memory.
+type sessionStatsCache struct {
+	mu      sync.Mutex
+	entries map[string]*sessionStatsEntry
+}
+
+func (sc *sessionStatsCache) get(path string, size int64, mod time.Time) (*SessionStats, bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	ent, ok := sc.entries[path]
+	if !ok || ent.size != size || !ent.modTime.Equal(mod) {
+		return nil, false
+	}
+	return ent.stats, true
+}
+
+func (sc *sessionStatsCache) put(path string, size int64, mod time.Time, stats *SessionStats) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.entries == nil {
+		sc.entries = make(map[string]*sessionStatsEntry)
+	}
+	sc.entries[path] = &sessionStatsEntry{size: size, modTime: mod, stats: stats}
+}
+
+// drop forgets path after its file disappeared.
+func (sc *sessionStatsCache) drop(path string) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	delete(sc.entries, path)
 }
 
 // statsTags 预过滤：只对可能贡献统计的事件行做 JSON 解析。

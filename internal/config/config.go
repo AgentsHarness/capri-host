@@ -57,14 +57,41 @@ type Config struct {
 	// before the agent's 30-day session cleanup can delete the source
 	// updates.jsonl, so /usage history outlives that cleanup.
 	UsageLedger string
-	// Proxy is the HTTP(S) proxy exported to this process and to the grok
-	// agent child as HTTPS_PROXY/HTTP_PROXY/ALL_PROXY. Empty before
-	// WithSystemProxy means "use macOS system proxy if enabled".
+	// Proxy is the HTTP(S) proxy address. Empty before WithSystemProxy means
+	// "use the OS network proxy if enabled".
 	Proxy string
 	// NoProxy is NO_PROXY: the comma-separated hosts that bypass Proxy.
 	NoProxy string
+	// AgentProxy / HubProxy 是 Proxy 的两个用途开关：agent 子进程环境与
+	// hub 中继各自独立。关闭的一方直连，互不影响。nil = 开启（与拆分前
+	// 的行为一致，也让 Config{} 字面量保持「配了就两边都用」）。
+	AgentProxy *bool
+	HubProxy   *bool
 	// proxyFromSystem 表示 Proxy 来自 macOS 系统网络设置，只给日志用。
 	proxyFromSystem bool
+}
+
+// AgentProxyOn 报告 agent 子进程是否该走代理（nil 视为开启）。
+func (c Config) AgentProxyOn() bool { return c.AgentProxy == nil || *c.AgentProxy }
+
+// HubProxyOn 报告 hub 中继是否该走代理（nil 视为开启）。
+func (c Config) HubProxyOn() bool { return c.HubProxy == nil || *c.HubProxy }
+
+// AgentProxyURL 是本机拉起的 grok agent 子进程该用的代理地址（关掉时为空，
+// 表示不写代理环境变量）。
+func (c Config) AgentProxyURL() string {
+	if !c.AgentProxyOn() {
+		return ""
+	}
+	return strings.TrimSpace(c.Proxy)
+}
+
+// HubProxyURL 是 hub 中继该用的代理地址（关掉时为空，表示直连）。
+func (c Config) HubProxyURL() string {
+	if !c.HubProxyOn() {
+		return ""
+	}
+	return strings.TrimSpace(c.Proxy)
 }
 
 func Load() Config {
@@ -105,6 +132,8 @@ func merge(file File) Config {
 		UsageLedger:    strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
 		Proxy:          proxyURL(os.Getenv("PROXY"), file.Proxy),
 		NoProxy:        envOr("NO_PROXY", strings.TrimSpace(file.NoProxy)),
+		AgentProxy:     boolPtr(envFlag("AGENT_PROXY", file.ShouldAgentProxy())),
+		HubProxy:       boolPtr(envFlag("HUB_PROXY", file.ShouldHubProxy())),
 	}
 }
 
@@ -170,6 +199,8 @@ func envOr(k, def string) string {
 	}
 	return def
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 func strOr(v, def string) string {
 	if v != "" {

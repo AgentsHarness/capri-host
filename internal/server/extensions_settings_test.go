@@ -167,8 +167,8 @@ func TestSettingsMissingFile(t *testing.T) {
 	}
 }
 
-// A config.toml with the known sections returns the scalar subset under
-// ui/session/models/cli; unknown sections are dropped.
+// A config.toml returns every scalar table keyed by its TOML path; custom
+// model definitions ([model] / [model.<id>]) are filtered out.
 func TestSettingsEndpoint(t *testing.T) {
 	grok := withFakeGrokHome(t)
 	s := newLocalServer(t)
@@ -190,8 +190,20 @@ keepalive = 30
 [cli]
 color = "always"
 
-[secret-stuff]
-token = "never-exposed"
+[features]
+telemetry = false
+
+[toolset.ask_user_question]
+timeout_secs = 90
+
+[model.deepseek]
+api_key = "sk-secret"
+
+[model."anthropic/claude"]
+api_key = "sk-other"
+
+[subagents.toggle]
+minimal = true
 `), 0o644)
 
 	rec := getJSON(t, s, "/api/settings")
@@ -217,9 +229,20 @@ token = "never-exposed"
 	if cli["color"] != "always" {
 		t.Errorf("cli = %v", m["cli"])
 	}
-	// Unknown sections must not leak into the response.
-	if _, has := m["secret-stuff"]; has {
-		t.Errorf("resp = %s, want no unknown sections", rec.Body.String())
+	// Previously whitelisted sections are no longer the only ones returned.
+	features, _ := m["features"].(map[string]any)
+	if features["telemetry"] != false {
+		t.Errorf("features = %v", m["features"])
+	}
+	sub, _ := m["subagents.toggle"].(map[string]any)
+	if sub["minimal"] != true {
+		t.Errorf("subagents.toggle = %v", m["subagents.toggle"])
+	}
+	// Custom-model definitions never leak (they carry API keys).
+	for _, name := range []string{"model", "model.deepseek", `model."anthropic/claude"`} {
+		if _, has := m[name]; has {
+			t.Errorf("resp has %s, want custom-model tables filtered", name)
+		}
 	}
 }
 
@@ -412,8 +435,8 @@ theme = "dark"
 }
 
 // GET /api/settings exposes [toolset.ask_user_question] as the `toolset`
-// section but only the two timeout scalars — [toolset.bash] and the rest
-// of the subtree must not leak.
+// section with only the two timeout scalars; other [toolset.*] tables are
+// shown under their own TOML path.
 func TestSettingsToolsetRead(t *testing.T) {
 	grok := withFakeGrokHome(t)
 	s := newLocalServer(t)
@@ -444,7 +467,11 @@ find_bfs = true
 		t.Fatalf("toolset = %v, secret_key must be filtered", m["toolset"])
 	}
 	if _, has := ts["bash"]; has {
-		t.Fatalf("toolset = %v, [toolset.bash] must not leak", m["toolset"])
+		t.Fatalf("toolset = %v, [toolset.bash] must not be folded into toolset", m["toolset"])
+	}
+	bash, _ := m["toolset.bash"].(map[string]any)
+	if bash["find_bfs"] != true {
+		t.Fatalf("toolset.bash = %v, want the table under its own path", m["toolset.bash"])
 	}
 	ui, _ := m["ui"].(map[string]any)
 	if ui["theme"] != "dark" {

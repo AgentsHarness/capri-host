@@ -2162,9 +2162,10 @@ func (s *Server) handleExtensions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, scanExtensions(home))
 }
 
-// handleSettings — GET /api/settings: the SAFE subset of config.toml
-// ({ui, session, models, cli} sections, scalar values only). A missing
-// file yields {}. Writes go through POST /api/settings (whitelist).
+// handleSettings — GET /api/settings: every scalar config.toml table, keyed
+// by its TOML path, except the custom-model definitions ([model],
+// [model.<id>...]). A missing file yields {}. Writes go through
+// POST /api/settings (whitelist).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.settingsPayload())
 }
@@ -2333,15 +2334,27 @@ func (s *Server) settingsPayload() map[string]any {
 	}
 	sections := parseConfigTOML(path)
 	out := map[string]any{}
-	for _, name := range []string{"ui", "session", "models", "cli"} {
-		if kv, ok := sections[name]; ok && len(kv) > 0 {
-			out[name] = kv
+	for name, kv := range sections {
+		// Custom-model tables carry API keys and are edited through the
+		// 自定义模型 panel's own endpoints; [toolset.ask_user_question] is
+		// folded into `toolset` below so it is not dumped twice.
+		if isCustomModelTable(name) || name == "toolset.ask_user_question" || len(kv) == 0 {
+			continue
 		}
+		if name == "toolset" {
+			// Copy: the ask_user_question merge below must not mutate the
+			// parsed section map.
+			merged := make(map[string]any, len(kv)+1)
+			for k, v := range kv {
+				merged[k] = v
+			}
+			out[name] = merged
+			continue
+		}
+		out[name] = kv
 	}
 	// [toolset.ask_user_question] — exposed under `toolset` with ONLY the
-	// two FE-consumed timeout scalars. The rest of [toolset] (bash / web_search
-	// method tables, runtime-only structs) must not leak the same way other
-	// unknown sections are dropped above.
+	// two FE-consumed timeout scalars; the raw table is not dumped.
 	if aq, ok := sections["toolset.ask_user_question"]; ok {
 		filtered := map[string]any{}
 		for _, k := range []string{"timeout_enabled", "timeout_secs"} {
@@ -2350,8 +2363,20 @@ func (s *Server) settingsPayload() map[string]any {
 			}
 		}
 		if len(filtered) > 0 {
-			out["toolset"] = map[string]any{"ask_user_question": filtered}
+			ts, _ := out["toolset"].(map[string]any)
+			if ts == nil {
+				ts = map[string]any{}
+			}
+			ts["ask_user_question"] = filtered
+			out["toolset"] = ts
 		}
 	}
 	return out
+}
+
+// isCustomModelTable reports whether a config.toml table path is a custom-model
+// definition ([model] or [model.<id>...]). `[models]` is the catalog table and
+// stays visible.
+func isCustomModelTable(name string) bool {
+	return name == "model" || strings.HasPrefix(name, "model.")
 }

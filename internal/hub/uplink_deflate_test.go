@@ -50,133 +50,111 @@ func TestDeflatePayloadThresholds(t *testing.T) {
 	}
 }
 
-// TestWSUplinkDeflateNegotiated runs a WS session against a fake hub that
-// echoes "deflate":true in its hello, then verifies uplink events arrive as
-// binary [0x01][flate] frames and decompress to the original JSON — and that
-// without the echo everything stays raw text JSON.
-func TestWSUplinkDeflateNegotiated(t *testing.T) {
-	for _, tt := range []struct {
-		name     string
-		echo     bool
-		wantBin  bool
-		wantText bool
-	}{
-		{name: "negotiated", echo: true, wantBin: true},
-		{name: "legacy-hub-raw-json", echo: false, wantText: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			var mu sync.Mutex
-			var sawBinary bool
-			var sawText bool
-			gotEvents := make(chan map[string]any, 8)
-			sawHeader := ""
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				sawHeader = r.Header.Get("X-Hub-Deflate")
-				conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+// TestWSUplinkDeflate runs a WS session against a hub and verifies uplink
+// events arrive as binary raw-deflate frames that decompress to the original
+// JSON. Compression is part of the protocol, not a negotiated option.
+func TestWSUplinkDeflate(t *testing.T) {
+	var mu sync.Mutex
+	var sawBinary bool
+	var sawText bool
+	gotEvents := make(chan map[string]any, 8)
+	sawHeader := ""
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawHeader = r.Header.Get("X-Hub-Deflate")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		ctx := r.Context()
+		hello := map[string]any{
+			"v": 1, "type": "hello", "service": "hub", "subscribers": 1, "seq": 0,
+			"deflate": true, "pingInterval": 5, "idleTimeout": 20,
+		}
+		hb, _ := json.Marshal(hello)
+		if err := conn.Write(ctx, websocket.MessageText, hb); err != nil {
+			return
+		}
+		for {
+			mt, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			if mt == websocket.MessageBinary {
+				mu.Lock()
+				sawBinary = true
+				mu.Unlock()
+				// Hub wire rule: a binary message IS the raw-deflate stream
+				// (no magic prefix). See PROTOCOL.md.
+				rc := flate.NewReader(bytes.NewReader(data))
+				raw, err := io.ReadAll(rc)
 				if err != nil {
+					t.Errorf("inflate: %v", err)
 					return
 				}
-				defer conn.Close(websocket.StatusNormalClosure, "")
-				ctx := r.Context()
-				hello := map[string]any{"v": 1, "type": "hello", "service": "hub", "subscribers": 1, "seq": 0}
-				if tt.echo {
-					hello["deflate"] = true
-				}
-				hb, _ := json.Marshal(hello)
-				if err := conn.Write(ctx, websocket.MessageText, hb); err != nil {
-					return
-				}
-				for {
-					mt, data, err := conn.Read(ctx)
-					if err != nil {
-						return
-					}
-					if mt == websocket.MessageBinary {
-						mu.Lock()
-						sawBinary = true
-						mu.Unlock()
-						// Hub wire rule: a binary message IS the raw-deflate
-						// stream (no magic prefix). See PROTOCOL.md.
-						rc := flate.NewReader(bytes.NewReader(data))
-						raw, err := io.ReadAll(rc)
-						if err != nil {
-							t.Errorf("inflate: %v", err)
-							return
-						}
-						data = raw
-					} else {
-						mu.Lock()
-						sawText = true
-						mu.Unlock()
-					}
-					var frame struct {
-						Type   string           `json:"type"`
-						Events []map[string]any `json:"events"`
-					}
-					if json.Unmarshal(data, &frame) != nil || frame.Type != "events" {
-						continue
-					}
-					for _, ev := range frame.Events {
-						gotEvents <- ev
-					}
-				}
-			}))
-			defer ts.Close()
+				data = raw
+			} else {
+				mu.Lock()
+				sawText = true
+				mu.Unlock()
+			}
+			var frame struct {
+				Type   string           `json:"type"`
+				Events []map[string]any `json:"events"`
+			}
+			if json.Unmarshal(data, &frame) != nil || frame.Type != "events" {
+				continue
+			}
+			for _, ev := range frame.Events {
+				gotEvents <- ev
+			}
+		}
+	}))
+	defer ts.Close()
 
-			c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", DisableQUIC: true})
-			c.sendCh = make(chan []byte, 64)
-			c.reqCh = make(chan reqFrame, 8)
-			bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+	c := NewClient(Config{URL: ts.URL, HostID: "h1", Token: "tok123", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 64)
+	c.reqCh = make(chan reqFrame, 8)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			fwdCtx, fwdCancel := context.WithCancel(ctx)
-			defer fwdCancel()
-			go c.forwardLoop(fwdCtx, bridge)
-			sessDone := make(chan error, 1)
-			go func() { sessDone <- c.wsSession(ctx, bridge) }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fwdCtx, fwdCancel := context.WithCancel(ctx)
+	defer fwdCancel()
+	go c.forwardLoop(fwdCtx, bridge)
+	sessDone := make(chan error, 1)
+	go func() { sessDone <- c.wsSession(ctx, bridge) }()
 
-			deadline := time.After(5 * time.Second)
-			for !c.forwardingEnabled() && !c.deflateOK.Load() {
-				select {
-				case <-deadline:
-					t.Fatalf("forwarding=%v deflate=%v (session err: %v)",
-						c.forwardingEnabled(), c.deflateOK.Load(), <-sessDone)
-				case <-time.After(10 * time.Millisecond):
-				}
-			}
-			if tt.echo && !c.deflateOK.Load() {
-				t.Fatal("deflate not armed despite hello echo")
-			}
-			if !tt.echo && c.deflateOK.Load() {
-				t.Fatal("deflate armed without hub echo")
-			}
+	deadline := time.After(5 * time.Second)
+	for !c.forwardingEnabled() || !c.deflateOK.Load() {
+		select {
+		case <-deadline:
+			t.Fatalf("forwarding=%v deflate=%v (session err: %v)",
+				c.forwardingEnabled(), c.deflateOK.Load(), <-sessDone)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 
-			// A large compressible event (> minCompressSize).
-			bridge.Broadcast(acp.Event{"type": "chunk", "sessionId": "s1",
-				"text": strings.Repeat("压流量测试 ", 128)})
-			select {
-			case ev := <-gotEvents:
-				if !strings.HasPrefix(ev["text"].(string), "压流量测试 ") {
-					t.Fatalf("event text corrupted: %v", ev)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("no events observed")
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if tt.wantBin && !sawBinary {
-				t.Error("expected at least one compressed binary uplink frame")
-			}
-			if tt.wantText && sawBinary {
-				t.Error("legacy hub must never receive binary frames")
-			}
-			if tt.wantText && !sawText {
-				t.Error("expected raw text uplink frames")
-			}
-			if sawHeader != "1" {
-				t.Errorf("X-Hub-Deflate offer header = %q, want 1", sawHeader)
-			}
-		})
+	// A large compressible event (> minCompressSize).
+	bridge.Broadcast(acp.Event{"type": "chunk", "sessionId": "s1",
+		"text": strings.Repeat("压流量测试 ", 128)})
+	select {
+	case ev := <-gotEvents:
+		if !strings.HasPrefix(ev["text"].(string), "压流量测试 ") {
+			t.Fatalf("event text corrupted: %v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no events observed")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !sawBinary {
+		t.Error("expected at least one compressed binary uplink frame")
+	}
+	if sawText && sawBinary && sawHeader != "1" {
+		t.Error("X-Hub-Deflate offer header missing")
+	}
+	if sawHeader != "1" {
+		t.Errorf("X-Hub-Deflate offer header = %q, want 1", sawHeader)
 	}
 }

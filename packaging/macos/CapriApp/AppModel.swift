@@ -22,6 +22,8 @@ final class AppModel: ObservableObject {
     @Published var grokBin = ""
     @Published var proxy = ""
     @Published var noProxy = ""
+    @Published var agentProxy = true
+    @Published var hubProxy = true
     @Published var startHostOnLaunch = true
     @Published var hubTokenReady = false
     @Published var hubTokenCaption = ""
@@ -77,6 +79,8 @@ final class AppModel: ObservableObject {
         grokBin = f.grokBin ?? ""
         proxy = f.proxy ?? ""
         noProxy = f.noProxy ?? ""
+        agentProxy = f.shouldAgentProxy
+        hubProxy = f.shouldHubProxy
         startHostOnLaunch = f.shouldStartHostOnLaunch
         startAtLogin = f.shouldStartAtLogin || Autostart.isEnabled
         keepAwake = sleepInhibitor.isEnabled || f.shouldKeepAwake
@@ -441,6 +445,8 @@ final class AppModel: ObservableObject {
                 f.grokBin = grokBin.trimmingCharacters(in: .whitespacesAndNewlines)
                 f.proxy = proxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 f.noProxy = noProxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                f.agentProxy = agentProxy
+                f.hubProxy = hubProxy
                 // 后端专用项，设置界面不暴露。update 在锁内重新从磁盘读取，
                 // 未在此处赋值的键会原样保留；唯独 ConfigFile 里没声明的键会在
                 // 解码阶段就被丢掉，所以 hub_quic_host 必须声明（见 ConfigFile.swift）。

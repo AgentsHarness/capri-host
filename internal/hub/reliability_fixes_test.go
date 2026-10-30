@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"strings"
 	"testing"
@@ -11,6 +12,116 @@ import (
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 )
+
+func TestLiveSendStopsAtAHole(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 1)
+	c.sendCh <- []byte("full")
+
+	c.enqueueEvents([]acp.Event{{"type": "chunk", "text": "a", "seq": uint64(1)}})
+	if !c.needCatchUp.Load() {
+		t.Fatal("a dropped batch must flag catch-up")
+	}
+	<-c.sendCh
+	c.enqueueEvents([]acp.Event{{"type": "chunk", "text": "b", "seq": uint64(2)}})
+	select {
+	case p := <-c.sendCh:
+		t.Fatalf("live send stepped past the hole: %s", p)
+	default:
+	}
+}
+
+func TestSeqResetFailureSkipsReplay(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	c.sendCh = make(chan []byte, 1)
+	c.sendCh <- []byte("full")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.bindSession(ctx, cancel)
+	c.seqAndReplay([]acp.Event{{"type": "chunk", "seq": uint64(1)}})
+
+	if err := c.handleHelloSeq(50); err == nil {
+		t.Fatal("seq_reset that did not queue must fail the hello")
+	}
+	select {
+	case p := <-c.sendCh:
+		if string(p) != "full" {
+			t.Fatalf("queue head = %q, want the pre-existing frame", p)
+		}
+	default:
+		t.Fatal("filler frame missing")
+	}
+	select {
+	case p := <-c.sendCh:
+		t.Fatalf("replay followed a dropped seq_reset: %s", p)
+	default:
+	}
+}
+
+func TestReplayKeepsUnacked(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	c.hubAckSeq = 5
+	evs := make([]acp.Event, replayHighWater+10)
+	for i := range evs {
+		evs[i] = acp.Event{"type": "chunk", "seq": uint64(i + 1)}
+	}
+	c.seqAndReplay(evs)
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	for _, it := range c.replay {
+		if it.seq == 6 {
+			return
+		}
+	}
+	t.Fatalf("unacked seq 6 missing from ring of %d", len(c.replay))
+}
+
+func TestOversizedEventBecomesPlaceholder(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	ev := acp.Event{
+		"type": "chunk",
+		"seq":  uint64(7),
+		"text": strings.Repeat("x", maxFrameBytes),
+	}
+	c.seqAndReplay([]acp.Event{ev})
+	if ev["type"] != "error" {
+		t.Fatalf("type = %v, want error placeholder", ev["type"])
+	}
+	if ev["seq"] != uint64(7) {
+		t.Fatalf("seq = %v, want 7", ev["seq"])
+	}
+}
+
+func TestLiveBatchSplitsOnBudget(t *testing.T) {
+	c := NewClient(Config{HostID: "h1"})
+	c.sendCh = make(chan []byte, 4)
+	text := strings.Repeat("a", replayFrameBudget)
+	c.enqueueEvents([]acp.Event{
+		{"type": "chunk", "seq": uint64(1), "text": text},
+		{"type": "chunk", "seq": uint64(2), "text": text},
+	})
+	if c.needCatchUp.Load() {
+		t.Fatal("two legal events must not be dropped as one oversized frame")
+	}
+	var seqs []uint64
+	for i := 0; i < 2; i++ {
+		select {
+		case p := <-c.sendCh:
+			var f struct {
+				SeqStart uint64 `json:"seqStart"`
+			}
+			if json.Unmarshal(p, &f) != nil {
+				t.Fatalf("bad frame %d bytes", len(p))
+			}
+			seqs = append(seqs, f.SeqStart)
+		default:
+			t.Fatalf("frame %d was not queued (got %v)", i, seqs)
+		}
+	}
+	if len(seqs) != 2 || seqs[0] != 1 || seqs[1] != 2 {
+		t.Fatalf("seqStarts = %v, want [1 2]", seqs)
+	}
+}
 
 // TestEnqueueEventsTryLockDoesNotBlock: while a replay holds the ordering
 // lock (each critical frame briefly blocking on a full queue), a live
@@ -408,5 +519,271 @@ func TestQueueDropLogThrottled(t *testing.T) {
 	}
 	if n := strings.Count(out, "\n"); n != 3 {
 		t.Fatalf("rollover logged %d lines, want 3 (summary + first drop of new window):\n%s", n, out)
+	}
+}
+
+// TestReconnectBackoffSequence pins the reconnect schedule: it doubles from
+// 1s but must never sleep longer than reconnectBackoffMax. The old inline
+// check (`if d < 30s { d *= 2 }`) overshot to 32s, which is why the log
+// showed a final 32s wait under a nominal 30s cap — and with a 15s dial
+// timeout on a lossy cross-border path, one burst cost ~140s of downtime.
+func TestReconnectBackoffSequence(t *testing.T) {
+	got := []time.Duration{time.Second}
+	d := time.Second
+	for i := 0; i < 8; i++ {
+		d = nextBackoff(d)
+		got = append(got, d)
+	}
+	want := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		reconnectBackoffMax,
+		reconnectBackoffMax,
+		reconnectBackoffMax,
+		reconnectBackoffMax,
+		reconnectBackoffMax,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("sequence length = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff[%d] = %v, want %v (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// A session that stayed up long enough resets the reconnect delay to 1s;
+// a short one keeps escalating. A fresh credential (pair/repair) resets it
+// too, in both the pairing loop and the reconnect loop.
+func TestReconnectDelayResetRule(t *testing.T) {
+	if got := reconnectDelay(reconnectBackoffMax, healthySessionMin, false); got != time.Second {
+		t.Errorf("healthy session delay = %v, want 1s", got)
+	}
+	if got := reconnectDelay(time.Second, healthySessionMin-time.Millisecond, false); got != 2*time.Second {
+		t.Errorf("short session delay = %v, want 2s (escalate)", got)
+	}
+	if got := reconnectDelay(reconnectBackoffMax, 0, true); got != time.Second {
+		t.Errorf("repaired delay = %v, want 1s", got)
+	}
+	// The shortened dial timeout plus the capped delay stays well below the
+	// old 15s + 32s stacking.
+	if wsDialTimeout+reconnectBackoffMax >= 30*time.Second {
+		t.Errorf("dial timeout %v + cap %v stacks past the old failure", wsDialTimeout, reconnectBackoffMax)
+	}
+}
+
+// TestHelloDoesNotDoubleReplay: hello carries both subscribers and seq, and
+// in one branch used to trigger TWO catch-ups — applySubscribers' 0→1 replay
+// (from lastSentSeq) followed by handleHelloSeq's replay (from hello.seq,
+// which is <= lastSentSeq). The first interval is fully contained in the
+// second, so the same events were queued twice (up to 2×replayCap into a
+// 256-slot queue), and their critical enqueues timed out and re-armed
+// needCatchUp. Every seq must appear exactly once.
+func TestHelloDoesNotDoubleReplay(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 64)
+	c.setBrowserSubscribers(0) // paused: hello is a 0→1 transition
+	c.seqAndReplay([]acp.Event{
+		{"type": "chunk", "text": "a", "seq": uint64(1)},
+		{"type": "chunk", "text": "b", "seq": uint64(2)},
+		{"type": "chunk", "text": "c", "seq": uint64(3)},
+	})
+
+	hello := []byte(`{"v":1,"type":"hello","subscribers":1,"seq":0,"deflate":true,"pingInterval":5,"idleTimeout":20}`)
+	sent := false
+	recv := func() ([]byte, error) {
+		if sent {
+			return nil, io.EOF
+		}
+		sent = true
+		return hello, nil
+	}
+	if err := c.readLoop(context.Background(), recv, newStatusBridge()); err == nil {
+		t.Fatal("readLoop must surface the recv error once the frame stream ends")
+	}
+
+	if !c.forwardingEnabled() {
+		t.Fatal("hello with subscribers>=1 must enable forwarding")
+	}
+	counts := map[uint64]int{}
+	var order []uint64
+drain:
+	for {
+		select {
+		case payload := <-c.sendCh:
+			var f struct {
+				Type   string           `json:"type"`
+				Events []map[string]any `json:"events"`
+			}
+			if json.Unmarshal(payload, &f) != nil || f.Type != "events" {
+				continue
+			}
+			for _, ev := range f.Events {
+				s := eventSeq(ev)
+				counts[s]++
+				order = append(order, s)
+			}
+		default:
+			break drain
+		}
+	}
+	if len(counts) != 3 {
+		t.Fatalf("replayed seqs = %v, want 1..3", order)
+	}
+	for _, s := range order {
+		if counts[s] != 1 {
+			t.Fatalf("seq %d replayed %d times (order %v); hello must not double-replay", s, counts[s], order)
+		}
+	}
+	for i := 1; i < len(order); i++ {
+		if order[i] <= order[i-1] {
+			t.Fatalf("replay order not strictly increasing: %v", order)
+		}
+	}
+}
+
+// TestHelloWithoutSeqFailsSession: hello.seq is mandatory. A hub that omits
+// it predates the current resume protocol, and the session must fail rather
+// than silently running without a catch-up path (buffered events would sit in
+// the ring forever while the FE waits on predecessors neither side can
+// produce).
+func TestHelloWithoutSeqFailsSession(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 64)
+	c.setBrowserSubscribers(0) // paused: hello would be a 0→1 transition
+	c.seqAndReplay([]acp.Event{
+		{"type": "chunk", "text": "a", "seq": uint64(1)},
+		{"type": "chunk", "text": "b", "seq": uint64(2)},
+	})
+
+	hello := []byte(`{"v":1,"type":"hello","subscribers":1}`)
+	sent := false
+	err := c.readLoop(context.Background(), func() ([]byte, error) {
+		if sent {
+			return nil, io.EOF
+		}
+		sent = true
+		return hello, nil
+	}, newStatusBridge())
+	if err == nil || !strings.Contains(err.Error(), "版本过旧") {
+		t.Fatalf("readLoop err = %v, want a version-gate failure", err)
+	}
+	if c.forwardingEnabled() {
+		t.Fatal("an outdated hello must not enable forwarding")
+	}
+}
+
+// TestReplayYieldsToQueuePressure: a replay must stop pushing frames once
+// the send queue is at least half full. Continuing made every remaining
+// critical enqueue wait 5s, time out, re-arm needCatchUp and replay the same
+// batch on the next beat — the amplification loop behind the 2026-10-22
+// storm. What did land must stay in seq order with lastSentSeq advanced, so
+// the next repair continues exactly where it stopped.
+func TestReplayYieldsToQueuePressure(t *testing.T) {
+	c := NewClient(Config{URL: "http://x", HostID: "h1", Token: "tok", DisableQUIC: true})
+	c.sendCh = make(chan []byte, 8)
+
+	big := strings.Repeat("x", 300<<10) // 8 events ≈ 2.4MB → 3 frames at the 1MB budget
+	evs := make([]acp.Event, 0, 8)
+	for i := 1; i <= 8; i++ {
+		evs = append(evs, acp.Event{"type": "chunk", "text": big, "seq": uint64(i)})
+	}
+	c.seqAndReplay(evs)
+	c.setBrowserSubscribers(1)
+
+	for i := 0; i < 4; i++ {
+		c.sendCh <- []byte("backlog") // half full: over the pressure threshold
+	}
+
+	start := time.Now()
+	c.enqueueMu.Lock()
+	last := c.enqueueReplayLocked(replayItemsOf(evs))
+	c.enqueueMu.Unlock()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("replay blocked for %v (critical enqueue timeout) instead of yielding", elapsed)
+	}
+	if last != 3 {
+		t.Fatalf("last enqueued seq = %d, want 3 (first frame only)", last)
+	}
+	if n := len(c.sendCh); n != 5 {
+		t.Fatalf("sendCh = %d frames, want 4 backlog + exactly 1 replay frame", n)
+	}
+	if !c.needCatchUp.Load() {
+		t.Fatal("yielded replay must set needCatchUp for the repair path")
+	}
+	c.seqMu.Lock()
+	gotLast := c.lastSentSeq
+	c.seqMu.Unlock()
+	if gotLast != 3 {
+		t.Fatalf("lastSentSeq = %d, want 3 (only the enqueued frame advances it)", gotLast)
+	}
+
+	// The frame that did land carries seq 1..3 in order.
+	for i := 0; i < 4; i++ {
+		<-c.sendCh
+	}
+	var seqStart uint64
+	var seqs []uint64
+	select {
+	case payload := <-c.sendCh:
+		var f struct {
+			Type     string           `json:"type"`
+			SeqStart uint64           `json:"seqStart"`
+			Events   []map[string]any `json:"events"`
+		}
+		if json.Unmarshal(payload, &f) != nil || f.Type != "events" {
+			t.Fatalf("bad replay frame: %.60s", payload)
+		}
+		seqStart = f.SeqStart
+		for _, ev := range f.Events {
+			seqs = append(seqs, eventSeq(ev))
+		}
+	default:
+		t.Fatal("yielded replay enqueued nothing")
+	}
+	if seqStart != 1 || len(seqs) != 3 || seqs[0] != 1 || seqs[2] != 3 {
+		t.Fatalf("frame seqStart=%d seqs=%v, want 1 and 1..3", seqStart, seqs)
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] <= seqs[i-1] {
+			t.Fatalf("frame seqs not increasing: %v", seqs)
+		}
+	}
+
+	// The repair path resumes exactly after the yielded point.
+	c.needCatchUp.Store(true)
+	c.repairDroppedEvents()
+	var repaired []uint64
+drain:
+	for {
+		select {
+		case payload := <-c.sendCh:
+			var f struct {
+				Type   string           `json:"type"`
+				Events []map[string]any `json:"events"`
+			}
+			if json.Unmarshal(payload, &f) != nil || f.Type != "events" {
+				continue
+			}
+			for _, ev := range f.Events {
+				repaired = append(repaired, eventSeq(ev))
+			}
+		default:
+			break drain
+		}
+	}
+	if len(repaired) != 5 {
+		t.Fatalf("repair replayed seqs %v, want 4..8", repaired)
+	}
+	for i, s := range repaired {
+		if s != uint64(i+4) {
+			t.Fatalf("repair replayed seqs %v, want 4..8 in order", repaired)
+		}
+	}
+	if c.needCatchUp.Load() {
+		t.Fatal("completed repair must clear needCatchUp")
 	}
 }

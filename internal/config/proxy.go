@@ -13,17 +13,38 @@ var proxyEnvKeys = []string{
 	"https_proxy", "http_proxy", "all_proxy",
 }
 
-// ApplyProxyEnv 把配置里的代理导出成标准环境变量，让本进程（hub 的
-// WebSocket / HTTP 中继）以及它拉起的 grok agent 都走代理。
+// ApplyProxyEnv 把配置里的代理导出成标准环境变量，让本进程以及它拉起的
+// grok agent 都走代理。保留给不走菜单栏的装配方（命令行 / launchd）。
 //
-// Proxy 为空时是 no-op：不写环境变量。菜单栏启动请先 WithSystemProxy，
-// 把系统网络设置填进 Proxy；命令行 / launchd 已经设过 HTTPS_PROXY 的，
-// 系统也没开代理时不会被覆盖。
+// 菜单栏应用起的 host 不用它：Agent 走 AgentEnv（子进程环境），Hub 走
+// hub.Config.Proxy（自己的 transport），两个开关因此互不影响。
+//
+// Proxy 为空时是 no-op：不写环境变量。
 func (c Config) ApplyProxyEnv() {
-	p := strings.TrimSpace(c.Proxy)
-	if p == "" {
-		return
+	if p := strings.TrimSpace(c.Proxy); p != "" {
+		c.setProxyEnv(p)
 	}
+}
+
+// AgentEnv 返回 agent 子进程要叠加的环境变量，两个方向都由它决定：开着
+// 代理就给代理地址，关掉就给空值覆盖。不能指望 host 进程自己的环境：菜单
+// 栏起的 host 没有代理变量，而关掉开关时又必须压掉从 launchd 继承来的值。
+func (c Config) AgentEnv() []string {
+	env := make([]string, 0, len(proxyEnvKeys)+2)
+	url := c.AgentProxyURL()
+	for _, k := range proxyEnvKeys {
+		env = append(env, k+"="+url)
+	}
+	if url == "" {
+		return append(env, "NO_PROXY=", "no_proxy=")
+	}
+	if np := strings.TrimSpace(c.NoProxy); np != "" {
+		env = append(env, "NO_PROXY="+np, "no_proxy="+np)
+	}
+	return env
+}
+
+func (c Config) setProxyEnv(p string) {
 	for _, k := range proxyEnvKeys {
 		_ = os.Setenv(k, p)
 	}
@@ -33,8 +54,17 @@ func (c Config) ApplyProxyEnv() {
 	}
 }
 
+// ClearProxyEnv 清掉进程里的代理变量。供需要「完全不读环境代理」的装配方
+// 使用；菜单栏启动的 host 不依赖它（Hub 代理在 transport 层判定）。
+func ClearProxyEnv() {
+	for _, k := range proxyEnvKeys {
+		_ = os.Unsetenv(k)
+	}
+}
+
 // WithSystemProxy 在 Proxy 未手写时，用 macOS 系统网络设置里的
 // HTTP/HTTPS/SOCKS 代理填上（PAC 自动配置不支持）。系统也没开则原样返回。
+// 这是默认启动路径：没有配置就跟随系统代理。
 func (c Config) WithSystemProxy() Config {
 	if strings.TrimSpace(c.Proxy) != "" {
 		return c

@@ -15,7 +15,7 @@ func clearHostEnv(t *testing.T) {
 		"HUB_URL", "HUB_PAIR_CODE", "HOST_TOKEN",
 		"HOST_ID", "HOST_NAME", "HUB_QUIC_PIN", "HUB_QUIC_HOST", "HUB_QUIC_DISABLE",
 		"FE_TOKEN", "ACCESS_TOKEN", "RESIDENT_CAP", "USAGE_LEDGER",
-		"PROXY", "NO_PROXY", "no_proxy",
+		"PROXY", "NO_PROXY", "no_proxy", "AGENT_PROXY", "HUB_PROXY",
 	} {
 		t.Setenv(k, "")
 	}

@@ -76,6 +76,108 @@ func TestApplyProxyEnvSetsBothCases(t *testing.T) {
 	}
 }
 
+// 两个开关各自只影响自己那一侧：关掉 Hub 代理时 Hub 侧直连，但 Agent
+// 仍拿到代理地址；反过来同理。这是「开关可独立控制」的核心约束。
+func TestProxySwitchesAreIndependent(t *testing.T) {
+	off := false
+	cfg := Config{Proxy: "http://127.0.0.1:7890", HubProxy: &off}
+	if got := cfg.HubProxyURL(); got != "" {
+		t.Errorf("hub proxy off: HubProxyURL = %q, want empty", got)
+	}
+	if got := cfg.AgentProxyURL(); got != "http://127.0.0.1:7890" {
+		t.Errorf("hub proxy off must not affect agent, got %q", got)
+	}
+	// Agent 侧开着代理：AgentEnv 必须把地址交给子进程，而不是指望它从
+	// host 进程继承（菜单栏起的 host 环境里没有代理变量）。
+	env := cfg.AgentEnv()
+	for _, k := range proxyEnvKeys {
+		if !contains(env, k+"=http://127.0.0.1:7890") {
+			t.Errorf("hub proxy off: AgentEnv missing %s: %v", k, env)
+		}
+	}
+
+	agentOff := false
+	cfg = Config{Proxy: "http://127.0.0.1:7890", AgentProxy: &agentOff}
+	if got := cfg.AgentProxyURL(); got != "" {
+		t.Errorf("agent proxy off: AgentProxyURL = %q, want empty", got)
+	}
+	if got := cfg.HubProxyURL(); got != "http://127.0.0.1:7890" {
+		t.Errorf("agent proxy off must not affect hub, got %q", got)
+	}
+	agentOffEnv := cfg.AgentEnv()
+	if !contains(agentOffEnv, "HTTPS_PROXY=") || !contains(agentOffEnv, "https_proxy=") {
+		t.Errorf("agent proxy off: overrides missing proxy vars: %v", agentOffEnv)
+	}
+}
+
+// 两个都关：两侧都直连。
+func TestProxyBothOff(t *testing.T) {
+	off := false
+	cfg := Config{Proxy: "http://127.0.0.1:7890", AgentProxy: &off, HubProxy: &off}
+	if cfg.AgentProxyURL() != "" || cfg.HubProxyURL() != "" {
+		t.Fatalf("both off must be direct: agent=%q hub=%q", cfg.AgentProxyURL(), cfg.HubProxyURL())
+	}
+}
+
+// 缺省（未写配置）跟随系统代理：WithSystemProxy 填上的地址两侧都生效。
+func TestProxyDefaultsFollowSystemProxy(t *testing.T) {
+	orig := lookupSystemProxy
+	t.Cleanup(func() { lookupSystemProxy = orig })
+	lookupSystemProxy = func() (string, string) { return "http://127.0.0.1:7890", "localhost" }
+
+	cfg := Config{}.WithSystemProxy()
+	if cfg.Proxy == "" {
+		t.Fatal("system proxy should fill an unset Proxy")
+	}
+	if cfg.AgentProxyURL() != cfg.Proxy || cfg.HubProxyURL() != cfg.Proxy {
+		t.Fatalf("defaults must apply to both sides: agent=%q hub=%q", cfg.AgentProxyURL(), cfg.HubProxyURL())
+	}
+}
+
+// 两者都开时 AgentEnv 把代理地址交给子进程——host 自身环境里可能没有
+// 代理变量（菜单栏启动），子进程不能只靠继承。
+func TestAgentEnvCarriesProxyWhenOn(t *testing.T) {
+	cfg := Config{Proxy: "http://127.0.0.1:7890"}
+	env := cfg.AgentEnv()
+	for _, k := range proxyEnvKeys {
+		if !contains(env, k+"=http://127.0.0.1:7890") {
+			t.Errorf("AgentEnv missing %s: %v", k, env)
+		}
+	}
+	// 没配 NoProxy 时不写 NO_PROXY，免得压掉继承来的排除列表。
+	if contains(env, "NO_PROXY=") || contains(env, "no_proxy=") {
+		t.Errorf("AgentEnv wrote empty NO_PROXY with proxy on: %v", env)
+	}
+}
+
+// 配了 NoProxy 就一起交给子进程，大小写各一份。
+func TestAgentEnvCarriesNoProxy(t *testing.T) {
+	cfg := Config{Proxy: "http://127.0.0.1:7890", NoProxy: "localhost,127.0.0.1"}
+	env := cfg.AgentEnv()
+	if !contains(env, "NO_PROXY=localhost,127.0.0.1") || !contains(env, "no_proxy=localhost,127.0.0.1") {
+		t.Fatalf("AgentEnv missing NO_PROXY: %v", env)
+	}
+}
+
+// 没配代理地址时 Close 不做无谓覆盖：AgentEnv 仍注入空值，避免从
+// launchd 继承来的 HTTPS_PROXY 让 agent 偷偷走代理。
+func TestAgentEnvClearsInheritedProxyWithoutConfig(t *testing.T) {
+	clearHostEnv(t)
+	cfg := Load()
+	if env := cfg.AgentEnv(); !contains(env, "HTTPS_PROXY=") {
+		t.Fatalf("AgentEnv = %v, want HTTPS_PROXY override", env)
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
 // 日志里的代理地址不能带出密码。
 func TestProxyDescriptionRedactsPassword(t *testing.T) {
 	if got := (Config{}).ProxyDescription(); got != "" {

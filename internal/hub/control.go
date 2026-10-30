@@ -97,6 +97,21 @@ func (c *Client) State() State {
 	st.LastError = c.lastErr
 	c.ctlMu.Unlock()
 
+	// Data-plane diagnostics: read-only, and len() on a nil channel is 0, so
+	// this is safe before Run has wired the queues.
+	c.seqMu.Lock()
+	st.ReplayEvents = len(c.replay)
+	st.ReplayBytes = int64(c.replayBytes)
+	st.NextSeq = c.nextSeq
+	st.LastSentSeq = c.lastSentSeq
+	st.HubAckSeq = c.hubAckSeq
+	c.seqMu.Unlock()
+	st.NeedCatchUp = c.needCatchUp.Load()
+	st.SendQueueDepth = len(c.sendCh)
+	st.CtrlQueueDepth = len(c.ctrlCh)
+	st.ReqQueueDepth = len(c.reqCh)
+	st.CtrlDropped = c.ctrlDropped.Load()
+
 	return st
 }
 
@@ -228,9 +243,42 @@ func (c *Client) requestRepair() {
 // setSessCancel publishes the cancel func for the session Run is about to
 // start, so requestRepair can interrupt it. Pass nil once the session ends.
 func (c *Client) setSessCancel(cancel context.CancelFunc) {
+	c.bindSession(nil, cancel)
+}
+
+// bindSession publishes the session context and its cancel together.
+// A nil context means no session is running; waiters then use a
+// background context only when no session was ever bound.
+func (c *Client) bindSession(ctx context.Context, cancel context.CancelFunc) {
 	c.ctlMu.Lock()
+	c.sessCtx = ctx
 	c.sessCancel = cancel
 	c.ctlMu.Unlock()
+}
+
+// sessionCtx is the live session's context, or Background when none is
+// bound (tests that enqueue without Run).
+func (c *Client) sessionCtx() context.Context {
+	c.ctlMu.Lock()
+	defer c.ctlMu.Unlock()
+	if c.sessCtx != nil {
+		return c.sessCtx
+	}
+	return context.Background()
+}
+
+// failSession ends the live session so Run reconnects. The replay ring
+// is kept: hello replays it. Safe to call without a session.
+func (c *Client) failSession(err error) {
+	if err != nil {
+		log.Printf("[hub-client] %v", err)
+	}
+	c.ctlMu.Lock()
+	cancel := c.sessCancel
+	c.ctlMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // noteConnected records that a transport handshake succeeded. Paired with
@@ -246,6 +294,7 @@ func (c *Client) noteConnected(transport string) {
 func (c *Client) noteDisconnected() {
 	c.connected.Store(false)
 	c.connectedAt.Store(0)
+	c.probe.Store(false)
 }
 
 // setLastErr stores (or clears) the last session failure for State.

@@ -37,11 +37,17 @@ type File struct {
 	// 但保不住会话的网络：出口地址漂移时握手能过、随后必被 hub 判无上行。
 	HubQUICDisable bool `json:"hub_quic_disable,omitempty"`
 
-	// Proxy / NoProxy 是出网代理：host 启动时导出成 HTTPS_PROXY 等标准
-	// 变量，hub 中继与本机拉起的 grok agent 都跟着走。留空时 macOS 上
-	// 改读系统网络设置里的 HTTP/HTTPS/SOCKS 代理；系统也没开才是直连。
+	// Proxy / NoProxy 是出网代理地址。留空时 macOS 上改读系统网络设置里的
+	// HTTP/HTTPS/SOCKS 代理；系统也没开才是直连。
 	Proxy   string `json:"proxy,omitempty"`
 	NoProxy string `json:"no_proxy,omitempty"`
+
+	// AgentProxy / HubProxy 决定上方的代理给谁用：前者写进本机拉起的
+	// grok agent 子进程环境，后者给 hub 中继（HTTP 配对 / WS / QUIC）。
+	// nil = 缺省，视为开启（沿用拆分前「一处配置两边都走」的行为）。
+	// 关掉某一个就让它直连，另一个不受影响。
+	AgentProxy *bool `json:"agent_proxy,omitempty"`
+	HubProxy   *bool `json:"hub_proxy,omitempty"`
 
 	// StartHostOnLaunch 由菜单栏应用读取：打开应用时是否自动拉起 host。
 	// nil = 缺省（视为 true）。
@@ -58,6 +64,22 @@ func (f File) ShouldKeepAwake() bool {
 		return false
 	}
 	return *f.KeepAwake
+}
+
+// ShouldAgentProxy 缺省为 true：代理地址配了就默认给 agent 用。
+func (f File) ShouldAgentProxy() bool {
+	if f.AgentProxy == nil {
+		return true
+	}
+	return *f.AgentProxy
+}
+
+// ShouldHubProxy 缺省为 true：代理地址配了就默认给 hub 中继用。
+func (f File) ShouldHubProxy() bool {
+	if f.HubProxy == nil {
+		return true
+	}
+	return *f.HubProxy
 }
 
 // ShouldStartHostOnLaunch 缺省为 true（第一次装上就想用）。

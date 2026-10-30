@@ -35,12 +35,13 @@ func main() {
 	log.Printf("[Capri-host] version %s", version)
 	cfg := config.Load()
 
-	// 代理要在任何出网客户端之前落地：hub 中继、agent 探测都读环境变量。
-	// 配置留空则改用 macOS 系统网络设置；系统也没开才是直连。
+	// 代理要在任何出网客户端之前落地。地址留空时改用系统网络设置；系统也
+	// 没开才是直连。Agent / Hub 两个开关分开落地：Agent 走子进程环境
+	// （SpawnEnv）；Hub 走 hub 客户端自己的 transport（Proxy 字段），
+	// 因此关掉任一方都不会连带影响另一方。
 	cfg = cfg.WithSystemProxy()
-	cfg.ApplyProxyEnv()
 	if desc := cfg.ProxyDescription(); desc != "" {
-		log.Printf("[Capri-host] proxy %s", desc)
+		log.Printf("[Capri-host] proxy %s（agent=%v hub=%v）", desc, cfg.AgentProxyOn(), cfg.HubProxyOn())
 	}
 	// 非回环监听必须配入站钥匙：withAuth 在 FE_TOKEN 为空时是刻意开放的
 	// （本机可信），那句话只在回环 socket 上成立。
@@ -74,6 +75,7 @@ func main() {
 		LastSessionFile: filepath.Join(config.Dir(), "last-session.json"),
 		ResidentCap:     cfg.ResidentCap,
 		UsageLedgerOn:   !cfg.UsageLedgerDisabled(),
+		SpawnEnv:        cfg.AgentEnv(),
 	})
 	srv := server.New(cfg, bridge)
 
@@ -120,6 +122,10 @@ func main() {
 		// with an exact fingerprint match; the safe way to run QUIC
 		// against a self-signed hub cert you control.
 		QUICPin: cfg.HubQUICPin,
+		// Hub 代理开关只作用于这条中继连接：关掉即直连，不受 host
+		// 进程环境里的 HTTPS_PROXY 影响（agent 侧另由 SpawnEnv 决定）。
+		Proxy:   cfg.HubProxyURL(),
+		NoProxy: cfg.NoProxy,
 	}, persistHubChoice(cfg))
 	// Keep the reference: dropping it is what made the pairing code a
 	// startup-only input, with nothing able to report whether the relay was up.

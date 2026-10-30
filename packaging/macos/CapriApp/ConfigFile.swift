@@ -20,6 +20,10 @@ struct ConfigFile: Codable, Equatable {
     var hubQUICDisable: Bool?
     var proxy: String?
     var noProxy: String?
+    /// 代理的两个用途开关：agent 子进程与本进程的 hub 中继。nil = 开启。
+    /// 必须在此声明，否则保存设置时这两个键会在解码阶段丢掉。
+    var agentProxy: Bool?
+    var hubProxy: Bool?
     var startHostOnLaunch: Bool?
     var startAtLogin: Bool?
     var keepAwake: Bool?
@@ -37,6 +41,8 @@ struct ConfigFile: Codable, Equatable {
         case hubQUICDisable = "hub_quic_disable"
         case proxy
         case noProxy = "no_proxy"
+        case agentProxy = "agent_proxy"
+        case hubProxy = "hub_proxy"
         case startHostOnLaunch = "start_host_on_launch"
         case startAtLogin = "start_at_login"
         case keepAwake = "keep_awake"
@@ -46,6 +52,9 @@ struct ConfigFile: Codable, Equatable {
         if let port, port > 0 { return port }
         return 8765
     }
+
+    var shouldAgentProxy: Bool { agentProxy ?? true }
+    var shouldHubProxy: Bool { hubProxy ?? true }
 
     var shouldStartHostOnLaunch: Bool { startHostOnLaunch ?? true }
     var shouldStartAtLogin: Bool { startAtLogin ?? false }

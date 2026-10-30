@@ -46,6 +46,7 @@ type testQUICHub struct {
 	accepted   []quic.StreamID          // in accept order
 	firstFrame map[quic.StreamID]string // first frame type seen per stream
 	closed     map[quic.StreamID]bool   // peer closed its send side (EOF)
+	authFrame  []byte                   // raw auth frame from the control stream
 }
 
 // testHubRespond is one observed type:"respond" frame.
@@ -135,6 +136,9 @@ func (h *testQUICHub) serve(onReady func(ctrl *quic.Stream)) {
 			h.errCh <- err
 			return
 		}
+		h.mu.Lock()
+		h.authFrame = append([]byte(nil), data...)
+		h.mu.Unlock()
 		var auth struct {
 			Type string `json:"type"`
 		}
@@ -144,6 +148,7 @@ func (h *testQUICHub) serve(onReady func(ctrl *quic.Stream)) {
 		}
 		if err := writeTestFrame(ctrl, map[string]any{
 			"v": 1, "type": "hello", "service": "hub", "subscribers": 1, "seq": 0,
+			"deflate": true, "pingInterval": 5, "idleTimeout": 20,
 		}); err != nil {
 			h.errCh <- err
 			return
@@ -198,6 +203,13 @@ func (h *testQUICHub) record(s *quic.Stream) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.accepted = append(h.accepted, s.StreamID())
+}
+
+// capturedAuth returns the raw auth frame the host sent.
+func (h *testQUICHub) capturedAuth() []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]byte(nil), h.authFrame...)
 }
 
 // acceptedIDs snapshots accepted stream IDs in order.
@@ -614,4 +626,49 @@ func TestQUICReqPlaneFallback(t *testing.T) {
 	if respD.Stream == ids[0] {
 		t.Fatal("d still on shared stream after a slot freed; want a dedicated stream")
 	}
+}
+
+// TestQUICHandshakeDeclaresCapabilities: the auth frame must carry both
+// protocol flags. The hub refuses a handshake without stateAck, so omitting
+// it here would break every real connection while in-process tests (which
+// build their own frame) still pass.
+func TestQUICHandshakeDeclaresCapabilities(t *testing.T) {
+	th := newTestQUICHub(t)
+	th.serve(nil)
+
+	c := NewClient(Config{
+		URL:          fmt.Sprintf("https://127.0.0.1:%d", th.port()),
+		HostID:       "h1",
+		Token:        "tok123",
+		QUICInsecure: true,
+	})
+	c.sendCh = make(chan []byte, 16)
+	c.reqCh = make(chan reqFrame, 8)
+	bridge := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h1", HostName: "H1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _ = c.quicSession(ctx, bridge) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		raw := th.capturedAuth()
+		if len(raw) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		var auth struct {
+			Type     string `json:"type"`
+			Deflate  bool   `json:"deflate"`
+			StateAck bool   `json:"stateAck"`
+		}
+		if err := json.Unmarshal(raw, &auth); err != nil {
+			t.Fatalf("auth frame is not JSON: %s", raw)
+		}
+		if !auth.Deflate || !auth.StateAck {
+			t.Fatalf("auth frame must declare deflate+stateAck: %s", raw)
+		}
+		return
+	}
+	t.Fatal("no auth frame was sent")
 }

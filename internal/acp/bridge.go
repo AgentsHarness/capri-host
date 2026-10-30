@@ -160,6 +160,15 @@ type Bridge struct {
 	// demand via /api/queue/status for the FE to re-align after load.
 	queueSnapshots map[string]map[string]any
 
+	// promptedIDs remembers recently accepted promptIds (prompt opts
+	// Meta["promptId"], minted by the FE per turn) so a client retrying a
+	// prompt it could not confirm — the uplink died between send and
+	// accept, and the FE fell back to "not delivered" — does not start a
+	// second turn. Bounded FIFO; b.mu protects it. The FE reuses the same
+	// id when it retries, which is what makes the retry idempotent.
+	promptedIDs map[string]struct{}
+	promptedFIFO []string
+
 	// Last focused session survives process death / host restart so we can
 	// session/load it instead of session/new (which would open a blank chat).
 	// Written whenever createSession / LoadSession makes a session active;
@@ -180,6 +189,13 @@ type Bridge struct {
 	// ── 会话历史归一化视图缓存（session_history.go）───────────────────
 	// 按 (size, mtime) 失效；只存行级元数据，不缓存信封内容。
 	hist historyCache
+
+	// ── 列表派生数据缓存（session_tasks.go / bridge_ext_stats.go）──────
+	// [bg] 徽章的 census 与单会话统计都要扫整份 updates.jsonl，而
+	// sessions_changed 在回合边界会连着触发。按 (size, mtime) 命中即可
+	// 跳过重扫——徽章与统计都是派生数据，源文件没变就没有新答案。
+	census taskCensusCache
+	stats  sessionStatsCache
 
 	// bus 是事件发布/订阅内核（event_bus.go）：订阅者集合 + 全局 seq。
 	bus eventBus
@@ -211,6 +227,10 @@ type GrokConfig struct {
 	// process. Zero = DefaultResidentCap (4). Negative = disable the
 	// idle-unload supervisor (tests, or RESIDENT_CAP=0).
 	ResidentCap int
+	// SpawnEnv 叠加到 agent 子进程的环境变量（KEY=VALUE，后者覆盖先者）。
+	// 用于「Agent 代理」开关：关掉时传空的 HTTPS_PROXY 等，覆盖 host 从
+	// 自身环境继承来的代理变量。
+	SpawnEnv []string
 }
 
 // lastSessionFile is the on-disk form of the most recently active session.
@@ -507,7 +527,7 @@ func (b *Bridge) noteTurnActivity(sid string) {
 	}
 	b.mu.Unlock()
 	if flipped {
-		b.broadcastRosterChange()
+		b.broadcastRosterRows(sid)
 	}
 }
 
@@ -527,7 +547,7 @@ func (b *Bridge) noteTurnEnd(sid string) {
 	}
 	b.mu.Unlock()
 	if flipped {
-		b.broadcastRosterChange()
+		b.broadcastRosterRows(sid)
 	}
 }
 
@@ -668,8 +688,67 @@ func (b *Bridge) ActiveSessionID() string {
 
 // broadcastRosterChange pushes sessions_changed so clients refresh the
 // dashboard list whenever the roster or a session's live state changed.
+//
+// No payload: the roster membership or a row's non-live fields changed
+// (create / delete / load / rename / rewind), which clients can only learn
+// by re-reading the list.
 func (b *Bridge) broadcastRosterChange() {
 	b.Broadcast(Event{kType: "sessions_changed", kParams: map[string]any{}})
+}
+
+// rosterRow builds the `sessions[]` entry for one session — the same shape
+// /api/sessions produces for live rows, minus the [bg] census fields (those
+// come from the on-disk scan and are unaffected by a busy flip).
+//
+// Callers must NOT hold b.mu.
+func (b *Bridge) rosterRow(sid string) map[string]any {
+	b.mu.Lock()
+	s := b.sessions[sid]
+	if s == nil {
+		b.mu.Unlock()
+		return nil
+	}
+	row := map[string]any{
+		kSessionID: sid,
+		"status": map[string]any{
+			"state":         s.State(),
+			"busy":          s.Busy,
+			"awaitingInput": s.AwaitingInput,
+			"lastActiveAt":  s.LastActiveAt,
+		},
+	}
+	if s.Cwd != "" {
+		row["cwd"] = s.Cwd
+	}
+	if s.Title != "" {
+		row[kTitle] = s.Title
+	}
+	if s.UpdatedAt != "" {
+		row[kUpdatedAt] = s.UpdatedAt
+	}
+	b.mu.Unlock()
+	return row
+}
+
+// broadcastRosterRows pushes sessions_changed carrying the affected rows, so
+// clients patch their list instead of re-fetching it. Used for live-state
+// transitions only (busy / awaiting flips): those are the high-frequency
+// ones — a turn boundary fires two of them — and the list read behind them
+// costs a full census scan.
+//
+// Rows omit the [bg] census fields by design; a client merging in place must
+// keep the values it already has (absent ≠ zero).
+func (b *Bridge) broadcastRosterRows(sids ...string) {
+	upserted := make([]any, 0, len(sids))
+	for _, sid := range sids {
+		if row := b.rosterRow(sid); row != nil {
+			upserted = append(upserted, row)
+		}
+	}
+	if len(upserted) == 0 {
+		return
+	}
+	b.Broadcast(Event{kType: "sessions_changed", kParams: map[string]any{"upserted": upserted}})
 }
 
 // releaseBusy drops one in-flight prompt's claim on a session and, when that
@@ -702,7 +781,7 @@ func (b *Bridge) releaseBusy(s *SessionState, sessionID string, turnEnded bool) 
 	}
 	b.mu.Unlock()
 	if changed {
-		b.broadcastRosterChange()
+		b.broadcastRosterRows(sessionID)
 	}
 }
 
@@ -734,7 +813,7 @@ func (b *Bridge) setSessionAwaiting(id string, awaiting bool) {
 	}
 	b.mu.Unlock()
 	if changed {
-		b.broadcastRosterChange()
+		b.broadcastRosterRows(id)
 	}
 }
 
@@ -1410,6 +1489,11 @@ func (b *Bridge) ensureProcess() error {
 	b.mu.Unlock()
 
 	cmd := exec.Command(b.cfg.Bin, "agent", "stdio")
+	if len(b.cfg.SpawnEnv) > 0 {
+		// 追加在 os.Environ 之后：同名变量后者生效，这是「Agent 代理」
+		// 关闭时把继承来的代理变量覆盖成空的做法。
+		cmd.Env = append(os.Environ(), b.cfg.SpawnEnv...)
+	}
 	// The agent talks JSON-RPC over the pipes attached below, so it never
 	// needs a console window. Suppressing it is what keeps a double-clicked
 	// GUI host from popping a terminal (see internal/procattr).
@@ -3175,6 +3259,55 @@ func (b *Bridge) failAllPending(err error) {
 	})
 }
 
+// promptIDOf returns the FE-minted per-turn id used for retry idempotency
+// (wire: meta.promptId), falling back to messageId when a client sends that
+// instead. Both are client-generated and stable across a retry.
+func promptIDOf(opts PromptOpts) string {
+	if v, ok := opts.Meta["promptId"].(string); ok && v != "" {
+		return v
+	}
+	return opts.MessageID
+}
+
+// promptedIDCap bounds the retry-id memory. A turn's id only needs to
+// survive the reconnect window it could be retried in, and the FE retries
+// seconds to minutes later; 512 turns is far more than that per process.
+const promptedIDCap = 512
+
+// claimPromptIDLocked records pid and reports whether it was already seen.
+// Caller holds b.mu.
+func (b *Bridge) claimPromptIDLocked(pid string) (dup bool) {
+	if b.promptedIDs == nil {
+		b.promptedIDs = make(map[string]struct{}, 32)
+	}
+	if _, ok := b.promptedIDs[pid]; ok {
+		return true
+	}
+	b.promptedIDs[pid] = struct{}{}
+	b.promptedFIFO = append(b.promptedFIFO, pid)
+	if len(b.promptedFIFO) > promptedIDCap {
+		old := b.promptedFIFO[0]
+		b.promptedFIFO = b.promptedFIFO[1:]
+		delete(b.promptedIDs, old)
+	}
+	return false
+}
+
+// releasePromptIDLocked forgets pid so a caller that failed before the
+// prompt reached the agent can retry. Caller holds b.mu.
+func (b *Bridge) releasePromptIDLocked(pid string) {
+	if _, ok := b.promptedIDs[pid]; !ok {
+		return
+	}
+	delete(b.promptedIDs, pid)
+	for i, id := range b.promptedFIFO {
+		if id == pid {
+			b.promptedFIFO = append(b.promptedFIFO[:i], b.promptedFIFO[i+1:]...)
+			break
+		}
+	}
+}
+
 // PromptOpts carries the optional official session/prompt fields: the
 // unstable `messageId` (UUID) and an extension `_meta` map. Empty fields
 // are omitted from the wire (absent key ≠ off, matching the TUI).
@@ -3182,6 +3315,11 @@ type PromptOpts struct {
 	MessageID string         // wire: messageId (UUID; 非空才发)
 	Meta      map[string]any // wire: _meta (非空才发)
 }
+
+// StopReasonDuplicate is returned with no error when the promptId was
+// already accepted, so a retried send is observable as a no-op instead of
+// looking like a completed turn with an empty stop reason.
+const StopReasonDuplicate = "duplicate"
 
 // PromptWithOpts sends session/prompt to the given session (default:
 // active) and blocks until the turn finishes. When no session exists yet
@@ -3197,8 +3335,38 @@ type PromptOpts struct {
 // session/prompt params when set; empty opts omit them from the wire
 // entirely. Returns the turn's stopReason plus the response `_meta` (the
 // agent's prompt-result meta, nil when absent) so the HTTP layer can pass
-// it through to the browser.
+// it through to the browser. A retried promptId returns
+// StopReasonDuplicate without sending anything.
 func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []ContentBlock, opts PromptOpts) (stopReason string, meta map[string]any, err error) {
+	// Retry idempotency: the FE mints one promptId per turn and reuses it
+	// when it re-sends a prompt whose acceptance it never saw. Claiming the
+	// id before the turn starts means a duplicate send is a no-op instead of
+	// a second turn — the failure mode this guards ("message showed up but
+	// never ran") is symmetric: after a fix that retries automatically, the
+	// original may well have been accepted, and running it twice is worse
+	// than the dropped message.
+	claimedID := promptIDOf(opts)
+	// issued flips once session/prompt actually goes to the agent. A call
+	// that dies before that (agent down, unknown session) never consumed
+	// the id: releasing it keeps the FE's retry meaningful.
+	issued := false
+	if claimedID != "" {
+		b.mu.Lock()
+		dup := b.claimPromptIDLocked(claimedID)
+		b.mu.Unlock()
+		if dup {
+			log.Printf("[Capri-host] duplicate promptId %s ignored (retry of an accepted turn)", claimedID)
+			return StopReasonDuplicate, nil, nil
+		}
+		defer func() {
+			if issued {
+				return
+			}
+			b.mu.Lock()
+			b.releasePromptIDLocked(claimedID)
+			b.mu.Unlock()
+		}()
+	}
 	b.mu.Lock()
 	if sessionID == "" {
 		sessionID = b.activeSessionID
@@ -3365,6 +3533,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	}
 
 	res, err := b.request(promptCtx, "session/prompt", params, promptTimeout)
+	issued = true
 	if err != nil {
 		if stalled.Load() {
 			err = ErrPromptStalled
@@ -3609,6 +3778,10 @@ func (b *Bridge) resetProcessRoster(reason string, expected *exec.Cmd) (string, 
 	// Agent 进程已死：队列是 agent 内存态，重启即清空 —— 快照缓存
 	// 一并作废，避免 /api/queue/status 回放过期队列。
 	b.queueSnapshots = nil
+	// 重试去重记忆随 agent 进程一起作废：上一个进程里的回合已经不存在，
+	// 此时 FE 的重试应当真的跑一次，而不是被当成重复静默吞掉。
+	b.promptedIDs = nil
+	b.promptedFIFO = nil
 	b.liveTools = make(map[string]*liveToolResolver)
 	// lastSessionID / lastSessionCwd intentionally survive.
 	if b.cancelRd != nil {
@@ -4195,7 +4368,7 @@ func (b *Bridge) ListSessions(ctx context.Context, opts ...ListSessionsOpts) (se
 		if sid == "" || cwd == "" {
 			continue
 		}
-		sum, ps := sessionTaskCensus(b.grokHome(), cwd, sid)
+		sum, ps := b.sessionTaskCensusCached(b.grokHome(), cwd, sid)
 		census[censusKey{sid, cwd}] = sum
 		orphans[censusKey{sid, cwd}] = ps
 	}

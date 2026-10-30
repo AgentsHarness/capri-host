@@ -706,6 +706,62 @@ func btwWindowRecords(grokHome, cwd, sessionID string, view *normalizedHistory, 
 	return out
 }
 
+// safeSessionID 判断 sessionId 能否安全参与路径拼接（空、分隔符、
+// `..` 一律拒绝，绝不允许穿越到 sessions 目录之外）。
+func safeSessionID(sessionID string) bool {
+	return sessionID != "" &&
+		!strings.ContainsAny(sessionID, `/\`) &&
+		!strings.Contains(sessionID, "..")
+}
+
+// resolveSessionUpdatesFile 解析会话 updates.jsonl 的实际位置，不依赖
+// 调用方给的 cwd 一定属于该会话。先按 cwd 拼直接路径：存在（且不是
+// 目录）就原样返回，不做任何扫描——这是绝大多数调用的热路径。子代理
+// 会话的 cwd 与父会话不同时，FE 只能传父 cwd，直接路径落空，此时按
+// sessionId 在 sessions/ 的一级子目录（cwd 编码目录）里查
+// <sessionId>/updates.jsonl；畸形 sessionId 会让 Join 越界，先整体拒绝。
+// 命中多份（session id 理论上唯一）取 mtime 最新的一份并记录所用路径。
+func resolveSessionUpdatesFile(grokHome, cwd, sessionID string) (string, bool) {
+	if grokHome == "" || !safeSessionID(sessionID) {
+		return "", false
+	}
+	if path := sessionUpdatesFile(grokHome, cwd, sessionID); path != "" {
+		// 打开一次确认可读：stat 成功但无读权限同样算不可用。
+		if f, err := os.Open(path); err == nil {
+			st, statErr := f.Stat()
+			f.Close()
+			if statErr == nil && !st.IsDir() {
+				return path, true
+			}
+		}
+	}
+	root := filepath.Join(grokHome, "sessions")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return "", false
+	}
+	best, bestMod, matches := "", time.Time{}, 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(root, e.Name(), sessionID, "updates.jsonl")
+		st, err := os.Stat(candidate)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		matches++
+		if best == "" || st.ModTime().After(bestMod) {
+			best, bestMod = candidate, st.ModTime()
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	log.Printf("[Capri-host] session updates resolved by session id (matches=%d, cwd=%q): %s", matches, cwd, best)
+	return best, true
+}
+
 // localUpdatesPage 在本地归一化可用时从 msgSeq 空间分页服务。分页语义
 // （契约）：turnIndex/offset/limit/promptStarts 一律在 msgSeq 空间解释——
 // turnIndex:N = 归一化序列的最后 N 个 prompt 轮；offset/limit 切
@@ -716,8 +772,8 @@ func btwWindowRecords(grokHome, cwd, sessionID string, view *normalizedHistory, 
 // 顶层带 msgSeq；promptStarts 由 host 重算；totalCount = 存活条数。
 // opts.Detail == meta 时只算窗口与锚点、不读信封（见 lite.go）。
 func (b *Bridge) localUpdatesPage(sessionID, cwd string, opts SessionUpdatesOpts) (UpdatesPage, error) {
-	path := sessionUpdatesFile(b.grokHome(), cwd, sessionID)
-	if path == "" {
+	path, found := resolveSessionUpdatesFile(b.grokHome(), cwd, sessionID)
+	if !found {
 		return UpdatesPage{}, errLocalHistoryUnavailable
 	}
 	view, ok := b.normalizedSessionHistory(path)

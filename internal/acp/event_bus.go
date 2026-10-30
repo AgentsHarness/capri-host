@@ -147,6 +147,21 @@ func (s *eventSub) enqueue(ev Event, critical bool) {
 	}
 	s.mu.Lock()
 	if s.n >= limit {
+		if !critical && s.n < len(s.ring) {
+			// Droppable backlog is at its cap. The event still owns a seq, so
+			// it takes one of the reserved slots as a placeholder instead of
+			// disappearing — see trimPlaceholder. Bounded: the reserve is
+			// subCriticalSlack, and past it the consumer is not merely slow.
+			s.ring[(s.head+s.n)%len(s.ring)] = trimPlaceholder(ev)
+			s.n++
+			s.dropped.Add(1)
+			s.mu.Unlock()
+			select {
+			case s.wake <- struct{}{}:
+			default:
+			}
+			return
+		}
 		s.mu.Unlock()
 		if critical {
 			// 可丢积压顶满预留区：消费者长时间假死而关键事件仍在产生。
@@ -168,10 +183,15 @@ func (s *eventSub) enqueue(ev Event, critical bool) {
 	}
 }
 
-// pump delivers this subscriber's queue in order. Droppable events are
-// dropped the moment the consumer channel is full (transient UI jitter the
-// FE repairs); critical events wait for a free slot instead — never dropped
-// while the subscriber is live, and never blocking anyone else.
+// pump delivers this subscriber's queue in order. Critical events wait for a
+// free slot — never dropped while the subscriber is live. A droppable event
+// whose consumer channel is full is replaced by a seq-only placeholder
+// instead of vanishing: the seq was assigned in publish and every subscriber
+// shares that numbering, so an event that never reaches this subscriber is a
+// hole the hub would see and the FE would treat as a lost event. Keeping the
+// number costs one tiny map and turns "the transcript is gone" into "this
+// subscriber must rebuild that session", which is the contract PROTOCOL.md
+// §6.4 already states for unwatched sessions.
 func (s *eventSub) pump() {
 	for {
 		s.mu.Lock()
@@ -193,9 +213,16 @@ func (s *eventSub) pump() {
 			case <-s.done:
 				return
 			default:
-				// 慢消费者：可丢事件不占位，seq 照常前进，落后方靠 FE
-				// 补拉 / 历史回放修复。
+				// 慢消费者：正文不占位，但 seq 必须照常前进。占位副本
+				// 独立于原事件，其它订阅者（以及 hub-client 的 batch）
+				// 看到的仍是完整正文。
 				s.dropped.Add(1)
+				ev = trimPlaceholder(ev)
+				select {
+				case s.ch <- ev:
+				case <-s.done:
+					return
+				}
 			}
 		} else {
 			select {
@@ -211,6 +238,21 @@ func (s *eventSub) pump() {
 		s.n--
 		s.mu.Unlock()
 	}
+}
+
+// trimPlaceholder copies ev down to {type:"trimmed", seq, sessionId}: the
+// body is unrecoverable for this subscriber, the sequence number is not.
+// A copy is required — the same Event is shared with every other subscriber
+// and with the hub-client's outgoing batch, and rewriting it in place would
+// turn a slow local reader into missing transcript on the hub uplink.
+func trimPlaceholder(ev Event) Event {
+	out := Event{"type": "trimmed"}
+	for _, k := range []string{kSeq, "sessionId"} {
+		if v, ok := ev[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // droppableEventType reports whether an event type is lossy-tolerable stream
@@ -229,4 +271,14 @@ func droppableEventType(t any) bool {
 		return true
 	}
 	return false
+}
+
+// IsDroppableEventType reports whether an event of this type may be dropped
+// under back-pressure: chunk-like payloads the transcript can rebuild. It is
+// the exported form of the drop tier above so the hub client's replay ring
+// does not keep a second, drifting copy of the list — it trims those events
+// while nobody is watching and must never trim the rest (a client_request
+// that is dropped has no history to come back from).
+func IsDroppableEventType(typ string) bool {
+	return droppableEventType(typ)
 }

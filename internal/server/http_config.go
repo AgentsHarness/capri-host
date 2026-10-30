@@ -30,6 +30,8 @@ type hostConfigUpdate struct {
 	GrokBin           *string `json:"grok_bin"`
 	Proxy             *string `json:"proxy"`
 	NoProxy           *string `json:"no_proxy"`
+	AgentProxy        *bool   `json:"agent_proxy"`
+	HubProxy          *bool   `json:"hub_proxy"`
 	StartHostOnLaunch *bool   `json:"start_host_on_launch"`
 	StartAtLogin      *bool   `json:"start_at_login"`
 	KeepAwake         *bool   `json:"keep_awake"`
@@ -120,6 +122,12 @@ func (s *Server) handlePostHostConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.NoProxy != nil {
 			f.NoProxy = strings.TrimSpace(*body.NoProxy)
+		}
+		if body.AgentProxy != nil {
+			f.AgentProxy = body.AgentProxy
+		}
+		if body.HubProxy != nil {
+			f.HubProxy = body.HubProxy
 		}
 		if body.StartHostOnLaunch != nil {
 			f.StartHostOnLaunch = body.StartHostOnLaunch

@@ -11,7 +11,7 @@ import (
 
 func TestEncodeCwdDirname(t *testing.T) {
 	cases := map[string]string{
-		"/Users/dev/ccwork":     "%2FUsers%2Fbenin%2Fccwork",
+		"/Users/dev/ccwork":     "%2FUsers%2Fdev%2Fccwork",
 		"/tmp":                    "%2Ftmp",
 		"/Volumes/SD10/Learning":  "%2FVolumes%2FSD10%2FLearning",
 		"/a b/c+d":                "%2Fa%20b%2Fc%2Bd",
@@ -498,5 +498,57 @@ func TestSessionRunningTasksFromBackgroundTasksSnapshot(t *testing.T) {
 	}
 	if events[0].TaskID != "t-1" || events[0].Command != "dev server" || !events[0].Running {
 		t.Errorf("events[0] = %+v, want running t-1 dev server", events[0])
+	}
+}
+
+// A cached entry whose file disappears is dropped on the next call and
+// recomputed if the file reappears (both caches).
+func TestTaskCachesDropMissingFile(t *testing.T) {
+	home := t.TempDir()
+	const sid = "sess-cache"
+	path := writeSessionFile(t, home, "/ws", sid, []string{
+		envLine(1, bgUpdate("t-1", "sleep 1")),
+		histEnvelope(sid, 2, 30, msgUserChunk("hi")),
+		histEnvelope(sid, 3, 40, msgAgentChunk("hello")),
+	})
+	b, _ := historyBridge(t, home)
+
+	if sum, _ := b.sessionTaskCensusCached(home, "/ws", sid); sum.BgCount != 1 {
+		t.Fatalf("initial census BgCount = %d, want 1", sum.BgCount)
+	}
+	if st, err := b.SessionStats(context.Background(), "/ws", sid); err != nil || st.Turns != 1 {
+		t.Fatalf("initial stats = %+v, %v; want 1 turn", st, err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if sum, _ := b.sessionTaskCensusCached(home, "/ws", sid); sum.BgCount != 0 {
+		t.Errorf("census after removal = %+v, want zero", sum)
+	}
+	if st, err := b.SessionStats(context.Background(), "/ws", sid); err != nil || st.Turns != 0 {
+		t.Errorf("stats after removal = %+v, %v; want zero", st, err)
+	}
+	if n := len(b.census.entries); n != 0 {
+		t.Errorf("census cache kept %d entries after the file disappeared", n)
+	}
+	if n := len(b.stats.entries); n != 0 {
+		t.Errorf("stats cache kept %d entries after the file disappeared", n)
+	}
+
+	// Reappearing file is recomputed rather than served from the old entry.
+	writeSessionFile(t, home, "/ws", sid, []string{
+		envLine(1, bgUpdate("t-1", "sleep 1")),
+		envLine(2, bgUpdate("t-2", "sleep 2")),
+		histEnvelope(sid, 3, 50, msgUserChunk("a")),
+		histEnvelope(sid, 4, 60, msgAgentChunk("a1")),
+		histEnvelope(sid, 5, 70, msgUserChunk("b")),
+		histEnvelope(sid, 6, 80, msgAgentChunk("b1")),
+	})
+	if sum, _ := b.sessionTaskCensusCached(home, "/ws", sid); sum.BgCount != 2 {
+		t.Errorf("census after reappearance BgCount = %d, want 2", sum.BgCount)
+	}
+	if st, err := b.SessionStats(context.Background(), "/ws", sid); err != nil || st.Turns != 2 {
+		t.Errorf("stats after reappearance = %+v, %v; want 2 turns", st, err)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -84,6 +85,13 @@ type Config struct {
 	// malformed value fails the QUIC handshake (Run then falls back to
 	// WebSocket).
 	QUICPin string
+	// Proxy is the HTTP(S) proxy URL for this client's own outbound HTTP and
+	// WebSocket dials. Empty = direct, regardless of the process environment:
+	// the hub link must honour the "Hub 代理" switch even when the agent's
+	// side still inherits the process proxy.
+	Proxy string
+	// NoProxy is the comma-separated bypass list paired with Proxy.
+	NoProxy string
 }
 
 // Client forwards events to the hub and executes relayed requests against
@@ -120,12 +128,18 @@ type Client struct {
 	// Created in Run; closed only when Run exits (not per reconnect).
 	sendCh chan []byte
 
+	// sendBudget bounds the BYTES queued on sendCh (including the frame the
+	// writer is holding): the channel itself only bounds the frame count, and
+	// one frame may be 8MB. Created in NewClient so it is never nil, even for
+	// tests that never call Run.
+	sendBudget *sendBudget
+
 	// reqCh carries relay respond frames (type:"respond") to the request
 	// plane write loop. With the QUIC transport each in-flight request gets
-	// a dedicated stream (T1) so a 16MB fs/read-file answer cannot
-	// head-of-line block either the control stream or other requests'
-	// responds; over WS everything multiplexes onto one connection. Created
-	// in Run next to sendCh.
+	// a dedicated stream (T1) so a relay answer up to the 28MB
+	// maxRelayResponseBytes ceiling cannot head-of-line block either the
+	// control stream or other requests' responds; over WS everything
+	// multiplexes onto one connection. Created in Run next to sendCh.
 	reqCh chan reqFrame
 
 	// Reliability: every forwarded event keeps its bridge.Broadcast seq
@@ -150,8 +164,16 @@ type Client struct {
 	seqMu       sync.Mutex
 	nextSeq     uint64
 	replay      []replayItem // ring, newest at the end, capped
+	replayBytes int          // len(raw) sum of replay, guarded by seqMu
 	lastSentSeq uint64
 	hubAckSeq   uint64
+	// pausedTrimmedThrough is the highest seq compaction actually dropped
+	// while forwarding was paused (see compactReplayLocked). Once the ring's
+	// oldest seq is above the hub's watermark the two can no longer be
+	// bridged by a replay — the missing range is gone — so a resume must
+	// start a new hub epoch with seq_reset instead (see
+	// resumeAfterPausedTrimLocked). Zero means nothing was trimmed.
+	pausedTrimmedThrough uint64
 
 	// enqueueMu serializes replay and live event enqueues so frames
 	// reach the hub in strictly increasing seq order. Without it, a live
@@ -168,18 +190,58 @@ type Client struct {
 	subsGen atomic.Uint64
 
 	// lastRecvUnixNano is when the last downlink frame arrived, for the
-	// session idle watchdog (see sessionIdleTimeout).
+	// session idle watchdog (see defaultSessionIdleTimeout).
 	lastRecvUnixNano atomic.Int64
+
+	// idleTimeoutNanos is THIS session's downlink watchdog budget: the hub's
+	// hello.idleTimeout, else the local default. An atomic rather than a
+	// plain field because the watchdog goroutine reads it while readLoop
+	// writes it when hello lands (the watchdog starts first — a session can
+	// go silent before the hello is decoded). Reset to the default at the
+	// top of every session, so a reconnect cannot inherit the previous
+	// hub's (possibly longer) budget.
+	idleTimeoutNanos atomic.Int64
 
 	// needCatchUp is set when a live or replay events frame was dropped
 	// before reaching the wire: the send queue was full, a replay held the
 	// ordering lock (enqueueEvents TryLock missed), or a critical enqueue
-	// timed out on a full queue. Those seqs may never reach the hub, so the
-	// FE's gap-pull (which reads the hub's buffer) can never fill the hole
-	// either — its ordered-delivery buffer then waits for a predecessor
-	// that will never arrive. The heartbeat re-sends from the hub's ack
-	// watermark to close the gap once the pressure passes.
+	// timed out on a full queue. While it is set, live sends stop. A later
+	// seq must not pass the hole: the hub's watermark would step over it
+	// and the repair, which resends from that watermark, would be rejected
+	// as stale. The repair runs under enqueueMu and clears the flag only
+	// once it holds the lock.
 	needCatchUp atomic.Bool
+
+	// probe is hello.probe for the current session. The host_status
+	// cadence follows it: 15s when the hub has a socket probe, 5s when
+	// it does not (QUIC). Cleared when the session ends.
+	probe atomic.Bool
+
+	// replaySaturated remembers that this session was asked to end
+	// because the unacked replay tail no longer fits. Reset when the
+	// next session starts.
+	replaySaturated atomic.Bool
+	// replayFuseLogged keeps the disconnected-tail trim from logging
+	// once per event.
+	replayFuseLogged atomic.Bool
+	// pausedCapLogged keeps the paused byte-gate's critical-event drop from
+	// logging on every flush; the trim itself keeps running.
+	pausedCapLogged atomic.Bool
+	// ackedTrimLogged keeps the acked-prefix byte trim from logging on
+	// every flush; those events are delivered, so the trim is routine.
+	ackedTrimLogged atomic.Bool
+
+	// ctrlCh carries frames that must not wait behind, or be dropped
+	// for, the event queue: pong, state_ack, host_status. nil when a
+	// test wires only sendCh; enqueueControl falls back then.
+	ctrlCh chan []byte
+
+	// ctrlDropped counts control frames dropped because ctrlCh stayed full
+	// for ctrlEnqueueWait. They are not lost data (the hub retransmits an
+	// unacked state_ack, the next ping brings another pong, host_status is
+	// re-sent on the next beat), but the count is the evidence that the
+	// writer was stalled. Never reset.
+	ctrlDropped atomic.Uint64
 
 	// dropMu guards the queue-pressure log throttle. When the uplink is
 	// down or the writer is stalled, the drop paths fire thousands of
@@ -192,11 +254,25 @@ type Client struct {
 	dropFrames int
 	dropLogged bool
 
-	// deflateOK is armed by the hub's hello echo ("deflate":true) after we
-	// offered compression in the QUIC auth frame / WS handshake. Until then
-	// (or with an old hub) every frame goes out as raw JSON — see
-	// PROTOCOL.md for the wire format.
+	// deflateOK records whether this session compresses uplink frames. It is
+	// off only for the handshake frames written before the hub's hello; the
+	// hub always supports the format, so the flag is armed as soon as the
+	// session starts.
 	deflateOK atomic.Bool
+
+	// viewMu guards the uplink session filter: viewAll/viewSeen/viewGen/
+	// viewSIDs and the viewChildren relation table. See trimUnwatched and
+	// PROTOCOL.md §6.4.
+	viewMu   sync.Mutex
+	viewAll  bool            // true = audience unknown, filter nothing
+	viewSeen bool            // false until the hub says anything
+	viewGen  uint64          // highest viewing-set generation applied
+	viewSIDs map[string]bool // sessions some page is displaying
+	// viewChildren maps a subagent child session (and its subagent id) to
+	// its parent, so a watched parent implies a watched child without a hub
+	// round trip. viewChildOrder is the insertion order for FIFO eviction.
+	viewChildren   map[string]string
+	viewChildOrder []string
 
 	// quicDial, when non-nil, replaces quic.DialAddr inside quicSession.
 	// Test seam for the connection-migration test (T6): the real session
@@ -232,12 +308,15 @@ type Client struct {
 	transport   atomic.Value // string: TransportQUIC | TransportWS
 	connectedAt atomic.Int64 // unix nano, 0 when not connected
 
-	// ctlMu guards sessCancel and lastErr.
+	// ctlMu guards sessCancel, sessCtx and lastErr.
 	ctlMu sync.Mutex
 	// sessCancel cancels the CURRENT session's context (a child of Run's
 	// ctx), which is what lets Pair drop a live connection without taking
 	// the whole process down. nil while no session is running.
+	// sessCtx is that same context, so a control frame can wait for a
+	// queue slot until the session ends instead of being dropped.
 	sessCancel context.CancelFunc
+	sessCtx    context.Context
 	lastErr    string
 
 	// forceRepair is set by requestRepair and consumed once by Run's
@@ -261,10 +340,31 @@ type Client struct {
 
 // replayItem is one ring slot. seq is denormalized for watermark
 // compares; raw is the marshaled Event so the map (and any large tool
-// payload it referenced) can be GC'd once seqAndReplay returns.
+// payload it referenced) can be GC'd once seqAndReplay returns. typ is the
+// event type, kept so paused compaction can tell chunk-like payloads (which
+// history can rebuild) from critical events (which it cannot).
 type replayItem struct {
 	seq uint64
+	typ string
 	raw json.RawMessage
+}
+
+// droppable reports whether this event may be trimmed while no browser is
+// watching. Unknown/empty types are treated as critical: keeping an event is
+// always safe, dropping one that has no history is not.
+func (it replayItem) droppable() bool {
+	return acp.IsDroppableEventType(it.typ)
+}
+
+// replayRingBytes is the byte weight of a ring slice (the marshaled event
+// bytes, which are what the ring actually holds). Used to recompute
+// c.replayBytes after a trim, so the counter cannot drift from the slice.
+func replayRingBytes(items []replayItem) int {
+	n := 0
+	for _, it := range items {
+		n += len(it.raw)
+	}
+	return n
 }
 
 // replayCap bounds the host-side replay buffer (events). 1000 critical+
@@ -274,8 +374,33 @@ type replayItem struct {
 const replayCap = 1000
 
 // replayHighWater is where seqAndReplay compacts back down to replayCap
-// (amortized, see seqAndReplay).
+// (amortized, see seqAndReplay). Only events the hub has already acked
+// are eligible. Unacked events stay: dropping them is how a hole becomes
+// permanent.
 const replayHighWater = 2 * replayCap
+
+// replayHardCap is how many unacked events the ring will hold before the
+// session is torn down so a reconnect can replay them. Past this the
+// link is not delivering, and continuing to append without a bound is
+// how a long outage keeps every chunk.
+const replayHardCap = 8 * replayCap
+
+// pausedReplayCap is how much of the ring survives while the hub has told
+// us nobody is watching this host (fwdKnown && !forwardEvents). With no
+// subscriber nothing will ever be acked, so an unacked tail judged against
+// replayHardCap would end the session every 8000 events — a reconnect loop
+// that replays the whole ring into a hub whose fan-out drops all of it. The
+// paused tail is only what a 0→1 resume needs; anything older is rebuilt
+// from host history by the FE, which never promised per-event replay of
+// events nobody was watching.
+const pausedReplayCap = 128
+
+// replayByteCap bounds the replay ring by memory as well as by event count:
+// replayHardCap events of the 8MB frame ceiling would be 64GB, and even a
+// normal run can pin hundreds of MB in a few giant tool results. A var so
+// tests can shrink it. At 64MB the ring holds several minutes of ordinary
+// transcript and a 28MB relay-sized event several times over.
+var replayByteCap = 64 << 20
 
 // maxFrameBytes caps any single events frame. The hub's host WS read
 // limit is 32MB; keeping frames well below it means an oversized frame
@@ -284,6 +409,95 @@ const replayHighWater = 2 * replayCap
 // (hello.seq never advances, and the same oversized frame is retried on
 // every reconnect).
 const maxFrameBytes = 8 << 20
+
+// sendByteCap bounds the bytes queued on sendCh (queued frames plus the one
+// the writer is holding). The channel bounds the frame COUNT (256); one frame
+// can be maxFrameBytes, so without this the theoretical backlog is 2GB. A var
+// so tests can shrink it — the budget snapshots it when NewClient creates the
+// client.
+var sendByteCap = 64 << 20
+
+// sendCriticalWait is how long a critical frame (replay, a critical control
+// frame) waits for a queue slot AND byte budget before giving up. A var so
+// tests can shrink it.
+var sendCriticalWait = 5 * time.Second
+
+// sendBudget tracks the bytes reserved on sendCh. A frame reserves before it
+// is queued and is released by whoever consumes it — writeLoop after the
+// write (success or failure), drainSendCh when a stale queue is cleared — so
+// used covers the payload's whole lifetime, not just its time in the channel.
+type sendBudget struct {
+	mu   sync.Mutex
+	used int
+	cap  int
+	// freed is closed and replaced on every release; waiters select on it, so
+	// a release between the capacity check and the wait cannot be missed.
+	freed chan struct{}
+}
+
+func newSendBudget(capacity int) *sendBudget {
+	return &sendBudget{cap: capacity, freed: make(chan struct{})}
+}
+
+// tryReserve claims n bytes without blocking.
+func (b *sendBudget) tryReserve(n int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > b.cap-b.used {
+		return false
+	}
+	b.used += n
+	return true
+}
+
+// waitReserve waits until n bytes fit, d passes (d > 0), or ctx ends. It
+// never reserves on failure.
+func (b *sendBudget) waitReserve(ctx context.Context, n int, d time.Duration) bool {
+	var timeout <-chan time.Time
+	if d > 0 {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		timeout = t.C
+	}
+	for {
+		b.mu.Lock()
+		if n <= b.cap-b.used {
+			b.used += n
+			b.mu.Unlock()
+			return true
+		}
+		freed := b.freed
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-freed:
+		case <-timeout:
+			return false
+		}
+	}
+}
+
+// release frees n reserved bytes.
+func (b *sendBudget) release(n int) {
+	if n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used -= n
+	if b.used < 0 {
+		b.used = 0 // defensive; a double release must not create free space
+	}
+	close(b.freed)
+	b.freed = make(chan struct{})
+	b.mu.Unlock()
+}
+
+func (b *sendBudget) usedBytes() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.used
+}
 
 // maxRelayResponseBytes caps a relayed local-API response body. The respond
 // frame carries it verbatim, so the ceiling is the transport's own frame
@@ -305,16 +519,97 @@ const replayFrameBudget = 1 << 20
 // healthy and reset the reconnect backoff (see Run).
 const healthySessionMin = 60 * time.Second
 
-// sessionIdleTimeout fails a hub session that has received NOTHING for
-// this long. The hub pings every 25s and answers our 10s pings, so silence
-// this long means the link is dead even though the socket still looks
-// open. Without it a half-open TCP connection (NAT rebind, silent
-// middlebox drop, laptop sleep) wedges the host permanently: reads block
-// forever, writes keep succeeding into the kernel buffer, no error ever
-// surfaces, and the reconnect loop is never entered — the host looks
-// online in the hub registry while uploading nothing. The hub has always
-// had the mirror-image guard (hostReadTimeout); the host had none.
-const sessionIdleTimeout = 75 * time.Second
+// wsDialTimeout bounds one WebSocket dial (DNS + TCP + TLS + upgrade). 6s
+// covers the first three SYN retransmits (1+2+4) plus a TLS handshake on a
+// high-RTT path; a genuinely slow path simply retries.
+const wsDialTimeout = 6 * time.Second
+
+// reconnectBackoffMax caps the reconnect delay so a recovered path is
+// retried quickly instead of waiting out an escalated timer.
+const reconnectBackoffMax = 10 * time.Second
+
+// defaultSessionIdleTimeout fails a hub session that has received NOTHING
+// (no downlink frame of any type) for this long. Without it a half-open TCP
+// connection (NAT rebind, silent middlebox drop, laptop sleep) wedges the
+// host permanently: reads block forever, writes keep succeeding into the
+// kernel buffer, no error ever surfaces, and the reconnect loop is never
+// entered — the host looks online in the hub registry while uploading
+// nothing. The hub has always had the mirror-image guard (hostReadTimeout);
+// the host had none.
+//
+// 20s leaves room around the hub's JSON ping (5s). That ping is the
+// downlink beat; 20s spans four of them and tolerates three lost frames.
+// The host does not send its own application ping: on QUIC the transport
+// keepalive refreshes NAT, and on WebSocket the hub's ping is enough.
+// Counting a host ping as peer traffic was also what kept the hub's
+// socket probe from running.
+//
+// A hub states its own numbers in hello (idleTimeout / pingInterval); this
+// constant is the value every session is reset to before hello is decoded,
+// and the fallback if a hub advertises an out-of-range idleTimeout.
+const defaultSessionIdleTimeout = 20 * time.Second
+
+// Bounds on the liveness parameters a hub may advertise in hello. Values
+// outside them are ignored and the local defaults stand: a typo in a hub
+// config must not become a reconnect loop here (idleTimeout too small) or a
+// session that takes minutes to notice death (too large).
+const (
+	minHelloPingSec = 1
+	maxHelloPingSec = 60
+	minHelloIdleSec = 5
+	maxHelloIdleSec = 300
+	// watchdogTicksPerTimeout splits the current budget into checks, so the
+	// detection delay stays a fraction of whatever the hub advertises
+	// instead of growing with it.
+	watchdogTicksPerTimeout = 8
+)
+
+// heartbeatInterval is how often host_status is re-sent over QUIC, where no
+// socket probe exists: the registry's 30s sweep reads only application
+// uplinks, and this frame is the periodic one. 5s survives a GC pause or a
+// lost packet yet stays well inside the hub's connection timeout.
+//
+// probeHeartbeatInterval is the cadence over WebSocket, where hello advertises
+// `probe`: the hub has a protocol-level ping to detect a half-open socket
+// sooner. That probe does NOT feed the registry — a control pong never
+// reaches the hub's frame handler, so it refreshes nothing the sweep reads.
+// The status frame therefore remains a registry beat on BOTH transports; the
+// stretched cadence here buys idle uplink traffic, not liveness, and it must
+// stay comfortably below the sweep (hub.HostSilenceTimeout, 30s) with room for
+// one lost beat. 15s leaves a whole extra beat of slack; a cadence at or above
+// the sweep would make a quiet-but-healthy host flap offline and back on every
+// beat. (An earlier version of this comment claimed the hub refreshed LastSeen
+// from the pong. It does not, and slowing this beat on that belief would flap
+// idle hosts.)
+//
+// Vars (not consts) so tests can shrink them.
+var (
+	heartbeatInterval      = 5 * time.Second
+	probeHeartbeatInterval = 15 * time.Second
+)
+
+// repairInterval is the gap-repair cadence, deliberately independent of the
+// heartbeat: repair repays events that never reached the wire (the FE cannot
+// gap-pull what the hub never buffered), so it must not wait for the slower
+// WebSocket beat.
+const repairInterval = 5 * time.Second
+
+// heartbeatEvery is the host_status cadence for this session. hello.probe
+// means the hub has a socket probe and host_status is only a registry
+// re-assert, so the beat stretches to probeHeartbeatInterval. Without it
+// (QUIC, or hello not yet read) the beat stays at heartbeatInterval,
+// because that frame is what keeps LastSeen inside the sweep.
+func (c *Client) heartbeatEvery() time.Duration {
+	if c.probe.Load() {
+		return probeHeartbeatInterval
+	}
+	return heartbeatInterval
+}
+
+// heartbeatTick paces the heartbeat CHECK, not the beat itself, so it only
+// bounds how late a beat can be. Var (not const) so tests can shrink it
+// along with the intervals.
+var heartbeatTick = time.Second
 
 // NewClient returns a hub client. LocalBase defaults to 127.0.0.1:8765.
 // hostName is the display name currently in use. Safe from any goroutine,
@@ -337,14 +632,81 @@ func NewClient(cfg Config) *Client {
 		cfg:   cfg,
 		local: cfg.Local,
 		// Generous timeout: relayed prompts can run up to 30 minutes.
-		httpc: &http.Client{Timeout: 50 * time.Minute},
+		httpc: &http.Client{
+			Timeout: 50 * time.Minute,
+			Transport: &http.Transport{
+				// 代理只按本客户端的配置决定，不读进程环境变量：
+				// 「Hub 代理」关掉时必须真直连，哪怕 host 进程还带着
+				// 从 launchd / 系统代理继承来的 HTTPS_PROXY。
+				Proxy: proxyFunc(cfg.Proxy, cfg.NoProxy),
+			},
+		},
 		// Created here rather than in Run: Pair is reachable from the tray
 		// and the HTTP API before Run's first iteration, and a nil channel
 		// would make requestRepair's non-blocking send silently vanish.
 		repairCh: make(chan struct{}, 1),
+		// Byte budget for sendCh; NewClient (not Run) so tests that enqueue
+		// without a session still account for their frames.
+		sendBudget: newSendBudget(sendByteCap),
 	}
 	c.name.Store(cfg.HostName)
 	return c
+}
+
+// proxyFunc turns the configured proxy URL into the transport's Proxy
+// callback. Empty URL means a nil proxy func → direct dials (never the
+// environment default), which is what makes the Hub switch authoritative.
+func proxyFunc(rawURL, rawNoProxy string) func(*http.Request) (*url.URL, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		log.Printf("[hub-client] 代理地址无效，直连: %v", err)
+		return nil
+	}
+	bypass := parseNoProxy(rawNoProxy)
+	return func(req *http.Request) (*url.URL, error) {
+		if bypassMatches(req.URL.Hostname(), bypass) {
+			return nil, nil
+		}
+		return u, nil
+	}
+}
+
+// parseNoProxy splits NO_PROXY into host patterns. A leading dot or "*."
+// means "this domain and its subdomains"; "*" matches everything.
+func parseNoProxy(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p == "" {
+			continue
+		}
+		if i := strings.Index(p, ":"); i >= 0 && !strings.Contains(p, "]") {
+			p = p[:i]
+		}
+		p = strings.TrimPrefix(p, ".")
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// bypassMatches reports whether host is covered by the NO_PROXY patterns.
+func bypassMatches(host string, patterns []string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, p := range patterns {
+		if p == "*" {
+			return true
+		}
+		if host == p || strings.HasSuffix(host, "."+p) {
+			return true
+		}
+	}
+	return false
 }
 
 // Run connects the host to the hub: pairs when no token exists, forwards
@@ -362,29 +724,29 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 			break
 		}
 		c.setLastErr(err)
-		log.Printf("[hub-client] 配对失败: %v（%.0fs 后重试）", err, pairBackoff.Seconds())
+		wait := backoffJitter(pairBackoff)
+		log.Printf("[hub-client] 配对失败: %v（%.1fs 后重试）", err, wait.Seconds())
 		select {
 		case <-ctx.Done():
 			return
 		case <-c.repairCh:
 			// Pair() persisted a token while we were waiting — retry at
 			// once. Without this a tray pairing would sit idle for up to
-			// 30 seconds behind a backoff timer that has nothing left to
-			// wait for.
+			// reconnectBackoffMax behind a backoff timer that has nothing
+			// left to wait for.
 			c.forceRepair.Store(false)
-			pairBackoff = time.Second
+			pairBackoff = reconnectDelay(pairBackoff, 0, true)
 			continue
-		case <-time.After(pairBackoff):
+		case <-time.After(wait):
 		}
-		if pairBackoff < 30*time.Second {
-			pairBackoff *= 2
-		}
+		pairBackoff = nextBackoff(pairBackoff)
 	}
 	c.setLastErr(nil)
 	log.Printf("[hub-client] connected to hub %s as %s (%s)", c.cfg.URL, c.cfg.HostID, c.hostName())
 
 	c.sendCh = make(chan []byte, 256)
 	c.reqCh = make(chan reqFrame, 64)
+	c.ctrlCh = make(chan []byte, 32)
 
 	// Bridge events → hub (async queue + batch; no text merge — dual-path seq).
 	fwdCtx, fwdCancel := context.WithCancel(ctx)
@@ -403,7 +765,7 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 		// restart. Cancelling it never affects ctx, so the checks below
 		// still distinguish "session ended" from "process shutting down".
 		sessCtx, sessCancel := context.WithCancel(ctx)
-		c.setSessCancel(sessCancel)
+		c.bindSession(sessCtx, sessCancel)
 
 		// QUIC first (loss-resilient, connection-migrating), WS fallback.
 		// The negative cache (pickTransport) skips QUIC while in cooldown
@@ -426,7 +788,7 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 				err = c.wsSession(sessCtx, bridge)
 			}
 		}
-		c.setSessCancel(nil)
+		c.bindSession(nil, nil)
 		sessCancel()
 
 		if ctx.Err() != nil {
@@ -434,14 +796,12 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 		}
 		// A session that stayed up is evidence the hub is healthy: reset
 		// the backoff. Without this, the delay only ever grows and pins at
-		// 30s for the rest of the process — so a single blip after hours of
-		// uptime costs 30 seconds of downtime, and every later blip does
-		// too. Only sessions shorter than the threshold keep escalating
-		// (that is the case backoff exists for: a hub that rejects or drops
-		// us immediately).
-		if time.Since(sessionStart) >= healthySessionMin {
-			backoff = time.Second
-		}
+		// reconnectBackoffMax for the rest of the process — so a single
+		// blip after hours of uptime costs the full cap, and every later
+		// blip does too. Only sessions shorter than the threshold keep
+		// escalating (that is the case backoff exists for: a hub that
+		// rejects or drops us immediately).
+		backoff = reconnectDelay(backoff, time.Since(sessionStart), false)
 		// Pause forwarding until the next hello re-arms subscribers.
 		c.fwdMu.Lock()
 		c.fwdKnown = false
@@ -461,23 +821,60 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 			}
 			log.Printf("[hub-client] 配对信息已更新，立即重连")
 			repaired = false
-			backoff = time.Second
+			backoff = reconnectDelay(backoff, 0, true)
 			continue
 		}
 
 		c.setLastErr(err)
-		if isAuthErr(err) && c.cfg.PairCode != "" && !repaired {
-			log.Printf("[hub-client] hub 拒绝了旧 token，重新配对…")
-			c.clearState()
-			if perr := c.ensureToken(ctx); perr == nil {
-				repaired = true
-				backoff = time.Second
-				continue
-			} else {
-				log.Printf("[hub-client] 重新配对失败: %v", perr)
-			}
+		// The wait is this attempt's jittered backoff; `backoff` stays the
+		// unjittered sequence so escalation is unchanged.
+		wait := backoffJitter(backoff)
+		// A close frame says what happened; a rejected handshake or a
+		// missing credential says the same thing without one. Both end up
+		// as closeAuth, and everything unrecognised keeps the old path
+		// (backoff, no re-pair).
+		kind := classifyClose(err)
+		if kind == closeOther && isAuthErr(err) {
+			kind = closeAuth
 		}
-		log.Printf("[hub-client] hub 连接断开: %v（%.0fs 后重连）", err, backoff.Seconds())
+		switch kind {
+		case closeSuperseded:
+			// Another connection already holds this hostId. The credential
+			// is FINE: re-pairing here would delete a working token and
+			// spend a pairing code every time a second host process (or a
+			// fast reconnect) overlaps the old socket, which is exactly
+			// what the old status-string match did.
+			log.Printf("[hub-client] hub: 本连接已被同 hostId 的新连接取代，立即重连（不重新配对）")
+			backoff = reconnectDelay(backoff, 0, true)
+			continue
+		case closeAuth:
+			if c.cfg.PairCode != "" && !repaired {
+				log.Printf("[hub-client] hub 拒绝了旧 token，重新配对…")
+				c.clearState()
+				if perr := c.ensureToken(ctx); perr == nil {
+					repaired = true
+					backoff = reconnectDelay(backoff, 0, true)
+					continue
+				} else {
+					log.Printf("[hub-client] 重新配对失败: %v", perr)
+				}
+			}
+		case closeLiveness:
+			// The hub buried the link because our pongs stopped arriving:
+			// a half-open socket, whose only recovery is a redial. Same
+			// backoff as any other drop, so a genuinely dead network still
+			// escalates instead of hammering.
+			log.Printf("[hub-client] hub 探测超时，判定链路半开（%.1fs 后重连）", wait.Seconds())
+		case closeShutdown:
+			// The hub is going down (deploy, restart). Nothing to repair;
+			// the ordinary backoff would otherwise look like an outage.
+			log.Printf("[hub-client] hub 正在关闭连接（%.1fs 后重连）", wait.Seconds())
+		case closeProtocol:
+			// The hub refused the handshake: one side is on the old
+			// protocol. Redialing cannot fix that, so say it plainly.
+			log.Printf("[hub-client] hub 拒绝了握手（协议版本不匹配），请把 host 与 hub 升到同一版本（%.1fs 后重试）", wait.Seconds())
+		}
+		log.Printf("[hub-client] hub 连接断开: %v（%.1fs 后重连）", err, wait.Seconds())
 		select {
 		case <-ctx.Done():
 			return
@@ -487,27 +884,218 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 			// credential we have never tried.
 			c.forceRepair.Store(false)
 			log.Printf("[hub-client] 配对信息已更新，提前重连")
-			backoff = time.Second
-		case <-time.After(backoff):
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
+			backoff = reconnectDelay(backoff, 0, true)
+		case <-time.After(wait):
+			backoff = nextBackoff(backoff)
 		}
 	}
+}
+
+// reconnectDelay returns the delay before the next attempt: a healthy
+// session or a freshly supplied credential resets it to 1s, otherwise it
+// escalates (see nextBackoff).
+func reconnectDelay(prev, lasted time.Duration, repaired bool) time.Duration {
+	if repaired || lasted >= healthySessionMin {
+		return time.Second
+	}
+	return nextBackoff(prev)
+}
+
+// nextBackoff doubles d, clamped to reconnectBackoffMax.
+func nextBackoff(d time.Duration) time.Duration {
+	d *= 2
+	if d > reconnectBackoffMax {
+		return reconnectBackoffMax
+	}
+	return d
+}
+
+// backoffJitter spreads one wait over [0.8d, 1.2d]. Every host behind a hub
+// saw the same outage, so without jitter a hub restart makes all of them
+// redial on the same tick; the spread breaks up that herd. Jitter is applied
+// to the WAIT only — nextBackoff still receives the unjittered sequence, so
+// the escalation (and its tests) is unchanged, and the 1.2× overshoot is
+// bounded by the cap being a scheduling floor rather than a hard limit.
+//
+// math/rand (auto-seeded since Go 1.20) is deliberate: this is scheduling
+// noise, not something an attacker should not predict.
+func backoffJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return time.Duration(float64(d) * (0.8 + rand.Float64()*0.4))
 }
 
 func isAuthErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	if strings.Contains(s, "401") || strings.Contains(s, "StatusPolicyViolation") {
+	// A WS close is decided by its frame, never by its text: the library's
+	// Error() renders the status constant ("status = StatusPolicyViolation
+	// and reason = ..."), which every policy close shares — matching on it
+	// made a superseded or half-dead link look like a rejected credential.
+	// A hub that means "auth" says so in the reason (see classifyClose).
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		return classifyClose(err) == closeAuth
+	}
+	// Handshake rejection: the upgrade is an HTTP request, so the status
+	// is there to be read instead of grepped out of the error text.
+	var he *wsHandshakeError
+	if errors.As(err, &he) {
+		return he.status == http.StatusUnauthorized
+	}
+	// QUIC says it in the application error code, since there is no close
+	// frame to carry a reason (see quicCode*). Only the auth code counts:
+	// every other verdict keeps the ordinary redial path.
+	var ae *quic.ApplicationError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode == quicCodeAuth
+	}
+	if errors.Is(err, errNoToken) || errors.Is(err, errHubAuthRejected) {
 		return true
 	}
 	// Match auth-specific phrases only — bare "token" is too broad
 	// (e.g. "token bucket", log lines mentioning HOST_TOKEN).
-	low := strings.ToLower(s)
+	low := strings.ToLower(err.Error())
 	return strings.Contains(low, "auth failed") || strings.Contains(low, "no token")
+}
+
+// errNoToken: this process has no credential at all (neither HOST_TOKEN nor
+// a paired state file). Re-pairing is the only fix, so it must classify as
+// an auth failure rather than as a transport error.
+var errNoToken = errors.New("401: no token")
+
+// errHubAuthRejected: the hub refused this host's credential on a
+// transport that has no WS close frame to say so. QUIC sends a JSON
+// {"type":"auth_error"} frame and drops the connection (see
+// serveQUICConn); readLoop maps it onto this sentinel so the reconnect
+// loop re-pairs instead of treating every attempt as an ordinary drop.
+var errHubAuthRejected = errors.New("hub 拒绝了本机的凭据")
+
+// wsHandshakeError is a WebSocket handshake the hub answered with an HTTP
+// status instead of 101. It keeps the response so the reconnect loop can
+// classify by StatusCode; the wrapped error is only for the log.
+type wsHandshakeError struct {
+	status int
+	err    error
+}
+
+func (e *wsHandshakeError) Error() string {
+	return fmt.Sprintf("%d hub ws handshake failed: %v", e.status, e.err)
+}
+
+func (e *wsHandshakeError) Unwrap() error { return e.err }
+
+// closeKind is what a hub-initiated WS close MEANS for this client. The
+// hub picks the pair deliberately (hostClose in acp-hub cmd/capri-hub), so
+// the reason is the contract — the code alone cannot carry it (1000 is both
+// an orderly shutdown and "a newer connection replaced yours"; 1008 is both
+// "re-pair" and "your pings stopped").
+type closeKind int
+
+const (
+	// closeOther: not a WS close we recognise — the ordinary error path
+	// (dial failure, watchdog, local cancel), or a peer that closed without
+	// a reason and therefore cannot be interpreted.
+	closeOther closeKind = iota
+	// closeAuth: the hub does not accept our credential. Only recovery is
+	// a fresh pairing.
+	closeAuth
+	// closeSuperseded: another connection took over this hostId. Redial,
+	// but do NOT re-pair — the credential is fine and clearing it would
+	// throw away a working pairing on every duplicate host process.
+	closeSuperseded
+	// closeShutdown: the hub is going down (or the process serving us is).
+	closeShutdown
+	// closeLiveness: the hub's probe went unanswered long enough to bury
+	// the link. The common shape of a half-open socket.
+	closeLiveness
+	// closeProtocol: the hub refused our handshake because it lacks a
+	// capability this build must announce. Redialing cannot fix it — one
+	// side has to be upgraded — so the loop backs off and says so.
+	closeProtocol
+)
+
+// Close reasons acp-hub sends. Duplicated here on purpose: the two modules
+// are separate binaries with no shared package, and the strings are wire
+// contract, so they must be reviewed together when either side changes.
+// A close without one of these reasons lands in closeOther.
+const (
+	closeReasonAuth       = "auth"
+	closeReasonSuperseded = "superseded"
+	closeReasonShutdown   = "shutdown"
+	closeReasonLiveness   = "liveness probe timeout"
+	closeReasonProtocol   = "protocol version"
+)
+
+// QUIC application error codes. QUIC has no close-reason frame, so the hub
+// carries the same verdicts in CloseWithError's code; without this table a
+// superseded QUIC session was indistinguishable from an ordinary drop, and
+// the old process re-acquired the same hostId on a 10s cycle while the new
+// one held it. Mirrors errCode* in acp-hub's cmd/capri-hub/main.go — the two
+// lists are wire contract and must move together.
+const (
+	quicCodeSuperseded = 2
+	quicCodeAuth       = 3
+	quicCodeProtocol   = 4
+	quicCodeLiveness   = 5
+	quicCodeUplinkIdle = 6
+	quicCodePingWrite  = 7
+	quicCodeShutdown   = 8
+	quicCodeUnreadable = 9
+)
+
+// classifyClose maps a hub close to what it means for the reconnect loop,
+// over either transport. Anything it cannot vouch for is closeOther, which
+// keeps the pre-existing behavior (backoff, no re-pair) — the safe default,
+// because a re-pair throws away a credential the hub may still accept.
+func classifyClose(err error) closeKind {
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		return classifyWSReason(ce.Reason)
+	}
+	var ae *quic.ApplicationError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode {
+		case quicCodeSuperseded:
+			return closeSuperseded
+		case quicCodeAuth:
+			return closeAuth
+		case quicCodeProtocol:
+			return closeProtocol
+		case quicCodeLiveness:
+			return closeLiveness
+		case quicCodeShutdown:
+			return closeShutdown
+		}
+		// Uplink-idle, ping-write and unreadable all end an otherwise
+		// healthy session: they are ordinary drops whose only recovery is
+		// the same backoff-and-redial the WebSocket path uses.
+	}
+	return closeOther
+}
+
+// classifyWSReason is the WebSocket half of the table. The reason is the
+// contract; the status code alone cannot separate shutdown from superseded
+// and 1008 already means three different things.
+func classifyWSReason(reason string) closeKind {
+	switch reason {
+	case closeReasonAuth:
+		return closeAuth
+	case closeReasonSuperseded:
+		return closeSuperseded
+	case closeReasonShutdown:
+		return closeShutdown
+	case closeReasonLiveness:
+		return closeLiveness
+	case closeReasonProtocol:
+		return closeProtocol
+	}
+	// Empty reason = a hub that predates this contract (or a peer that
+	// closed without saying why). Its code is the only signal and it is
+	// ambiguous, so it must NOT be read as auth — that was the bug.
+	return closeOther
 }
 
 func ctxDone(ctx context.Context) bool {
@@ -540,7 +1128,16 @@ func (c *Client) ensureToken(ctx context.Context) error {
 	return nil
 }
 
+// pairTimeout bounds a single pairing request. c.httpc.Timeout is 50
+// minutes (relayed prompts run that long), so without a call-level deadline
+// a hub whose hostname resolves to a blackhole keeps Run's pairing retry
+// parked inside one request — no backoff, no error, no retry. Var (not
+// const) so tests can shrink it.
+var pairTimeout = 15 * time.Second
+
 func (c *Client) pair(ctx context.Context, code string) (string, error) {
+	pctx, cancel := context.WithTimeout(ctx, pairTimeout)
+	defer cancel()
 	payload := map[string]any{
 		"code":     code,
 		"hostId":   c.cfg.HostID,
@@ -550,7 +1147,7 @@ func (c *Client) pair(ctx context.Context, code string) (string, error) {
 		payload["port"] = p
 	}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.URL+"/api/pair", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(pctx, "POST", c.cfg.URL+"/api/pair", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -653,13 +1250,27 @@ func (c *Client) forwardingEnabled() bool {
 	return c.fwdKnown && c.forwardEvents
 }
 
+// replayPaused reports that the hub has positively told us this host has no
+// audience (fwdKnown && !forwardEvents). A fwdKnown=false client is NOT
+// paused: the hub has not spoken yet, and the ring must keep its normal
+// shape for a reconnect.
+//
+// Lock order: callers may hold seqMu (compactReplayLocked), so this must not
+// take any lock that could be held while seqMu is taken. Nothing acquires
+// fwdMu and then seqMu — setBrowserSubscribers releases fwdMu before
+// applySubscribers touches the ring.
+func (c *Client) replayPaused() bool {
+	c.fwdMu.Lock()
+	defer c.fwdMu.Unlock()
+	return c.fwdKnown && !c.forwardEvents
+}
+
 // seqAndReplay appends evs to the replay ring, keeping each event's
 // own seq when present (bridge.Broadcast 分配全局序号，本地 SSE 与中继
 // 同源 —— 前端双路去重依赖两侧 seq 一致)；无 seq 的事件（旧桥/内部
 // 事件）才由本客户端分配兜底。定位一律按事件实际 seq 比较。
 func (c *Client) seqAndReplay(evs []acp.Event) {
 	c.seqMu.Lock()
-	defer c.seqMu.Unlock()
 	for _, ev := range evs {
 		s := eventSeq(ev)
 		if s == 0 {
@@ -669,23 +1280,281 @@ func (c *Client) seqAndReplay(evs []acp.Event) {
 		} else if s > c.nextSeq {
 			c.nextSeq = s
 		}
+		c.clampOversized(ev)
 		raw, err := json.Marshal(ev)
 		if err != nil {
 			continue
 		}
-		c.replay = append(c.replay, replayItem{seq: s, raw: raw})
-		if len(c.replay) > replayHighWater {
-			// Compact into a FRESH array rather than reslicing: Go keeps
-			// the whole backing array alive for as long as any slice of it
-			// is, so `c.replay = c.replay[n:]` would pin every dropped
-			// payload until the next reallocation — roughly doubling
-			// steady-state memory. Compact at the high-water mark so the
-			// copy stays amortized O(1).
-			trimmed := make([]replayItem, replayCap, replayHighWater)
-			copy(trimmed, c.replay[len(c.replay)-replayCap:])
-			c.replay = trimmed
+		typ, _ := ev["type"].(string)
+		c.replay = append(c.replay, replayItem{seq: s, typ: typ, raw: raw})
+		c.replayBytes += len(raw)
+	}
+	saturated := c.compactReplayLocked()
+	c.seqMu.Unlock()
+	// Cancel outside the lock: failSession takes ctlMu, and the session
+	// goroutines take seqMu.
+	if saturated && c.connected.Load() && c.replaySaturated.CompareAndSwap(false, true) {
+		c.failSession(fmt.Errorf("未确认事件超过回放环上限（%d），断开会话以便按水位重放", replayHardCap))
+	}
+}
+
+// clampOversized replaces a single event that cannot fit in one frame
+// with an explicit error placeholder that keeps its seq. Dropping it
+// would open a hole the hub then steps over. The placeholder is what
+// both the live send and a later replay transmit.
+func (c *Client) clampOversized(ev acp.Event) {
+	raw, err := json.Marshal(ev)
+	if err != nil || len(raw)+64 <= maxFrameBytes {
+		return
+	}
+	seq := ev["seq"]
+	sid := ev["sessionId"]
+	for k := range ev {
+		delete(ev, k)
+	}
+	ev["type"] = "error"
+	ev["seq"] = seq
+	if sid != nil {
+		ev["sessionId"] = sid
+	}
+	ev["message"] = "事件超过单帧上限，正文已丢弃"
+	log.Printf("[hub-client] 单条事件 %d 字节超过单帧上限，改为错误占位 seq=%v", len(raw), seq)
+}
+
+// compactPausedReplayLocked trims the ring while forwarding is paused: the
+// most recent pausedReplayCap droppable events plus EVERY non-droppable one
+// (client_request, done, error, …). Critical events may exceed the cap on
+// purpose — a permission prompt is not in host history, so a resume cannot
+// rebuild it — and the lock/ack state of a request is what the user acts on.
+//
+// Dropping events makes the ring's start jump above the hub's delivery
+// watermark; pausedTrimmedThrough records the highest seq that was really
+// dropped so the resume can detect that a replay alone cannot bridge the
+// gap and must reset the epoch instead. Caller holds seqMu.
+func (c *Client) compactPausedReplayLocked() {
+	// Count-based trim: keep the newest pausedReplayCap droppable events.
+	droppable := 0
+	for _, it := range c.replay {
+		if it.droppable() {
+			droppable++
 		}
 	}
+	drop := 0
+	if droppable > pausedReplayCap {
+		drop = droppable - pausedReplayCap
+	}
+	var droppedThrough uint64
+	if drop > 0 {
+		kept := make([]replayItem, 0, len(c.replay)-drop)
+		for _, it := range c.replay {
+			if drop > 0 && it.droppable() {
+				drop--
+				if it.seq > droppedThrough {
+					droppedThrough = it.seq
+				}
+				continue
+			}
+			kept = append(kept, it)
+		}
+		c.replay = kept
+		c.replayBytes = replayRingBytes(c.replay)
+	}
+
+	// Byte gate. Critical events bypass the count cap on purpose (a
+	// permission prompt has no history), but they must not grow the ring
+	// without bound either. Drop from the oldest: first only droppable
+	// events, then — if the ring is still over the cap — the oldest critical
+	// ones too. A dropped prompt is worse than a dropped chunk, but both
+	// beat running out of memory, and the trim marker sends the resume
+	// through seq_reset.
+	if c.replayBytes > replayByteCap {
+		bytesLeft := c.replayBytes
+		kept := make([]replayItem, 0, len(c.replay))
+		for _, it := range c.replay {
+			if bytesLeft > replayByteCap && it.droppable() {
+				bytesLeft -= len(it.raw)
+				if it.seq > droppedThrough {
+					droppedThrough = it.seq
+				}
+				continue
+			}
+			kept = append(kept, it)
+		}
+		criticalDropped := 0
+		if bytesLeft > replayByteCap {
+			out := kept[:0]
+			for _, it := range kept {
+				if bytesLeft > replayByteCap {
+					bytesLeft -= len(it.raw)
+					if it.seq > droppedThrough {
+						droppedThrough = it.seq
+					}
+					criticalDropped++
+					continue
+				}
+				out = append(out, it)
+			}
+			kept = out
+			if criticalDropped > 0 && c.pausedCapLogged.CompareAndSwap(false, true) {
+				log.Printf("[hub-client] 无订阅期间关键事件超过回放字节上限（%dMB），已丢弃最旧的关键事件 %d 条；恢复客户端时会走 seq_reset 重放",
+					replayByteCap>>20, criticalDropped)
+			}
+		}
+		c.replay = kept
+		c.replayBytes = bytesLeft
+	}
+	if droppedThrough > c.pausedTrimmedThrough {
+		c.pausedTrimmedThrough = droppedThrough
+	}
+}
+
+// resumeAfterPausedTrimLocked repairs a resume whose replay ring no longer
+// reaches the hub's watermark. Replaying the surviving tail (say 1050 after
+// ack 1000) would park it in the hub's out-of-order set forever: 1001..1049
+// no longer exist, so the cumulative watermark could never move and every
+// later event would pile up behind the hole. A seq_reset starts a new hub
+// epoch from the oldest event we still hold — the hub's first-event baseline
+// rule then anchors the watermark just below it.
+//
+// The caller must hold enqueueMu, and it must span BOTH the reset and the
+// replay: a live frame landing in between would let the hub jump to a higher
+// seq first and stale-drop the replayed events. Returns false when the reset
+// could not be queued; the trim marker and needCatchUp stay set so a later
+// repair retries instead of replaying into the hole.
+func (c *Client) resumeAfterPausedTrimLocked() bool {
+	if !c.enqueueSeqResetLocked() {
+		c.needCatchUp.Store(true)
+		c.noteEventDrop("seq_reset 未能入队，暂不补发", 0)
+		return false
+	}
+	last := c.sendReplayAfterLocked(0)
+	// The hub's watermark is 0 after the reset; ours must be too, or the
+	// next ping (still carrying the pre-reset number) would re-anchor
+	// repairs past the replayed events. lastSentSeq follows what actually
+	// reached the queue, so a yielded replay resumes from the right point.
+	c.seqMu.Lock()
+	c.hubAckSeq = 0
+	c.lastSentSeq = last
+	c.pausedTrimmedThrough = 0
+	c.seqMu.Unlock()
+	if last > 0 {
+		log.Printf("[hub-client] 暂停裁剪后重置世代，重放本地缓冲 seq 至 %d", last)
+	}
+	return true
+}
+
+// compactReplayLocked drops only events the hub has acked (seq <=
+// hubAckSeq) once the ring passes replayHighWater. Unacked events are
+// kept. It reports whether the unacked tail itself exceeds replayHardCap,
+// which is the point the session should end rather than grow without a
+// delivery ack. While forwarding is paused (a known-empty audience) the ring
+// is trimmed to pausedReplayCap droppable events plus every critical one, and
+// saturation is never reported: no subscriber means no ack is coming, so
+// growth is not evidence of a broken link. Caller holds seqMu.
+func (c *Client) compactReplayLocked() (saturated bool) {
+	// No audience: nothing sent can be acked, so the unacked tail must not
+	// be measured against replayHardCap (that ended the session every 8000
+	// events for a host nobody was watching). Keep a small tail for the
+	// 0→1 resume instead; older events are rebuilt from host history.
+	if c.replayPaused() {
+		c.compactPausedReplayLocked()
+		return false
+	}
+	// Both caps are checked before the cheap early return: a handful of
+	// 8MB events passes replayHighWater's count check long after it passes
+	// the byte budget.
+	if len(c.replay) <= replayHighWater && c.replayBytes <= replayByteCap {
+		return false
+	}
+	ack := c.hubAckSeq
+	cut := 0
+	if ack > 0 {
+		for cut < len(c.replay) && c.replay[cut].seq <= ack {
+			cut++
+		}
+	}
+	unacked := len(c.replay) - cut
+	unackedBytes := replayRingBytes(c.replay[cut:])
+	if unacked > replayHardCap || unackedBytes > replayByteCap {
+		if c.connected.Load() {
+			// End the session instead of dropping. hello replays the tail.
+			return true
+		}
+		// No session to end. Keep the newest unacked events that fit both
+		// caps; anything older is in the agent transcript. Unacked events
+		// are never silently dropped while a live session could replay
+		// them — this branch only runs disconnected.
+		dropN := 0
+		for cut+dropN < len(c.replay) &&
+			(len(c.replay)-(cut+dropN) > replayHardCap || unackedBytes > replayByteCap) {
+			unackedBytes -= len(c.replay[cut+dropN].raw)
+			dropN++
+		}
+		trimmed := make([]replayItem, len(c.replay)-(cut+dropN))
+		copy(trimmed, c.replay[cut+dropN:])
+		c.replay = trimmed
+		c.replayBytes = replayRingBytes(c.replay)
+		if c.replayFuseLogged.CompareAndSwap(false, true) {
+			log.Printf("[hub-client] 断线期间未确认回放超出上限（上限 %d 条 / %dMB），更早的事件不再进入回放环（历史记录仍在）",
+				replayHardCap, replayByteCap>>20)
+		}
+		return false
+	}
+	// Keep every unacked event. Drop the oldest acked ones until the
+	// ring is back at replayCap, but never past `cut`.
+	target := replayCap
+	if unacked > target {
+		target = unacked
+	}
+	countStart := 0
+	if len(c.replay) > target {
+		countStart = len(c.replay) - target
+		if countStart > cut {
+			countStart = cut
+		}
+	}
+
+	// Byte trim of the ACKED prefix. The count trim above cannot bound the
+	// ring when everything is acked (cut == len(replay), unacked == 0): a
+	// full replayCap of 8MB events is 8GB, and "recent" acked events are
+	// still just history the FE can rebuild. Keep the NEWEST acked events
+	// that fit beside the unacked tail; the unacked tail itself is already
+	// under replayByteCap (checked above), and dropping acked events never
+	// fails the session — they are delivered by definition.
+	//
+	// The walk stops at the first event that does not fit rather than
+	// skipping it: the kept ring stays a contiguous suffix, so a replay or
+	// gap-pull never sees an older event behind a newer missing one.
+	byteStart := cut
+	budget := replayByteCap - unackedBytes
+	for i := cut - 1; i >= countStart; i-- {
+		if budget < len(c.replay[i].raw) {
+			break
+		}
+		budget -= len(c.replay[i].raw)
+		byteStart = i
+	}
+	start := countStart
+	if byteStart > start {
+		start = byteStart
+	}
+	if start <= 0 {
+		return false
+	}
+	n := len(c.replay) - start
+	capN := replayHighWater
+	if n > capN {
+		capN = n
+	}
+	trimmed := make([]replayItem, n, capN)
+	copy(trimmed, c.replay[start:])
+	c.replay = trimmed
+	c.replayBytes = replayRingBytes(c.replay)
+	if start > countStart && c.ackedTrimLogged.CompareAndSwap(false, true) {
+		log.Printf("[hub-client] 已确认事件占用超过回放字节上限（%dMB），丢弃最旧的已确认事件 %d 条（历史记录仍在）",
+			replayByteCap>>20, start-countStart)
+	}
+	return false
 }
 
 func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
@@ -705,6 +1574,10 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 		// drops are repaired by FE gap-pull, not by coalescing.
 		evs := batch
 		batch = make([]acp.Event, 0, 32)
+		// Trim BEFORE the replay ring so a later resume replays the same
+		// small placeholders instead of resurrecting payloads for sessions
+		// nobody is watching (the FE rebuilds those from host history).
+		c.trimUnwatched(evs)
 		// Always enter replay (even while browser subscribers are
 		// paused) so a later 0→1 resume can catch up.
 		c.seqAndReplay(evs)
@@ -714,8 +1587,14 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 	}
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	heartbeat := time.NewTicker(15 * time.Second)
+	// The heartbeat cadence is per session (the transport decides it), so
+	// the ticker only paces the check and lastBeat is compared against the
+	// current interval. A ticker built once from either constant would pin
+	// the wrong cadence on the other transport.
+	heartbeat := time.NewTicker(heartbeatTick)
 	defer heartbeat.Stop()
+	lastBeat := time.Now()
+	var lastRepair time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -731,9 +1610,12 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 			// Host registry fields only change on these transitions —
 			// mirror them to the hub right away (control frame, works
 			// even while event upload is paused) instead of waiting for
-			// the 15s heartbeat.
+			// the next heartbeat. client_request_resolved is here for the
+			// DECREASE: pendingCount only drops when a request is answered
+			// or times out, and on a probing hub the next beat is
+			// probeHeartbeatInterval away.
 			switch t, _ := ev["type"].(string); t {
-			case "busy", "sessions_changed", "client_request", "error":
+			case "busy", "sessions_changed", "client_request", "client_request_resolved", "error":
 				c.maybeNotifyHostStatus(bridge)
 			}
 			batch = append(batch, ev)
@@ -743,16 +1625,31 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 		case <-ticker.C:
 			flush()
 		case <-heartbeat.C:
+			now := time.Now()
 			flush()
 			// Neither of these is useful without a live transport: the
 			// uplink queue survives reconnects (drained on the next
 			// session), so frames queued while disconnected are thrown
-			// away anyway — on Oct 7 a DNS outage turned every 15s beat
+			// away anyway — on Oct 7 a DNS outage turned every beat
 			// into "发送队列满，丢弃帧" for two and a half hours.
+			//
+			// Both deadlines stay un-advanced here, so a reconnect repairs
+			// and re-asserts immediately instead of after a full interval.
 			if !c.connected.Load() {
 				continue
 			}
-			c.repairDroppedEvents()
+			// Gap repair keeps its own fast cadence: it repays events that
+			// never reached the wire, and the FE cannot fill those holes
+			// itself. Slowing it down with a probe-backed heartbeat would
+			// trade liveness messaging for a longer visible stall.
+			if now.Sub(lastRepair) >= repairInterval {
+				lastRepair = now
+				c.repairDroppedEvents()
+			}
+			if now.Sub(lastBeat) < c.heartbeatEvery() {
+				continue
+			}
+			lastBeat = now
 			// Always heartbeat while connected: keeps hub registry ready
 			// flag fresh even with zero browser subscribers. Control
 			// frame, not data-plane seq.
@@ -767,46 +1664,109 @@ func (c *Client) forwardLoop(ctx context.Context, bridge bridgeSource) {
 // the hub's gap-pull buffer. Re-send from the hub's ack watermark once the
 // burst has passed.
 func (c *Client) repairDroppedEvents() {
-	if !c.needCatchUp.Swap(false) || !c.forwardingEnabled() {
+	if !c.needCatchUp.Load() || !c.forwardingEnabled() {
 		return
 	}
 	// Only repair once the queue has actually drained. Replaying into a
 	// still-full queue is self-defeating: the replay's critical enqueue
 	// blocks up to 5s per frame, times out, sets needCatchUp again, and
-	// the next heartbeat repeats the whole batch. That loop is what turned
+	// the next pass repeats the whole batch. That loop is what turned
 	// one oversized burst (2026-10-22 22:14) into thousands of drops.
-	// Putting the flag back keeps the repair pending; nothing is lost
+	// Leaving the flag set keeps the repair pending; nothing is lost
 	// because the events stay in the ring.
 	if c.sendQueuePressure() {
-		c.needCatchUp.Store(true)
+		return
+	}
+	// Hold the ordering lock before clearing the flag. A live enqueue
+	// that observed needCatchUp==false in the gap would send a higher
+	// seq first, and the hub watermark would step over the hole.
+	c.enqueueMu.Lock()
+	defer c.enqueueMu.Unlock()
+	if !c.needCatchUp.Load() || c.sendQueuePressure() {
 		return
 	}
 	c.seqMu.Lock()
-	// Anchor at the DELIVERY watermark when this session has one: it covers
-	// anything not provably on the hub, including frames lost between
-	// enqueue and the wire; re-sent in-flight frames are deduped by the
-	// hub's stale-seq gate, and the re-sent window is bounded (queue depth
-	// plus one ping interval of production). Before the first ack (old
-	// hub, hello not yet processed) fall back to the enqueue watermark.
+	// Anchor at the delivery watermark. Live sends do not pass a hole,
+	// so this watermark cannot have stepped over the events we are
+	// about to resend. Before the first ack, fall back to the enqueue
+	// watermark: nothing past it was handed to the writer.
 	after := c.lastSentSeq
 	if c.hubAckSeq > 0 {
 		after = c.hubAckSeq
 	}
+	trimmed := c.pausedTrimmedThrough
 	c.seqMu.Unlock()
-	if last := c.sendReplayAfter(after); last > 0 {
+	if trimmed > after {
+		// The ring starts above the watermark, so a replay cannot bridge
+		// the gap; restart the hub epoch from the oldest event still held.
+		// needCatchUp is re-armed by the helper if the reset cannot land.
+		c.needCatchUp.Store(false)
+		c.resumeAfterPausedTrimLocked()
+		return
+	}
+	c.needCatchUp.Store(false)
+	if last := c.sendReplayAfterLocked(after); last > 0 {
 		log.Printf("[hub-client] 补发被丢弃的事件 seq %d..%d", after+1, last)
 	}
 }
 
 // sendQueuePressure reports whether the uplink queue is too full to accept
-// a repair replay: more than half of sendCh's capacity is still occupied.
-// The writer drains one frame per send, so half-full means the backlog is
-// at least half a round of writes — replaying now would refill it.
+// a repair replay: more than half of sendCh's slots — or half of its byte
+// budget — are still occupied. The writer drains one frame per send, so
+// half-full means the backlog is at least half a round of writes; replaying
+// now would refill it. The byte half matters because a few large frames can
+// fill the budget while the channel looks empty.
 func (c *Client) sendQueuePressure() bool {
 	if c.sendCh == nil {
 		return false
 	}
-	return len(c.sendCh) >= cap(c.sendCh)/2
+	if len(c.sendCh) >= cap(c.sendCh)/2 {
+		return true
+	}
+	if c.sendBudget != nil {
+		b := c.sendBudget
+		b.mu.Lock()
+		used, capacity := b.used, b.cap
+		b.mu.Unlock()
+		if capacity > 0 && used >= capacity/2 {
+			return true
+		}
+	}
+	return false
+}
+
+// reserveSendNow claims n bytes of the send budget without waiting. A nil
+// budget (a Client not built by NewClient) means accounting is disabled.
+func (c *Client) reserveSendNow(n int) bool {
+	if c.sendBudget == nil {
+		return true
+	}
+	return c.sendBudget.tryReserve(n)
+}
+
+// reserveSendWait claims n bytes, waiting at most d (d = 0 means until the
+// session ends). Callers must not hold seqMu/enqueueMu longer than the
+// existing critical timeout already allows.
+func (c *Client) reserveSendWait(n int, d time.Duration) bool {
+	if c.sendBudget == nil {
+		return true
+	}
+	return c.sendBudget.waitReserve(c.sessionCtx(), n, d)
+}
+
+// releaseSend returns n reserved bytes to the budget.
+func (c *Client) releaseSend(n int) {
+	if c.sendBudget != nil {
+		c.sendBudget.release(n)
+	}
+}
+
+// sendBudgetUsed is the diagnostics read side of the send budget.
+func (c *Client) sendBudgetUsed() int {
+	if c.sendBudget == nil {
+		return 0
+	}
+	return c.sendBudget.usedBytes()
 }
 
 // eventSeq extracts an event's seq (bridge uint64 / float64 after JSON
@@ -842,13 +1802,19 @@ func (c *Client) enqueueEvents(evs []acp.Event) {
 	// then fills and Broadcast drops droppable events BEFORE they reach the
 	// replay ring, where no repair path can recover them. The batch is
 	// already in the ring (flush ran seqAndReplay first), so dropping here
-	// is safe: needCatchUp's heartbeat repair re-sends it in order.
+	// is safe: the repair re-sends it in order, and live sends stay
+	// parked until that repair holds this same lock.
 	if !c.enqueueMu.TryLock() {
 		c.needCatchUp.Store(true)
 		c.noteEventDrop("重放占用发送通道", len(evs))
 		return
 	}
 	defer c.enqueueMu.Unlock()
+	if c.needCatchUp.Load() {
+		// A hole is already open. These events are in the ring.
+		// Sending them would step past it.
+		return
+	}
 	c.enqueueEventsLocked(evs, false)
 }
 
@@ -860,34 +1826,82 @@ func (c *Client) enqueueEventsLocked(evs []acp.Event, critical bool) {
 	if len(evs) == 0 || c.sendCh == nil {
 		return
 	}
-	payload := c.marshalEventsFrame(evs)
-	if payload == nil {
-		return
+	// Same budget the replay path uses. A 50ms/32-event batch of tool
+	// output can exceed maxFrameBytes even when each event fits; sending
+	// it as one frame used to drop the batch with no catch-up flag.
+	var batch []acp.Event
+	size := 0
+	flush := func() bool {
+		if len(batch) == 0 {
+			return true
+		}
+		sending := batch
+		batch = nil
+		size = 0
+		payload := c.marshalEventsFrame(sending)
+		if payload == nil {
+			c.needCatchUp.Store(true)
+			c.noteEventDrop("事件帧无法编码", len(sending))
+			return false
+		}
+		if !c.enqueuePayload(payload, sending, critical) {
+			return false
+		}
+		return true
 	}
+	for _, ev := range evs {
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			continue
+		}
+		if len(batch) > 0 && size+len(raw) > replayFrameBudget {
+			if !flush() {
+				return
+			}
+		}
+		batch = append(batch, ev)
+		size += len(raw)
+	}
+	flush()
+}
+
+// enqueuePayload puts one events frame on sendCh. On failure it sets
+// needCatchUp and does not advance lastSentSeq, so the caller must not
+// send a later seq. critical waits up to sendCriticalWait for a slot and
+// for byte budget; the live path never blocks.
+func (c *Client) enqueuePayload(payload []byte, evs []acp.Event, critical bool) bool {
+	n := len(payload)
 	if critical {
+		if !c.reserveSendWait(n, sendCriticalWait) {
+			c.needCatchUp.Store(true)
+			c.noteEventDrop("关键事件帧入队超时（发送预算满）", len(evs))
+			return false
+		}
 		select {
 		case c.sendCh <- payload:
 			c.noteLastSentSeq(evs)
-		case <-time.After(5 * time.Second):
-			// lastSentSeq was NOT advanced, so a later repair re-sends this
-			// batch; without the flag nothing retriggered it until the next
-			// reconnect, leaving the hub missing transcript the whole
-			// session.
+			return true
+		case <-time.After(sendCriticalWait):
+			c.releaseSend(n)
 			c.needCatchUp.Store(true)
 			c.noteEventDrop("关键事件帧入队超时（队列满）", len(evs))
+			return false
 		}
-		return
+	}
+	if !c.reserveSendNow(n) {
+		c.needCatchUp.Store(true)
+		c.noteEventDrop("发送预算不足", len(evs))
+		return false
 	}
 	select {
 	case c.sendCh <- payload:
 		c.noteLastSentSeq(evs)
+		return true
 	default:
-		// Dropped: the hub will never see these seqs, and neither will the
-		// FE's gap-pull (it reads the hub's buffer). Flag a catch-up so the
-		// heartbeat re-sends from lastSentSeq instead of leaving a hole the
-		// FE can only wait forever on.
+		c.releaseSend(n)
 		c.needCatchUp.Store(true)
 		c.noteEventDrop("发送队列满", len(evs))
+		return false
 	}
 }
 
@@ -924,6 +1938,18 @@ func (c *Client) noteHubAck(seq uint64) {
 	if seq > c.hubAckSeq {
 		c.hubAckSeq = seq
 	}
+}
+
+// setHubAck installs hello's watermark as-is (it may be lower than the
+// previous session's). seq above anything this process produced is
+// ignored, same as noteHubAck.
+func (c *Client) setHubAck(seq uint64) {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	if seq > c.nextSeq {
+		return
+	}
+	c.hubAckSeq = seq
 }
 
 // marshalEventsFrame builds a type:"events" frame for evs, enforcing the
@@ -982,11 +2008,9 @@ func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 		return 0
 	}
 	items := append([]replayItem(nil), c.replay[idx:]...)
-	last := items[len(items)-1].seq
 	// Release before enqueue so noteLastSentSeq can take seqMu.
 	c.seqMu.Unlock()
-	c.enqueueReplayLocked(items)
-	return last
+	return c.enqueueReplayLocked(items)
 }
 
 // enqueueReplayLocked packs replay events into frames of at most
@@ -1004,36 +2028,69 @@ func (c *Client) sendReplayAfterLocked(after uint64) uint64 {
 // gap-pull buffer too, so the transcript would be permanently lost.
 // Live enqueues simply wait for the lock and then land after the
 // replay, in strictly increasing seq order.
-func (c *Client) enqueueReplayLocked(items []replayItem) {
+//
+// It yields to queue pressure: after each frame actually lands on sendCh,
+// sendQueuePressure() is re-checked, and when the queue is at least half
+// full the remaining events are left for the repair path (needCatchUp) with
+// lastSentSeq advanced past whatever did land. Pushing the rest would time
+// out each critical enqueue (5s), re-arm needCatchUp, and replay the same
+// batch again on the next beat — the 2026-10-22 amplification loop. Returns
+// the seq of the last event actually queued (0 when none was).
+func (c *Client) enqueueReplayLocked(items []replayItem) uint64 {
 	var frame []replayItem
 	size := 0
-	flush := func() {
+	var lastSent uint64
+	var firstSent uint64
+	flush := func() (queued, ok bool) {
 		if len(frame) == 0 {
-			return
+			return false, true
 		}
 		// Frames are sent via the CRITICAL path — replay is reconnect
 		// catch-up, so frames must not be dropped when the send queue
 		// happens to be full (a dropped replay frame would leave the hub
 		// missing transcript after the resume).
-		c.enqueueReplayFrameLocked(frame)
+		queued, ok = c.enqueueReplayFrameLocked(frame)
+		if queued {
+			if firstSent == 0 {
+				firstSent = frame[0].seq
+			}
+			lastSent = frame[len(frame)-1].seq
+		}
 		frame = nil
 		size = 0
+		return queued, ok
 	}
-	for _, it := range items {
+	for i := range items {
+		it := items[i]
 		if len(frame) > 0 && size+len(it.raw) > replayFrameBudget {
-			flush()
+			queued, ok := flush()
+			if !ok {
+				return lastSent
+			}
+			if queued && i < len(items) && c.sendQueuePressure() {
+				c.needCatchUp.Store(true)
+				log.Printf("[hub-client] 补发中途让出：队列已过半满，已入队 seq %d..%d，剩余 %d 条留待修补通道", firstSent, lastSent, len(items)-i)
+				return lastSent
+			}
 		}
 		frame = append(frame, it)
 		size += len(it.raw)
 	}
 	flush()
+	return lastSent
 }
 
 // enqueueReplayFrameLocked writes one events frame from already-marshaled
-// ring slots (no Event map round-trip). Caller holds enqueueMu.
-func (c *Client) enqueueReplayFrameLocked(items []replayItem) {
-	if len(items) == 0 || c.sendCh == nil {
-		return
+// ring slots (no Event map round-trip). Caller holds enqueueMu. queued
+// reports whether the frame reached sendCh; ok reports whether the caller
+// may keep sending (false on a critical-enqueue timeout, where every further
+// frame would eat another 5s).
+func (c *Client) enqueueReplayFrameLocked(items []replayItem) (queued, ok bool) {
+	if len(items) == 0 {
+		return false, true
+	}
+	if c.sendCh == nil {
+		return false, false
 	}
 	raws := make([]json.RawMessage, len(items))
 	for i, it := range items {
@@ -1041,14 +2098,27 @@ func (c *Client) enqueueReplayFrameLocked(items []replayItem) {
 	}
 	payload := c.marshalEventsFrameRaw(items[0].seq, raws)
 	if payload == nil {
-		return
+		// Do not skip this seq and continue. A later seq would weld the
+		// hole. clampOversized makes a single event fit; a nil here is
+		// the repair stopping so the next pass can try again.
+		c.needCatchUp.Store(true)
+		c.noteEventDrop("事件帧过大无法发送", len(items))
+		return false, false
+	}
+	if !c.reserveSendWait(len(payload), sendCriticalWait) {
+		c.needCatchUp.Store(true)
+		c.noteEventDrop("关键事件帧入队超时（发送预算满）", len(items))
+		return false, false
 	}
 	select {
 	case c.sendCh <- payload:
 		c.noteLastSentSeqItems(items)
-	case <-time.After(5 * time.Second):
+		return true, true
+	case <-time.After(sendCriticalWait):
+		c.releaseSend(len(payload))
 		c.needCatchUp.Store(true)
 		c.noteEventDrop("关键事件帧入队超时（队列满）", len(items))
+		return false, false
 	}
 }
 
@@ -1095,11 +2165,14 @@ func (c *Client) marshalEventsFrameRaw(seqStart uint64, raws []json.RawMessage) 
 //
 //	{"v":1,"type":"host_status","ready":true,"busy":false,"booting":false,"pendingCount":0}
 //
-// No seq, not stored in the replay buffer. critical=false: under pressure
-// the next heartbeat will refresh the hub registry flags. Records the sent
-// fields so maybeNotifyHostStatus can diff — the 15s heartbeat keeps
-// sending unconditionally for liveness, while a status change mid-window
-// is pushed via maybeNotifyHostStatus.
+// No seq, not stored in the replay buffer. Records the sent fields so
+// maybeNotifyHostStatus can diff — the heartbeat keeps sending
+// unconditionally, while a status change mid-window is pushed via
+// maybeNotifyHostStatus.
+//
+// The frame rides the control queue, which is not dropped when the event
+// queue is full. lastStatus moves only after the frame is actually
+// queued, so a miss does not suppress the next diff.
 func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 	snap := bridge.Snapshot()
 	fields := c.hostStatusFieldsOf(snap)
@@ -1118,7 +2191,9 @@ func (c *Client) enqueueHostStatus(bridge bridgeSource) {
 	if err != nil {
 		return
 	}
-	c.enqueueFrame(payload, false)
+	if !c.enqueueControl(payload) {
+		return
+	}
 	c.statusMu.Lock()
 	c.lastStatus = &fields
 	c.statusMu.Unlock()
@@ -1174,7 +2249,7 @@ func (c *Client) listenPort() int {
 
 // maybeNotifyHostStatus immediately re-sends host_status when the bridge
 // snapshot's registry fields changed since the last frame, so thinking /
-// pending / idle transitions reach the hub without waiting for the 15s
+// pending / idle transitions reach the hub without waiting for the 5s
 // heartbeat. The diff is against the last SENT fields (the heartbeat's
 // unconditional frame refreshes it too), so a quiet host sends nothing.
 // Must run on state transitions only — the caller gates it on event
@@ -1197,7 +2272,7 @@ func (c *Client) maybeNotifyHostStatus(bridge bridgeSource) {
 // Without a reset, hello would push lastSentSeq to the alien high value
 // (0→1 catch-up would no-op) and hub would skip fan-out for every new
 // event with seq <= old LastSeq.
-func (c *Client) handleHelloSeq(hubSeq uint64) {
+func (c *Client) handleHelloSeq(hubSeq uint64) error {
 	c.seqMu.Lock()
 	localMax := c.nextSeq
 	c.seqMu.Unlock()
@@ -1216,10 +2291,27 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 		// from its gap-pull buffer too (seq_reset cleared it), so the
 		// transcript is permanently lost. This is exactly the hazard the
 		// enqueueMu doc describes; the reset path just wasn't covered.
+		paused := c.replayPaused()
 		c.enqueueMu.Lock()
-		c.enqueueSeqResetLocked()
-		last := c.sendReplayAfterLocked(0)
+		ok := c.enqueueSeqResetLocked()
+		var last uint64
+		if ok && !paused {
+			last = c.sendReplayAfterLocked(0)
+		}
 		c.enqueueMu.Unlock()
+		if !ok {
+			return fmt.Errorf("seq_reset 未能入队，中止本次会话以免在旧水位上补发")
+		}
+		if paused {
+			// Nothing was replayed, so the enqueue watermark must not
+			// outlive the epoch: the 0→1 resume replays from 0. The trim
+			// marker is obsolete too — the reset already started the new
+			// epoch at the oldest event still held.
+			c.seqMu.Lock()
+			c.lastSentSeq = 0
+			c.pausedTrimmedThrough = 0
+			c.seqMu.Unlock()
+		}
 		// The hub's watermark is now 0 (seq_reset cleared it); so is our
 		// view of it. A ping carrying the pre-reset high ack must not
 		// re-anchor repairs past the replay (noteHubAck filters it).
@@ -1227,27 +2319,71 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 		c.hubAckSeq = 0
 		c.seqMu.Unlock()
 		// Do NOT advance lastSentSeq from the alien hubSeq. Replay
-		// everything this process has buffered (after 0).
+		// everything this process has buffered (after 0) — unless nobody
+		// is watching, in which case the reset alone is enough and the
+		// ring waits for the 0→1 resume.
 		if last > 0 {
 			log.Printf("[hub-client] 世代重置后补发本地缓冲 seq 1..%d", last)
 		}
-		return
+		return nil
 	}
 
 	// Same process (or hub is behind): precise resume.
-	if last := c.sendReplayAfter(hubSeq); last > 0 {
+	//
+	// Paused (hub says nobody is watching): do not push the ring into a
+	// hub whose fan-out would drop every frame, and do not let the
+	// unacked size end the session. Record the hub's delivery watermark
+	// and anchor lastSentSeq at it, so the 0→1 resume (applySubscribers)
+	// sends exactly the events after it — the ring keeps only that tail
+	// while paused (pausedReplayCap). If paused compaction has trimmed past
+	// hubSeq, lastSentSeq still sits at hubSeq, so the resume sees the trim
+	// marker and takes the seq_reset path instead of replaying into a hole.
+	if c.replayPaused() {
+		c.setHubAck(hubSeq)
+		c.seqMu.Lock()
+		c.lastSentSeq = hubSeq
+		c.seqMu.Unlock()
+		return nil
+	}
+
+	// Replay what the ring still holds above the hub's watermark — unless a
+	// paused trim already dropped events between the two. Sending 1050 to a
+	// hub parked at 1000 would leave 1001..1049 missing forever, so that
+	// case resets the epoch instead. enqueueMu spans both the reset and the
+	// replay, so no live frame can land in between.
+	c.enqueueMu.Lock()
+	c.seqMu.Lock()
+	trimmed := c.pausedTrimmedThrough
+	c.seqMu.Unlock()
+	if trimmed > hubSeq {
+		reset := c.resumeAfterPausedTrimLocked()
+		c.enqueueMu.Unlock()
+		if !reset {
+			// Nothing was sent over the old watermark; needCatchUp is set
+			// so a later repair retries the reset.
+			return nil
+		}
+		log.Printf("[hub-client] 暂停裁剪越过 hub 水位（through %d > %d），重连时重置世代并重放", trimmed, hubSeq)
+		return nil
+	}
+	last := c.sendReplayAfterLocked(hubSeq)
+	c.enqueueMu.Unlock()
+	if last > 0 {
 		log.Printf("[hub-client] 重连补发事件 seq %d..%d", hubSeq+1, last)
 	}
-	// hello.seq doubles as this session's first delivery ack.
-	c.noteHubAck(hubSeq)
-	// Hub is caught up through hubSeq — raise watermark so a later 0→1
-	// does not re-send what hub already has. Only safe when hubSeq is in
-	// this process's seq space (hubSeq <= localMax).
+	// hello.seq is this session's delivery ack, absolutely: a restarted
+	// hub counts from zero and a monotonic update would keep the previous
+	// session's high watermark.
+	c.setHubAck(hubSeq)
+	// Hub is caught up through hubSeq — raise the enqueue watermark so a
+	// later 0→1 does not re-send what the hub already has. Only safe when
+	// hubSeq is in this process's seq space (the caller already checked).
 	c.seqMu.Lock()
 	if hubSeq > c.lastSentSeq {
 		c.lastSentSeq = hubSeq
 	}
 	c.seqMu.Unlock()
+	return nil
 }
 
 // enqueueSeqResetLocked asks the hub to clear per-host LastSeq + event
@@ -1257,15 +2393,15 @@ func (c *Client) handleHelloSeq(hubSeq uint64) {
 // the replay).
 //
 //	{"v":1,"type":"seq_reset"}
-func (c *Client) enqueueSeqResetLocked() {
+func (c *Client) enqueueSeqResetLocked() bool {
 	payload, err := json.Marshal(map[string]any{
 		"v":    1,
 		"type": "seq_reset",
 	})
 	if err != nil {
-		return
+		return false
 	}
-	c.enqueueFrame(payload, true)
+	return c.enqueueFrameWait(payload)
 }
 
 // drainSendCh non-blocking drains the uplink queues. Called once per new
@@ -1294,7 +2430,21 @@ func (c *Client) drainSendCh() {
 		}
 	}
 	if c.sendCh != nil {
-		drain(c.sendCh)
+		// Released frame by frame: a stale queue still holds its budget, and
+		// forgetting it would leak space for the life of the process.
+	drainSend:
+		for {
+			select {
+			case payload := <-c.sendCh:
+				c.releaseSend(len(payload))
+				n++
+			default:
+				break drainSend
+			}
+		}
+	}
+	if c.ctrlCh != nil {
+		drain(c.ctrlCh)
 	}
 	if c.reqCh != nil {
 		drainReq(c.reqCh)
@@ -1304,25 +2454,94 @@ func (c *Client) drainSendCh() {
 	}
 }
 
-// enqueueFrame queues a pre-built JSON frame. critical=true blocks briefly
-// so request responds are less likely to be dropped under load.
-func (c *Client) enqueueFrame(payload []byte, critical bool) {
+// enqueueFrame queues a pre-built JSON frame on sendCh. critical waits
+// up to sendCriticalWait for a slot and byte budget; otherwise the frame is
+// dropped when either is exhausted. Reports whether the frame was queued.
+func (c *Client) enqueueFrame(payload []byte, critical bool) bool {
 	if c.sendCh == nil {
-		return
+		return false
 	}
+	n := len(payload)
 	if critical {
+		if !c.reserveSendWait(n, sendCriticalWait) {
+			c.noteFrameDrop("关键帧入队超时（发送预算满）", 0)
+			return false
+		}
 		select {
 		case c.sendCh <- payload:
-		case <-time.After(5 * time.Second):
+			return true
+		case <-time.After(sendCriticalWait):
+			c.releaseSend(n)
 			c.noteFrameDrop("关键帧入队超时（队列满）", 0)
+			return false
 		}
-		return
+	}
+	if !c.reserveSendNow(n) {
+		c.noteFrameDrop("发送预算不足", 0)
+		return false
 	}
 	select {
 	case c.sendCh <- payload:
+		return true
 	default:
+		c.releaseSend(n)
 		c.noteFrameDrop("发送队列满", 0)
+		return false
 	}
+}
+
+// enqueueFrameWait blocks until the frame is queued or the session ends.
+// seq_reset uses it: a dropped reset followed by a replay lets the hub
+// keep the old watermark and stale-drop the whole replay. It waits for send
+// budget too — the reset must never be silently dropped for a full queue.
+func (c *Client) enqueueFrameWait(payload []byte) bool {
+	if c.sendCh == nil {
+		return false
+	}
+	n := len(payload)
+	if !c.reserveSendWait(n, 0) {
+		c.noteFrameDrop("会话结束，帧未入队", 0)
+		return false
+	}
+	select {
+	case c.sendCh <- payload:
+		return true
+	case <-c.sessionCtx().Done():
+		c.releaseSend(n)
+		c.noteFrameDrop("会话结束，帧未入队", 0)
+		return false
+	}
+}
+
+// ctrlEnqueueWait bounds how long readLoop may block handing a control frame
+// to the writer. A writer stuck on one large frame (a 28MB respond on the WS
+// transport) fills ctrlCh; blocking readLoop there stops it draining the
+// socket, so relay requests and pings queue up behind a pong nobody is
+// waiting for. Dropping under that pressure is safe: state_ack is
+// retransmitted by the hub until acked, a lost pong is replaced by the next
+// ping's, and host_status is re-sent on the next beat.
+const ctrlEnqueueWait = 100 * time.Millisecond
+
+// enqueueControl queues a small frame that must not be dropped because
+// the event queue is full: pong, state_ack, host_status. When ctrlCh is
+// unwired (tests), it falls back to a critical send on sendCh.
+func (c *Client) enqueueControl(payload []byte) bool {
+	if c.ctrlCh != nil {
+		select {
+		case c.ctrlCh <- payload:
+			return true
+		case <-c.sessionCtx().Done():
+			return false
+		case <-time.After(ctrlEnqueueWait):
+			// Bounded wait, then drop: never park readLoop behind the
+			// writer. Counted and logged (throttled) so a stalled writer
+			// cannot silently swallow every ack.
+			c.ctrlDropped.Add(1)
+			c.noteFrameDrop("控制帧队列满", 0)
+			return false
+		}
+	}
+	return c.enqueueFrame(payload, true)
 }
 
 // dropLogWindow is how often the queue-pressure log may emit. One line per
@@ -1421,7 +2640,7 @@ func (c *Client) hostToken() (string, error) {
 		if c.cfg.Token != "" {
 			return c.cfg.Token, nil
 		}
-		return "", errors.New("401: no token")
+		return "", errNoToken
 	}
 	return c.token, nil
 }
@@ -1434,23 +2653,38 @@ func (c *Client) wsSession(ctx context.Context, bridge bridgeSource) error {
 	if err != nil {
 		return err
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, wsDialTimeout)
 	defer cancel()
 	opts := &websocket.DialOptions{
 		HTTPHeader: http.Header{
 			"Authorization": []string{"Bearer " + tok},
-			// Offer uplink compression; armed only when the hub's hello
-			// echoes "deflate":true (see PROTOCOL.md).
+			// Uplink compression is part of the protocol; the hello echoes
+			// the same flag so both ends agree on the frame format.
 			"X-Hub-Deflate": []string{"1"},
+			// Confirmed state delivery is mandatory too: the hub refuses a
+			// handshake without it (close reason "protocol version").
+			"X-Hub-State-Ack": []string{"1"},
 		},
+		// 与 c.httpc 同一份代理判定，但独立实例：库会把
+		// HTTPClient.Timeout 当成拨号超时，复用 50s 分钟的 httpc 会让
+		// wsDialTimeout 失效。
+		HTTPClient: &http.Client{Transport: c.httpc.Transport},
 	}
 	conn, resp, err := websocket.Dial(dialCtx, c.wsURL(), opts)
 	if err != nil {
-		if resp != nil && resp.StatusCode == 401 {
-			return fmt.Errorf("401 hub ws auth failed: %w", err)
+		// Classify the handshake by its HTTP status, not by the text the
+		// library happens to include: a 401 is a rejected credential (the
+		// reconnect loop re-pairs), anything else is a transport problem.
+		if resp != nil {
+			return &wsHandshakeError{status: resp.StatusCode, err: err}
 		}
 		return fmt.Errorf("hub ws dial: %w", err)
 	}
+	// 16MB read limit protects the DOWNLINK: a relayed request frame
+	// carries a body the hub caps at 5MB plus the envelope, so 16MB is all
+	// headroom. It is a different constraint from the 28MB uplink
+	// maxRelayResponseBytes ceiling (hub-side read limit 32MB, QUIC length
+	// prefix 31-bit) — do not tie the two numbers together.
 	conn.SetReadLimit(16 << 20)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
@@ -1509,9 +2743,9 @@ func (c *Client) wsSession(ctx context.Context, bridge bridgeSource) error {
 // host_status, seq_reset, the hub's hello/subscribers downlink, and the
 // relayed `request` downlink. Stream B (shared request plane) is opened and
 // primed up front purely as the FALLBACK: whenever a per-request stream
-// cannot be opened (peer stream limit, old hub) or the in-flight cap is
-// hit, respond frames ride B — or A when even B failed — which is exactly
-// the WS-equivalent single-stream behavior.
+// cannot be opened (peer stream limit) or the in-flight cap is hit, respond
+// frames ride B — or A when even B failed — which is exactly the
+// WS-equivalent single-stream behavior.
 //
 // Per-request streams (T1): the first respond for a relay request opens a
 // dedicated bidirectional stream, primed with a no-op pong, and every
@@ -1520,9 +2754,9 @@ func (c *Client) wsSession(ctx context.Context, bridge bridgeSource) error {
 // accepts streams in arrival order and dispatches purely by frame type —
 // no stream carries a request's identity. Keeping each request's answer on
 // its own stream removes QUIC flow-control head-of-line blocking between a
-// 16MB relay answer (which saturates its stream's window for seconds) and
-// both the control frames and other requests' small responds. See
-// PROTOCOL.md.
+// relay answer (up to the 28MB maxRelayResponseBytes ceiling, which
+// saturates its stream's window for seconds) and both the control frames
+// and other requests' small responds. See PROTOCOL.md.
 func (c *Client) quicSession(ctx context.Context, bridge bridgeSource) (bool, error) {
 	tok, err := c.hostToken()
 	if err != nil {
@@ -1564,9 +2798,9 @@ func (c *Client) quicSession(ctx context.Context, bridge bridgeSource) (bool, er
 		return false, err
 	}
 	defer streamA.Close()
-	// Stream B failure is not fatal: an older hub may cap bidirectional
-	// streams at 1. It is only the shared fallback for per-request streams;
-	// without it responds share stream A (WS-equivalent behavior).
+	// Stream B failure is not fatal: the hub may cap bidirectional streams
+	// at 1. It is only the shared fallback for per-request streams; without
+	// it responds share stream A (WS-equivalent behavior).
 	streamB, err2 := openStream()
 	if err2 != nil {
 		log.Printf("[hub-client] 共享请求流创建失败（%v），中转响应退回控制流", err2)
@@ -1575,10 +2809,12 @@ func (c *Client) quicSession(ctx context.Context, bridge bridgeSource) (bool, er
 		defer streamB.Close()
 	}
 
-	// Auth rides stream A, uncompressed (negotiation has not happened yet).
-	// The "deflate":true field offers uplink compression; the hub arms it by
-	// echoing "deflate":true in its hello (see PROTOCOL.md).
-	auth, _ := json.Marshal(map[string]any{"v": 1, "type": "auth", "token": tok, "deflate": true})
+	// Auth rides stream A, uncompressed (compression starts after the
+	// hello). "deflate" and "stateAck" are part of the handshake contract:
+	// the hub echoes the first and refuses a frame without the second.
+	auth, _ := json.Marshal(map[string]any{
+		"v": 1, "type": "auth", "token": tok, "deflate": true, "stateAck": true,
+	})
 	if err := c.quicSendFrame(streamA, auth); err != nil {
 		return false, fmt.Errorf("hub quic auth send: %w", err)
 	}
@@ -1661,8 +2897,8 @@ func (p *quicReqPlane) send(reqID string, payload []byte, final bool) error {
 
 // streamFor returns the dedicated stream for reqID, opening one when this
 // is the request's first respond. Open failure or a full cap degrades to
-// the shared stream — an old hub or a stream-limit exhaustion must not
-// break relay answers.
+// the shared stream — a stream-limit exhaustion must not break relay
+// answers.
 func (p *quicReqPlane) streamFor(reqID string) *quic.Stream {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1788,8 +3024,9 @@ const (
 
 // QUIC flapping: a session counts as "young" when it died before
 // quicFlapMin. Three in a row (well inside one reconnect cycle — the hub
-// drops a silent uplink after 90s, so a rotation path produces exactly
-// this pattern every ~91s) arm quicFailCooldown of WebSocket instead.
+// marks a silent uplink offline at 30s and drops the socket at 45s, so a
+// rotation path dies well inside two minutes) arm quicFailCooldown of
+// WebSocket instead.
 const (
 	quicFlapMax = 3
 	quicFlapMin = 2 * time.Minute
@@ -1842,11 +3079,9 @@ func (c *Client) noteQuicSessionEnd(established bool, lived time.Duration) {
 	}
 }
 
-// quicKeepAlive is the QUIC transport keepalive interval. 15s (was 10s):
-// the hub pings every 25s and answers ours, and with the control plane on
-// its own stream a slightly lazier keepalive no longer risks NAT expiry
-// for the data plane — meanwhile mobile clients spend less radio awake
-// time.
+// quicKeepAlive is the QUIC transport keepalive. It is what refreshes a
+// client-side NAT binding. The hub's JSON ping is the downlink beat;
+// this host does not send an application ping of its own.
 const quicKeepAlive = 15 * time.Second
 
 // quicTLSClientConfig builds the TLS config for the QUIC host transport.
@@ -2026,19 +3261,32 @@ func (c *Client) runSession(ctx context.Context, bridge bridgeSource, tr frameTr
 	// write loop starts, so they cannot interleave with hello-driven
 	// replay and double-send.
 	c.drainSendCh()
-	// Compression is armed per session by the hub's hello echo; a stale
-	// flag from a previous session must not leak into this one.
+	// Compression is armed for the whole session; the flag is cleared at the
+	// top of every session so no state leaks from a previous hub.
 	c.deflateOK.Store(false)
+	// The downlink watchdog budget is per session too: reset to the local
+	// default before the read loop starts until hello advertises the hub's
+	// own idleTimeout.
+	c.idleTimeoutNanos.Store(0)
 	// New session ⇒ new hub process possibly, whose subscriber-count
 	// generation counter restarts low. Clear our high-water mark or every
 	// count from a restarted hub would look stale and be ignored.
 	c.subsGen.Store(0)
-	// The delivery ack is per-session too: a restarted hub counts from
-	// zero, and the previous session's ack says nothing about what THIS
-	// hub process has seen. hello.seq re-arms it.
-	c.seqMu.Lock()
-	c.hubAckSeq = 0
-	c.seqMu.Unlock()
+	// The viewing set is per-session state as well: a restarted hub starts
+	// with no set, and a stale set from the previous session would keep
+	// trimming sessions nobody is watching.
+	c.viewMu.Lock()
+	c.viewSeen = false
+	c.viewAll = false
+	c.viewGen = 0
+	c.viewSIDs = nil
+	c.viewMu.Unlock()
+	// hubAckSeq is left as the previous session left it until hello
+	// installs the new watermark (setHubAck). Zeroing it here would make
+	// every buffered event look unacked for the whole dial, and the ring
+	// would refuse to drop events the previous hub had already confirmed.
+	c.replaySaturated.Store(false)
+	c.probe.Store(false)
 	c.markRecv()
 	c.enqueueHostStatus(bridge)
 
@@ -2073,39 +3321,96 @@ func (c *Client) markRecv() {
 	c.lastRecvUnixNano.Store(time.Now().UnixNano())
 }
 
-// idleWatchdog fails the session when no frame has arrived for
-// sessionIdleTimeout, so the reconnect loop can take over. See
-// sessionIdleTimeout for why the transport's own error reporting is not
-// enough (half-open sockets never report anything).
+// idleWatchdog fails the session when no frame has arrived for the current
+// session's idle budget, so the reconnect loop can take over. See
+// defaultSessionIdleTimeout for why the transport's own error reporting is
+// not enough (half-open sockets never report anything).
+//
+// The budget is re-read on every tick: hello arrives after this goroutine
+// starts and may replace the default with the hub's own idleTimeout. The
+// ticker only paces the CHECK, so a shorter budget applies at the next tick
+// rather than a full old interval later.
 func (c *Client) idleWatchdog(ctx context.Context) error {
-	t := time.NewTicker(sessionIdleTimeout / 3)
+	timeout := c.idleTimeout()
+	t := time.NewTicker(watchdogTick(timeout))
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			if cur := c.idleTimeout(); cur != timeout {
+				timeout = cur
+				t.Reset(watchdogTick(timeout))
+			}
 			last := c.lastRecvUnixNano.Load()
 			if last == 0 {
 				continue
 			}
-			if idle := time.Since(time.Unix(0, last)); idle >= sessionIdleTimeout {
-				return fmt.Errorf("hub 静默 %.0fs（无任何下行帧），判定链路已死", idle.Seconds())
+			if idle := time.Since(time.Unix(0, last)); idle >= timeout {
+				return fmt.Errorf("hub 静默 %.0fs（无任何下行帧，阈值 %.0fs），判定链路已死", idle.Seconds(), timeout.Seconds())
 			}
 		}
 	}
 }
 
+// watchdogTick is the check interval for a given budget, floored so a tiny
+// budget (tests) cannot produce a zero-duration ticker.
+func watchdogTick(timeout time.Duration) time.Duration {
+	if d := timeout / watchdogTicksPerTimeout; d > 0 {
+		return d
+	}
+	return time.Millisecond
+}
+
+// idleTimeout is the current session's downlink watchdog budget.
+func (c *Client) idleTimeout() time.Duration {
+	if d := time.Duration(c.idleTimeoutNanos.Load()); d > 0 {
+		return d
+	}
+	return defaultSessionIdleTimeout
+}
+
+// applyHubLiveness adopts the liveness parameters a hub advertised in its
+// hello, so the two ends agree on when the link is dead instead of each
+// hard-coding its own assumption (the MQTT Server Keep Alive idea). Both
+// fields are mandatory in hello; a value out of range is a hub bug and
+// keeps the local default rather than letting a typo become a reconnect
+// loop here (idleTimeout too small) or a link that takes minutes to notice
+// death (too large).
+//
+// pingInterval is accepted but only logged: it describes the hub's own
+// cadence, and the watchdog needs only the resulting idleTimeout.
+func (c *Client) applyHubLiveness(pingInterval, idleTimeout int) {
+	if pingInterval < minHelloPingSec || pingInterval > maxHelloPingSec {
+		log.Printf("[hub-client] 忽略越界的 hello.pingInterval=%d（允许 %d..%d）", pingInterval, minHelloPingSec, maxHelloPingSec)
+	}
+	if idleTimeout < minHelloIdleSec || idleTimeout > maxHelloIdleSec {
+		log.Printf("[hub-client] 忽略越界的 hello.idleTimeout=%d（允许 %d..%d），沿用本地 %.0fs", idleTimeout, minHelloIdleSec, maxHelloIdleSec, c.idleTimeout().Seconds())
+		return
+	}
+	c.idleTimeoutNanos.Store(int64(time.Duration(idleTimeout) * time.Second))
+}
+
 func (c *Client) writeLoop(ctx context.Context, send func([]byte) error) error {
-	// Application ping so idle NATs do not drop the socket.
-	ping := time.NewTicker(10 * time.Second)
-	defer ping.Stop()
+	// Control frames (pong, state_ack, host_status) go out ahead of
+	// events. A nil ctrlCh is never selected, so tests that only wire
+	// sendCh keep a single queue.
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ping.C:
-			payload, _ := json.Marshal(map[string]any{"v": 1, "type": "ping", "ts": time.Now().Unix()})
+		case payload := <-c.ctrlCh:
+			if err := send(payload); err != nil {
+				return err
+			}
+			continue
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case payload := <-c.ctrlCh:
 			if err := send(payload); err != nil {
 				return err
 			}
@@ -2113,7 +3418,11 @@ func (c *Client) writeLoop(ctx context.Context, send func([]byte) error) error {
 			if !ok {
 				return errors.New("send channel closed")
 			}
-			if err := send(payload); err != nil {
+			// Release on both outcomes: the budget covers the payload until
+			// the write attempt finishes, success or failure.
+			err := send(payload)
+			c.releaseSend(len(payload))
+			if err != nil {
 				return err
 			}
 		}
@@ -2157,10 +3466,32 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			Body        json.RawMessage `json:"body"`
 			Count       *int            `json:"count"`       // type:"subscribers"
 			Subscribers *int            `json:"subscribers"` // type:"hello" / "ping"
-			SubsGen     *uint64         `json:"subsGen"`     // type:"ping" — ordering stamp
-			Gen         *uint64         `json:"gen"`         // type:"subscribers" — ordering stamp
-			Seq         *uint64         `json:"seq"`         // type:"hello" — hub's last seen seq
+			SubsGen     *uint64         `json:"subsGen"`     // type:"hello" — subscriber-count generation stamp (acked immediately)
+			Gen         *uint64         `json:"gen"`         // type:"subscribers" / "viewing" — ordering stamp
+			Seq         *uint64         `json:"seq"`         // type:"hello" / "ping" — hub watermark
 			Deflate     *bool           `json:"deflate"`     // type:"hello" — uplink compression ack
+			// PingInterval / IdleTimeout: type:"hello" only — the hub states
+			// the time scale it judges silence on, in seconds, so the two
+			// ends agree instead of each hard-coding it (MQTT Server Keep
+			// Alive). See applyHubLiveness.
+			PingInterval *int `json:"pingInterval"`
+			IdleTimeout  *int `json:"idleTimeout"`
+			// Probe is hello.probe. Present and true means this hub has a
+			// socket probe, so host_status may slow down. Absent (QUIC)
+			// keeps the fast beat.
+			Probe *bool `json:"probe"`
+			// Viewing is the hub's answer to "which sessions do its browser
+			// pages display" — see viewingFiltered. Absent means no page has
+			// declared anything yet, which leaves the host unfiltered
+			// (viewSeen=false).
+			Viewing *viewingView `json:"viewing"`
+			// The standalone "viewing" frame carries the same set flat at the
+			// top level; hello nests it under "viewing" instead.
+			All      *bool    `json:"all"`
+			Sessions []string `json:"sessions"`
+			// Error is type:"auth_error" — the hub's reason for refusing
+			// our credential over QUIC (WS expresses this as a close reason).
+			Error string `json:"error"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			log.Printf("[hub-client] 忽略无法解析的中转消息: %v", err)
@@ -2168,21 +3499,39 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 		}
 		switch msg.Type {
 		case "hello":
-			if msg.Subscribers != nil {
-				c.applySubscribers(*msg.Subscribers, 0, bridge)
+			// hello is the version handshake: every field this build acts on
+			// is mandatory. A hub that omits one predates the current
+			// protocol, and the two ends must not run mismatched — fail the
+			// session so the operator upgrades the hub instead of debugging
+			// subtle behaviour differences.
+			if msg.Seq == nil || msg.Subscribers == nil || msg.Deflate == nil || !*msg.Deflate ||
+				msg.PingInterval == nil || msg.IdleTimeout == nil {
+				return fmt.Errorf("hub 版本过旧：hello 缺少当前协议字段（seq/subscribers/deflate/pingInterval/idleTimeout），请升级 hub")
 			}
-			// Hub echoed our compression offer (we sent "deflate":true in
-			// the QUIC auth frame / X-Hub-Deflate:1 on the WS dial):
-			// arm uplink flate for events/respond frames.
-			if msg.Deflate != nil && *msg.Deflate {
-				if c.deflateOK.CompareAndSwap(false, true) {
-					log.Printf("[hub-client] 上行压缩已启用（deflate）")
-				}
+			// hello.seq drives the whole resume: handleHelloSeq replays from
+			// the hub's delivery watermark and also runs the 0→1 catch-up
+			// when the subscriber count goes from zero to one.
+			//
+			// hello.subsGen stamps that count. Applying and acking it here
+			// saves the hub's 1s retransmit of the same count as a standalone
+			// `subscribers` frame on every connection; the retransmit remains
+			// as the repair path when this ack is lost.
+			subsGen := uint64(0)
+			if msg.SubsGen != nil {
+				subsGen = *msg.SubsGen
 			}
-			// Resume against hub's last-seen seq — or reset the epoch when
-			// this process cannot produce seqs that high (host restart).
-			if msg.Seq != nil {
-				c.handleHelloSeq(*msg.Seq)
+			if c.applySubscribers(*msg.Subscribers, subsGen, bridge, false) && subsGen > 0 {
+				c.sendStateAck("subscribers", subsGen)
+			}
+			if msg.Viewing != nil {
+				c.applyViewing(*msg.Viewing)
+			}
+			c.deflateOK.Store(true)
+			log.Printf("[hub-client] 上行压缩已启用（deflate）")
+			c.applyHubLiveness(*msg.PingInterval, *msg.IdleTimeout)
+			c.probe.Store(msg.Probe != nil && *msg.Probe)
+			if err := c.handleHelloSeq(*msg.Seq); err != nil {
+				return err
 			}
 		case "subscribers":
 			n := 0
@@ -2193,30 +3542,53 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 			if msg.Gen != nil {
 				gen = *msg.Gen
 			}
-			c.applySubscribers(n, gen, bridge)
+			if c.applySubscribers(n, gen, bridge, true) && gen > 0 {
+				c.sendStateAck("subscribers", gen)
+			}
+		case "viewing":
+			// The hub sends this set flat at the top level.
+			v := viewingView{Sessions: msg.Sessions}
+			if msg.All != nil {
+				v.All = *msg.All
+			}
+			if msg.Gen != nil {
+				v.Gen = *msg.Gen
+			}
+			if c.applyViewing(v) && v.Gen > 0 {
+				c.sendStateAck("viewing", v.Gen)
+			}
 		case "request":
 			go c.handleRelay(ctx, msg.ReqID, msg.HostID, msg.Method, msg.Path, msg.Body)
-		case "ping":
-			// The hub re-asserts the authoritative subscriber count on its
-			// ping, so a `subscribers` frame lost to a write error or a
-			// superseded connection self-heals within one ping interval
-			// instead of leaving us paused while a browser waits on a
-			// frozen page.
-			if msg.Subscribers != nil {
-				var gen uint64
-				if msg.SubsGen != nil {
-					gen = *msg.SubsGen
-				}
-				c.applySubscribers(*msg.Subscribers, gen, bridge)
+		case "auth_error":
+			// QUIC-only: the hub writes this frame and closes when the
+			// token is missing or invalid. Without it the session looks
+			// like an ordinary drop — backoff redial forever, never a
+			// re-pair. classifyClose stays WS-only (there is no close
+			// frame here); the sentinel is what isAuthErr recognises.
+			reason := msg.Error
+			if reason == "" {
+				reason = "hub 未说明原因"
 			}
-			// Data-plane delivery ack piggy-backed on the liveness ping
-			// (absent on old hubs): anchors needCatchUp repairs at the
-			// hub's actual watermark instead of the enqueue watermark.
+			return fmt.Errorf("%w: %s", errHubAuthRejected, reason)
+		case "ping":
+			// Data-plane delivery ack piggy-backed on the liveness ping:
+			// anchors needCatchUp repairs at the hub's actual watermark
+			// instead of the enqueue watermark. Absolute state (subscribers
+			// / viewing) rides its own confirmed frames, never this one.
 			if msg.Seq != nil {
 				c.noteHubAck(*msg.Seq)
+				// An ack that just landed is the cheapest possible moment
+				// to repair: the hole is still open and the repair does not
+				// have to wait out the next repairInterval. It runs on this
+				// goroutine because readLoop must keep draining the socket;
+				// repairDroppedEvents takes enqueueMu itself and is a no-op
+				// unless a hole is actually open.
+				if c.needCatchUp.Load() {
+					go c.repairDroppedEvents()
+				}
 			}
 			pong, _ := json.Marshal(map[string]any{"v": 1, "type": "pong"})
-			c.enqueueFrame(pong, false)
+			c.enqueueControl(pong)
 		case "pong":
 			// ignore
 		}
@@ -2224,7 +3596,10 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 }
 
 // applySubscribers applies a hub subscriber-count update, ignoring frames
-// that lost a race with a newer one.
+// that lost a race with a newer one. It reports whether the frame was
+// accepted (applied, or already applied at this gen) — the caller acks on
+// true, and a duplicate retransmit of an already-applied gen still acks so
+// the hub's timer can stop.
 //
 // The count is ABSOLUTE state that decides whether we upload bridge events
 // at all, and the hub writes its notifications from one goroutine per host
@@ -2232,15 +3607,26 @@ func (c *Client) readLoop(ctx context.Context, recv func() ([]byte, error), brid
 // apart) can arrive as 1 then 0. Applying the stale 0 pauses our uplink
 // while host_status heartbeats keep us "online": the user's freshly
 // reloaded page looks connected and never updates. `gen` is the hub's
-// monotonic stamp; gen==0 means a hub too old to send one (apply as
-// before). On a 0→1 transition we also replay what was buffered while
-// paused.
-func (c *Client) applySubscribers(count int, gen uint64, bridge bridgeSource) {
+// monotonic stamp (always present: hello's subscriber count is applied
+// without one only because it precedes the first generation).
+//
+// replayOnResume controls whether a 0→1 transition also replays what was
+// buffered while paused and re-asserts host_status. The `hello` frame is
+// the one caller that passes false: handleHelloSeq runs immediately after
+// it and replays from hello.seq, an interval that fully contains the 0→1
+// catch-up (hubSeq <= lastSentSeq), so doing both would queue the same
+// events twice — up to 2×replayCap events into a 256-slot queue, whose
+// critical enqueues then time out and re-arm needCatchUp. hello also
+// follows runSession's own host_status, so the extra status is redundant.
+func (c *Client) applySubscribers(count int, gen uint64, bridge bridgeSource, replayOnResume bool) bool {
 	if gen > 0 {
 		for {
 			prev := c.subsGen.Load()
-			if gen <= prev {
-				return // superseded by a newer count already applied
+			if gen < prev {
+				return false // superseded by a newer count already applied
+			}
+			if gen == prev {
+				return true // duplicate delivery of the newest state
 			}
 			if c.subsGen.CompareAndSwap(prev, gen) {
 				break
@@ -2249,17 +3635,252 @@ func (c *Client) applySubscribers(count int, gen uint64, bridge bridgeSource) {
 	}
 	was := c.forwardingEnabled()
 	c.setBrowserSubscribers(count)
-	if !was && c.forwardingEnabled() {
+	if replayOnResume && !was && c.forwardingEnabled() {
 		// Catch up events buffered while paused (they were seqAndReplay'd
-		// but never enqueued).
+		// but never enqueued). The ordering lock spans the decision AND the
+		// replay: a live batch taking it first would let the hub see a
+		// higher seq before the reset/replay and stale-drop the replay.
+		c.enqueueMu.Lock()
 		c.seqMu.Lock()
 		after := c.lastSentSeq
+		trimmed := c.pausedTrimmedThrough
 		c.seqMu.Unlock()
-		if last := c.sendReplayAfter(after); last > 0 {
+		if trimmed > after {
+			// Paused compaction dropped events the hub never received, so
+			// the ring now starts above the hub's watermark: replaying
+			// alone would leave a permanent hole (the hub parks the tail in
+			// its out-of-order set and the watermark never moves). Reset
+			// the epoch and replay what we still hold.
+			if c.resumeAfterPausedTrimLocked() {
+				log.Printf("[hub-client] 暂停裁剪越过 hub 水位（through %d > %d），已重置世代并重放", trimmed, after)
+			}
+		} else if last := c.sendReplayAfterLocked(after); last > 0 {
 			log.Printf("[hub-client] 订阅恢复补发事件 seq %d..%d", after+1, last)
 		}
+		c.enqueueMu.Unlock()
 		c.enqueueHostStatus(bridge)
 	}
+	return true
+}
+
+// viewingView is the hub's viewing set for this host: which sessions its
+// browser pages are displaying (see Hub.ViewingStateFor on the hub side).
+//
+// All means the hub cannot narrow the audience — at least one page that
+// receives this host's events has not declared a session yet (still
+// loading). The host then filters nothing.
+type viewingView struct {
+	All      bool     `json:"all"`
+	Sessions []string `json:"sessions"`
+	// Gen is the hub's monotonic stamp. Viewing sets are absolute state
+	// written from one goroutine per host, so a switch (old set → new set,
+	// microseconds apart) can arrive out of order; without the stamp the
+	// stale one wins and the host trims exactly the session the user just
+	// opened. 0 means the frame carried no stamp; it is applied without the
+	// ordering gate.
+	Gen uint64 `json:"gen"`
+}
+
+// applyViewing replaces the uplink session filter. Absolute state: every
+// frame carries the whole set, so a host that missed one is corrected by
+// the hub's retransmit rather than staying stuck on a partial set.
+//
+// It reports whether the frame was accepted, so the caller can acknowledge
+// it. A duplicate of an already-applied gen reports true as well: the hub
+// only stops retransmitting once it sees the ack, and silence would make a
+// lost ack look like a lost frame.
+func (c *Client) applyViewing(v viewingView) bool {
+	next := make(map[string]bool, len(v.Sessions))
+	for _, sid := range v.Sessions {
+		if sid != "" {
+			next[sid] = true
+		}
+	}
+	c.viewMu.Lock()
+	if v.Gen > 0 && v.Gen < c.viewGen {
+		c.viewMu.Unlock()
+		return false // superseded by a newer set already applied
+	}
+	if v.Gen > 0 && v.Gen == c.viewGen && c.viewSeen {
+		c.viewMu.Unlock()
+		return true // duplicate of the set already in force
+	}
+	if v.Gen > c.viewGen {
+		c.viewGen = v.Gen
+	}
+	prevAll, prevSeen, prevN := c.viewAll, c.viewSeen, len(c.viewSIDs)
+	c.viewAll = v.All
+	c.viewSeen = true
+	c.viewSIDs = next
+	c.viewMu.Unlock()
+	if !prevSeen || prevAll != v.All || prevN != len(next) {
+		if v.All {
+			log.Printf("[hub-client] 订阅页面未声明会话，上行事件不过滤")
+		} else {
+			log.Printf("[hub-client] 上行只发送 %d 个被查看会话的正文（其余只留序号）", len(next))
+		}
+	}
+	return true
+}
+
+// sendStateAck confirms that an absolute-state frame of `kind` at
+// generation gen has been applied, which is what lets the hub stop
+// retransmitting it. A gen of 0 means the frame carried no stamp, so there
+// is nothing to confirm.
+//
+// The ack rides the control queue, not the event queue. A lost ack is
+// recovered by the hub's backoff retransmit; dropping it because events
+// filled sendCh is what made that retransmit run forever.
+func (c *Client) sendStateAck(kind string, gen uint64) {
+	if gen == 0 {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"v": 1, "type": "state_ack", "kind": kind, "gen": gen,
+	})
+	if err != nil {
+		return
+	}
+	c.enqueueControl(payload)
+}
+
+// viewingFiltered reports whether events of sessionID must be replaced by
+// a placeholder on the wire. Filtering only starts after the hub has sent a
+// viewing set; a host that guessed "nobody is watching" would silently stop
+// the transcript.
+//
+// A session that spawns a subagent stays watched through its children: the
+// child transcript feeds the parent page's mini scrollback, and the page
+// never declares the child id.
+func (c *Client) viewingFiltered(sessionID string) bool {
+	c.viewMu.Lock()
+	defer c.viewMu.Unlock()
+	if !c.viewSeen || c.viewAll {
+		return false
+	}
+	if sessionID == "" || c.viewSIDs[sessionID] {
+		return false
+	}
+	if parent := c.viewChildren[sessionID]; parent != "" && c.viewSIDs[parent] {
+		return false
+	}
+	return true
+}
+
+// noteViewingChild records a subagent child session so its stream follows
+// its parent's watch state (see viewingFiltered). One level, same rule as
+// the hub's guest whitelist; the table is a bounded FIFO because a
+// long-lived host spawns without limit. Evicting the oldest relation is
+// safe: the child is merely trimmed until the hub re-supplies it.
+func (c *Client) noteViewingChild(childSessionID, subagentID, parentSessionID string) {
+	if childSessionID == "" || parentSessionID == "" || childSessionID == parentSessionID {
+		return
+	}
+	c.viewMu.Lock()
+	defer c.viewMu.Unlock()
+	c.setViewChildLocked(childSessionID, parentSessionID)
+	if subagentID != "" {
+		c.setViewChildLocked(subagentID, parentSessionID)
+	}
+}
+
+// setViewChildLocked inserts key without letting viewChildren exceed
+// viewingChildCap, evicting oldest-first. Caller holds viewMu.
+func (c *Client) setViewChildLocked(key, parentSessionID string) {
+	if c.viewChildren == nil {
+		c.viewChildren = make(map[string]string, 16)
+	}
+	if _, ok := c.viewChildren[key]; ok {
+		c.viewChildren[key] = parentSessionID
+		return
+	}
+	for len(c.viewChildren) >= viewingChildCap {
+		old := c.viewChildOrder[0]
+		c.viewChildOrder = c.viewChildOrder[1:]
+		delete(c.viewChildren, old)
+	}
+	c.viewChildren[key] = parentSessionID
+	c.viewChildOrder = append(c.viewChildOrder, key)
+}
+
+// viewingChildCap bounds the parent/child table (FIFO eviction above).
+const viewingChildCap = 4096
+
+// bulkTranscriptTypes are the session-scoped types that carry a
+// conversation's body; trimUnwatched replaces them for unwatched sessions.
+// PROTOCOL.md §6.4 is the authoritative list; control rails and terminals
+// stay unfiltered so a page switching in finds the session consistent.
+var bulkTranscriptTypes = map[string]bool{
+	"chunk":                true,
+	"thought":              true,
+	"user_chunk":           true,
+	"user_message":         true,
+	"text":                 true,
+	"image":                true,
+	"tool_call":            true,
+	"tool_call_update":     true,
+	"plan":                 true,
+	"session_notification": true, // 未建模 kind 的 generic 载体
+	"ext_notification":     true, // x.ai/* 直通载体（可能带正文）
+}
+
+// trimUnwatched replaces the body of events belonging to sessions no browser
+// page displays with a seq-only placeholder, in place, so per-host seq stays
+// gapless and the FE's ordered delivery is untouched. The FE rebuilds an
+// unwatched session from host history on switch.
+func (c *Client) trimUnwatched(evs []acp.Event) {
+	for _, ev := range evs {
+		t, _ := ev["type"].(string)
+		if t == "subagent_spawned" {
+			// Register the relation even when the spawn itself is kept: the
+			// child's later events must follow the parent's watch state.
+			c.noteSpawnEvent(ev)
+		}
+		if !bulkTranscriptTypes[t] {
+			continue
+		}
+		sid := eventSessionID(ev)
+		if !c.viewingFiltered(sid) {
+			continue
+		}
+		seq := ev["seq"]
+		for k := range ev {
+			delete(ev, k)
+		}
+		ev["type"] = "trimmed"
+		ev["sessionId"] = sid
+		if seq != nil {
+			ev["seq"] = seq
+		}
+	}
+}
+
+// noteSpawnEvent records a subagent_spawned event's parent/child relation
+// (see noteViewingChild).
+func (c *Client) noteSpawnEvent(ev acp.Event) {
+	parent, _ := ev["sessionId"].(string)
+	up, _ := ev["update"].(map[string]any)
+	if up == nil {
+		return
+	}
+	child, _ := up["child_session_id"].(string)
+	subID, _ := up["subagent_id"].(string)
+	c.noteViewingChild(child, subID, parent)
+}
+
+// eventSessionID reads an event's session id, preferring the top-level
+// `sessionId` (the withSid convention) and falling back to the params copy
+// older generic carriers use.
+func eventSessionID(ev acp.Event) string {
+	if sid, _ := ev["sessionId"].(string); sid != "" {
+		return sid
+	}
+	if p, ok := ev["params"].(map[string]any); ok {
+		if sid, _ := p["sessionId"].(string); sid != "" {
+			return sid
+		}
+	}
+	return ""
 }
 
 // handleRelay executes one relayed browser request against the local HTTP
@@ -2395,6 +4016,19 @@ func (c *Client) relayInProcess(ctx context.Context, reqID, method, path string,
 	c.respond(reqID, rec.code, json.RawMessage(rec.buf.Bytes()))
 }
 
+// relayChunkSize is the raw body bytes carried by one chunked `respond`
+// frame. A 28MB answer used to go out as a single frame whose write holds the
+// transport's write lock for tens of seconds on a slow link, blocking every
+// event, ping and host_status behind it. At ~1MB per chunk (≈1.37MB base64)
+// the writer releases the lock between frames, so the link stays responsive
+// and each frame stays far below both transports' 32MB read limit.
+//
+// Responses at or below this size keep the original single-frame shape; the
+// hub assembles a chunked body back into the exact same bytes before handing
+// it to the browser, so the FE never sees the split.
+const relayChunkSize = 1 << 20
+
+// respond answers a relayed request with status and body.
 func (c *Client) respond(reqID string, status int, body json.RawMessage) {
 	// A body that is not embeddable JSON (JSONL lines, plain text — json
 	// compacts RawMessage and rejects concatenated values) must not
@@ -2403,6 +4037,10 @@ func (c *Client) respond(reqID string, status int, body json.RawMessage) {
 	// gives up.
 	if !json.Valid(body) {
 		body = mustJSON(string(body))
+	}
+	if len(body) > relayChunkSize {
+		c.respondChunked(reqID, status, body)
+		return
 	}
 	payload, err := json.Marshal(map[string]any{
 		"v":      1,
@@ -2415,11 +4053,50 @@ func (c *Client) respond(reqID string, status int, body json.RawMessage) {
 		return
 	}
 	// Request plane: over QUIC each request's answer rides its own stream
-	// (T1) so a large relay answer (fs/read-file can reach 16MB) never
-	// head-of-line blocks the control/event frames or other requests.
+	// (T1) so a large relay answer (up to the 28MB maxRelayResponseBytes
+	// ceiling) never head-of-line blocks the control/event frames or other
+	// requests.
 	// A relay request gets exactly one respond — its terminal frame, which
 	// also closes the request's stream.
 	c.enqueueReqFrame(reqFrame{reqID: reqID, payload: payload, final: true})
+}
+
+// respondChunked splits an oversized body into relayChunkSize chunks and
+// queues one `respond` frame per chunk. Every frame repeats reqId/status and
+// carries `chunk` (base64 of that slice) + `encoding:"base64"` + `more`; the
+// hub appends the decoded bytes and only resolves the browser request on the
+// `more:false` frame. `final` is true only on that last frame, so the QUIC
+// per-request stream stays open across chunks and closes exactly once.
+//
+// The chunking is not visible to the FE: the hub reassembles the exact
+// original body bytes before answering the relayed HTTP request.
+func (c *Client) respondChunked(reqID string, status int, body json.RawMessage) {
+	chunks := (len(body) + relayChunkSize - 1) / relayChunkSize
+	for i := 0; i < chunks; i++ {
+		start := i * relayChunkSize
+		end := start + relayChunkSize
+		if end > len(body) {
+			end = len(body)
+		}
+		more := i < chunks-1
+		payload, err := json.Marshal(map[string]any{
+			"v":        1,
+			"type":     "respond",
+			"reqId":    reqID,
+			"status":   status,
+			"chunk":    base64.StdEncoding.EncodeToString(body[start:end]),
+			"encoding": "base64",
+			"more":     more,
+		})
+		if err != nil {
+			// Cannot happen for a string/number map; a partially queued
+			// answer would leave the hub pending until its timeout, which
+			// is the same outcome as any other write failure.
+			log.Printf("[hub-client] 分块响应编码失败 reqId=%s: %v", reqID, err)
+			return
+		}
+		c.enqueueReqFrame(reqFrame{reqID: reqID, payload: payload, final: !more})
+	}
 }
 
 // reqFrame is one queued request-plane frame: the marshaled respond body,
@@ -2432,17 +4109,20 @@ type reqFrame struct {
 }
 
 // enqueueReqFrame queues a respond frame onto the request plane queue.
-// Critical: request answers must not be silently dropped under load (the
-// browser is blocked on them), so block briefly instead of dropping.
+// A request has exactly one respond. Dropping it leaves the browser
+// waiting out RelayTimeout while heartbeats keep the host looking alive,
+// so this waits until the frame is queued or the session ends.
 func (c *Client) enqueueReqFrame(f reqFrame) {
 	if c.reqCh == nil {
-		c.enqueueFrame(f.payload, true)
+		if !c.enqueueFrameWait(f.payload) {
+			log.Printf("[hub-client] 中转响应随会话结束未发出 reqId=%s", f.reqID)
+		}
 		return
 	}
 	select {
 	case c.reqCh <- f:
-	case <-time.After(5 * time.Second):
-		log.Printf("[hub-client] 中转响应帧入队超时（队列满），丢弃 reqId=%s 帧", f.reqID)
+	case <-c.sessionCtx().Done():
+		log.Printf("[hub-client] 中转响应随会话结束未发出 reqId=%s", f.reqID)
 	}
 }
 

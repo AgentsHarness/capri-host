@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -769,6 +770,83 @@ func sessionTaskCensus(grokHome, cwd, sessionID string) (TaskSummary, []string) 
 	if err != nil {
 		return TaskSummary{}, nil
 	}
+	return sum, orphanPaths
+}
+
+// censusEntry is one session's cached census keyed by the source file's
+// (size, mtime). An updated file always changes size, and mtime catches the
+// rewrite-with-same-size case, so a hit means "this is the same timeline we
+// already reduced".
+type censusEntry struct {
+	size    int64
+	modTime time.Time
+	sum     TaskSummary
+	orphans []string
+}
+
+// taskCensusCache memoizes sessionTaskCensus against updates.jsonl's
+// (size, mtime). ListSessions used to re-parse every session's whole
+// timeline on every call: 30 sessions / 92 MB took ~0.5 s, and every
+// sessions_changed event paid it again. The badge is derived data — a cache
+// hit costs one stat per session.
+//
+// The cache is bounded by the roster, except that a deleted session file's
+// entry is dropped on the next stat failure (see sessionTaskCensusCached).
+type taskCensusCache struct {
+	mu      sync.Mutex
+	entries map[string]*censusEntry
+}
+
+func (tc *taskCensusCache) get(path string, size int64, mod time.Time) (TaskSummary, []string, bool) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	ent, ok := tc.entries[path]
+	if !ok || ent.size != size || !ent.modTime.Equal(mod) {
+		return TaskSummary{}, nil, false
+	}
+	return ent.sum, ent.orphans, true
+}
+
+func (tc *taskCensusCache) put(path string, size int64, mod time.Time, sum TaskSummary, orphans []string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.entries == nil {
+		tc.entries = make(map[string]*censusEntry)
+	}
+	tc.entries[path] = &censusEntry{size: size, modTime: mod, sum: sum, orphans: orphans}
+}
+
+// drop forgets path after its file disappeared.
+func (tc *taskCensusCache) drop(path string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	delete(tc.entries, path)
+}
+
+// sessionTaskCensusCached is sessionTaskCensus with the (size, mtime) cache.
+// A genuinely missing file drops its cached entry; other stat errors return
+// the zero summary without touching the cache.
+func (b *Bridge) sessionTaskCensusCached(grokHome, cwd, sessionID string) (TaskSummary, []string) {
+	path := sessionUpdatesFile(grokHome, cwd, sessionID)
+	if path == "" {
+		return TaskSummary{}, nil
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			b.census.drop(path)
+		}
+		return TaskSummary{}, nil
+	}
+	size, mod := st.Size(), st.ModTime()
+	if sum, orphans, ok := b.census.get(path, size, mod); ok {
+		return sum, orphans
+	}
+	sum, orphanPaths, err := scanTaskCensus(path)
+	if err != nil {
+		return TaskSummary{}, nil
+	}
+	b.census.put(path, size, mod, sum, orphanPaths)
 	return sum, orphanPaths
 }
 
