@@ -440,6 +440,13 @@ func (b *Bridge) Subscribe() (ch chan Event, unsubscribe func()) {
 	return b.bus.subscribe()
 }
 
+// LastSeq is the highest event seq the bus has assigned so far. The hub client
+// uses it as a new session epoch's baseline (hello.resume.up): the hub's up
+// watermark starts there and the first live event is LastSeq+1.
+func (b *Bridge) LastSeq() uint64 {
+	return b.bus.lastSeq()
+}
+
 // Broadcast publishes one event on the host's event bus.
 //
 // session/load 的整段重放（params._meta.isReplay，agent 在 replay.rs 给两条

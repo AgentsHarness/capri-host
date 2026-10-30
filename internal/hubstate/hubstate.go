@@ -114,22 +114,15 @@ type State struct {
 	// (or for StoredURL when no hub is currently configured).
 	CanReuse bool `json:"canReuse,omitempty"`
 
-	// Data-plane diagnostics. Read-only snapshots taken while the lock is
-	// held; nothing here feeds a delivery decision. They are the answer to
-	// "how far behind is the hub, and is the ring growing?" without reading
-	// the log.
-	ReplayEvents int    `json:"replayEvents,omitempty"`
-	ReplayBytes  int64  `json:"replayBytes,omitempty"`
+	// Data-plane diagnostics. Read-only snapshots; nothing here feeds a
+	// delivery decision. They are the answer to "how far behind is the hub,
+	// and how big is the unacked uplink log?" without reading logs.
+	OutboxEvents int    `json:"outboxEvents,omitempty"`
+	OutboxBytes  int64  `json:"outboxBytes,omitempty"`
 	NextSeq      uint64 `json:"nextSeq,omitempty"`
 	LastSentSeq  uint64 `json:"lastSentSeq,omitempty"`
 	HubAckSeq    uint64 `json:"hubAckSeq,omitempty"`
-	// NeedCatchUp means a frame was dropped before the wire and the repair
-	// pass still owes the hub that range.
-	NeedCatchUp    bool   `json:"needCatchUp,omitempty"`
-	SendQueueDepth int    `json:"sendQueueDepth,omitempty"`
-	CtrlQueueDepth int    `json:"ctrlQueueDepth,omitempty"`
-	ReqQueueDepth  int    `json:"reqQueueDepth,omitempty"`
-	CtrlDropped    uint64 `json:"ctrlDropped,omitempty"`
+	RelayQueued  int    `json:"relayQueued,omitempty"`
 }
 
 // NormalizeURL cleans an address a person typed. An empty input stays empty.

@@ -1,95 +1,79 @@
-# host↔hub 上行压缩协议（deflate）
+# host↔hub 会话协议（v2）— host 侧实现说明
 
-状态：**双侧已实现并对齐**（capri-host `internal/hub/client.go`、acp-hub
-`cmd/capri-hub/main.go`）。本文件与 acp-hub `internal/hub/PROTOCOL.md` 保持一致。
+权威协议定义在 `capri-wire/PROTOCOL-V2.md`（帧模型、Sender/Receiver、关闭原因、
+限额与默认值都由 `github.com/AgentsHarness/capri-wire` 提供）。本文件只记录
+**capri-host 这一侧**的实现约定，以及阅读代码时容易误解的几处取舍。
 
-三端（host / hub / FE）同版本发布，协议不保留旧版本兼容：任何一侧缺少下述
-字段或握手项，另一侧直接拒绝会话，而不是退化成裸 JSON 或旧行为。
+三端（host / hub / FE）同版本发布，不保留 v1 兼容：`auth` 帧、`X-Hub-*` 请求头、
+`seqStart`、`seq_reset`、`state_ack`、`ping`/`pong`、`host_status`、`subscribers` /
+`viewing` 全部删除。
 
-> 事件语义（seq 分配 / 双路去重 / 分级背压 / 断线恢复）的契约另见
-> [docs/EVENT-CONTRACTS.md](../../docs/EVENT-CONTRACTS.md)。
+## 1. 上行 seq 就是事件 seq
 
-## 0. 帧可解码性（两条传输一致）
+`wire.Sender` 的日志是**每条事件一个条目**，序号由 bridge 的事件总线
+（`acp.eventBus.publish`）分配一次，永不重编号。由此：
 
-Hub 解不开的上行帧一律**结束会话**，不跳过：
+- `AppendAt(eventSeq, eventJSON)` 只接受 `next+1`；事件总线在上游丢了事件时，
+  中间缺失的序号立刻补成 `wire.TrimmedEvent("", seq)` 占位，**空洞不上线**。
+- `events` 帧是日志里一段连续条目的批次：`Frame.Seq` 是首条事件的 seq，
+  `Frame.Events` 是原始事件字节，`Frame.Ack` 是下行水位。hub 逐条接收，因此
+  它的水位与 FE 的 `EventSequencer` 是同一个坐标。
+- 因此 `seq` 是「事件序号」而不是「帧序号」；不要按帧数推算它。
 
-- WS：binary 帧 inflate 失败；
-- 两条传输：`seqStart` 与首事件 `seq` 不一致。
+## 2. 上行日志（outbox）是唯一的修复路径
 
-跳过它会让该帧的序号凭空消失：下一帧更大的号把交付水位推过这个洞，host 按
-该水位删掉回放副本，FE 再到 hub 环里补也补不回来。结束会话则水位保持原值，
-host 重连后从该点补发，回放环里的副本仍在。WS 侧的关闭原因是
-`uplink unreadable`（1011），QUIC 侧是应用错误码 9（见 §5 的码表）。
+`internal/hub/outbox.go`。进程级（跨会话）持有，`forwardLoop` 生产、会话循环消费：
 
-## 1. 协商
+- 重连时从 hub 的 `ackUp` 处重放，`hello.resume.up` 只提供基线。
+- 新 epoch（host 进程重启）的基线是 `bridge.LastSeq()`：第一次握手的
+  `resume.up` 就是它，第一条实时事件是 `baseline+1`，更早的事件视为历史，
+  由 FE 从 host 侧历史重建。
+- 超过字节预算时，可丢的正文事件就地换成 `trimmed` 占位（**序号不变**），
+  关键事件保留；关键条目自己就超过硬上限时以 `overflow` 结束会话，让 hub
+  重连后按水位重放。
+- 超长单条事件在入日志前就换占位，保证任何 `events` 帧都不超过
+  `limits.maxFrame`。
 
-1. host 发出压缩提议：
-   - QUIC：auth 帧增加字段 `"deflate":true`
-     （`{"v":1,"type":"auth","token":"…","deflate":true}`）。
-   - WebSocket：`GET /ws/host` 握手请求头 `X-Hub-Deflate: 1` 与
-     `X-Hub-State-Ack: 1`（两者都是必填；hub 缺少任一项即按协议版本拒绝）。
-2. hub 在 hello 帧中回声确认：`{"v":1,"type":"hello",…,"deflate":true}`。
-   - 回声为 true ⇒ 本次会话内 host 对 **events 帧与 respond 帧**的载荷启用
-     flate 压缩（见 §2 wire format）。
-   - 字段缺失或为 false ⇒ host 判定 hub 版本过旧，直接结束会话并重连。
-3. 压缩开关是每会话状态：host 在每次重连后清除，必须重新协商。
+## 3. 下行
 
-## 2. wire format（字节级）
+- `audience`（绝对状态，带 `gen`）：`watchers == 0` 暂停上行（继续发 `hb`），
+  `all:true` 关闭会话过滤，否则按 `sessions`（含一层子代理子会话）丢弃未观看
+  会话的正文。
+- `request`（可靠，占用下行 seq）：按 `reqId` 去重后执行本地 HTTP API。
+  同 epoch 重连重投的同一 `reqId` **不会**再次执行：仍在跑的等待并重发结果，
+  已完成的若响应还在内存就重发，否则回 `409 duplicate request`。
+- `respond` 属于中继面，`seq:0`，带 `ack = 下行水位`；QUIC 上每个请求独占一条
+  stream，WS 上与事件共用一条连接。
 
-压缩采用 RFC 1951 raw deflate（Go `compress/flate`，DefaultCompression；与 hub→FE
-路径一致），**不带 zlib/gzip 头**。
+## 4. 时间尺度
 
-### 2.1 QUIC（4 字节大端长度前缀帧）
+- `hello_ack.liveness` 决定 `hb` 周期与空闲上限；`hb` 同时携带 `ack` 和
+  host 状态快照，状态变化或收到新 ack 时立刻补发一帧。
+- 超过 `idle` 没有任何下行帧即 `close(liveness)`。
+- RTO = `2*keepalive`，收到 ack 有进展时重置；没有重试次数上限，空闲计时器
+  才是判死依据。
+- 传输自身的心跳（WS ping / QUIC keepalive）只为 NAT 与半开连接存在，不参与
+  协议判定。QUIC 的 keepalive 是拨号时的连接级选项（`quicKeepAlive`），
+  无法随 `hello_ack` 调整。
 
-```
-bit  31        bits 30..0
-┌─────────┬──────────────────┐
-│ deflate │   payload 长度    │
-└─────────┴──────────────────┘
-```
+## 5. 压缩
 
-- 长度前缀的最高位（`0x80000000`）为压缩标志：置 1 ⇒ 帧载荷为 raw deflate 流；
-  置 0 ⇒ 裸 JSON（现状）。长度字段取**压缩后**字节数。帧上限 32MB（`n &^
-  0x80000000 > 32<<20` 即拒），标志位不占用长度空间。
+`hello.caps.deflate` 提议、`hello_ack.caps.deflate` 回声确认后才启用；载荷
+`< 256` 字节或压缩无收益则发裸帧。
 
-### 2.2 WebSocket
+- QUIC：4 字节大端长度前缀，最高位置 1 表示 raw deflate（RFC 1951，无 zlib 头）。
+- WS：text = 裸 JSON，binary = 整条 raw deflate 流；下行不压缩。
 
-- 裸帧保持现状：**text** 消息，UTF-8 JSON。
-- 压缩帧：**binary** 消息，载荷**整体**为 raw deflate 流（无魔数/前缀）。
-  hub 按 message type 区分，无需逐帧试探。
+## 6. 关闭与重连策略
 
-## 3. 何时压缩
+关闭原因只有 `wire.CloseReason` 这一个枚举（WS 映射 `(code, reason)`，QUIC 映射
+application error code），host 只按枚举决策：
 
-- 载荷（压缩前 JSON）`< 256` 字节不压缩（`minCompressSize`，与 hub→FE 一致）。
-- 压缩后 ≥ 原始大小则放弃压缩、按裸帧发送。
-- auth / ping / pong / host_status / seq_reset 等控制帧本就小于阈值，天然不压缩；
-  即便被压缩，上述 wire format 也是自描述的，hub 无需知道帧类型即可解压。
-- 下行（hub→host）不压缩；hub→FE 的压缩由 hub 侧另行实施。
+| 判定 | 重连策略 |
+| --- | --- |
+| `superseded` | 立即重拨，**不重新配对**（token 仍然有效） |
+| `auth` | 有配对码时重新配对一次，然后立即重连 |
+| `protocol` | 退避并明确报「两端版本不一致」 |
+| `liveness` / `shutdown` / `overflow` / `unreadable` / `normal` | 退避 |
 
-## 4. 实现要点（host 侧）
-
-- writer / buffer 来自 `sync.Pool`（`flateWriterPool` / `flateBufPool`）。
-- 压缩在会话写闭包内做（QUIC 置标志位 / WS 改 binary），队列中始终是未压缩
-  JSON，便于重放/补发逻辑复用。
-
-## 5. 关闭原因（两条传输同一张表）
-
-WS 用 `(code, reason)`，QUIC 没有 reason 通道，用 `CloseWithError` 的 application
-error code 承载同一个判定。host 的 `classifyClose` 两者都认，语义必须一一对应：
-
-| 语义 | WS code / reason | QUIC code |
-| --- | --- | --- |
-| 无关本次会话 | — | 0 |
-| 内部错误 | 1011 `internal error` | 1 |
-| 被新连接取代 | 1000 `superseded` | 2 |
-| 凭据失效 | 1008 `auth` | 3 |
-| 协议版本不符 | 1002 `protocol version` | 4 |
-| 探针超时 | 1008 `liveness probe timeout` | 5 |
-| 上行空闲超时 | 1001 `uplink idle timeout` | 6 |
-| ping 写失败 | 1001 `ping write failed` | 7 |
-| hub 关闭 | 1000 `shutdown` | 8 |
-| 帧无法解码 | 1011 `uplink unreadable` | 9 |
-
-`superseded` 的语义是「立即重拨、不重新配对」：证书是好的，重配对会删掉一个
-仍然有效的 token。两条传输都必须给出这个判定，否则同一份 token 上的两个进程
-会以退避上限（10s）为周期来回抢同一条会话。
+握手层的 401 / QUIC auth 码视为 `auth`（没有关闭帧的地方靠握手状态判断）。

@@ -114,6 +114,15 @@ func (eb *eventBus) publish(ev Event) {
 	}
 }
 
+// lastSeq is the highest seq this bus has assigned. It is the baseline a new
+// hub session declares in hello.resume.up: the hub's up watermark starts
+// there, so the first live event is lastSeq+1.
+func (eb *eventBus) lastSeq() uint64 {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	return eb.seq
+}
+
 // enqueueOrDirect hands ev to this subscriber: a direct non-blocking write
 // while the channel has room and nothing is backlogged, otherwise a queue
 // append (drained in order by the pump). Called with eb.mu held; the

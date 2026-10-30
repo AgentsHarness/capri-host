@@ -97,20 +97,16 @@ func (c *Client) State() State {
 	st.LastError = c.lastErr
 	c.ctlMu.Unlock()
 
-	// Data-plane diagnostics: read-only, and len() on a nil channel is 0, so
-	// this is safe before Run has wired the queues.
-	c.seqMu.Lock()
-	st.ReplayEvents = len(c.replay)
-	st.ReplayBytes = int64(c.replayBytes)
-	st.NextSeq = c.nextSeq
-	st.LastSentSeq = c.lastSentSeq
-	st.HubAckSeq = c.hubAckSeq
-	c.seqMu.Unlock()
-	st.NeedCatchUp = c.needCatchUp.Load()
-	st.SendQueueDepth = len(c.sendCh)
-	st.CtrlQueueDepth = len(c.ctrlCh)
-	st.ReqQueueDepth = len(c.reqCh)
-	st.CtrlDropped = c.ctrlDropped.Load()
+	// Data-plane diagnostics: the unacked uplink log and the session loop's
+	// cursors. Read-only — nothing here feeds a delivery decision.
+	st.OutboxEvents = c.out.len()
+	st.OutboxBytes = int64(c.out.bytes())
+	st.NextSeq = c.out.next()
+	st.HubAckSeq = c.out.acked()
+	if s := c.currentSession(); s != nil {
+		st.LastSentSeq = s.sentThrough
+		st.RelayQueued = len(s.relayOut)
+	}
 
 	return st
 }
@@ -267,20 +263,6 @@ func (c *Client) sessionCtx() context.Context {
 	return context.Background()
 }
 
-// failSession ends the live session so Run reconnects. The replay ring
-// is kept: hello replays it. Safe to call without a session.
-func (c *Client) failSession(err error) {
-	if err != nil {
-		log.Printf("[hub-client] %v", err)
-	}
-	c.ctlMu.Lock()
-	cancel := c.sessCancel
-	c.ctlMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
 // noteConnected records that a transport handshake succeeded. Paired with
 // noteDisconnected in runSession, which every transport funnels through.
 func (c *Client) noteConnected(transport string) {
@@ -294,7 +276,6 @@ func (c *Client) noteConnected(transport string) {
 func (c *Client) noteDisconnected() {
 	c.connected.Store(false)
 	c.connectedAt.Store(0)
-	c.probe.Store(false)
 }
 
 // setLastErr stores (or clears) the last session failure for State.

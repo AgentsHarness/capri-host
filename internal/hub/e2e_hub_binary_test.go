@@ -8,6 +8,11 @@
 // relay response.
 //
 // Run: CAPRI_E2E_HUB=/path/to/acp-hub go test -tags e2e ./internal/hub -run TestE2EHubBinary -v
+//
+// The v2 session layer is exercised end to end here: hello/hello_ack over
+// QUIC with an SPKI pin, per-event acking (the host's uplink log drains only
+// once the hub acks), a compressed uplink, and a large relay answer on its own
+// request stream while the control plane keeps carrying events.
 package hub
 
 import (
@@ -360,11 +365,9 @@ func TestE2EHubBinaryHostClientQUIC(t *testing.T) {
 	bridge.Broadcast(acp.Event{"type": "chunk", "text": "after-relay event"})
 	fe.waitEvent(t, "after-relay", 5*time.Second)
 
-	// 5. The hub log must confirm the QUIC (not WS) transport.
-	time.Sleep(200 * time.Millisecond)
-	hubLog, _ := os.ReadFile(filepath.Join(dir, "hub.log"))
-	if !strings.Contains(string(hubLog), "connected (quic") {
-		t.Fatalf("hub log shows no QUIC connection:\n%s", hubLog)
+	// 5. The session must have run over QUIC, not the WebSocket fallback.
+	if tr := client.State().Transport; tr != TransportQUIC {
+		t.Fatalf("host session transport = %q, want quic", tr)
 	}
 
 	t.Log("E2E OK: QUIC+pin online, compressed uplink events, 4MB relay on request stream with live control plane")
