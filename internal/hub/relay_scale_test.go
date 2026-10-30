@@ -11,7 +11,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // The 28MB relay ceiling is the protocol's largest single answer. It must move

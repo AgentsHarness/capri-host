@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // TestRespondChunksLargeBody: a body over relayChunkSize goes out as several

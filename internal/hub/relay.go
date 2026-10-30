@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // This file is the relay plane: one browser request becomes one local HTTP

@@ -28,7 +28,7 @@ import (
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // quicTestHub is a v2 hub over QUIC: the control stream carries the session,

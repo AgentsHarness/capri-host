@@ -12,7 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // wsDialTimeout bounds one WebSocket dial (DNS + TCP + TLS + upgrade). 6s

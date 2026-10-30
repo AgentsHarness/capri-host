@@ -12,7 +12,7 @@ import (
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // runClient starts Run against hub and returns a stop func.

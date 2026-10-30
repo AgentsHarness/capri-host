@@ -1,7 +1,7 @@
 # PROTOCOL — host 侧传输说明
 
-协议权威定义在 `capri-wire/PROTOCOL-V2.md`，帧模型、Sender/Receiver、关闭原因
-与默认限额都由 `github.com/AgentsHarness/capri-wire` 提供。本文只记录
+协议权威定义在 `wire/PROTOCOL-V2.md`，帧模型、Sender/Receiver、关闭原因
+与默认限额都由 `github.com/AgentsHarness/capri-hub/wire` 提供。本文只记录
 **capri-host 这一侧**收发帧时需要注意的传输细节。
 
 可靠性模型与故障矩阵：`acp-hub/docs/SESSION-V2-RELIABILITY.md`。

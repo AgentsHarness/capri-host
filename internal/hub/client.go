@@ -43,7 +43,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // Config configures the hub client.

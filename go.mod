@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	fyne.io/systray v1.12.2
-	github.com/AgentsHarness/capri-wire v0.0.0
+	github.com/AgentsHarness/capri-hub/wire v0.0.0
 	github.com/BurntSushi/toml v1.6.0
 	github.com/coder/websocket v1.8.14
 	github.com/ncruces/zenity v0.10.15
@@ -25,4 +25,4 @@ require (
 	golang.org/x/net v0.56.0 // indirect
 )
 
-replace github.com/AgentsHarness/capri-wire => ../capri-wire
+replace github.com/AgentsHarness/capri-hub/wire => ../acp-hub/wire

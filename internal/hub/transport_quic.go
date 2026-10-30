@@ -14,7 +14,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // quicDialTimeout bounds the QUIC handshake before falling back to WebSocket.

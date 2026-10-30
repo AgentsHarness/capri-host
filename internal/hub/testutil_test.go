@@ -13,7 +13,7 @@ import (
 	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/coder/websocket"
 
-	"github.com/AgentsHarness/capri-wire"
+	"github.com/AgentsHarness/capri-hub/wire"
 )
 
 // ── fake transport ────────────────────────────────────────────────────
