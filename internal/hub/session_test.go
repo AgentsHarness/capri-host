@@ -293,7 +293,7 @@ func TestOversizedEventBecomesPlaceholder(t *testing.T) {
 	h := newSessionHarness(t, c, bridge)
 	small := &wire.Limits{MaxFrame: 2048, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, Audience: audiencePtr(watchingAudience(1, "s1")),
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: &wire.Caps{Deflate: true},
 	}))
 	runForwardLoop(t, c, bridge)
@@ -322,7 +322,7 @@ func TestOutboxElidesDroppableWhilePaused(t *testing.T) {
 	h := newSessionHarness(t, c, bridge)
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, Audience: audiencePtr(pausedAudience(1)),
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: &wire.Caps{Deflate: true},
 	}))
 	runForwardLoop(t, c, bridge)
@@ -563,7 +563,7 @@ func TestBatchingRespectsMaxFrame(t *testing.T) {
 	h := newSessionHarness(t, c, bridge)
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, Audience: audiencePtr(watchingAudience(1, "s1")),
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: &wire.Caps{Deflate: true},
 	}))
 	runForwardLoop(t, c, bridge)
@@ -589,6 +589,31 @@ func TestBatchingRespectsMaxFrame(t *testing.T) {
 }
 
 func audiencePtr(a wire.Audience) *wire.Audience { return &a }
+
+// TestDownReceiverUsesAdvertisedWindow: the down receiver parks at most
+// hello_ack.limits.resumeWindow frames, not the local package default. A host
+// that kept the default would happily buffer far past what the hub promised
+// and never notice the gap is unrecoverable.
+func TestDownReceiverUsesAdvertisedWindow(t *testing.T) {
+	c := newSessionClient(t)
+	h := newSessionHarness(t, c, newTestBridge())
+	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: 2}
+	h.adopt(wire.NewHelloAck(wire.HelloAck{
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: &wire.Caps{Deflate: true},
+	}))
+	if got := c.currentSession().down.Window(); got != 2 {
+		t.Fatalf("down receiver window = %d, want the advertised 2", got)
+	}
+
+	// Seq 1 is missing; 2..4 park one frame past the advertised window.
+	h.tr.push(t, requestFrame(2, 0, "a", "GET", "/api/x", ""))
+	h.tr.push(t, requestFrame(3, 0, "b", "GET", "/api/x", ""))
+	h.tr.push(t, requestFrame(4, 0, "c", "GET", "/api/x", ""))
+	if res := h.wait(t, 3*time.Second); res.reason != wire.CloseOverflow {
+		t.Fatalf("close = %s, want overflow at the advertised bound", res.reason)
+	}
+}
 
 func waitRespond(t *testing.T, tr *fakeTransport) wire.Frame {
 	t.Helper()

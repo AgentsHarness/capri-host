@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,7 +132,7 @@ func TestRelayInProcess(t *testing.T) {
 	h := newSessionHarness(t, c, newTestBridge())
 	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: 1 << 20, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, Audience: audiencePtr(watchingAudience(1)),
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: &wire.Caps{Deflate: true},
 	}))
 
@@ -181,4 +183,144 @@ func newHTTPStub(t *testing.T) *httpStub {
 		_, _ = w.Write([]byte(`{"ok":true,"auth":"` + r.Header.Get("Authorization") + `"}`))
 	})
 	return &httpStub{url: startTestServer(t, h)}
+}
+
+// memoEntriesFor counts the memo entries scoped to one hub incarnation.
+func memoEntriesFor(m *relayMemo, hubBoot uint64) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for key := range m.entries {
+		if key.hubBoot == hubBoot {
+			n++
+		}
+	}
+	return n
+}
+
+// countingHandler answers every request with the running call number, so a
+// test can tell a re-execution from a resend.
+func countingHandler(calls *atomic.Int32, body func(n int32) string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/count", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body(calls.Add(1))))
+	})
+	return mux
+}
+
+func helloAckBoot(epoch, hubBoot, ackUp, ackDown uint64) wire.Frame {
+	ack := helloAckFrame(epoch, ackUp, ackDown, watchingAudience(1))
+	ack.HubBoot = hubBoot
+	return ack
+}
+
+// TestRelayMemoScopedByHubBoot: a hub restart resets its reqId counter, so the
+// same reqId in the new incarnation is a NEW request. It must execute again
+// and must never receive the previous hub's cached answer.
+func TestRelayMemoScopedByHubBoot(t *testing.T) {
+	var calls atomic.Int32
+	c := NewClient(Config{
+		HostID: "h1", Token: "tok123",
+		Local: countingHandler(&calls, func(n int32) string {
+			return fmt.Sprintf(`{"call":%d}`, n)
+		}),
+	})
+
+	first := newSessionHarness(t, c, newTestBridge())
+	first.handshake(helloAckBoot(c.epoch, 11, 0, 0))
+	first.tr.push(t, requestFrame(1, 0, "1", "GET", "/api/count", ""))
+	if got := waitRespond(t, first.tr); !bytes.Contains(got.Body, []byte(`"call":1`)) {
+		t.Fatalf("first answer = %d %s", got.RespondStatus(), got.Body)
+	}
+
+	// The link dies; a restarted hub comes back with a fresh reqId space.
+	first.cancel()
+	first.wait(t, 3*time.Second)
+
+	second := newSessionHarness(t, c, newTestBridge())
+	second.handshake(helloAckBoot(c.epoch, 12, 0, 0))
+	second.tr.push(t, requestFrame(1, 0, "1", "GET", "/api/count", ""))
+	got := waitRespond(t, second.tr)
+	if !bytes.Contains(got.Body, []byte(`"call":2`)) {
+		t.Fatalf("second incarnation answered from the old hub's memo: %s", got.Body)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("executions = %d, want 2 (the new hub's request must run again)", n)
+	}
+	if left := memoEntriesFor(c.memo, 11); left != 0 {
+		t.Fatalf("old hubBoot entries survived the restart: %d", left)
+	}
+}
+
+// TestRelayAnswerFlushedAfterSessionGap: an answer that finishes with no
+// session is resent on the next hello_ack of the same hub incarnation. The hub
+// already acked the request and will not replay it, so this resend is the only
+// way the browser ever sees the answer.
+func TestRelayAnswerFlushedAfterSessionGap(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/slow", func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		close(started)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"slow":1}`))
+	})
+	c := NewClient(Config{HostID: "h1", Token: "tok123", Local: mux})
+
+	first := newSessionHarness(t, c, newTestBridge())
+	first.handshake(helloAckBoot(c.epoch, 21, 0, 0))
+	first.tr.push(t, requestFrame(1, 0, "1", "GET", "/api/slow", ""))
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay execution never started")
+	}
+
+	// The link drops while the request is still running.
+	first.cancel()
+	first.wait(t, 3*time.Second)
+
+	// The answer completes with no session at all.
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for len(c.memo.undelivered(21)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the answer never reached the memo")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Same hub incarnation reconnects: the answer rides the new link once.
+	second := newSessionHarness(t, c, newTestBridge())
+	second.handshake(helloAckBoot(c.epoch, 21, 0, 0))
+	got := waitRespond(t, second.tr)
+	if got.ReqID != "1" || got.RespondStatus() != 200 || !bytes.Contains(got.Body, []byte(`"slow":1`)) {
+		t.Fatalf("resend = %d %s (reqId %q)", got.RespondStatus(), got.Body, got.ReqID)
+	}
+	// Exactly once: no second copy behind it.
+	deadline = time.Now().Add(300 * time.Millisecond)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			break
+		}
+		select {
+		case b := <-second.tr.sent:
+			f, err := wire.Decode(b)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if f.Type == wire.TypeRespond {
+				t.Fatalf("the answer was resent twice (reqId %q)", f.ReqID)
+			}
+		case <-time.After(left):
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("executions = %d, a resend must not re-run the request", n)
+	}
 }

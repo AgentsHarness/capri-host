@@ -85,6 +85,10 @@ type session struct {
 	tr     Transport
 
 	epoch uint64
+	// hubBoot is the hub process behind this link, adopted from hello_ack.
+	// Relay answers may only be sent to the hub that asked for them: a hub
+	// restart resets its request ids.
+	hubBoot uint64
 
 	up     *outbox
 	down   *wire.Receiver
@@ -350,11 +354,24 @@ func (s *session) adoptHelloAck(data []byte) (wire.CloseReason, error) {
 
 	// ackUp is authoritative: it drops everything the hub already applied and
 	// leaves the rest queued for replay. ackDown seeds the down receiver over
-	// the hub's own sequence space, which a hub restart resets.
+	// the hub's own sequence space, which a hub restart resets; the parked-run
+	// bound is the window the hub advertised, not a local constant.
 	s.up.ack(ack.AckUp)
-	s.down = wire.NewReceiver(ack.AckDown)
+	window := wire.DefaultLimits.ResumeWindow
+	if lim := ack.Limits; lim != nil {
+		window = lim.ResumeWindow
+	}
+	s.down = wire.NewReceiverWindow(ack.AckDown, window)
 	s.c.setDownApplied(ack.AckDown)
 	s.sentThrough = s.up.acked()
+
+	// A different hubBoot is a restarted hub: its request-id counter starts
+	// over, so nothing remembered under the old boot may answer (or suppress)
+	// a request from this one.
+	if ack.HubBoot != s.hubBoot {
+		s.c.memo.pruneHub(ack.HubBoot)
+		s.hubBoot = ack.HubBoot
+	}
 
 	if l := ack.Liveness; l != nil {
 		s.keepalive = time.Duration(l.Keepalive) * time.Second
@@ -373,6 +390,11 @@ func (s *session) adoptHelloAck(data []byte) (wire.CloseReason, error) {
 	}
 	s.lastStatus = s.status()
 	s.sendHeartbeat()
+
+	// Answers that finished while this host had no session go out now: the
+	// hub acked their requests and will never replay them, so this link is
+	// their only route to the browser.
+	s.c.flushRelayAnswers(s)
 
 	log.Printf("[hub-client] hub 会话已就绪（epoch %d，ackUp %d，ackDown %d，audience gen %d，watchers %d）",
 		s.epoch, ack.AckUp, ack.AckDown, s.lastGen, s.c.watchers())

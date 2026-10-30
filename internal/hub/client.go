@@ -125,7 +125,8 @@ type Client struct {
 	out *outbox
 
 	// memo dedupes relayed requests across a same-epoch resume, so a prompt is
-	// never executed twice.
+	// never executed twice. Entries are scoped by the hub's boot id: a
+	// restarted hub reuses reqIds and must not inherit these answers.
 	memo *relayMemo
 
 	// wake tells the session loop the uplink log grew; statusCh tells it the
@@ -149,11 +150,8 @@ type Client struct {
 	sess   *session
 
 	// downApplied is the highest down seq this host has applied, reported in
-	// hello.resume.down. sentThrough / upAcked mirror the session loop's
-	// cursors for State().
-	downSeq      atomic.Uint64
-	sentThroughA atomic.Uint64
-	upAckedA     atomic.Uint64
+	// hello.resume.down.
+	downSeq atomic.Uint64
 
 	// quicDial, when non-nil, replaces quic.DialAddr inside quicSession.
 	// Test seam for the connection-migration test (T6): the real session
@@ -179,13 +177,12 @@ type Client struct {
 	transport   atomic.Value // string: TransportQUIC | TransportWS
 	connectedAt atomic.Int64 // unix nano, 0 when not connected
 
-	// ctlMu guards sessCancel, sessCtx and lastErr.
+	// ctlMu guards sessCancel and lastErr.
 	ctlMu sync.Mutex
 	// sessCancel cancels the CURRENT session's context (a child of Run's
 	// ctx), which is what lets Pair drop a live connection without taking
 	// the whole process down. nil while no session is running.
 	sessCancel context.CancelFunc
-	sessCtx    context.Context
 	lastErr    string
 
 	// forceRepair is set by requestRepair and consumed once by Run's
@@ -374,11 +371,11 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 		// restart. Cancelling it never affects ctx, so the checks below
 		// still distinguish "session ended" from "process shutting down".
 		sessCtx, sessCancel := context.WithCancel(ctx)
-		c.bindSession(sessCtx, sessCancel)
+		c.setSessCancel(sessCancel)
 
 		start := time.Now()
 		reason, err := c.attempt(sessCtx, bridge)
-		c.bindSession(nil, nil)
+		c.setSessCancel(nil)
 		sessCancel()
 
 		if ctx.Err() != nil {

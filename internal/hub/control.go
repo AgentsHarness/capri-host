@@ -239,28 +239,9 @@ func (c *Client) requestRepair() {
 // setSessCancel publishes the cancel func for the session Run is about to
 // start, so requestRepair can interrupt it. Pass nil once the session ends.
 func (c *Client) setSessCancel(cancel context.CancelFunc) {
-	c.bindSession(nil, cancel)
-}
-
-// bindSession publishes the session context and its cancel together.
-// A nil context means no session is running; waiters then use a
-// background context only when no session was ever bound.
-func (c *Client) bindSession(ctx context.Context, cancel context.CancelFunc) {
 	c.ctlMu.Lock()
-	c.sessCtx = ctx
 	c.sessCancel = cancel
 	c.ctlMu.Unlock()
-}
-
-// sessionCtx is the live session's context, or Background when none is
-// bound (tests that enqueue without Run).
-func (c *Client) sessionCtx() context.Context {
-	c.ctlMu.Lock()
-	defer c.ctlMu.Unlock()
-	if c.sessCtx != nil {
-		return c.sessCtx
-	}
-	return context.Background()
 }
 
 // noteConnected records that a transport handshake succeeded. Paired with

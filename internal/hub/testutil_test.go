@@ -28,7 +28,6 @@ type fakeTransport struct {
 	closed    chan struct{}
 
 	mu          sync.Mutex
-	reason      wire.CloseReason
 	deflate     bool
 	keepalive   time.Duration
 	keepaliveCh chan time.Duration
@@ -74,10 +73,7 @@ func (f *fakeTransport) failRecv(err error) {
 	f.recvErr <- err
 }
 
-func (f *fakeTransport) Close(r wire.CloseReason) error {
-	f.mu.Lock()
-	f.reason = r
-	f.mu.Unlock()
+func (f *fakeTransport) Close(wire.CloseReason) error {
 	f.closeOnce.Do(func() { close(f.closed) })
 	return nil
 }
@@ -96,12 +92,6 @@ func (f *fakeTransport) SetDeflate(v bool) {
 	f.mu.Lock()
 	f.deflate = v
 	f.mu.Unlock()
-}
-
-func (f *fakeTransport) closeReason() wire.CloseReason {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.reason
 }
 
 // next reads one frame the host wrote.
@@ -147,17 +137,6 @@ func (f *fakeTransport) push(t *testing.T, fr wire.Frame) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("host is not reading (%s)", fr.Type)
 	}
-}
-
-func (f *fakeTransport) waitClose(t *testing.T, timeout time.Duration) wire.CloseReason {
-	t.Helper()
-	select {
-	case <-f.closed:
-		return f.closeReason()
-	case <-time.After(timeout):
-		t.Fatal("host never closed the session")
-	}
-	return 0
 }
 
 // ── fake bridge ───────────────────────────────────────────────────────
@@ -233,6 +212,9 @@ func testLimits() *wire.Limits {
 	return &l
 }
 
+// testHubBoot is the hub incarnation every harness hello_ack names.
+const testHubBoot = 7
+
 func helloAckFrame(epoch, ackUp, ackDown uint64, aud wire.Audience) wire.Frame {
 	return helloAckFrameLiveness(epoch, ackUp, ackDown, aud, 1, 2)
 }
@@ -242,6 +224,7 @@ func helloAckFrame(epoch, ackUp, ackDown uint64, aud wire.Audience) wire.Frame {
 func helloAckFrameLiveness(epoch, ackUp, ackDown uint64, aud wire.Audience, keepalive, idle int) wire.Frame {
 	return wire.NewHelloAck(wire.HelloAck{
 		Epoch:    epoch,
+		HubBoot:  testHubBoot,
 		AckUp:    ackUp,
 		AckDown:  ackDown,
 		Audience: &aud,
@@ -269,14 +252,6 @@ func requestFrame(seq, ack uint64, reqID, method, path string, body string) wire
 		f.Body = json.RawMessage(body)
 	}
 	return f
-}
-
-func eventJSON(ev acp.Event) []byte {
-	b, err := json.Marshal(ev)
-	if err != nil {
-		panic(err)
-	}
-	return b
 }
 
 // websocketCloseCode maps a protocol reason onto the WS close code the hub

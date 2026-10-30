@@ -39,11 +39,11 @@ type quicTestHub struct {
 	certDER []byte
 	aud     wire.Audience
 
-	eventsCh  chan wire.Frame
-	respondCh chan quicRespond
-	errCh     chan error
-	ctrlCh    chan *quic.Stream
-	readyCh   chan struct{}
+	eventsCh    chan wire.Frame
+	respondCh   chan quicRespond
+	errCh       chan error
+	ctrlStreams chan *quic.Stream
+	readyCh     chan struct{}
 
 	mu        sync.Mutex
 	ctrlMu    sync.Mutex
@@ -90,16 +90,16 @@ func newQUICTestHub(t *testing.T, aud wire.Audience) *quicTestHub {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	return &quicTestHub{
-		t:         t,
-		ln:        ln,
-		certDER:   der,
-		aud:       aud,
-		eventsCh:  make(chan wire.Frame, 32),
-		respondCh: make(chan quicRespond, 32),
-		errCh:     make(chan error, 4),
-		ctrlCh:    make(chan *quic.Stream, 4),
-		readyCh:   make(chan struct{}),
-		streams:   make(map[quic.StreamID]*quic.Stream),
+		t:           t,
+		ln:          ln,
+		certDER:     der,
+		aud:         aud,
+		eventsCh:    make(chan wire.Frame, 32),
+		respondCh:   make(chan quicRespond, 32),
+		errCh:       make(chan error, 4),
+		ctrlStreams: make(chan *quic.Stream, 4),
+		readyCh:     make(chan struct{}),
+		streams:     make(map[quic.StreamID]*quic.Stream),
 	}
 }
 
@@ -142,7 +142,7 @@ func (h *quicTestHub) serve() {
 		h.mu.Lock()
 		h.streams[ctrl.StreamID()] = ctrl
 		h.mu.Unlock()
-		h.ctrlCh <- ctrl
+		h.ctrlStreams <- ctrl
 
 		fr, err := readQUICTestFrame(h, ctrl)
 		if err != nil {
@@ -235,7 +235,7 @@ func (h *quicTestHub) recordRespond(r quicRespond) {
 func (h *quicTestHub) control(t *testing.T) *quic.Stream {
 	t.Helper()
 	select {
-	case s := <-h.ctrlCh:
+	case s := <-h.ctrlStreams:
 		select {
 		case <-h.readyCh:
 		case <-time.After(5 * time.Second):

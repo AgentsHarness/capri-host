@@ -15,7 +15,7 @@ import (
 )
 
 // This file is the Stage-4 fault matrix at the host end of the session: the
-// failure modes that created the v1 patch layer, driven through the real
+// failure modes v2 must answer, driven through the real
 // session loop over the in-process fake transport (deterministic) plus Run
 // over a real WebSocket where the reconnect policy matters.
 
@@ -450,7 +450,7 @@ func TestOutboxElisionKeepsSeqAndWatermark(t *testing.T) {
 	h := newSessionHarness(t, c, bridge)
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, Audience: audiencePtr(pausedAudience(1)),
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: &wire.Caps{Deflate: true},
 	}))
 	runForwardLoop(t, c, bridge)
@@ -555,7 +555,7 @@ func TestOverflowWhileDisconnectedKeepsCriticalEvents(t *testing.T) {
 	h := newSessionHarness(t, c, bridge)
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, Audience: audiencePtr(pausedAudience(1)),
+		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: &wire.Caps{Deflate: true},
 	}))
 	runForwardLoop(t, c, bridge)

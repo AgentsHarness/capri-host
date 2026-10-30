@@ -35,12 +35,12 @@ const relayChunkSize = 1 << 20
 // for the in-flight run and resends its result, resends a cached answer, or
 // refuses.
 func (c *Client) serveRelay(s *session, f wire.Frame) {
-	e, owner := c.memo.begin(f.ReqID)
+	e, owner := c.memo.begin(s.hubBoot, f.ReqID)
 	if owner {
 		go func() {
 			status, body := c.executeRelay(s, f.Method, f.Path, f.Body)
 			c.memo.finish(e, status, body)
-			c.deliverRelay(f.ReqID, status, body)
+			c.deliverRelay(e, status, body)
 		}()
 		return
 	}
@@ -53,10 +53,10 @@ func (c *Client) serveRelay(s *session, f wire.Frame) {
 			return
 		}
 		if status, body, ok := c.memo.response(e); ok {
-			c.deliverRelay(f.ReqID, status, body)
+			c.deliverRelay(e, status, body)
 			return
 		}
-		c.deliverRelay(f.ReqID, http.StatusConflict, mustJSON(map[string]any{
+		c.deliverRelay(e, http.StatusConflict, mustJSON(map[string]any{
 			"ok": false, "error": "duplicate request",
 		}))
 	}()
@@ -66,16 +66,43 @@ func (c *Client) serveRelay(s *session, f wire.Frame) {
 // the one that received the request. The execution deliberately outlives its
 // session, and the hub proved delivery of the request frame (it will not
 // retransmit it), so answering the dead link would strand the browser for the
-// whole relay deadline. With no live session the answer is dropped: respond is
-// not in the session seq log and the relay deadline owns its loss (§5.4).
-func (c *Client) deliverRelay(reqID string, status int, body json.RawMessage) bool {
+// whole relay deadline.
+//
+// The answer may only go to the hub process that asked, though: a hub restart
+// resets the reqId counter, so the same id in a later incarnation names a
+// different request. With no live session, or a session of another hubBoot,
+// the answer is dropped here — flushRelayAnswers resends it if that same hub
+// comes back.
+func (c *Client) deliverRelay(e *relayEntry, status int, body json.RawMessage) bool {
 	s := c.currentSession()
-	if s == nil {
-		log.Printf("[hub-client] 请求已执行但当前无会话，响应丢失 reqId=%s（由中继超时接管）", reqID)
+	if s == nil || s.hubBoot != e.key.hubBoot {
+		log.Printf("[hub-client] 请求已执行但当前无会话或 hub 已重启，响应暂存 reqId=%s hubBoot=%d", e.key.reqID, e.key.hubBoot)
 		return false
 	}
-	s.respond(reqID, status, body)
+	c.memo.markDelivered(e)
+	s.respond(e.key.reqID, status, body)
 	return true
+}
+
+// flushRelayAnswers resends every completed answer this hubBoot is still owed,
+// on the session that just adopted its hello_ack. An answer whose session died
+// before it was written is otherwise lost for good: the hub acked the request,
+// never replays it, and the browser would wait out RelayTimeout. An answer that
+// already reached a session of this hubBoot is not resent, so a reconnect does
+// not duplicate answers the hub has resolved. respond is idempotent at the hub
+// anyway, so even a racing duplicate is harmless and nothing is re-executed.
+// The work is bounded by the memo's own TTL and byte cap.
+func (c *Client) flushRelayAnswers(s *session) {
+	answers := c.memo.undelivered(s.hubBoot)
+	for _, a := range answers {
+		if !c.memo.markDelivered(a.entry) {
+			continue
+		}
+		s.respond(a.reqID, a.status, a.body)
+	}
+	if len(answers) > 0 {
+		log.Printf("[hub-client] 会话恢复：重发 %d 个已完成的中继响应（hubBoot=%d）", len(answers), s.hubBoot)
+	}
 }
 
 // executeRelay runs one relayed request against the local HTTP API and returns
@@ -271,9 +298,9 @@ func (s *session) respondChunked(reqID string, status int, body json.RawMessage)
 // ── request dedupe ────────────────────────────────────────────────────
 
 // Bounds on the seen-request table. A duplicate only matters across a
-// same-epoch reconnect, which happens within seconds; the TTL keeps a hub that
-// restarted and restarted its reqId counter from inheriting our memory of the
-// previous incarnation.
+// same-epoch reconnect, which happens within seconds; the TTL bounds the
+// memory a finished answer may hold. hubBoot scopes the key, so a restarted
+// hub's reused reqId can never inherit the previous process's answer.
 const (
 	memoIDs        = 256
 	memoTTL        = 5 * time.Minute
@@ -281,46 +308,67 @@ const (
 	memoTotalBytes = 8 << 20
 )
 
+// relayKey names one request: a reqId is only unique inside one hub process.
+type relayKey struct {
+	hubBoot uint64
+	reqID   string
+}
+
 // relayEntry is one seen request.
 type relayEntry struct {
+	key      relayKey
 	done     chan struct{}
 	finished bool
-	status   int
-	body     json.RawMessage
-	cached   bool
-	at       time.Time
+	// delivered records that an answer for this entry was handed to a live
+	// session of key.hubBoot. A reconnect only resends answers that never
+	// made it onto a link.
+	delivered bool
+	status    int
+	body      json.RawMessage
+	cached    bool
+	at        time.Time
+}
+
+// relayAnswer is one completed answer eligible for a resend.
+type relayAnswer struct {
+	entry  *relayEntry
+	reqID  string
+	status int
+	body   json.RawMessage
 }
 
 // relayMemo remembers requests this process has started or answered, so a
 // duplicate never runs a prompt twice.
 type relayMemo struct {
 	mu          sync.Mutex
-	order       []string
-	entries     map[string]*relayEntry
+	order       []relayKey
+	entries     map[relayKey]*relayEntry
 	cachedBytes int
 }
 
 func newRelayMemo() *relayMemo {
-	return &relayMemo{entries: make(map[string]*relayEntry)}
+	return &relayMemo{entries: make(map[relayKey]*relayEntry)}
 }
 
-// begin returns the entry for id and reports whether the caller owns the
-// execution. A duplicate gets the existing entry and must wait for done.
-func (m *relayMemo) begin(id string) (*relayEntry, bool) {
+// begin returns the entry for (hubBoot, reqID) and reports whether the caller
+// owns the execution. A duplicate gets the existing entry and must wait for
+// done.
+func (m *relayMemo) begin(hubBoot uint64, id string) (*relayEntry, bool) {
+	key := relayKey{hubBoot: hubBoot, reqID: id}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if e, ok := m.entries[id]; ok {
+	if e, ok := m.entries[key]; ok {
 		if !e.finished || time.Since(e.at) < memoTTL {
 			return e, false
 		}
-		// A stale entry from a hub incarnation that restarted its counter:
-		// forget it and treat this id as new.
+		// A finished answer older than the TTL no longer suppresses a repeat:
+		// the hub has long since given up on it.
 		m.cachedBytes -= len(e.body)
-		delete(m.entries, id)
+		delete(m.entries, key)
 	}
-	e := &relayEntry{done: make(chan struct{}), at: time.Now()}
-	m.entries[id] = e
-	m.order = append(m.order, id)
+	e := &relayEntry{key: key, done: make(chan struct{}), at: time.Now()}
+	m.entries[key] = e
+	m.order = append(m.order, key)
 	m.evictLocked()
 	return e, true
 }
@@ -350,14 +398,57 @@ func (m *relayMemo) response(e *relayEntry) (int, json.RawMessage, bool) {
 	return e.status, e.body, true
 }
 
-// reset forgets every seen request (a new uplink epoch cannot receive their
-// duplicates).
-func (m *relayMemo) reset() {
+// pruneHub drops every entry of another hub incarnation. A restarted hub has
+// its own reqId namespace, so nothing keyed by the old boot can ever be
+// answered or deduped there.
+func (m *relayMemo) pruneHub(hubBoot uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.entries = make(map[string]*relayEntry)
-	m.order = nil
-	m.cachedBytes = 0
+	for key, e := range m.entries {
+		if key.hubBoot != hubBoot {
+			m.cachedBytes -= len(e.body)
+			delete(m.entries, key)
+		}
+	}
+	kept := m.order[:0]
+	for _, key := range m.order {
+		if key.hubBoot == hubBoot {
+			kept = append(kept, key)
+		}
+	}
+	m.order = kept
+}
+
+// undelivered returns the answers this hubBoot has not received yet, oldest
+// first. It only reports answers that are still cached and inside the TTL,
+// which is the same bound that keeps the table from growing.
+func (m *relayMemo) undelivered(hubBoot uint64) []relayAnswer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []relayAnswer
+	for _, key := range m.order {
+		e, ok := m.entries[key]
+		if !ok || key.hubBoot != hubBoot || !e.finished || !e.cached || e.delivered {
+			continue
+		}
+		if time.Since(e.at) >= memoTTL {
+			continue
+		}
+		out = append(out, relayAnswer{entry: e, reqID: key.reqID, status: e.status, body: e.body})
+	}
+	return out
+}
+
+// markDelivered records that e's answer was handed to a session of its
+// hubBoot and reports whether this call was the one that flipped it.
+func (m *relayMemo) markDelivered(e *relayEntry) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e.delivered {
+		return false
+	}
+	e.delivered = true
+	return true
 }
 
 // evictLocked keeps the table bounded, skipping requests that are still
@@ -365,8 +456,8 @@ func (m *relayMemo) reset() {
 func (m *relayMemo) evictLocked() {
 	for len(m.entries) > memoIDs {
 		removed := false
-		for i, id := range m.order {
-			e, ok := m.entries[id]
+		for i, key := range m.order {
+			e, ok := m.entries[key]
 			if !ok {
 				m.order = append(m.order[:i], m.order[i+1:]...)
 				removed = true
@@ -376,7 +467,7 @@ func (m *relayMemo) evictLocked() {
 				continue
 			}
 			m.cachedBytes -= len(e.body)
-			delete(m.entries, id)
+			delete(m.entries, key)
 			m.order = append(m.order[:i], m.order[i+1:]...)
 			removed = true
 			break

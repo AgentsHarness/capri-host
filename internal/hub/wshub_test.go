@@ -150,6 +150,7 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 
 	ack := wire.NewHelloAck(wire.HelloAck{
 		Epoch:    hello.Epoch,
+		HubBoot:  testHubBoot,
 		AckUp:    h.ackUp.load(),
 		AckDown:  0,
 		Audience: &aud,
@@ -334,12 +335,6 @@ func (h *wsHub) frameOnConnAfter(connIdx int, minSeq uint64, from int) (wire.Fra
 		}
 	}
 	return wire.Frame{}, false
-}
-
-func (h *wsHub) recordedFrames() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.events)
 }
 
 func (h *wsHub) waitRespond(t *testing.T, reqID string, timeout time.Duration) wire.Frame {
