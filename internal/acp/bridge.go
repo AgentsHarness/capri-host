@@ -3443,7 +3443,7 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 	s.busyCount++
 	s.LastActiveAt = time.Now().UnixMilli()
 	b.openTurnLocked(sessionID, s.LastActiveAt)
-	b.syncBusyLocked(s)
+	flipped := b.syncBusyLocked(s)
 	// Keep last-session pointer fresh even if the user only talks to this
 	// session without re-loading it (multi-session focus via prompt).
 	b.rememberSessionLocked(sessionID, s.Cwd)
@@ -3453,6 +3453,13 @@ func (b *Bridge) PromptWithOpts(ctx context.Context, sessionID string, blocks []
 		// in-flight prompt must not re-announce — the session never left
 		// busy between the two.
 		b.Broadcast(Event{kType: "busy", kSessionID: sessionID})
+	}
+	if flipped {
+		// The row now reads active/busy; patch it so clients that render
+		// the list from sessions_changed skip the fetch. flipped is false
+		// when first is true but the observed turn already held Busy: that
+		// flip went out from noteTurnActivity.
+		b.broadcastRosterRows(sessionID)
 	}
 
 	// turnEnded records whether the agent actually finished this turn. It

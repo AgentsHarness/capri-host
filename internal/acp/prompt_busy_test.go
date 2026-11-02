@@ -67,8 +67,8 @@ func resolveLine(t *testing.T, b *Bridge, w *recordingStdin, n int, result map[s
 
 // 两个并发 prompt（同一会话）：A 在飞时 B 照常转发（不 409）；A 先
 // resolve 后会话必须仍 busy（B 还在跑）；只有 B（最后一个）resolve 才
-// 清成 idle。事件纪律：busy 只在 0→1 报一次，sessions_changed 只在
-// busy→idle 报一次。
+// 清成 idle。事件纪律：busy 只在 0→1 报一次；sessions_changed 在
+// busy 翻转的两端各报一次（prompt 开始 active 行、回合收尾 idle 行）。
 func TestPromptConcurrentBusyRefcount(t *testing.T) {
 	b, w := metaReadyBridge(t)
 	ctx := context.Background()
@@ -143,27 +143,122 @@ func TestPromptConcurrentBusyRefcount(t *testing.T) {
 	}
 	b.mu.Unlock()
 
-	// 事件纪律：busy 只报一次（A 的 0→1），sessions_changed 只报一次
-	// （B 的 busy→idle）——A 的 resolve 不得误报 idle。
-	var busyEvents, rosterEvents int
+	// 事件纪律：busy 只在 A 的 0→1 报一次；sessions_changed 有两条——
+	// prompt 开始（Busy 翻 true，行里 busy=true/state=active）和最后一个
+	// 回合收尾（busy→idle）。A 的 resolve 不得报行。
+	type rosterSnap struct {
+		busy  any
+		state any
+	}
+	var busyEvents int
+	var rosters []rosterSnap
 	deadline := time.After(2 * time.Second)
-	for busyEvents+rosterEvents < 2 {
+	for busyEvents < 1 || len(rosters) < 2 {
 		select {
 		case ev := <-sub:
 			switch ev["type"] {
 			case "busy":
 				busyEvents++
 			case "sessions_changed":
-				rosterEvents++
+				params, _ := ev["params"].(map[string]any)
+				upserted, _ := params["upserted"].([]any)
+				if len(upserted) != 1 {
+					t.Fatalf("sessions_changed params = %+v, want one upserted row", params)
+				}
+				row, _ := upserted[0].(map[string]any)
+				status, _ := row["status"].(map[string]any)
+				rosters = append(rosters, rosterSnap{busy: status["busy"], state: status["state"]})
 			}
 		case <-deadline:
-			t.Fatalf("events exhausted: busy=%d sessions_changed=%d",
-				busyEvents, rosterEvents)
+			t.Fatalf("events exhausted: busy=%d sessions_changed=%d, want 1/2",
+				busyEvents, len(rosters))
 		}
 	}
-	if busyEvents != 1 || rosterEvents != 1 {
-		t.Errorf("event counts = busy:%d sessions_changed:%d, want 1/1",
-			busyEvents, rosterEvents)
+	if busyEvents != 1 {
+		t.Errorf("busy events = %d, want 1 (only the 0→1, B must not re-announce)", busyEvents)
+	}
+	// 第一条是 prompt 0→1 的 active 行，第二条是最后一个回合的 idle 行；
+	// A 先 resolve 时 B 仍在飞，不应多出第三条。
+	if rosters[0].busy != true || rosters[0].state != "active" {
+		t.Errorf("start row status = busy:%v state:%v, want busy:true state:active",
+			rosters[0].busy, rosters[0].state)
+	}
+	if rosters[1].busy != false || rosters[1].state != "idle" {
+		t.Errorf("end row status = busy:%v state:%v, want busy:false state:idle",
+			rosters[1].busy, rosters[1].state)
+	}
+	// 事件已全部在订阅队列里：静默窗口内再出现 busy/sessions_changed 即误报。
+	quiet := time.After(100 * time.Millisecond)
+	for {
+		select {
+		case ev := <-sub:
+			if typ := ev["type"]; typ == "busy" || typ == "sessions_changed" {
+				t.Errorf("unexpected extra %v event after the last turn resolved", typ)
+			}
+		case <-quiet:
+			return
+		}
+	}
+}
+
+// TestPromptStartBroadcastsBusyRow 盯住 prompt 路径自己的 0→1 广播：回合
+// 还在等应答时，客户端就必须收到带 active 行的 sessions_changed（不等回合
+// 结束、不等下一次列表拉取）。
+func TestPromptStartBroadcastsBusyRow(t *testing.T) {
+	b, w := metaReadyBridge(t)
+	ctx := context.Background()
+	sub, unsub := b.Subscribe()
+	defer unsub()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := b.PromptWithOpts(ctx, "s1",
+			[]ContentBlock{{"type": "text", "text": "hi"}}, PromptOpts{})
+		done <- err
+	}()
+	waitLineCount(t, w, 1) // 回合已上 wire，但还没有应答
+
+	var gotBusy bool
+	var startRow map[string]any
+	deadline := time.After(5 * time.Second)
+	for !gotBusy || startRow == nil {
+		select {
+		case ev := <-sub:
+			switch ev["type"] {
+			case "busy":
+				gotBusy = true
+			case "sessions_changed":
+				if startRow != nil {
+					continue
+				}
+				params, _ := ev["params"].(map[string]any)
+				upserted, _ := params["upserted"].([]any)
+				if len(upserted) != 1 {
+					t.Fatalf("sessions_changed params = %+v, want one upserted row", params)
+				}
+				startRow, _ = upserted[0].(map[string]any)
+			}
+		case <-deadline:
+			t.Fatalf("prompt 0→1 while still in flight: busy=%v row=%v",
+				gotBusy, startRow != nil)
+		}
+	}
+	if startRow["sessionId"] != "s1" {
+		t.Errorf("upserted row sessionId = %v, want s1", startRow["sessionId"])
+	}
+	status, _ := startRow["status"].(map[string]any)
+	if status["busy"] != true || status["state"] != "active" {
+		t.Fatalf("start row status = %+v, want busy:true state:active", status)
+	}
+
+	resolveLine(t, b, w, 0, map[string]any{"stopReason": "end_turn"})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("prompt: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("prompt never resolved")
 	}
 }
 
