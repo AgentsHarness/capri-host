@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,38 +19,74 @@ import (
 
 // ── fake transport ────────────────────────────────────────────────────
 
-// fakeTransport is one in-memory link: frames the host writes arrive on sent,
-// frames pushed on in are what the host reads.
+// sentRecord is one uplink message as the transport wrote it: a complete
+// logical frame (Send) or one encoded transport unit (SendFragment).
+type sentRecord struct {
+	fragment bool
+	payload  []byte
+}
+
+// fakeTransport is one in-memory link: records the host writes arrive on sent,
+// frames pushed on in are what the host reads. Unit records are kept raw so a
+// test can assert on interleaving; next reassembles them.
 type fakeTransport struct {
 	in   chan []byte
-	sent chan []byte
+	sent chan sentRecord
 
 	closeOnce sync.Once
 	closed    chan struct{}
 
-	mu          sync.Mutex
-	deflate     bool
-	keepalive   time.Duration
-	keepaliveCh chan time.Duration
+	mu           sync.Mutex
+	deflate      bool
+	keepalive    time.Duration
+	keepaliveCh  chan time.Duration
+	writeTimeout time.Duration
+	maxFrame     int
+	// fragmentHook runs after each unit is queued, the way a slow socket
+	// stalls a writer mid-frame.
+	fragmentHook func()
 	// recvErr delivers an injected Recv error, the way a transport reports a
 	// frame it could not decode. A channel so a Recv already parked on the
 	// input wakes up.
 	recvErr chan error
+
+	lastActivity atomic.Int64
+	asm          wire.Reassembler
 }
 
 func newFakeTransport() *fakeTransport {
-	return &fakeTransport{
+	f := &fakeTransport{
 		in:          make(chan []byte, 64),
-		sent:        make(chan []byte, 64),
+		sent:        make(chan sentRecord, 256),
 		closed:      make(chan struct{}),
 		keepaliveCh: make(chan time.Duration, 4),
 		recvErr:     make(chan error, 1),
+		maxFrame:    wire.DefaultLimits.MaxFrame,
 	}
+	f.lastActivity.Store(time.Now().UnixNano())
+	return f
 }
 
 func (f *fakeTransport) Send(payload []byte) error {
+	return f.write(sentRecord{payload: payload})
+}
+
+func (f *fakeTransport) SendFragment(unit []byte) error {
+	if err := f.write(sentRecord{fragment: true, payload: unit}); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	hook := f.fragmentHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return nil
+}
+
+func (f *fakeTransport) write(rec sentRecord) error {
 	select {
-	case f.sent <- payload:
+	case f.sent <- rec:
 		return nil
 	case <-f.closed:
 		return io.EOF
@@ -61,6 +98,7 @@ func (f *fakeTransport) Recv() ([]byte, error) {
 	case err := <-f.recvErr:
 		return nil, err
 	case b := <-f.in:
+		f.lastActivity.Store(time.Now().UnixNano())
 		return b, nil
 	case <-f.closed:
 		return nil, io.EOF
@@ -94,20 +132,89 @@ func (f *fakeTransport) SetDeflate(v bool) {
 	f.mu.Unlock()
 }
 
-// next reads one frame the host wrote.
-func (f *fakeTransport) next(t *testing.T, timeout time.Duration) wire.Frame {
+func (f *fakeTransport) SetWriteTimeout(d time.Duration) {
+	f.mu.Lock()
+	f.writeTimeout = d
+	f.mu.Unlock()
+}
+
+func (f *fakeTransport) SetMaxFrame(n int) {
+	f.mu.Lock()
+	f.maxFrame = n
+	f.mu.Unlock()
+}
+
+func (f *fakeTransport) LastActivity() time.Time {
+	ns := f.lastActivity.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// setFragmentHook installs a callback that runs after each unit write.
+func (f *fakeTransport) setFragmentHook(hook func()) {
+	f.mu.Lock()
+	f.fragmentHook = hook
+	f.mu.Unlock()
+}
+
+// nextRecord returns the next raw uplink record (a frame or a unit).
+func (f *fakeTransport) nextRecord(t *testing.T, timeout time.Duration) sentRecord {
 	t.Helper()
 	select {
-	case b := <-f.sent:
-		fr, err := wire.Decode(b)
-		if err != nil {
-			t.Fatalf("host wrote an invalid frame: %v (%s)", err, b)
-		}
-		return fr
+	case rec := <-f.sent:
+		return rec
 	case <-time.After(timeout):
-		t.Fatal("host wrote no frame in time")
+		t.Fatal("host wrote nothing in time")
 	}
-	return wire.Frame{}
+	return sentRecord{}
+}
+
+// tryFrame returns the next reassembled frame, or ok=false on timeout.
+func (f *fakeTransport) tryFrame(timeout time.Duration) (wire.Frame, bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case rec := <-f.sent:
+			if !rec.fragment {
+				fr, err := wire.Decode(rec.payload)
+				return fr, err == nil
+			}
+			f.mu.Lock()
+			limit := f.maxFrame
+			f.mu.Unlock()
+			frame, compressed, complete, err := f.asm.Accept(rec.payload, limit)
+			if err != nil {
+				return wire.Frame{}, false
+			}
+			if !complete {
+				continue
+			}
+			if compressed {
+				if frame, err = inflatePayload(frame); err != nil {
+					return wire.Frame{}, false
+				}
+			}
+			fr, err := wire.Decode(frame)
+			return fr, err == nil
+		case <-f.closed:
+			return wire.Frame{}, false
+		case <-timer.C:
+			return wire.Frame{}, false
+		}
+	}
+}
+
+// next reads one frame the host wrote, reassembling units.
+func (f *fakeTransport) next(t *testing.T, timeout time.Duration) wire.Frame {
+	t.Helper()
+	fr, ok := f.tryFrame(timeout)
+	if !ok {
+		t.Fatal("host wrote no decodable frame in time")
+	}
+	return fr
 }
 
 // nextOfType skips heartbeats until a frame of the wanted type arrives.
@@ -215,6 +322,12 @@ func testLimits() *wire.Limits {
 // testHubBoot is the hub incarnation every harness hello_ack names.
 const testHubBoot = 7
 
+// testCaps is the capability echo every fixture uses: the host requires
+// transport units, and the relay-ack bit is carried ahead of its phase.
+func testCaps() *wire.Caps {
+	return &wire.Caps{Deflate: true, TransportUnits: true, RelayAck: true}
+}
+
 func helloAckFrame(epoch, ackUp, ackDown uint64, aud wire.Audience) wire.Frame {
 	return helloAckFrameLiveness(epoch, ackUp, ackDown, aud, 1, 2)
 }
@@ -230,7 +343,7 @@ func helloAckFrameLiveness(epoch, ackUp, ackDown uint64, aud wire.Audience, keep
 		Audience: &aud,
 		Liveness: &wire.Liveness{Keepalive: keepalive, Idle: idle},
 		Limits:   testLimits(),
-		Caps:     &wire.Caps{Deflate: true},
+		Caps:     testCaps(),
 	})
 }
 
@@ -281,10 +394,19 @@ type sessionHarness struct {
 // complete the handshake with handshake.
 func newSessionHarness(t *testing.T, c *Client, bridge bridgeSource) *sessionHarness {
 	t.Helper()
-	h := &sessionHarness{t: t, tr: newFakeTransport(), c: c, res: make(chan sessionResult, 1)}
+	ft := newFakeTransport()
+	return newSessionHarnessOn(t, c, bridge, ft, ft)
+}
+
+// newSessionHarnessOn starts a session over tr, using fake for the frame-level
+// assertions. A transport that wraps a fakeTransport lets a test drive a
+// special plane (relay streams) while still reading control frames.
+func newSessionHarnessOn(t *testing.T, c *Client, bridge bridgeSource, tr Transport, fake *fakeTransport) *sessionHarness {
+	t.Helper()
+	h := &sessionHarness{t: t, tr: fake, c: c, res: make(chan sessionResult, 1)}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	go func() {
-		reason, err := c.runSession(h.ctx, bridge, h.tr)
+		reason, err := c.runSession(h.ctx, bridge, tr)
 		h.res <- sessionResult{reason: reason, err: err}
 	}()
 	t.Cleanup(h.cancel)

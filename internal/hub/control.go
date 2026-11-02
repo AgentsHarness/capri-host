@@ -103,9 +103,9 @@ func (c *Client) State() State {
 	st.OutboxBytes = int64(c.out.bytes())
 	st.NextSeq = c.out.next()
 	st.HubAckSeq = c.out.acked()
+	st.RelayQueued = c.relayOutbox.queued()
 	if s := c.currentSession(); s != nil {
-		st.LastSentSeq = s.sentThrough
-		st.RelayQueued = len(s.relayOut)
+		st.LastSentSeq = s.w.sentThrough()
 	}
 
 	return st

@@ -40,6 +40,9 @@ func TestRespondChunksLargeBody(t *testing.T) {
 		if f.Seq != 0 {
 			t.Fatalf("respond carried session seq %d", f.Seq)
 		}
+		if f.ChunkSeq != uint64(i+1) {
+			t.Fatalf("frame %d chunkSeq = %d, want %d", i, f.ChunkSeq, i+1)
+		}
 		if f.Body != nil {
 			t.Fatalf("chunk frame %d also carried a body", i)
 		}
@@ -85,6 +88,9 @@ func TestRespondSmallBodyStaysSingleFrame(t *testing.T) {
 		}
 		if f.Chunk != "" || f.Encoding != "" || f.More {
 			t.Fatalf("frame %d used the chunk shape for a small body", i)
+		}
+		if f.ChunkSeq != 1 {
+			t.Fatalf("frame %d chunkSeq = %d, want an inline answer as chunk 1", i, f.ChunkSeq)
 		}
 	}
 }
@@ -133,7 +139,7 @@ func TestRelayInProcess(t *testing.T) {
 	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: 1 << 20, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1)),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: testCaps(),
 	}))
 
 	h.tr.push(t, requestFrame(1, 0, "1", "POST", "/api/echo", `{"hello":"relay"}`))
@@ -210,14 +216,22 @@ func countingHandler(calls *atomic.Int32, body func(n int32) string) http.Handle
 }
 
 func helloAckBoot(epoch, hubBoot, ackUp, ackDown uint64) wire.Frame {
+	return helloAckBootAcks(epoch, hubBoot, ackUp, ackDown)
+}
+
+// helloAckBootAcks is helloAckBoot with the hub's relay ack table: a resumed
+// host only keeps an answer the hub still lists.
+func helloAckBootAcks(epoch, hubBoot, ackUp, ackDown uint64, acks ...wire.RelayAck) wire.Frame {
 	ack := helloAckFrame(epoch, ackUp, ackDown, watchingAudience(1))
 	ack.HubBoot = hubBoot
+	ack.RelayAcks = acks
 	return ack
 }
 
 // TestRelayMemoScopedByHubBoot: a hub restart resets its reqId counter, so the
-// same reqId in the new incarnation is a NEW request. It must execute again
-// and must never receive the previous hub's cached answer.
+// same reqId in the new incarnation is a NEW request. It must execute again,
+// never inherit the previous hub's tombstone, and the old answer must not
+// survive the restart.
 func TestRelayMemoScopedByHubBoot(t *testing.T) {
 	var calls atomic.Int32
 	c := NewClient(Config{
@@ -287,37 +301,30 @@ func TestRelayAnswerFlushedAfterSessionGap(t *testing.T) {
 	// The answer completes with no session at all.
 	close(release)
 	deadline := time.Now().Add(3 * time.Second)
-	for len(c.memo.undelivered(21)) == 0 {
+	for !c.relayOutbox.pending() {
 		if time.Now().After(deadline) {
-			t.Fatal("the answer never reached the memo")
+			t.Fatal("the answer never reached the outbox")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Same hub incarnation reconnects: the answer rides the new link once.
+	// Same hub incarnation reconnects: its table still lists the request, so
+	// the answer rides the new link from chunk 1.
 	second := newSessionHarness(t, c, newTestBridge())
-	second.handshake(helloAckBoot(c.epoch, 21, 0, 0))
+	second.handshake(helloAckBootAcks(c.epoch, 21, 0, 0, wire.RelayAck{ReqID: "1"}))
 	got := waitRespond(t, second.tr)
 	if got.ReqID != "1" || got.RespondStatus() != 200 || !bytes.Contains(got.Body, []byte(`"slow":1`)) {
 		t.Fatalf("resend = %d %s (reqId %q)", got.RespondStatus(), got.Body, got.ReqID)
 	}
 	// Exactly once: no second copy behind it.
 	deadline = time.Now().Add(300 * time.Millisecond)
-	for {
-		left := time.Until(deadline)
-		if left <= 0 {
+	for time.Now().Before(deadline) {
+		f, ok := second.tr.tryFrame(time.Until(deadline))
+		if !ok {
 			break
 		}
-		select {
-		case b := <-second.tr.sent:
-			f, err := wire.Decode(b)
-			if err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if f.Type == wire.TypeRespond {
-				t.Fatalf("the answer was resent twice (reqId %q)", f.ReqID)
-			}
-		case <-time.After(left):
+		if f.Type == wire.TypeRespond {
+			t.Fatalf("the answer was resent twice (reqId %q)", f.ReqID)
 		}
 	}
 	if n := calls.Load(); n != 1 {

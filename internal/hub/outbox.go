@@ -115,8 +115,11 @@ func (o *outbox) enforceLocked() error {
 	if o.snd.Bytes() <= o.soft {
 		return nil
 	}
-	for _, e := range o.snd.Entries() {
-		if o.snd.Bytes() <= o.soft {
+	// Walk the log once. ElideFrom resumes after the previous replacement, so
+	// compacting n entries costs one scan instead of one head scan per entry.
+	for i, n := 0, o.snd.Len(); i < n && o.snd.Bytes() > o.soft; i++ {
+		e, ok := o.snd.EntryAt(i)
+		if !ok {
 			break
 		}
 		var head struct {
@@ -129,7 +132,7 @@ func (o *outbox) enforceLocked() error {
 		if !acp.IsDroppableEventType(head.Type) {
 			continue
 		}
-		if err := o.snd.Elide(e.Seq, wire.TrimmedEvent(head.SessionID, e.Seq)); err != nil {
+		if _, err := o.snd.ElideFrom(i, e.Seq, wire.TrimmedEvent(head.SessionID, e.Seq)); err != nil {
 			continue
 		}
 	}

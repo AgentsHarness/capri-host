@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,14 +46,14 @@ type quicTestHub struct {
 	ctrlStreams chan *quic.Stream
 	readyCh     chan struct{}
 
-	mu        sync.Mutex
-	ctrlMu    sync.Mutex
-	conns     int
-	helloOf   *wire.Hello
-	events    []wire.Frame
-	responds  []quicRespond
-	binary    int
-	noAutoAck bool
+	mu         sync.Mutex
+	ctrlMu     sync.Mutex
+	conns      int
+	helloOf    *wire.Hello
+	events     []wire.Frame
+	responds   []quicRespond
+	compressed int
+	noAutoAck  bool
 
 	streams map[quic.StreamID]*quic.Stream
 }
@@ -139,12 +140,13 @@ func (h *quicTestHub) serve() {
 			h.errCh <- fmt.Errorf("first stream id = %d, want 0", ctrl.StreamID())
 			return
 		}
+		ctrlReader := &quicUnitReader{h: h, s: ctrl}
 		h.mu.Lock()
 		h.streams[ctrl.StreamID()] = ctrl
 		h.mu.Unlock()
 		h.ctrlStreams <- ctrl
 
-		fr, err := readQUICTestFrame(h, ctrl)
+		fr, err := readQUICTestUnit(h, ctrlReader)
 		if err != nil {
 			h.errCh <- err
 			return
@@ -167,8 +169,34 @@ func (h *quicTestHub) serve() {
 
 		go h.acceptRequestStreams(conn)
 
+		// The real hub heartbeats every keepalive; without it the host's idle
+		// timer would close a session that is only busy sending (a long relay
+		// answer), especially under the race detector.
+		stopHB := make(chan struct{})
+		defer close(stopHB)
+		go func() {
+			// helloAckFrame advertises keepalive 1 / idle 2, so one heartbeat
+			// per second keeps the host's idle timer satisfied.
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopHB:
+					return
+				case <-ticker.C:
+					hb, err := wire.NewHeartbeat(0, wire.HeartbeatStatus{Ready: true})
+					if err != nil {
+						return
+					}
+					if err := h.writeControl(ctrl, hb); err != nil {
+						return
+					}
+				}
+			}
+		}()
+
 		for {
-			f, err := readQUICTestFrame(h, ctrl)
+			f, err := readQUICTestUnit(h, ctrlReader)
 			if err != nil {
 				return
 			}
@@ -218,11 +246,11 @@ func (h *quicTestHub) acceptRequestStreams(conn *quic.Conn) {
 
 // writeControl serializes control-stream writes: quic-go streams are not
 // safe for concurrent writers, and the session's heartbeats share the stream
-// with whatever the test pushes.
+// with whatever the test pushes. Every control frame is one transport unit.
 func (h *quicTestHub) writeControl(s *quic.Stream, f wire.Frame) error {
 	h.ctrlMu.Lock()
 	defer h.ctrlMu.Unlock()
-	return writeQUICTestFrame(s, f, false)
+	return writeQUICTestUnit(s, f)
 }
 
 func (h *quicTestHub) recordRespond(r quicRespond) {
@@ -270,32 +298,102 @@ func (h *quicTestHub) waitRespond(t *testing.T, timeout time.Duration) quicRespo
 	return quicRespond{}
 }
 
-func readQUICTestFrame(h *quicTestHub, s *quic.Stream) (wire.Frame, error) {
+// quicUnitReader decodes the control stream, whose records are transport
+// units; a fragmented frame is reassembled and inflated here so the test hub
+// sees whole frames.
+type quicUnitReader struct {
+	h   *quicTestHub
+	s   *quic.Stream
+	asm wire.Reassembler
+}
+
+func readQUICTestUnit(h *quicTestHub, r *quicUnitReader) (wire.Frame, error) {
+	for {
+		raw, _, err := readQUICTestRecord(r.s)
+		if err != nil {
+			return wire.Frame{}, err
+		}
+		frame, compressed, complete, err := r.asm.Accept(raw, wire.DefaultLimits.MaxFrame)
+		if err != nil {
+			return wire.Frame{}, err
+		}
+		if !complete {
+			continue
+		}
+		if compressed {
+			h.mu.Lock()
+			h.compressed++
+			h.mu.Unlock()
+			out, err := inflatePayload(frame)
+			if err != nil {
+				return wire.Frame{}, err
+			}
+			frame = out
+		}
+		return wire.Decode(frame)
+	}
+}
+
+// readQUICTestRecord reads one length-prefixed record and reports the legacy
+// relay-plane deflate bit.
+func readQUICTestRecord(s *quic.Stream) ([]byte, bool, error) {
 	var prefix [4]byte
 	if _, err := io.ReadFull(s, prefix[:]); err != nil {
-		return wire.Frame{}, err
+		return nil, false, err
 	}
 	n := binary.BigEndian.Uint32(prefix[:])
 	compressed := n&deflateFlagQUIC != 0
 	size := n &^ deflateFlagQUIC
 	if size > 32<<20 {
-		return wire.Frame{}, fmt.Errorf("frame too large: %d", size)
+		return nil, false, fmt.Errorf("frame too large: %d", size)
 	}
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(s, buf); err != nil {
+		return nil, false, err
+	}
+	return buf, compressed, nil
+}
+
+var quicTestFrameID atomic.Uint32
+
+// writeQUICTestUnit writes one frame as a single complete transport unit.
+func writeQUICTestUnit(s *quic.Stream, f wire.Frame) error {
+	b, err := wire.Encode(f)
+	if err != nil {
+		return err
+	}
+	units, err := wire.SplitFrame(b, false, quicTestFrameID.Add(1), wire.UnitSize)
+	if err != nil {
+		return err
+	}
+	for _, u := range units {
+		prefix := frameLengthPrefix(len(u), false)
+		if _, err := s.Write(prefix[:]); err != nil {
+			return err
+		}
+		if _, err := s.Write(u); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readQUICTestFrame reads one whole-frame relay-stream record (respond frames
+// keep complete-frame framing and may be deflated).
+func readQUICTestFrame(h *quicTestHub, s *quic.Stream) (wire.Frame, error) {
+	raw, compressed, err := readQUICTestRecord(s)
+	if err != nil {
 		return wire.Frame{}, err
 	}
 	if compressed {
 		h.mu.Lock()
-		h.binary++
+		h.compressed++
 		h.mu.Unlock()
-		out, err := inflatePayload(buf)
-		if err != nil {
+		if raw, err = inflatePayload(raw); err != nil {
 			return wire.Frame{}, err
 		}
-		buf = out
 	}
-	return wire.Decode(buf)
+	return wire.Decode(raw)
 }
 
 func writeQUICTestFrame(s *quic.Stream, f wire.Frame, compress bool) error {
@@ -428,11 +526,14 @@ func TestQUICCloseMapping(t *testing.T) {
 		res <- sessionResult{reason: reason, err: err}
 	}()
 	ctrl := hub.control(t)
-	_ = ctrl
 
-	// Close the connection the way the hub does for a superseded host.
+	// Close the session the way the hub does when it stops: the control
+	// stream goes away, which the host sees as a normal link drop.
 	if err := hub.ln.Close(); err != nil {
 		t.Logf("close listener: %v", err)
+	}
+	if err := ctrl.Close(); err != nil {
+		t.Logf("close control stream: %v", err)
 	}
 	select {
 	case r := <-res:
@@ -465,7 +566,7 @@ func TestQUICCompressedUplink(t *testing.T) {
 	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": strings.Repeat("quic-compress ", 200)})
 	hub.waitEvent(t, 5*time.Second)
 	hub.mu.Lock()
-	binary := hub.binary
+	binary := hub.compressed
 	hub.mu.Unlock()
 	if binary == 0 {
 		t.Fatal("large QUIC frame was not compressed")
@@ -779,13 +880,12 @@ func TestPinSPKIVerifyUnits(t *testing.T) {
 	}
 }
 
-// injectCorruptControl writes a length prefix flagged as deflate followed by
-// bytes that are not a deflate stream: the host's control-stream decoder must
-// report ErrUnreadable.
+// injectCorruptControl writes a length-prefixed record that is not a
+// transport unit: the host's control-stream decoder must report ErrUnreadable.
 func (h *quicTestHub) injectCorruptControl(ctrl *quic.Stream) error {
 	h.ctrlMu.Lock()
 	defer h.ctrlMu.Unlock()
-	prefix := frameLengthPrefix(6, true)
+	prefix := frameLengthPrefix(6, false)
 	if _, err := ctrl.Write(prefix[:]); err != nil {
 		return err
 	}
@@ -849,7 +949,7 @@ func TestQUICBareAndCompressedFrames(t *testing.T) {
 		t.Fatalf("bare frame event = %s (%v)", first.Events[0], err)
 	}
 	hub.mu.Lock()
-	compressedAfterSmall := hub.binary
+	compressedAfterSmall := hub.compressed
 	hub.mu.Unlock()
 	if compressedAfterSmall != 0 {
 		t.Fatalf("a %d-byte event was compressed (binary=%d)", len(small), compressedAfterSmall)
@@ -858,7 +958,7 @@ func TestQUICBareAndCompressedFrames(t *testing.T) {
 	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": strings.Repeat("compressible ", 400)})
 	hub.waitEvent(t, 5*time.Second)
 	hub.mu.Lock()
-	compressedAfterBig := hub.binary
+	compressedAfterBig := hub.compressed
 	hub.mu.Unlock()
 	if compressedAfterBig == 0 {
 		t.Fatal("a large frame was not compressed after deflate was negotiated")

@@ -20,62 +20,113 @@ import (
 // high-RTT path; a genuinely slow path simply retries.
 const wsDialTimeout = 6 * time.Second
 
-// wsWriteTimeout caps one uplink write so a half-open peer cannot pin the
-// session loop.
-const wsWriteTimeout = 30 * time.Second
+// wsWriteTimeout caps one uplink message before hello_ack supplied the
+// session's own deadline (three quarters of idle). 15s is far above any live
+// 32KiB unit write and short enough that a half-open peer cannot pin the
+// writer.
+const wsWriteTimeout = 15 * time.Second
 
-// wsDownlinkLimit bounds one downlink message. A relayed request carries a
-// body the hub caps well below this; 16MB is all the headroom needed.
+// wsDownlinkLimit bounds one downlink message: either a text JSON frame or one
+// transport unit, so it only has to cover the largest single frame a hub may
+// send inline.
 const wsDownlinkLimit = 16 << 20
 
-// wsTransport adapts one /ws/host WebSocket. A text message is one plain JSON
-// frame; a binary message is one raw-deflate stream of an uplink frame, allowed
-// only after hello_ack echoed hello.caps.deflate.
+// wsTransport adapts one /ws/host WebSocket. A text message is one complete
+// JSON frame; a binary message is one wire transport unit. Compression is the
+// session writer's job, and a binary unit carries its own flag, so the
+// transport never looks at deflate.
 type wsTransport struct {
 	conn *websocket.Conn
-	// deflate is set once the capability was negotiated; the handshake frame
-	// is always text.
-	deflate atomic.Bool
-	// wmu serializes writes: coder/websocket forbids concurrent ones, and the
-	// groomer (session loop) and the relay plane both send.
+	// wmu serializes writes: coder/websocket forbids concurrent ones. Only
+	// the session writer writes after the handshake, but the handshake itself
+	// goes through the same lock.
 	wmu       sync.Mutex
 	stop      chan struct{}
 	closeOnce sync.Once
+
+	writeTimeout atomic.Int64 // nanoseconds; 0 = wsWriteTimeout
+	maxFrame     atomic.Int64
+	lastActivity atomic.Int64 // unix nanoseconds of the last successful read
+	// asm reassembles fragmented downlink frames. Recv is the only reader, so
+	// no lock.
+	asm wire.Reassembler
 }
 
 func newWSTransport(conn *websocket.Conn) *wsTransport {
-	return &wsTransport{conn: conn, stop: make(chan struct{})}
+	t := &wsTransport{conn: conn, stop: make(chan struct{})}
+	t.lastActivity.Store(time.Now().UnixNano())
+	return t
 }
 
+// Send writes one complete logical frame as a text message. The writer only
+// calls it for uncompressed frames that fit one unit.
 func (t *wsTransport) Send(payload []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), wsWriteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), t.unitTimeout())
 	defer cancel()
-	if t.deflate.Load() {
-		if zp, ok := deflatePayload(payload); ok {
-			t.wmu.Lock()
-			defer t.wmu.Unlock()
-			return t.conn.Write(ctx, websocket.MessageBinary, zp)
-		}
-	}
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	return t.conn.Write(ctx, websocket.MessageText, payload)
 }
 
-func (t *wsTransport) Recv() ([]byte, error) {
-	typ, data, err := t.conn.Read(context.Background())
-	if err != nil {
-		return nil, wrapWSClose(err)
-	}
-	if typ == websocket.MessageBinary {
-		// The hub never compresses its downlink; a binary message is a peer
-		// speaking something else.
-		return nil, fmt.Errorf("%w: binary downlink frame", wire.ErrUnreadable)
-	}
-	return data, nil
+// SendFragment writes one encoded transport unit as a binary message.
+func (t *wsTransport) SendFragment(unit []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), t.unitTimeout())
+	defer cancel()
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	return t.conn.Write(ctx, websocket.MessageBinary, unit)
 }
 
-func (t *wsTransport) SetDeflate(v bool) { t.deflate.Store(v) }
+// Recv returns the next complete frame, reassembling fragmented binary units.
+func (t *wsTransport) Recv() ([]byte, error) {
+	for {
+		typ, data, err := t.conn.Read(context.Background())
+		if err != nil {
+			return nil, wrapWSClose(err)
+		}
+		t.lastActivity.Store(time.Now().UnixNano())
+		if typ != websocket.MessageBinary {
+			return data, nil
+		}
+		frame, compressed, complete, err := t.asm.Accept(data, int(t.maxFrame.Load()))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", wire.ErrUnreadable, err)
+		}
+		if !complete {
+			continue
+		}
+		if compressed {
+			out, err := inflatePayload(frame)
+			if err != nil {
+				return nil, fmt.Errorf("%w: inflate: %v", wire.ErrUnreadable, err)
+			}
+			frame = out
+		}
+		return frame, nil
+	}
+}
+
+// SetWriteTimeout bounds one message write.
+func (t *wsTransport) SetWriteTimeout(d time.Duration) { t.writeTimeout.Store(int64(d)) }
+
+// SetMaxFrame bounds one reassembled downlink frame.
+func (t *wsTransport) SetMaxFrame(n int) { t.maxFrame.Store(int64(n)) }
+
+func (t *wsTransport) unitTimeout() time.Duration {
+	if d := time.Duration(t.writeTimeout.Load()); d > 0 {
+		return d
+	}
+	return wsWriteTimeout
+}
+
+// LastActivity is the last successful read, partial unit included.
+func (t *wsTransport) LastActivity() time.Time {
+	ns := t.lastActivity.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
 
 // SetKeepalive runs WS control pings at the negotiated cadence. The ping is
 // not a protocol signal: it keeps NAT bindings alive and surfaces half-open

@@ -66,18 +66,31 @@ func TestQUICRelay28MB(t *testing.T) {
 		t.Fatalf("request: %v", err)
 	}
 
-	var got []byte
+	// Chunks are collected by ChunkSeq: a retransmission (the RTO may repeat
+	// the oldest unacked chunk, and the hub drops it as a duplicate) must not
+	// be mistaken for extra payload.
+	chunks := make(map[uint64][]byte)
+	var last uint64
 	var stream quic.StreamID
 	for {
 		r := hub.waitRespond(t, 30*time.Second)
 		if r.frame.ReqID != "77" {
 			continue
 		}
-		got = append(got, decodedChunk(t, r.frame)...)
+		chunks[r.frame.ChunkSeq] = decodedChunk(t, r.frame)
 		if !r.frame.More {
+			last = r.frame.ChunkSeq
 			stream = r.stream
 			break
 		}
+	}
+	got := make([]byte, 0, len(body))
+	for seq := uint64(1); seq <= last; seq++ {
+		c, ok := chunks[seq]
+		if !ok {
+			t.Fatalf("chunk %d of %d never arrived", seq, last)
+		}
+		got = append(got, c...)
 	}
 	if !bytes.Equal(got, body) {
 		t.Fatalf("relay reassembled %d bytes, want the %d-byte original", len(got), len(body))
@@ -105,16 +118,34 @@ func TestWSRelay28MB(t *testing.T) {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		frames := hub.respondsFor("78")
-		if n := len(frames); n > 0 && !frames[n-1].More {
-			var got []byte
+		// The terminal chunk closes the answer; a retransmission can arrive
+		// after it, so look for the marker instead of the last frame.
+		var last uint64
+		for _, f := range frames {
+			if !f.More && f.ChunkSeq > last {
+				last = f.ChunkSeq
+			}
+		}
+		if last > 0 {
+			// Indexed by ChunkSeq: a retransmitted chunk is a duplicate the
+			// hub drops, not extra payload.
+			chunks := make(map[uint64][]byte, len(frames))
 			for _, f := range frames {
-				got = append(got, decodedChunk(t, f)...)
+				chunks[f.ChunkSeq] = decodedChunk(t, f)
+			}
+			got := make([]byte, 0, len(body))
+			for seq := uint64(1); seq <= last; seq++ {
+				c, ok := chunks[seq]
+				if !ok {
+					t.Fatalf("chunk %d of %d never arrived", seq, last)
+				}
+				got = append(got, c...)
 			}
 			if !bytes.Equal(got, body) {
 				t.Fatalf("relay reassembled %d bytes, want the %d-byte original", len(got), len(body))
 			}
-			if len(frames) < 2 {
-				t.Fatalf("28MB answer arrived as %d frame(s); it must be chunked", len(frames))
+			if last < 2 {
+				t.Fatalf("28MB answer arrived as %d frame(s); it must be chunked", last)
 			}
 			if tr := c.State().Transport; tr != TransportWS {
 				t.Fatalf("transport = %q, want ws", tr)

@@ -388,7 +388,8 @@ func TestRequestReplayAfterDropRunsOnce(t *testing.T) {
 	second.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
 	second.tr.push(t, requestFrame(1, 0, "7", "POST", "/api/prompt", `{"x":1}`))
 
-	// Let the run finish; both deliveries get the same cached answer.
+	// Let the run finish; the single answer is delivered on the live link and
+	// the replayed request itself stays a no-op.
 	close(release)
 	fr := waitRespond(t, second.tr)
 	if fr.ReqID != "7" || fr.RespondStatus() != 200 {
@@ -405,8 +406,9 @@ func TestRequestReplayAfterDropRunsOnce(t *testing.T) {
 	}
 }
 
-// TestDuplicateOfFinishedRequestGetsCachedAnswer: after a drop, a duplicate of
-// an already-answered request is answered from the memo without re-executing.
+// TestDuplicateOfFinishedRequestGetsCachedAnswer: after a drop, an answer that
+// never reached the hub is replayed from the answer log, and the duplicate
+// request itself does not re-execute.
 func TestDuplicateOfFinishedRequestGetsCachedAnswer(t *testing.T) {
 	var hits atomic.Int32
 	c := NewClient(Config{
@@ -426,13 +428,16 @@ func TestDuplicateOfFinishedRequestGetsCachedAnswer(t *testing.T) {
 	first.cancel()
 	first.wait(t, 3*time.Second)
 
-	// The hub never saw the answer (ackDown stays 0) and replays the request.
+	// The hub never applied the answer and replays the request; its table
+	// still lists the request, so the answer resumes from chunk 1.
+	ack := helloAckFrame(c.epoch, 0, 0, watchingAudience(1))
+	ack.RelayAcks = []wire.RelayAck{{ReqID: "21"}}
 	second := newSessionHarness(t, c, newTestBridge())
-	second.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
+	second.handshake(ack)
 	second.tr.push(t, requestFrame(1, 0, "21", "GET", "/api/state", ""))
 	again := waitRespond(t, second.tr)
 	if string(again.Body) != string(firstResp.Body) {
-		t.Fatalf("cached answer = %s, want %s", again.Body, firstResp.Body)
+		t.Fatalf("replayed answer = %s, want %s", again.Body, firstResp.Body)
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("duplicate re-executed: hits = %d", hits.Load())
@@ -451,7 +456,7 @@ func TestOutboxElisionKeepsSeqAndWatermark(t *testing.T) {
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: testCaps(),
 	}))
 	runForwardLoop(t, c, bridge)
 
@@ -556,7 +561,7 @@ func TestOverflowWhileDisconnectedKeepsCriticalEvents(t *testing.T) {
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: testCaps(),
 	}))
 	runForwardLoop(t, c, bridge)
 

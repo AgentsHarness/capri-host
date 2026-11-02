@@ -35,8 +35,8 @@ func TestHandshakeAdoptsHelloAck(t *testing.T) {
 	if hello.Resume == nil || hello.Resume.Up != 41 || hello.Resume.Down != 0 {
 		t.Errorf("hello resume = %+v, want up 41 down 0", hello.Resume)
 	}
-	if hello.Caps == nil || !hello.Caps.Deflate {
-		t.Errorf("hello caps = %+v, want deflate offered", hello.Caps)
+	if hello.Caps == nil || !hello.Caps.Deflate || !hello.Caps.TransportUnits || !hello.Caps.RelayAck {
+		t.Errorf("hello caps = %+v, want deflate, transportUnits and relayAck offered", hello.Caps)
 	}
 	if hello.Token != "tok123" {
 		t.Errorf("hello token = %q", hello.Token)
@@ -61,6 +61,42 @@ func TestHandshakeAdoptsHelloAck(t *testing.T) {
 	}
 	if !h.tr.deflate {
 		t.Error("deflate not enabled after the hub echoed the offer")
+	}
+	if h.tr.writeTimeout != 1500*time.Millisecond {
+		t.Errorf("write timeout = %v, want 3/4 of the 2s idle budget", h.tr.writeTimeout)
+	}
+	if h.tr.maxFrame != testLimits().MaxFrame {
+		t.Errorf("max frame = %d, want the advertised %d", h.tr.maxFrame, testLimits().MaxFrame)
+	}
+}
+
+// TestHelloAckWithoutNewCapsIsProtocol: this host speaks transport units and
+// the relay ack table, so a hub that echoes neither (or only one) is a protocol
+// mismatch.
+func TestHelloAckWithoutNewCapsIsProtocol(t *testing.T) {
+	cases := []struct {
+		name string
+		caps *wire.Caps
+	}{
+		{name: "no caps", caps: nil},
+		{name: "no transport units", caps: &wire.Caps{Deflate: true, RelayAck: true}},
+		{name: "no relay ack", caps: &wire.Caps{Deflate: true, TransportUnits: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newSessionClient(t)
+			h := newSessionHarness(t, c, newTestBridge())
+			if hello := h.tr.next(t, 2*time.Second); hello.Type != wire.TypeHello {
+				t.Fatalf("first frame = %q", hello.Type)
+			}
+			ack := helloAckFrame(c.epoch, 0, 0, watchingAudience(1))
+			ack.Caps = tc.caps
+			h.tr.push(t, ack)
+			res := h.wait(t, 3*time.Second)
+			if res.reason != wire.CloseProtocol {
+				t.Fatalf("close reason = %s, want protocol", res.reason)
+			}
+		})
 	}
 }
 
@@ -192,16 +228,8 @@ func TestAudiencePauseStopsUpload(t *testing.T) {
 
 	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "while-paused"})
 	// Only heartbeats may arrive while paused.
-	select {
-	case raw := <-h.tr.sent:
-		fr, err := wire.Decode(raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if fr.Type == wire.TypeEvents {
-			t.Fatal("event frame sent while the audience was empty")
-		}
-	case <-time.After(500 * time.Millisecond):
+	if fr, ok := h.tr.tryFrame(500 * time.Millisecond); ok && fr.Type == wire.TypeEvents {
+		t.Fatal("event frame sent while the audience was empty")
 	}
 
 	h.tr.push(t, audienceFrame(1, 0, watchingAudience(2, "s1")))
@@ -221,21 +249,37 @@ func TestAudienceGenOrdering(t *testing.T) {
 
 	// Older generation with watchers: must not resume the uplink.
 	h.tr.push(t, audienceFrame(1, 0, watchingAudience(4, "s1")))
-	deadline := time.After(300 * time.Millisecond)
-	for {
-		select {
-		case raw := <-h.tr.sent:
-			fr, _ := wire.Decode(raw)
-			if fr.Type == wire.TypeHeartbeat && fr.Ack != 1 {
-				t.Fatalf("heartbeat ack = %d, want the audience frame acked", fr.Ack)
-			}
-		case <-deadline:
-			if !c.out.isPaused() {
-				t.Fatal("a stale audience generation (4 < 5) was applied")
-			}
-			return
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		fr, ok := h.tr.tryFrame(time.Until(deadline))
+		if !ok {
+			break
+		}
+		if fr.Type == wire.TypeHeartbeat && fr.Ack != 1 {
+			t.Fatalf("heartbeat ack = %d, want the audience frame acked", fr.Ack)
 		}
 	}
+	if !c.out.isPaused() {
+		t.Fatal("a stale audience generation (4 < 5) was applied")
+	}
+}
+
+// TestAudienceDuplicateSeqAppliesNewerGen: the hub may fold a newer absolute
+// snapshot into an audience frame whose seq the host already applied. A
+// duplicate seq must still apply the newer generation instead of being
+// mistaken for a retransmission.
+func TestAudienceDuplicateSeqAppliesNewerGen(t *testing.T) {
+	c := newSessionClient(t)
+	bridge := newTestBridge()
+	h := newSessionHarness(t, c, bridge)
+	h.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
+
+	h.tr.push(t, audienceFrame(1, 0, wire.Audience{Gen: 2, Watchers: 2, Sessions: []string{"s1"}}))
+	waitUntil(t, "audience gen 2", func() bool { return c.watchers() == 2 })
+
+	// Same seq, newer gen: a retransmitted payload after an in-place update.
+	h.tr.push(t, audienceFrame(1, 0, wire.Audience{Gen: 3, Watchers: 3, Sessions: []string{"s1"}}))
+	waitUntil(t, "audience gen 3", func() bool { return c.watchers() == 3 })
 }
 
 // TestAudienceTrimsUnwatchedSessions: bulk transcript for a session nobody
@@ -294,7 +338,7 @@ func TestOversizedEventBecomesPlaceholder(t *testing.T) {
 	small := &wire.Limits{MaxFrame: 2048, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: testCaps(),
 	}))
 	runForwardLoop(t, c, bridge)
 
@@ -323,7 +367,7 @@ func TestOutboxElidesDroppableWhilePaused(t *testing.T) {
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: testCaps(),
 	}))
 	runForwardLoop(t, c, bridge)
 
@@ -425,7 +469,8 @@ func TestHeartbeatCarriesDownAckAndStatus(t *testing.T) {
 }
 
 // TestRequestRunsOncePerReqID: a same-epoch duplicate neither re-executes nor
-// loses its answer.
+// gets a second answer. The first answer lives in the outbox until the hub
+// confirms it; once resolved, a duplicate is ignored.
 func TestRequestRunsOncePerReqID(t *testing.T) {
 	var hits atomic.Int32
 	c := NewClient(Config{
@@ -449,13 +494,18 @@ func TestRequestRunsOncePerReqID(t *testing.T) {
 		t.Fatalf("handler hits = %d, want 1", hits.Load())
 	}
 
-	// Same-epoch resume redelivers the request.
+	// The hub confirms chunk 1 as the whole answer.
+	h.tr.push(t, wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat,
+		Status:    mustJSON(wire.HeartbeatStatus{}),
+		RelayAcks: []wire.RelayAck{{ReqID: "7", Chunk: 1, Done: true}}})
+	waitUntil(t, "the answer to be released", func() bool { return !c.relayOutbox.pending() })
+
+	// Same-epoch resume redelivers the request: it must be a no-op now.
 	h2 := newSessionHarness(t, c, bridge)
 	h2.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
 	h2.tr.push(t, requestFrame(1, 0, "7", "POST", "/api/prompt", `{"x":1}`))
-	again := waitRespond(t, h2.tr)
-	if again.ReqID != "7" || again.RespondStatus() != 200 {
-		t.Fatalf("duplicate respond = %+v", again)
+	if fr, ok := h2.tr.tryFrame(300 * time.Millisecond); ok && fr.Type == wire.TypeRespond {
+		t.Fatalf("a resolved duplicate was answered again: %+v", fr)
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("a duplicate request re-executed the prompt: hits = %d", hits.Load())
@@ -471,9 +521,10 @@ func TestRequestRunsOncePerReqID(t *testing.T) {
 	}
 }
 
-// TestDuplicateInFlightWaits: a duplicate that arrives while the first run is
-// still executing must wait for it, not start a second one.
-func TestDuplicateInFlightWaits(t *testing.T) {
+// TestDuplicateInFlightIsDropped: a duplicate that arrives while the first run
+// is still executing must not start a second run, and the single answer is the
+// one the hub receives.
+func TestDuplicateInFlightIsDropped(t *testing.T) {
 	release := make(chan struct{})
 	var hits atomic.Int32
 	c := NewClient(Config{
@@ -495,21 +546,25 @@ func TestDuplicateInFlightWaits(t *testing.T) {
 	}
 	close(release)
 	waitRespond(t, h.tr)
-	waitRespond(t, h.tr) // both deliveries answered, one execution
+	// Exactly one answer: the duplicate must not queue a second one.
+	if fr, ok := h.tr.tryFrame(300 * time.Millisecond); ok && fr.Type == wire.TypeRespond {
+		t.Fatalf("the duplicate produced a second answer: %+v", fr)
+	}
 	if hits.Load() != 1 {
 		t.Fatalf("handler hits = %d, want 1", hits.Load())
 	}
 }
 
-// TestRequestThenDuplicateWithEvictedAnswerGets409: when the answer is no
-// longer in memory a duplicate is refused rather than re-executed.
-func TestRequestThenDuplicateWithEvictedAnswerGets409(t *testing.T) {
+// TestSettledDuplicateDoesNotRerun: the memo is a tombstone, not a body cache.
+// After the hub confirmed the answer, a duplicate is ignored rather than
+// re-executed or answered from memory.
+func TestSettledDuplicateDoesNotRerun(t *testing.T) {
 	var hits atomic.Int32
 	c := NewClient(Config{
 		HostID: "h1", Token: "tok123",
 		Local: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			hits.Add(1)
-			_, _ = w.Write([]byte(`{"big":"` + strings.Repeat("z", memoEntryBytes) + `"}`))
+			_, _ = w.Write([]byte(`{"big":"` + strings.Repeat("z", 512<<10) + `"}`))
 		}),
 	})
 	h := newSessionHarness(t, c, newTestBridge())
@@ -519,14 +574,16 @@ func TestRequestThenDuplicateWithEvictedAnswerGets409(t *testing.T) {
 	if fr := waitRespond(t, h.tr); fr.ReqID != "11" {
 		t.Fatalf("respond = %+v", fr)
 	}
+	h.tr.push(t, wire.Frame{V: wire.ProtocolVersion, Type: wire.TypeHeartbeat,
+		Status:    mustJSON(wire.HeartbeatStatus{}),
+		RelayAcks: []wire.RelayAck{{ReqID: "11", Chunk: 1, Done: true}}})
+	waitUntil(t, "the answer to be released", func() bool { return !c.relayOutbox.pending() })
 
 	h2 := newSessionHarness(t, c, newTestBridge())
 	h2.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
 	h2.tr.push(t, requestFrame(1, 0, "11", "GET", "/api/big", ""))
-	fr := waitRespond(t, h2.tr)
-	status := fr.RespondStatus()
-	if status != http.StatusConflict && status != 200 {
-		t.Fatalf("duplicate answer status = %d", status)
+	if fr, ok := h2.tr.tryFrame(300 * time.Millisecond); ok && fr.Type == wire.TypeRespond {
+		t.Fatalf("a settled duplicate was answered again: %+v", fr)
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("duplicate re-executed: hits = %d", hits.Load())
@@ -564,7 +621,7 @@ func TestBatchingRespectsMaxFrame(t *testing.T) {
 	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: testCaps(),
 	}))
 	runForwardLoop(t, c, bridge)
 
@@ -600,7 +657,7 @@ func TestDownReceiverUsesAdvertisedWindow(t *testing.T) {
 	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: 2}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: &wire.Caps{Deflate: true},
+		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: testCaps(),
 	}))
 	if got := c.currentSession().down.Window(); got != 2 {
 		t.Fatalf("down receiver window = %d, want the advertised 2", got)

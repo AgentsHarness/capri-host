@@ -128,6 +128,10 @@ type Client struct {
 	// never executed twice. Entries are scoped by the hub's boot id: a
 	// restarted hub reuses reqIds and must not inherit these answers.
 	memo *relayMemo
+	// relayOutbox holds finished answers until the hub confirms every chunk.
+	// It is per process, not per session, so an answer outlives the link that
+	// produced it; hubBoot scopes it the same way the memo is scoped.
+	relayOutbox *relayOutbox
 
 	// wake tells the session loop the uplink log grew; statusCh tells it the
 	// host's registry fields changed and a heartbeat is due now.
@@ -144,8 +148,8 @@ type Client struct {
 	viewChildren   map[string]string
 	viewChildOrder []string
 
-	// sess is the live session, nil while disconnected. respond() and the
-	// overflow path reach it here.
+	// sess is the live session, nil while disconnected. The answer log's wake
+	// signal and the overflow path reach it here.
 	sessMu sync.Mutex
 	sess   *session
 
@@ -253,8 +257,10 @@ func NewClient(cfg Config) *Client {
 		epoch:    epoch,
 		out:      newOutbox(),
 		memo:     newRelayMemo(),
-		wake:     make(chan struct{}, 1),
-		statusCh: make(chan struct{}, 1),
+
+		relayOutbox: newRelayOutbox(),
+		wake:        make(chan struct{}, 1),
+		statusCh:    make(chan struct{}, 1),
 	}
 	c.name.Store(cfg.HostName)
 	return c

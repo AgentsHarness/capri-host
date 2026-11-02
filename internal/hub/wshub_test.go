@@ -156,7 +156,7 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 		Audience: &aud,
 		Liveness: &h.live,
 		Limits:   limits,
-		Caps:     &wire.Caps{Deflate: true},
+		Caps:     testCaps(),
 	})
 	if err := cc.send(ack); err != nil {
 		return
@@ -376,6 +376,9 @@ type wsHubConn struct {
 	mu   sync.Mutex
 	// idx is the 1-based connection ordinal (see eventsConn).
 	idx int
+	// asm reassembles the host's binary transport units; read() is the only
+	// reader.
+	asm wire.Reassembler
 }
 
 func (c *wsHubConn) send(f wire.Frame) error {
@@ -390,18 +393,36 @@ func (c *wsHubConn) send(f wire.Frame) error {
 	return c.conn.Write(ctx, websocket.MessageText, b)
 }
 
+// read returns the next complete frame: a text message is one JSON frame, a
+// binary message is one transport unit (reassembled and inflated here).
 func (c *wsHubConn) read() ([]byte, error) {
-	typ, data, err := c.conn.Read(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	if typ == websocket.MessageBinary {
+	for {
+		typ, data, err := c.conn.Read(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		if typ == websocket.MessageText {
+			return data, nil
+		}
 		c.h.mu.Lock()
 		c.h.binary++
 		c.h.mu.Unlock()
-		return inflatePayload(data)
+		frame, compressed, complete, err := c.asm.Accept(data, wire.DefaultLimits.MaxFrame)
+		if err != nil {
+			return nil, err
+		}
+		if !complete {
+			continue
+		}
+		if compressed {
+			out, err := inflatePayload(frame)
+			if err != nil {
+				return nil, err
+			}
+			frame = out
+		}
+		return frame, nil
 	}
-	return data, nil
 }
 
 func writeTestJSON(w http.ResponseWriter, status int, v any) {
