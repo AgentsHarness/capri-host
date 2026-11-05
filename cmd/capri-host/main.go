@@ -17,9 +17,9 @@ import (
 	"github.com/AgentsHarness/capri-host/internal/server"
 )
 
-// version rides acp.Version, which release builds stamp via
-// -ldflags "-X .../internal/acp.Version=<tag>"; local builds show "dev".
-var version = acp.Version
+// version rides acp.EffectiveVersion: release builds stamp the tag via
+// -ldflags; local builds report a git-derived dev-<shortsha> label.
+var version = acp.EffectiveVersion()
 
 // This binary is deliberately UI-free: it is a console program that logs to
 // stderr and serves an HTTP API. Every visible affordance — the tray icon, the

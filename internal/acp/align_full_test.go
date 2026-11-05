@@ -26,7 +26,7 @@ func TestInitMetaSeedsDefaults(t *testing.T) {
 	meta := initMetaSeeds()
 	// clientType/clientVersion mirror the TUI's PAGER_CLIENT_TYPE /
 	// PAGER_CLIENT_VERSION (build-time → host constant).
-	want := map[string]any{"clientType": "grok-pager", "clientVersion": Version}
+	want := map[string]any{"clientType": "grok-pager", "clientVersion": EffectiveVersion()}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("initMetaSeeds = %v, want %v (env-driven keys must be omitted when absent)", meta, want)
 	}
@@ -44,7 +44,7 @@ func TestInitMetaSeedsEnvDriven(t *testing.T) {
 	meta := initMetaSeeds()
 	want := map[string]any{
 		"clientType":           "grok-pager",
-		"clientVersion":        Version,
+		"clientVersion":        EffectiveVersion(),
 		"clientIdentifier":     "my-editor",
 		"clientSource":         "web",
 		"systemPromptOverride": "YOU ARE A PIRATE.",
@@ -427,7 +427,7 @@ func TestModelsUpdateCarriesRaw(t *testing.T) {
 
 // models/update（config.toml 热重载）：会话当前档位不被新目录的静态默认档
 // 覆盖——目录刷新只换 availableModels，会话选中的 reasoningEffort 原样保留
-//（当前模型仍提供该档位时），且当前模型条目上的静态默认 effort 被清除，
+// （当前模型仍提供该档位时），且当前模型条目上的静态默认 effort 被清除，
 // 免得 FE / session-info 把默认档当会话当前档。
 func TestModelsUpdatePreservesSessionEffort(t *testing.T) {
 	b, _ := metaReadyBridge(t)
@@ -501,7 +501,7 @@ func TestModelsUpdateDropsStaleSessionEffort(t *testing.T) {
 		"currentModelId": "grok-4",
 		"availableModels": []any{
 			map[string]any{"modelId": "grok-4", "_meta": map[string]any{
-				"reasoningEffort": "low",
+				"reasoningEffort":  "low",
 				"reasoningEfforts": []any{map[string]any{"value": "low"}},
 			}},
 		},
@@ -645,4 +645,3 @@ loop:
 		t.Errorf("snapshot ReceivedAt = %d, want matching broadcast receivedAt = %d", found.ReceivedAt, recv)
 	}
 }
-

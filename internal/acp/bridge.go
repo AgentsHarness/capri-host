@@ -1090,7 +1090,7 @@ func (b *Bridge) ensureBooted(ctx context.Context) error {
 		"clientInfo": map[string]any{
 			"name":    "capri-host",
 			kTitle:    "ACP Host",
-			"version": Version,
+			"version": EffectiveVersion(),
 		},
 		// `_meta` mirrors the Grok Build TUI's build_initialize_meta
 		// (xai-grok-pager/src/acp/mod.rs): clientType defaults to the
@@ -1170,7 +1170,8 @@ func (b *Bridge) NewSession(ctx context.Context, sc SessionConfig) error {
 
 // Version is stamped at build time via
 // go build -ldflags "-X github.com/AgentsHarness/capri-host/internal/acp.Version=<tag>".
-// Plain `go build` / `go run` falls back to "dev". It feeds both the
+// Plain `go build` / `go run` leaves it "dev"; EffectiveVersion reports a
+// git-derived dev-<shortsha> label for those builds. It feeds both the
 // initialize `clientInfo.version` and the `_meta` clientVersion, so the
 // released binary's version always equals its git tag.
 var Version = "dev"
@@ -1191,7 +1192,7 @@ const initClientType = "grok-pager"
 func initMetaSeeds() map[string]any {
 	meta := map[string]any{
 		"clientType":    initClientType,
-		"clientVersion": Version,
+		"clientVersion": EffectiveVersion(),
 	}
 	addStringEnv(meta, "clientIdentifier", "ACP_INIT_CLIENT_IDENTIFIER")
 	addStringEnv(meta, "clientSource", "ACP_INIT_CLIENT_SOURCE")

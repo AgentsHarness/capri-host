@@ -461,6 +461,9 @@ func TestHeartbeatCarriesDownAckAndStatus(t *testing.T) {
 		if !st.Ready || !st.Busy || st.PendingCount != 1 {
 			t.Fatalf("heartbeat status = %+v", st)
 		}
+		if st.Version != acp.EffectiveVersion() {
+			t.Fatalf("heartbeat version = %q, want %q", st.Version, acp.EffectiveVersion())
+		}
 		if st.Port != 1 {
 			t.Logf("port = %d (LocalBase has no port in this test)", st.Port)
 		}

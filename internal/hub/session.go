@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/AgentsHarness/capri-hub/wire"
 )
 
@@ -609,6 +610,7 @@ func (s *session) status() wire.HeartbeatStatus {
 		Booting:      st.Booting,
 		PendingCount: len(st.PendingRequests),
 		Port:         s.c.listenPort(),
+		Version:      acp.EffectiveVersion(),
 	}
 }
 

@@ -39,9 +39,9 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 	if !ok {
 		t.Fatalf("initialize params carry no _meta: %v", params)
 	}
-	if meta["clientType"] != "grok-pager" || meta["clientVersion"] != acp.Version {
+	if meta["clientType"] != "grok-pager" || meta["clientVersion"] != acp.EffectiveVersion() {
 		t.Errorf("_meta clientType/clientVersion = %v/%v, want grok-pager/%v",
-			meta["clientType"], meta["clientVersion"], acp.Version)
+			meta["clientType"], meta["clientVersion"], acp.EffectiveVersion())
 	}
 	if meta["clientIdentifier"] != "capri-fe" {
 		t.Errorf("_meta clientIdentifier = %v, want capri-fe", meta["clientIdentifier"])
@@ -96,7 +96,7 @@ func TestInitializeOmitsEnvSeedsWhenAbsent(t *testing.T) {
 	req := findRequest(t, readRecordedRequests(t, recordPath), "initialize")
 	params, _ := req["params"].(map[string]any)
 	meta, _ := params["_meta"].(map[string]any)
-	want := map[string]any{"clientType": "grok-pager", "clientVersion": acp.Version}
+	want := map[string]any{"clientType": "grok-pager", "clientVersion": acp.EffectiveVersion()}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("_meta = %v, want %v (env seeds omitted when absent)", meta, want)
 	}

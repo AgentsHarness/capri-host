@@ -752,7 +752,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // cwd / sessionId / roster），塞进启动关键路径既慢又漏信息。
 func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	mode, hubURL := s.deployment()
-	out := map[string]any{"ok": true, "hostId": s.bridge.Snapshot().HostID, "mode": mode, "version": acp.Version}
+	out := map[string]any{"ok": true, "hostId": s.bridge.Snapshot().HostID, "mode": mode, "version": acp.EffectiveVersion()}
 	if hubURL != "" {
 		out["hubUrl"] = hubURL
 	}
