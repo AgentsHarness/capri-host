@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/AgentsHarness/capri-host/internal/config"
 	"github.com/AgentsHarness/capri-host/internal/hubstate"
 )
 
@@ -42,6 +43,26 @@ func TestSensitiveEndpointRejectsCrossOrigin(t *testing.T) {
 			if h := rec.Header().Get("Access-Control-Allow-Origin"); h != "" {
 				t.Fatalf("%s with Origin %q: ACAO = %q, want empty", path, origin, h)
 			}
+		}
+	}
+}
+
+// The interfaces that drive the agent or write files are just as powerful as
+// /api/shell: a web page that can reach 127.0.0.1 must not be able to call
+// them.
+func TestAgentDrivingEndpointsRejectCrossOrigin(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	for _, path := range []string{"/api/prompt", "/api/fs/write-file", "/api/settings", "/api/session"} {
+		req := httptest.NewRequest("POST", "http://127.0.0.1:8765"+path, strings.NewReader(`{}`))
+		req.Header.Set("Origin", "http://evil.example")
+		rec := httptest.NewRecorder()
+		s.http.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s with evil Origin: status = %d, want 403; body=%s", path, rec.Code, rec.Body.String())
+		}
+		if h := rec.Header().Get("Access-Control-Allow-Origin"); h != "" {
+			t.Fatalf("%s with evil Origin: ACAO = %q, want empty", path, h)
 		}
 	}
 }
@@ -110,6 +131,9 @@ func TestSensitiveEndpointAllowsLiveHubOrigin(t *testing.T) {
 // calls, and no Origin at all (curl / same-origin GET) — keep working.
 func TestSensitiveEndpointAllowsLocalOrigins(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
+	// The "origin matches request Host" case below is the host UI opened via
+	// a LAN address, which only exists when the listener is non-loopback.
+	s.cfg.BindAddr = "0.0.0.0"
 
 	cases := []struct{ name, origin, host string }{
 		{"no origin (curl)", "", "127.0.0.1:8765"},
@@ -117,6 +141,7 @@ func TestSensitiveEndpointAllowsLocalOrigins(t *testing.T) {
 		{"127.0.0.1 same port", "http://127.0.0.1:8765", "127.0.0.1:8765"},
 		{"::1 same port", "http://[::1]:8765", "[::1]:8765"},
 		{"origin matches request Host", "http://192.168.1.5:8765", "192.168.1.5:8765"},
+		{"LAN dev another port", "http://192.168.1.5:5173", "192.168.1.5:8765"},
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest("POST", "http://"+tc.host+"/api/shell", strings.NewReader(`{"command":"echo hi"}`))
@@ -166,27 +191,137 @@ func TestSensitiveEndpointPreflight(t *testing.T) {
 		t.Fatalf("local preflight ACAO = %q, want origin echo", h)
 	}
 
+	// Non-sensitive endpoints follow the same allowlist: a page that can
+	// reach 127.0.0.1 still must not drive /api/prompt or /api/fs/*.
 	req3 := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8765/api/status", nil)
 	req3.Header.Set("Origin", "http://evil.example")
 	rec3 := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec3, req3)
-	if rec3.Code != http.StatusNoContent {
-		t.Fatalf("non-sensitive preflight status = %d, want 204", rec3.Code)
+	if rec3.Code != http.StatusForbidden {
+		t.Fatalf("non-sensitive evil preflight status = %d, want 403", rec3.Code)
 	}
-	if h := rec3.Header().Get("Access-Control-Allow-Origin"); h != "*" {
-		t.Fatalf("non-sensitive preflight ACAO = %q, want *", h)
+	if h := rec3.Header().Get("Access-Control-Allow-Origin"); h != "" {
+		t.Fatalf("non-sensitive evil preflight ACAO = %q, want empty", h)
 	}
 
-	// Non-sensitive actual requests stay open to any origin.
 	req4 := httptest.NewRequest("GET", "http://127.0.0.1:8765/api/status", nil)
 	req4.Header.Set("Origin", "http://evil.example")
 	rec4 := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec4, req4)
-	if rec4.Code != http.StatusOK {
-		t.Fatalf("non-sensitive GET with evil Origin status = %d, want 200", rec4.Code)
+	if rec4.Code != http.StatusForbidden {
+		t.Fatalf("non-sensitive GET with evil Origin status = %d, want 403", rec4.Code)
 	}
-	if h := rec4.Header().Get("Access-Control-Allow-Origin"); h != "*" {
-		t.Fatalf("non-sensitive GET ACAO = %q, want *", h)
+	if h := rec4.Header().Get("Access-Control-Allow-Origin"); h != "" {
+		t.Fatalf("non-sensitive evil GET ACAO = %q, want empty", h)
+	}
+
+	// A page that merely resolves its own domain to 127.0.0.1 (DNS
+	// rebinding) sends its domain in Host. It must be refused even though
+	// Origin and Host agree — that equality is what used to bypass the
+	// sensitive-endpoint check.
+	for _, method := range []string{"GET", "POST"} {
+		req5 := httptest.NewRequest(method, "http://evil.example:8765/api/host/config", strings.NewReader(`{}`))
+		req5.Host = "evil.example:8765"
+		req5.Header.Set("Origin", "http://evil.example:8765")
+		rec5 := httptest.NewRecorder()
+		s.http.Handler.ServeHTTP(rec5, req5)
+		if rec5.Code != http.StatusForbidden {
+			t.Fatalf("DNS-rebinding %s status = %d, want 403", method, rec5.Code)
+		}
+	}
+}
+
+func TestIsAllowedHost(t *testing.T) {
+	cases := []struct {
+		name string
+		bind string
+		host string
+		want bool
+	}{
+		{"loopback localhost", "", "localhost:8765", true},
+		{"loopback v4", "", "127.0.0.1:8765", true},
+		{"loopback v6", "", "[::1]:8765", true},
+		{"loopback rejects lan ip", "", "192.168.1.5:8765", false},
+		{"loopback rejects domain", "", "evil.example:8765", false},
+		{"all ifaces accepts lan ip", "0.0.0.0", "192.168.1.5:8765", true},
+		{"all ifaces accepts another ip", "0.0.0.0", "10.0.0.8:8765", true},
+		{"all ifaces rejects domain", "0.0.0.0", "evil.example:8765", false},
+		{"specific iface accepts its ip", "192.168.1.5", "192.168.1.5:8765", true},
+		{"specific iface rejects other ip", "192.168.1.5", "192.168.1.6:8765", false},
+		{"bind hostname", "myhost.local", "myhost.local:8765", true},
+		{"other hostname", "myhost.local", "evil.example:8765", false},
+	}
+	for _, tc := range cases {
+		s := &Server{cfg: config.Config{BindAddr: tc.bind}}
+		if got := s.isAllowedHost(tc.host); got != tc.want {
+			t.Errorf("%s: isAllowedHost(%q) = %v, want %v", tc.name, tc.host, got, tc.want)
+		}
+	}
+}
+
+// DNS rebinding can issue a same-origin GET without an Origin header. Host
+// alone must reject it; otherwise /api/host/config would leak the config.
+func TestHostGuardRejectsDNSRebindingWithoutOrigin(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+
+	for _, path := range []string{"/api/host/config", "/api/status", "/api/hosts"} {
+		req := httptest.NewRequest("GET", "http://evil.example:8765"+path, nil)
+		rec := httptest.NewRecorder()
+		s.http.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s with rebinding Host: status = %d, want 403", path, rec.Code)
+		}
+	}
+}
+
+// The same allowlist covers non-sensitive endpoints too, and a trusted hub
+// origin still gets both normal reads and the Private Network Access grant.
+func TestNonSensitiveEndpointAllowsTrustedHubOrigin(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	// The browser omits the default HTTPS port from Origin; HubURL may spell
+	// it out. Both must compare equal.
+	s.cfg.HubURL = "https://agents.example:443"
+
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8765/api/status", nil)
+	req.Header.Set("Origin", "https://agents.example")
+	rec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s; want 200", rec.Code, rec.Body.String())
+	}
+	if h := rec.Header().Get("Access-Control-Allow-Origin"); h != "https://agents.example" {
+		t.Fatalf("ACAO = %q, want hub origin echo", h)
+	}
+
+	pre := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8765/api/status", nil)
+	pre.Header.Set("Origin", "https://agents.example")
+	pre.Header.Set("Access-Control-Request-Method", "GET")
+	pre.Header.Set("Access-Control-Request-Private-Network", "true")
+	prerec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(prerec, pre)
+	if prerec.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", prerec.Code)
+	}
+	if prerec.Header().Get("Access-Control-Allow-Private-Network") != "true" {
+		t.Fatalf("missing Access-Control-Allow-Private-Network for trusted hub")
+	}
+
+	evil := httptest.NewRequest("GET", "http://127.0.0.1:8765/api/status", nil)
+	evil.Header.Set("Origin", "https://evil.example")
+	evilRec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(evilRec, evil)
+	if evilRec.Code != http.StatusForbidden {
+		t.Fatalf("untrusted Origin status = %d, want 403", evilRec.Code)
+	}
+
+	// A cross-site form POST can arrive without Origin; Sec-Fetch-Site still
+	// identifies it and must not be treated as a local caller.
+	form := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/shell", strings.NewReader(`{}`))
+	form.Header.Set("Sec-Fetch-Site", "cross-site")
+	formRec := httptest.NewRecorder()
+	s.http.Handler.ServeHTTP(formRec, form)
+	if formRec.Code != http.StatusForbidden {
+		t.Fatalf("cross-site form status = %d, want 403", formRec.Code)
 	}
 }
 

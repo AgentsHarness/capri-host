@@ -29,7 +29,7 @@ func newLocalServer(t *testing.T) *Server {
 // getJSON issues a GET against the server's mux and returns the recorder.
 func getJSON(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest("GET", path, nil)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8765"+path, nil)
 	rec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec, req)
 	return rec

@@ -14,6 +14,26 @@ import (
 
 // ── inbound access-token gate ─────────────────────────────────────────
 
+func TestAuthAttemptLimiterBlocksThenResets(t *testing.T) {
+	l := newAuthAttemptLimiter()
+	for i := 0; i < authFailureLimit; i++ {
+		if !l.allow("203.0.113.1") {
+			t.Fatalf("attempt %d should be allowed", i+1)
+		}
+		l.fail("203.0.113.1")
+	}
+	if l.allow("203.0.113.1") {
+		t.Fatal("IP should be blocked after failure limit")
+	}
+	l.reset("203.0.113.1")
+	if !l.allow("203.0.113.1") {
+		t.Fatal("reset must clear the bucket")
+	}
+	if !l.allow("203.0.113.2") {
+		t.Fatal("other IPs must not be affected")
+	}
+}
+
 // newTokenServer builds a fake-agent server with an access token
 // configured (same harness as newFakeAgentServer, plus AccessToken).
 func newTokenServer(t *testing.T, token string) *Server {

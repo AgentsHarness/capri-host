@@ -286,7 +286,10 @@ func (c *Client) relayInProcess(ctx context.Context, method, path string, body j
 	if len(body) > 0 {
 		rd = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "http://capri-local"+path, rd)
+	// 127.0.0.1, not a symbolic host: the local handler now enforces a Host
+	// allowlist (DNS-rebinding defence), and this in-process call must look
+	// like the loopback request it is.
+	req, err := http.NewRequestWithContext(ctx, method, "http://127.0.0.1"+path, rd)
 	if err != nil {
 		return 500, mustJSON(map[string]any{"ok": false, "error": "invalid relay request"})
 	}

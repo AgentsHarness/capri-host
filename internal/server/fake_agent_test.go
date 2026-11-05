@@ -141,10 +141,10 @@ const fakeMemorySessionLogBody = "# Session 2026-09-18\n\n- 排查了前端构�
 // The inbox observation is absent on purpose: an unreadable note must render as
 // a read failure (and lose its delete evidence) instead of an empty preview.
 var fakeMemoryBodies = map[string]string{
-	"/ws/.grok/memory/topics/deploy-conventions.md":   fakeMemoryTopicBody,
+	"/ws/.grok/memory/topics/deploy-conventions.md":    fakeMemoryTopicBody,
 	"/home/deploy/.grok/memory/sessions/2026-09-18.md": fakeMemorySessionLogBody,
 	"/home/deploy/.grok/memory/MEMORY.md":              "# Memory index\n\n- [部署约定](topics/deploy-conventions.md)\n",
-	"/ws/.grok/memory/MEMORY.md":                      "# Memory index\n\n- (no notes yet)\n",
+	"/ws/.grok/memory/MEMORY.md":                       "# Memory index\n\n- (no notes yet)\n",
 }
 
 // readFilePath extracts params.path from a recorded x.ai/fs/read_file request.
@@ -518,7 +518,7 @@ func newFakeAgentServer(t *testing.T) (*Server, *acp.Bridge) {
 // postJSON issues a POST against the server's mux and returns the recorder.
 func postJSON(t *testing.T, s *Server, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest("POST", path, strings.NewReader(body))
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8765"+path, strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec, req)
 	return rec

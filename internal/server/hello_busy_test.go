@@ -54,7 +54,7 @@ func readSSEHello(t *testing.T, s *Server) map[string]any {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req := httptest.NewRequest("GET", "/events", nil).WithContext(ctx)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8765/events", nil).WithContext(ctx)
 	rec := &sseRecorder{flushed: make(chan struct{}, 4), hdr: http.Header{}}
 	go s.http.Handler.ServeHTTP(rec, req)
 
@@ -116,7 +116,7 @@ func TestSSEHelloBusyReflectsAnnouncedSessionOnly(t *testing.T) {
 	waitBusy(t, b, "sess-B")
 
 	// /api/status 的聚合 busy 保持 true（任一会话在飞）。
-	req := httptest.NewRequest("GET", "/api/status", nil)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8765/api/status", nil)
 	statusRec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(statusRec, req)
 	if busy, _ := decodeBody(t, statusRec)["busy"].(bool); !busy {

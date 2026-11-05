@@ -35,7 +35,7 @@ func TestPromptDisconnectKeepsTurnRunning(t *testing.T) {
 		return "completed", nil
 	}
 
-	req := httptest.NewRequest("POST", "/api/prompt",
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/prompt",
 		strings.NewReader(`{"blocks":[{"type":"text","text":"hi"}]}`))
 	reqCtx, cancel := context.WithCancel(req.Context())
 	req = req.WithContext(reqCtx)
@@ -85,7 +85,7 @@ func TestPromptConnectedReturnsAccepted(t *testing.T) {
 		return "completed", nil
 	}
 
-	req := httptest.NewRequest("POST", "/api/prompt",
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/prompt",
 		strings.NewReader(`{"blocks":[{"type":"text","text":"hi"}]}`))
 	w := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(w, req)

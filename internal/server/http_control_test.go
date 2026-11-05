@@ -342,25 +342,6 @@ func TestHubUseSurfacesAMissingCredential(t *testing.T) {
 	}
 }
 
-func TestControlPathsAreSensitive(t *testing.T) {
-	// Pairing, renaming and quitting are all privileged state changes; the
-	// local-origin gate costs nothing and must cover every one of them. A new
-	// endpoint that forgets to register here would silently be reachable from
-	// a page the user merely visited.
-	sensitive := func(path string) bool {
-		return isSensitiveEndpoint(httptest.NewRequest("POST", "http://127.0.0.1:8765"+path, nil))
-	}
-	for _, p := range []string{"/api/hub/pair", "/api/hub/reuse", "/api/hub/disconnect", "/api/host/rename", "/api/host/config", "/api/host/quit"} {
-		if !sensitive(p) {
-			t.Errorf("%s is not registered as sensitive", p)
-		}
-	}
-	// /api/hub/state is a read, and the tray polls it twice a second.
-	if sensitive("/api/hub/state") {
-		t.Error("/api/hub/state is marked sensitive; it is a read the tray polls")
-	}
-}
-
 func TestHubDisconnect(t *testing.T) {
 	s := newControlServer(t)
 	stub := &stubHub{state: hubstate.State{Configured: true, HubURL: "https://h.example", Connected: true}}

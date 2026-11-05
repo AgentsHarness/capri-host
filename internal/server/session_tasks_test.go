@@ -57,7 +57,7 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 	b := acp.NewBridge(acp.GrokConfig{Bin: "grok", HostID: "h", HostName: "host", GrokHome: home})
 	s := New(config.Config{Port: 0, GrokBin: "grok"}, b)
 
-	req := httptest.NewRequest("POST", "/api/session-running-tasks",
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/session-running-tasks",
 		strings.NewReader(`{"sessionId":"sess-1","cwd":"/Users/dev/ccwork"}`))
 	rec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec, req)
@@ -97,7 +97,7 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 	}
 
 	// Unknown session → empty events, still ok.
-	req2 := httptest.NewRequest("POST", "/api/session-running-tasks",
+	req2 := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/session-running-tasks",
 		strings.NewReader(`{"sessionId":"nope","cwd":"/Users/dev/ccwork"}`))
 	rec2 := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec2, req2)
@@ -106,7 +106,7 @@ func TestSessionRunningTasksEndpoint(t *testing.T) {
 	}
 
 	// Missing cwd → 400.
-	req3 := httptest.NewRequest("POST", "/api/session-running-tasks", strings.NewReader(`{}`))
+	req3 := httptest.NewRequest("POST", "http://127.0.0.1:8765/api/session-running-tasks", strings.NewReader(`{}`))
 	rec3 := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusBadRequest {

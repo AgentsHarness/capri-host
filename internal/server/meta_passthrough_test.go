@@ -128,7 +128,7 @@ func TestSessionsResponseOmitsCursorAndMetaWhenAbsent(t *testing.T) {
 // getStatus fetches GET /api/status and decodes it.
 func getStatus(t *testing.T, s *Server) map[string]any {
 	t.Helper()
-	req := httptest.NewRequest("GET", "/api/status", nil)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8765/api/status", nil)
 	rec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

@@ -123,7 +123,7 @@ func (s *Server) handleHubPair(w http.ResponseWriter, r *http.Request) {
 	// embedded FE on localhost) may do that. A hub FE is a trusted origin
 	// for re-pairing the current hub, but must not point us at another one.
 	hubURL := body.HubURL
-	if !isLocalOrigin(r) {
+	if !s.isLocalOrigin(r) {
 		hubURL = ""
 	}
 
@@ -219,7 +219,7 @@ func (s *Server) handleHubReuse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hubURL := body.HubURL
-	if !isLocalOrigin(r) {
+	if !s.isLocalOrigin(r) {
 		hubURL = ""
 	}
 	if err := ctl.Reuse(hubURL); err != nil {

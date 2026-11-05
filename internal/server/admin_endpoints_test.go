@@ -456,7 +456,7 @@ func TestSetModePlanStillSessionSetMode(t *testing.T) {
 func TestMCPListEndpoint(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
 
-	req := httptest.NewRequest("GET", "/api/mcp/list", nil)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8765/api/mcp/list", nil)
 	rec := httptest.NewRecorder()
 	s.http.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

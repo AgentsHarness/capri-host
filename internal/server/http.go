@@ -42,6 +42,10 @@ type Server struct {
 	hubMu  sync.Mutex
 	hubCtl HubController
 
+	// authLimiter throttles failed inbound token attempts by client IP.
+	// Successful requests clear the bucket; this is not a request quota.
+	authLimiter *authAttemptLimiter
+
 	// quitFn triggers the same orderly shutdown a SIGINT would, so a
 	// supervisor process can stop this host without hard-killing it and
 	// orphaning the grok child. nil in tests and in any embedder that does
@@ -50,7 +54,7 @@ type Server struct {
 }
 
 func New(cfg config.Config, bridge bridgeAPI) *Server {
-	s := &Server{cfg: cfg, bridge: bridge}
+	s := &Server{cfg: cfg, bridge: bridge, authLimiter: newAuthAttemptLimiter()}
 	s.handler = s.routes()
 	s.http = &http.Server{
 		Addr:              net.JoinHostPort(bindAddrOf(cfg), strconv.Itoa(cfg.Port)),
@@ -98,7 +102,9 @@ func (s *Server) routes() http.Handler {
 	// 嵌入的 capri-fe SPA（web/dist）：兜底 GET 路由，静态文件 +
 	// 非 API 路径回退 index.html（实现见 web.go）
 	mux.HandleFunc("GET /", s.handleWeb)
-	return s.withCORS(withAuth(mux, s.cfg.AccessToken))
+	// Host guard 在最外层：DNS rebinding 页面的请求 Host 是攻击者域名，
+	// 必须在 CORS / 鉴权 / 路由之前拒绝，否则同源请求可以不带 Origin。
+	return s.withHostGuard(s.withCORS(withAuth(mux, s.cfg.AccessToken, s.authLimiter)))
 }
 
 // registerCoreRoutes 注册核心 API（回合、会话、权限、任务、终端外的主链路）。
@@ -181,62 +187,90 @@ func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 // TCP 回环——同一条鉴权管线，少一个端口依赖。
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// ── local-origin guard for sensitive endpoints ────────────────────────
+// ── Host and browser-origin guards ────────────────────────────────────
 
-// sensitiveEndpointPaths are the routes that expose privileged host
-// capabilities — arbitrary local command execution (/api/shell) and
-// API-key/auth material — and must never be reachable cross-origin from a
-// random web page. Any /api/auth/* route is sensitive too.
-var sensitiveEndpointPaths = []string{
-	"/api/shell",
-	// 本地目录浏览/新建：读任意路径的目录结构、在任意可写目录里落文件夹。
-	// 与 /api/shell 同级的本地能力，同样只许本机来源或受信 hub 来源。
-	"/api/local/dirs",
-	"/api/local/mkdir",
-	"/api/api-key-get",
-	"/api/api-key-set",
-	// Pairing is a privileged write (it persists a hub credential). The
-	// request may also carry hubUrl, which retargets this host; handleHubPair
-	// only honours that field from a local origin, so a hub FE can re-pair
-	// the current hub but cannot point us at a different one.
-	"/api/hub/pair",
-	// Reusing a stored credential also changes which hub this host talks to,
-	// which is the decision pairing is gated for.
-	"/api/hub/reuse",
-	// Disconnecting switches the host back to local mode.
-	"/api/hub/disconnect",
-	// Renaming rewrites the host's persisted identity and re-registers it on
-	// the hub. Same reasoning as pairing: a privileged state change that a
-	// local-origin gate costs nothing to guard.
-	"/api/host/rename",
-	// Reading and updating host configuration file.
-	"/api/host/config",
-	// Stopping the host is the supervisor's job and it already holds this
-	// token; keeping the gate uniform means a LAN-bound host cannot be shut
-	// down by anything that can reach the port.
-	"/api/host/quit",
+// hostOnly strips an optional port and IPv6 brackets from a Host header.
+func hostOnly(hostport string) string {
+	hostport = strings.TrimSpace(hostport)
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return strings.Trim(hostport, "[]")
 }
 
-// isSensitiveEndpoint reports whether r targets a sensitive endpoint.
-func isSensitiveEndpoint(r *http.Request) bool {
-	for _, p := range sensitiveEndpointPaths {
-		if r.URL.Path == p {
+// isLoopbackHost reports whether host names this machine's loopback
+// interface: localhost, 127.0.0.0/8, or ::1.
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// isAllowedHost reports whether a request's Host header names an address this
+// host is deliberately serving. It is the DNS-rebinding line of defence: a
+// page at evil.example that resolves to 127.0.0.1 keeps sending
+// `Host: evil.example:8765`, so rejecting anything outside loopback and the
+// configured bind address stops the page before Origin (which is also
+// evil.example) is even considered. A literal IP cannot be supplied by DNS
+// rebinding; it is allowed only when the listener itself is non-loopback.
+func (s *Server) isAllowedHost(hostport string) bool {
+	host := hostOnly(hostport)
+	// HTTP/1.0 requests may omit Host. Browsers always send it, and local
+	// non-browser clients are already inside the local-trust boundary.
+	if host == "" || isLoopbackHost(host) {
+		return true
+	}
+	if s.cfg.BindIsLoopback() {
+		return false
+	}
+	bind := strings.Trim(strings.TrimSpace(s.cfg.BindAddr), "[]")
+	if bind == "" {
+		bind = config.DefaultBindAddr
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if bind == "0.0.0.0" || bind == "::" {
 			return true
 		}
+		if bip := net.ParseIP(bind); bip != nil {
+			return bip.Equal(ip)
+		}
+		return false
 	}
-	return strings.HasPrefix(r.URL.Path, "/api/auth/")
+	// BIND may itself be a hostname; the browser will then put that same
+	// name in Host.
+	return strings.EqualFold(host, bind)
+}
+
+// withHostGuard rejects requests whose Host header is not a local address or
+// the configured bind address. See isAllowedHost for the DNS-rebinding
+// rationale.
+func (s *Server) withHostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.isAllowedHost(r.Host) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok": false, "error": "不受信任的 Host",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // isLocalOrigin reports whether the request's Origin header (when present)
-// names a local origin: localhost / 127.0.0.1 / ::1 on any port (covers the
-// Vite dev server on another localhost port), or the exact host:port of the
-// request's own Host header (same-origin calls made through the machine's
-// LAN address). A missing Origin — curl, server-side callers, the host UI's
-// own same-origin requests — is allowed: browsers only attach Origin on
-// cross-origin or non-GET requests, and a hostile page cannot forge it to a
-// local value. `Origin: null` (sandboxed iframes) has no host and is
-// rejected.
-func isLocalOrigin(r *http.Request) bool {
+// names the host's own UI: loopback on any port, or the request's own Host
+// when that Host itself passed the Host allowlist (same-origin calls through
+// a LAN address). A missing Origin — curl, server-side callers, same-origin
+// browser requests — is allowed: browsers only attach Origin on cross-origin
+// or non-GET requests, and a hostile page cannot forge it to a local value.
+// `Origin: null` (sandboxed iframes) has no host and is rejected.
+//
+// Origin.Host == r.Host alone is deliberately not enough: after DNS
+// rebinding both are the attacker's domain. isAllowedHost is what makes the
+// equality trustworthy.
+func (s *Server) isLocalOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
@@ -245,21 +279,32 @@ func isLocalOrigin(r *http.Request) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
-	host := u.Hostname()
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if isLoopbackHost(u.Hostname()) {
 		return true
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	// Compare hostnames, not full host:port, so the same UI reached through
+	// a LAN address on a different port (Vite dev on 192.168.x.y:5173 hitting
+	// the host on :8765) stays local. The Host allowlist is what keeps this
+	// from trusting a rebinding domain.
+	return strings.EqualFold(u.Hostname(), hostOnly(r.Host)) && s.isAllowedHost(r.Host)
 }
 
-// allowSensitiveOrigin reports whether r may hit a sensitive endpoint:
-// local origins (Vite / same-host), or the live hub URL's origin
-// (deployed FE on the hub talking straight to this host's 127.0.0.1 port).
-func (s *Server) allowSensitiveOrigin(r *http.Request) bool {
-	if isLocalOrigin(r) {
-		return true
+// originAllowed reports whether r's Origin may reach the host API: the local
+// UI (including Vite dev on another loopback port), or the live hub URL's
+// origin (deployed FE on the hub talking straight to this host's 127.0.0.1
+// port). Requests without Origin come from non-browser callers and keep the
+// local-trust behaviour.
+func (s *Server) originAllowed(r *http.Request) bool {
+	if r.Header.Get("Origin") == "" {
+		// Browsers sometimes omit Origin on a form POST. Sec-Fetch-Site
+		// still marks it cross-site; reject that. curl and other
+		// non-browser callers send neither header and keep local trust.
+		return !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site")
 	}
-	return s.isTrustedHubOrigin(r.Header.Get("Origin"))
+	return s.isLocalOrigin(r) || s.isTrustedHubOrigin(r.Header.Get("Origin"))
 }
 
 // isTrustedHubOrigin is true when origin matches the live hub URL's
@@ -282,42 +327,62 @@ func (s *Server) isTrustedHubOrigin(origin string) bool {
 	if err != nil || hu.Scheme == "" || hu.Host == "" {
 		return false
 	}
-	return strings.EqualFold(ou.Scheme, hu.Scheme) && strings.EqualFold(ou.Host, hu.Host)
+	return sameURLOrigin(ou, hu)
 }
 
+// sameURLOrigin compares scheme + hostname + effective port. Comparing raw
+// Host strings would reject `https://hub.example` against a HubURL written as
+// `https://hub.example:443`.
+func sameURLOrigin(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Scheme, b.Scheme) ||
+		!strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	return effectiveURLPort(a) == effectiveURLPort(b)
+}
+
+func effectiveURLPort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
+// withCORS applies the same allowlist to every browser-facing API and live
+// endpoint, sensitive or not. `Access-Control-Allow-Origin: *` is never sent:
+// /api/prompt, /api/fs/write-file and the rest can drive the agent, so a
+// random page must not be able to call them merely because it can reach
+// 127.0.0.1. Untrusted Origins are rejected outright (not merely left without
+// ACAO), which also blocks "simple" cross-origin POSTs that skip preflight.
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sensitive := isSensitiveEndpoint(r)
-		allowed := !sensitive || s.allowSensitiveOrigin(r)
-		if sensitive {
-			// Sensitive endpoints never answer `*`: echo the request Origin
-			// only when it is local or the trusted hub FE origin.
-			if origin := r.Header.Get("Origin"); origin != "" && allowed {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Add("Vary", "Origin")
-			}
-			if !allowed {
+		if isAPIOrLivePath(r.URL.Path) {
+			if !s.originAllowed(r) {
 				writeJSON(w, http.StatusForbidden, map[string]any{
-					"ok": false, "error": "cross-origin request to sensitive endpoint denied",
+					"ok": false, "error": "cross-origin request denied",
 				})
 				return
 			}
-		} else {
-			// CORS for Vite dev: the FE runs on another localhost port and
-			// must reach every non-sensitive endpoint. Hub FE on a public
-			// origin also probes /api/hosts + /api/status this way.
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		// Authorization: the FE attaches Bearer on every API call; the
-		// preflight must admit it or cross-origin direct host calls (hub
-		// mode 双连接) would be blocked by the browser.
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		// Chrome Private Network Access: public HTTPS pages probing
-		// 127.0.0.1 send Access-Control-Request-Private-Network on
-		// preflight; without the matching Allow header the probe fails.
-		if r.Header.Get("Access-Control-Request-Private-Network") == "true" && allowed {
-			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			w.Header().Add("Vary", "Origin")
+			if origin := r.Header.Get("Origin"); origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			// Authorization: the FE attaches Bearer on every API call; the
+			// preflight must admit it or cross-origin direct host calls (hub
+			// mode 双连接) would be blocked by the browser.
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			// Chrome Private Network Access: only a trusted origin may learn
+			// that this private-network host is reachable.
+			if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			}
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -349,21 +414,123 @@ func authRequiredForPath(path string) bool {
 	return path == "/events"
 }
 
+// authAttemptLimiter throttles failed inbound token attempts per client IP.
+// A successful request clears the bucket; only wrong credentials consume it,
+// so normal UI polling and EventSource reconnects are unaffected.
+type authAttemptLimiter struct {
+	mu     sync.Mutex
+	failed map[string][]time.Time
+	block  map[string]time.Time
+}
+
+const (
+	authFailureLimit  = 10
+	authFailureWindow = time.Minute
+	authBlockDuration = time.Minute
+)
+
+func newAuthAttemptLimiter() *authAttemptLimiter {
+	return &authAttemptLimiter{failed: make(map[string][]time.Time), block: make(map[string]time.Time)}
+}
+
+func (l *authAttemptLimiter) allow(ip string) bool {
+	if l == nil || ip == "" {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if until, ok := l.block[ip]; ok {
+		if now.Before(until) {
+			return false
+		}
+		delete(l.block, ip)
+		delete(l.failed, ip)
+	}
+	l.pruneLocked(now.Add(-authFailureWindow))
+	return true
+}
+
+func (l *authAttemptLimiter) fail(ip string) {
+	if l == nil || ip == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-authFailureWindow)
+	hs := l.failed[ip]
+	i := 0
+	for i < len(hs) && hs[i].Before(cutoff) {
+		i++
+	}
+	hs = append(hs[i:], now)
+	l.failed[ip] = hs
+	if len(hs) >= authFailureLimit {
+		l.block[ip] = now.Add(authBlockDuration)
+	}
+}
+
+func (l *authAttemptLimiter) reset(ip string) {
+	if l == nil || ip == "" {
+		return
+	}
+	l.mu.Lock()
+	delete(l.failed, ip)
+	delete(l.block, ip)
+	l.mu.Unlock()
+}
+
+func (l *authAttemptLimiter) pruneLocked(cutoff time.Time) {
+	for ip, hs := range l.failed {
+		i := 0
+		for i < len(hs) && hs[i].Before(cutoff) {
+			i++
+		}
+		if i == len(hs) {
+			delete(l.failed, ip)
+		} else {
+			l.failed[ip] = hs[i:]
+		}
+	}
+}
+
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // withAuth gates /api/* (except /api/hosts) and /events with the host's
-// access token when one is configured; empty token disables the gate
+// access token when one is configured; empty token leaves the gate open
 // (local trusted default). Accepted transports:
 //   - Authorization: Bearer <token>   (the FE's apiFetch always sends it)
 //   - ?token=<token>                  (EventSource cannot set headers)
-func withAuth(next http.Handler, token string) http.Handler {
+func withAuth(next http.Handler, token string, limiter *authAttemptLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token == "" || !authRequiredForPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if tokenEqual(bearerToken(r.Header.Get("Authorization")), token) ||
-			tokenEqual(strings.TrimSpace(r.URL.Query().Get("token")), token) {
+		ip := remoteIP(r)
+		if !limiter.allow(ip) {
+			w.Header().Set("Retry-After", strconv.Itoa(int(authBlockDuration/time.Second)))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"ok": false, "error": "认证尝试过于频繁，请稍后再试",
+			})
+			return
+		}
+		bearer := bearerToken(r.Header.Get("Authorization"))
+		queryToken := strings.TrimSpace(r.URL.Query().Get("token"))
+		if tokenEqual(bearer, token) || tokenEqual(queryToken, token) {
+			limiter.reset(ip)
 			next.ServeHTTP(w, r)
 			return
+		}
+		if bearer != "" || queryToken != "" {
+			limiter.fail(ip)
 		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"ok": false, "error": "需要有效的访问 token",
