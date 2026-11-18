@@ -18,15 +18,15 @@ import (
 	"time"
 )
 
-// ── 用量台账（跨会话 · 落盘 · 不随 agent 的 30 天会话清理失效）────────────
+// ── 用量台账（跨会话 · 落盘 · 不随 agent 的会话清理失效）────────────
 //
-// 为什么需要：grok agent 的 cleanup_stale_sessions 按文件 mtime 删除 30 天前
-// 的会话文件（DEFAULT_CLEANUP_TTL_DAYS = 30），而 updates.jsonl 是用量的唯一
-// 载体——源文件被删后那部分历史用量无法再计算，「全部」窗口因此实际只覆盖
-// 约 30 天（实测本机「全部」6.82G 与「近 30 天」6.79G 只差 0.45%）。台账在
-// 文件被删之前把回合用量抄写一份到 ~/.capri-host/usage-ledger.jsonl，此后
-// 即使源文件消失，历史用量仍可长期回溯（实测 580 个文件 / 1.28GB 的回合
-// 事件，台账约 1MB）。
+// 为什么需要：grok agent 的 cleanup_stale_sessions 在启用 `[storage] cleanup_ttl_days`
+// 时，会按会话最后活动时间删除空闲超过 TTL 的整个会话目录（Grok Build 1.0.37 及以前默认
+// 30 天；1.0.38+ 默认关闭，需要显式配置）。updates.jsonl 是用量的唯一载体——会话目录被
+// 删后那部分历史用量无法再计算，「全部」窗口因此最多只覆盖清理保留期内的数据（实测启用
+// 30 天清理时，本机「全部」6.82G 与「近 30 天」6.79G 只差 0.45%）。台账在目录被删之前
+// 把回合用量抄写一份到 ~/.capri-host/usage-ledger.jsonl，此后即使源文件消失，历史用量仍
+// 可长期回溯（实测 580 个文件 / 1.28GB 的回合事件，台账约 1MB）。
 //
 // 口径与直扫路径完全一致（复用同一套解析函数 usageInts / parseStoredUsageEvent）：
 // 一条 turn_completed 事件 = 一条台账记录，per-model 明细原样保留，不做任何
@@ -609,7 +609,7 @@ func (b *Bridge) syncUsageLedger() error {
 		toScan = append(toScan, fileToScan{path: p, cursor: cur})
 	}
 
-	// 僵尸游标清理 (GC)：源文件被 30 天清理机制删除后，从 cursors 中剔除
+	// 僵尸游标清理 (GC)：源文件被会话清理机制删除后，从 cursors 中剔除
 	var stalePaths []string
 	for oldPath := range cursorsCopy {
 		if _, ok := pathSet[oldPath]; !ok {

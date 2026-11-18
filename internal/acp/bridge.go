@@ -115,7 +115,7 @@ type Bridge struct {
 	// 仅流水期顶部广播使用；turn-end 提取的事件不受影响。b.mu 保护。
 	usageLastUsed map[string]int64
 	// ledger 是用量落盘台账（~/.capri-host/usage-ledger.jsonl）。它把回合
-	// 用量在源文件被删之前抄一份，使历史用量不随 agent 的 30 天会话清理
+	// 用量在源文件被删之前抄一份，使历史用量不随 agent 的会话清理
 	// 消失；见 usage_ledger.go。非 nil（关闭时内部判空跳过）。
 	ledger *usageLedger
 	// liveTools 是 per-session 的实时工具事件合成 ID 注入器（与历史主路径
