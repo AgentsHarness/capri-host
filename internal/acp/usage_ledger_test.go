@@ -39,7 +39,7 @@ func ledgerLine(ts int64, promptID string, in, out, cached int64) string {
 	})
 }
 
-// 台账落盘后，即使源 updates.jsonl 被删（模拟 agent 的 30 天清理），
+// 台账落盘后，即使源 updates.jsonl 被删（模拟 agent 的会话清理），
 // 用量仍可查——这是本次改动的核心目的。
 func TestUsageLedgerSurvivesSourceDeletion(t *testing.T) {
 	home := t.TempDir()
@@ -62,7 +62,7 @@ func TestUsageLedgerSurvivesSourceDeletion(t *testing.T) {
 			rep.Total.Turns, rep.Total.InputTokens)
 	}
 
-	// 模拟 30 天清理：删掉源文件。
+	// 模拟会话清理：删掉源文件（真实清理会删除整个会话目录）。
 	if err := os.Remove(filepath.Join(home, "sessions", EncodeCwdDirname("/ws"), "s1", "updates.jsonl")); err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestUsageLedgerParallelSyncAndGC(t *testing.T) {
 	}
 	b.ledger.mu.Unlock()
 
-	// 删除 s5 文件，模拟 agent 的 30 天清理
+	// 删除 s5 文件，模拟会话清理（真实清理会删除整个会话目录）
 	s5Path := sessionUpdatesFile(home, "/ws", "s5")
 	if err := os.Remove(s5Path); err != nil {
 		t.Fatal(err)
