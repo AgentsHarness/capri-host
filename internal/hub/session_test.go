@@ -675,6 +675,41 @@ func TestDownReceiverUsesAdvertisedWindow(t *testing.T) {
 	}
 }
 
+// TestDownAckIsEmittedWithoutWaitingForHeartbeat: a request frame's ack must
+// not wait for the periodic heartbeat. The handler blocks, so the only frame
+// that can carry the ack is the delayed-ACK path.
+func TestDownAckIsEmittedWithoutWaitingForHeartbeat(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	c := NewClient(Config{
+		HostID: "h1", Token: "tok123",
+		Local: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-release
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}),
+	})
+	h := newSessionHarness(t, c, newTestBridge())
+	h.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
+	start := time.Now()
+	h.tr.push(t, requestFrame(1, 0, "ack-1", "GET", "/api/slow", ""))
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		fr, ok := h.tr.tryFrame(time.Until(deadline))
+		if !ok {
+			t.Fatal("no frame carrying the down ack within 500ms")
+		}
+		if fr.Type == wire.TypeRespond {
+			t.Fatalf("handler answered before it was released: %+v", fr)
+		}
+		if fr.Type == wire.TypeHeartbeat && fr.Ack >= 1 {
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Fatalf("ack took %s, want less than 500ms", elapsed)
+			}
+			return
+		}
+	}
+}
+
 func waitRespond(t *testing.T, tr *fakeTransport) wire.Frame {
 	t.Helper()
 	return tr.nextOfType(t, wire.TypeRespond, 5*time.Second)

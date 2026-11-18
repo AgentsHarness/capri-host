@@ -124,10 +124,13 @@ type session struct {
 	// probeSeq mints liveness probe nonces.
 	probeSeq atomic.Uint64
 
-	// Loop-owned link state: the hub's last heartbeat status and whether the
-	// last frame advanced the uplink watermark.
+	// Loop-owned link state: the hub's last heartbeat status, whether the
+	// last frame advanced the uplink watermark, and the delayed-ACK timer for
+	// a down-ack that has no other outbound frame to ride on.
 	lastStatus  wire.HeartbeatStatus
 	ackProgress bool
+	ackPending  bool
+	ackDue      time.Time
 
 	ctx      context.Context
 	stopOnce sync.Once
@@ -279,6 +282,9 @@ func (s *session) run(reader <-chan readResult) (wire.CloseReason, error) {
 		if s.hasPending() && !s.w.Busy() && rtoAt.Before(next) {
 			next = rtoAt
 		}
+		if s.ackPending && s.ackDue.Before(next) {
+			next = s.ackDue
+		}
 		if d := s.probeDeadline(lastRecv, probeNonce, probeSentAt); d.Before(next) {
 			next = d
 		}
@@ -329,6 +335,13 @@ func (s *session) run(reader <-chan readResult) (wire.CloseReason, error) {
 
 		case <-timer.C:
 			now := time.Now()
+			if s.ackPending && !now.Before(s.ackDue) {
+				// A down frame advanced the ack watermark but no outbound
+				// frame has carried it yet. Emit a heartbeat now instead of
+				// waiting for the periodic one: the ack latency must not
+				// equal the keepalive interval.
+				s.sendHeartbeat()
+			}
 			if !now.Before(nextHB) {
 				s.sendHeartbeat()
 				nextHB = now.Add(s.hbInterval(s.lastStatus.Busy))
@@ -586,6 +599,14 @@ func (s *session) acceptDown(f wire.Frame, raw []byte, apply func(wire.Frame) (w
 	}
 	s.c.setDownApplied(ack)
 	s.downAck.Store(ack)
+	if ack > prev {
+		// The request is delivered as soon as its frame is applied; this is
+		// independent of how long the local handler runs. Arm a short
+		// delayed-ACK timer so a quiet link does not wait for the periodic
+		// heartbeat to carry the new watermark.
+		s.ackPending = true
+		s.ackDue = time.Now().Add(wire.AckDelay)
+	}
 	return 0, nil
 }
 
@@ -625,6 +646,9 @@ func (s *session) sendHeartbeat() {
 		return
 	}
 	s.lastStatus = st
+	// This frame carries the latest down ack; a pending delayed ACK no
+	// longer needs its own timer.
+	s.ackPending = false
 	s.w.postControl(payload)
 }
 
@@ -639,6 +663,7 @@ func (s *session) sendProbe(nonce uint64) {
 	if err != nil {
 		return
 	}
+	s.ackPending = false
 	s.w.postControl(payload)
 }
 
@@ -652,6 +677,7 @@ func (s *session) sendProbeAck(nonce uint64) {
 	if err != nil {
 		return
 	}
+	s.ackPending = false
 	s.w.postControl(payload)
 }
 

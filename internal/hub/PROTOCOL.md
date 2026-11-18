@@ -14,7 +14,9 @@
   `hello_ack` 后，下行 seq、上行水位、重传与空闲计时都交给会话循环。
 - 可靠帧带 seq：`events`、`audience`、`request`；不可靠帧必须不带：
   `hello`、`hello_ack`、`hb`、`respond`。
-- `ack` 是本端对反方向的水位，随可携带它的帧一起发出。
+- `ack` 是本端对反方向的水位，随可携带它的帧一起发出。下行 ack 前进后，
+  如果 `wire.AckDelay`（20ms）内没有其他出站帧，必须立即补一帧 heartbeat；
+  不能等周期心跳，否则确认延迟会等于 keepalive。
 - `audience` 是绝对状态：hub 可能在未确认期间原地更新同一 seq 的 payload。
   收到 seq 不高于已应用水位的 `audience` 时，只要 `gen` 更新，仍必须应用，
   不能按普通重传丢弃。
