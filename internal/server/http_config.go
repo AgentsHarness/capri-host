@@ -37,6 +37,19 @@ type hostConfigUpdate struct {
 	KeepAwake         *bool   `json:"keep_awake"`
 }
 
+// handleDetectGrok 在 host 所在机器上按常见安装路径探测 grok，供设置页的
+// 「探测 grok」按钮使用。前端跑在浏览器里，读不到本机文件系统。
+func (s *Server) handleDetectGrok(w http.ResponseWriter, r *http.Request) {
+	path := config.DiscoverGrokBin()
+	if path == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "error": "没有找到 grok，请先安装 Grok Build 或填写绝对路径",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path})
+}
+
 func (s *Server) handleGetHostConfig(w http.ResponseWriter, r *http.Request) {
 	cfgFile, err := config.LoadFile()
 	if err != nil {

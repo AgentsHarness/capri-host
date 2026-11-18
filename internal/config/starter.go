@@ -11,10 +11,11 @@ import (
 
 // This file writes the starter config.json.
 //
-// Capri.app does not need it: it has a form for these settings, so the file is
-// an implementation detail there. The Windows tray hands the user a text
-// editor, and a file containing only {"port": 8765} answers none of "what else
-// can this host be told?" — so the file the tray opens has to teach.
+// Capri.app does not need it: its settings live in the embedded web page at
+// /settings, so the file is an implementation detail there. The Windows tray
+// hands the user a text editor, and a file containing only {"port": 8765}
+// answers none of "what else can this host be told?" — so the file the tray
+// opens has to teach.
 
 // StarterFile is the content of a brand-new config.json: the values the host
 // will actually run with, every key spelled out.

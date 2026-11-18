@@ -6,6 +6,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 
 // Capri.ico 由 packaging/macos/render-menubar-icon.swift 的 drawAppIcon 绘出
 // （16/20/24/32/48/64/128/256 PNG）。托盘运行时读它；make-exes.sh 再把它嵌进 Capri.exe。
+//
 //go:embed assets/Capri.ico
 var assets embed.FS
 
@@ -74,6 +76,10 @@ type trayApp struct {
 	// 退出
 	mQuit *systray.MenuItem
 
+	// 设置页保存的偏好。只在值变化时应用一次，避免和系统设置互相覆盖。
+	lastStartAtLogin *bool
+	lastKeepAwake    *bool
+
 	hubShown bool
 	quitOnce sync.Once
 }
@@ -121,6 +127,28 @@ func (t *trayApp) onReady() {
 	t.reloadSettings()
 	t.refreshNet()
 
+	s := t.settingsSnapshot()
+	startAtLogin := s.ShouldStartAtLogin()
+	keepAwake := s.ShouldKeepAwake()
+	t.lastStartAtLogin = &startAtLogin
+	t.lastKeepAwake = &keepAwake
+	if startAtLogin && autostartSupported() && !autostartEnabled() {
+		if err := autostartSet(true); err != nil {
+			logf("按配置开启开机自启失败: %v", err)
+		}
+	}
+	// 配置文件还没写过这个键、但系统登录项已经启用时，把它写回配置，
+	// 保证网页设置页显示和实际登录项一致。
+	if autostartSupported() && autostartEnabled() && s.StartAtLogin == nil {
+		enabled := true
+		if err := config.UpdateFile(func(f *config.File) { f.StartAtLogin = &enabled }); err != nil {
+			logf("回写开机自启状态失败: %v", err)
+		} else {
+			startAtLogin = true
+			t.lastStartAtLogin = &startAtLogin
+		}
+	}
+
 	if fixed, err := autostartSync(); err != nil {
 		logf("检查开机自启失败: %v", err)
 	} else if fixed {
@@ -133,9 +161,9 @@ func (t *trayApp) onReady() {
 
 	systray.AddSeparator()
 	// 2. 界面与连接
-	t.mConsole = systray.AddMenuItem("打开 Capri 控制台", "在浏览器中打开本机页面，未运行时会自动启动")
+	t.mConsole = systray.AddMenuItem("打开 Capri FE", "在浏览器中打开本机页面，未运行时会自动启动")
 	t.mCopyLAN = systray.AddMenuItem("复制内网访问地址", "复制同一局域网内其他设备可访问的地址到剪贴板")
-	t.mHub = systray.AddMenuItem("打开 Hub 控制台", "在浏览器中打开已连接的 Hub 网页")
+	t.mHub = systray.AddMenuItem("打开 Hub 地址", "在浏览器中打开已连接的 Hub 网页")
 	t.mHub.Hide()
 
 	systray.AddSeparator()
@@ -273,6 +301,7 @@ func (t *trayApp) refresh() {
 	running := t.host.running()
 
 	t.reloadSettings()
+	t.applyConfigPrefs()
 	port := t.settingsSnapshot().ListenPort()
 	if running {
 		if p, _, ok := t.host.endpoint(); ok {
@@ -340,6 +369,35 @@ func (t *trayApp) refresh() {
 			} else {
 				t.mBoot.Uncheck()
 			}
+		}
+	}
+}
+
+// applyConfigPrefs 把设置页写入的 start_at_login / keep_awake 落到系统
+// 自启项和电源请求上。refresh 本来就每拍重读配置，这里只比较值变化，
+// 因此网页保存后下一拍即生效，也不会覆盖用户在系统设置里的改动。
+func (t *trayApp) applyConfigPrefs() {
+	s := t.settingsSnapshot()
+	if t.lastStartAtLogin == nil || *t.lastStartAtLogin != s.ShouldStartAtLogin() {
+		want := s.ShouldStartAtLogin()
+		t.lastStartAtLogin = &want
+		if autostartSupported() {
+			if err := autostartSet(want); err != nil {
+				logf("应用开机自启设置失败: %v", err)
+			}
+		}
+	}
+	if t.lastKeepAwake == nil || *t.lastKeepAwake != s.ShouldKeepAwake() {
+		want := s.ShouldKeepAwake()
+		t.lastKeepAwake = &want
+		var err error
+		if want {
+			err = t.sleep.Enable()
+		} else {
+			err = t.sleep.Disable()
+		}
+		if err != nil {
+			logf("应用休眠设置失败: %v", err)
 		}
 	}
 }
@@ -467,7 +525,13 @@ func (t *trayApp) onOpenSettingsWeb() {
 		t.hostNotReady(port)
 		return
 	}
-	openURL(fmt.Sprintf("http://localhost:%d/settings", port))
+	settingsURL := fmt.Sprintf("http://localhost:%d/settings", port)
+	// 设置页必须钉在这台 Host 上：hub 模式下没有 ?host= 时，hub 会转给
+	// 「最近心跳的在线 Host」，多台在线时状态与保存都会飘到别的机器。
+	if id := strings.TrimSpace(t.settingsSnapshot().HostID); id != "" {
+		settingsURL += "?host=" + url.QueryEscape(id)
+	}
+	openURL(settingsURL)
 }
 
 func (t *trayApp) onEditSettings() {
@@ -495,6 +559,11 @@ func (t *trayApp) onToggleAutostart() {
 		logf("已关闭开机自启")
 		notify("Capri", "已关闭开机自启")
 	}
+	if err := config.UpdateFile(func(f *config.File) { f.StartAtLogin = &want }); err != nil {
+		logf("保存开机自启设置失败: %v", err)
+	} else {
+		t.lastStartAtLogin = &want
+	}
 }
 
 func (t *trayApp) onToggleAwake() {
@@ -513,9 +582,13 @@ func (t *trayApp) onToggleAwake() {
 		logf("已恢复正常休眠")
 		notify("Capri", "已恢复系统休眠设置")
 	}
-	_ = config.UpdateFile(func(f *config.File) {
+	if err := config.UpdateFile(func(f *config.File) {
 		f.KeepAwake = &on
-	})
+	}); err != nil {
+		logf("保存休眠设置失败: %v", err)
+	} else {
+		t.lastKeepAwake = &on
+	}
 }
 
 func (t *trayApp) onInfo() {

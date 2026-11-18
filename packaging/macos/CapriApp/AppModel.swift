@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 
 final class AppModel: ObservableObject {
@@ -8,26 +9,9 @@ final class AppModel: ObservableObject {
     @Published var statusText = "已停止"
     @Published var toggleTitle = "启动 Host"
     @Published var toggleDisabled = false
+    @Published var restartDisabled = true
     @Published var startAtLogin = false
     @Published var keepAwake = false
-    @Published var hint = ""
-
-    @Published var hostName = ""
-    @Published var hostID = ""
-    @Published var port = "8765"
-    @Published var bindLAN = false
-    @Published var feToken = ""
-    @Published var hubURL = ""
-    @Published var pairCode = ""
-    @Published var grokBin = ""
-    @Published var proxy = ""
-    @Published var noProxy = ""
-    @Published var agentProxy = true
-    @Published var hubProxy = true
-    @Published var startHostOnLaunch = true
-    @Published var hubTokenReady = false
-    @Published var hubTokenCaption = ""
-    @Published var rePairExpanded = false
 
     @Published var hubSnapshot: HubSnapshot?
     @Published var lanBound = false
@@ -37,17 +21,34 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
     private var hubFetchGen = 0
     private var hubFetchBusy = false
+    private var lastStartAtLoginPref: Bool?
+    private var lastKeepAwakePref: Bool?
+    private var configWatch: DispatchSourceFileSystemObject?
 
     private init() {}
 
     func bootstrap() {
         appLog("Capri-app \(capriVersion) launched")
-        loadForm()
-        startAtLogin = Autostart.isEnabled || ConfigFile.load().shouldStartAtLogin
-        keepAwake = sleepInhibitor.isEnabled || ConfigFile.load().shouldKeepAwake
-        if keepAwake {
+
+        var f = ConfigFile.load()
+        // 配置里还没写过这个键、但系统登录项已经启用（例如用户在「系统设置」
+        // 里手动开启）时，把它写回配置，保证网页设置页显示的不是过期值。
+        if Autostart.isEnabled && f.startAtLogin == nil {
+            try? ConfigFile.update { $0.startAtLogin = true }
+            f.startAtLogin = true
+        }
+        lastStartAtLoginPref = f.shouldStartAtLogin
+        lastKeepAwakePref = f.shouldKeepAwake
+        if f.shouldStartAtLogin {
+            try? Autostart.setEnabled(true)
+        }
+        if f.shouldKeepAwake {
             _ = sleepInhibitor.enable()
         }
+        startAtLogin = Autostart.isEnabled
+        keepAwake = sleepInhibitor.isEnabled
+
+        startConfigWatcher()
         refreshStatus()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.refreshStatus()
@@ -57,80 +58,77 @@ final class AppModel: ObservableObject {
         }
 
         if !ConfigFile.exists() {
-            SettingsWindow.show()
+            openSettings()
             return
         }
-        if startAtLogin {
-            try? Autostart.setEnabled(true)
-        }
-        if ConfigFile.load().shouldStartHostOnLaunch {
+        if f.shouldStartHostOnLaunch {
             startHost()
         }
     }
 
-    func loadForm() {
-        let f = ConfigFile.load()
-        hostName = f.hostName?.nilIfEmpty ?? Paths.defaultHostName()
-        hostID = f.hostID?.nilIfEmpty ?? Paths.defaultHostID()
-        port = String(f.listenPort)
-        bindLAN = f.isLAN
-        feToken = f.feToken ?? ""
-        hubURL = f.hubURL?.nilIfEmpty ?? HubState.load()?.url ?? ""
-        grokBin = f.grokBin ?? ""
-        proxy = f.proxy ?? ""
-        noProxy = f.noProxy ?? ""
-        agentProxy = f.shouldAgentProxy
-        hubProxy = f.shouldHubProxy
-        startHostOnLaunch = f.shouldStartHostOnLaunch
-        startAtLogin = f.shouldStartAtLogin || Autostart.isEnabled
-        keepAwake = sleepInhibitor.isEnabled || f.shouldKeepAwake
-        hint = ""
-        rePairExpanded = false
-        refreshHubTokenState()
-        if hubTokenReady {
-            pairCode = ""
-        } else {
-            pairCode = f.hubPairCode ?? ""
+    /// 设置页保存后会原子替换 config.json。监听目录而不是轮询文件：
+    /// 写临时文件再 rename 也能收到 write/rename 事件，平时没有额外开销。
+    private func startConfigWatcher() {
+        let dir = ConfigFile.configDir()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fd = open(dir.path, O_EVTONLY)
+        guard fd >= 0 else {
+            appLog("无法监听配置文件目录: \(dir.path)")
+            return
         }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .rename, .delete],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            self?.syncSystemPrefs()
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        source.resume()
+        configWatch = source
     }
 
-    func refreshHubTokenState() {
-        let typed = HubURL.normalize(hubURL)
-        let st = HubState.load()
-        let storedRaw = st?.url?.nilIfEmpty ?? hubSnapshot?.storedUrl?.nilIfEmpty ?? ""
-        let stored = HubURL.normalize(storedRaw)
-
-        let nextReady: Bool
-        let nextCaption: String
-        if typed.isEmpty {
-            if st?.hasToken == true {
-                nextReady = true
-                nextCaption = "已有可用 token（\(stored.isEmpty ? "hub.json" : stored)），启动 Host 会自动连上。"
-            } else {
-                nextReady = false
-                nextCaption = "一次性配对码。成功后写在 ~/.capri-host/hub.json，之后不用再填。"
-            }
-        } else if st?.matches(hubURL: typed) == true {
-            nextReady = true
-            if host.isRunning, ConfigFile.load().hubURL?.nilIfEmpty != nil {
-                nextCaption = "已有可用 token，Host 会用它连 Hub，不必再填配对码。"
-            } else {
-                nextCaption = "已有可用凭证（\(stored)），可直接连上或更换配对。"
-            }
-        } else {
-            nextReady = false
-            if !stored.isEmpty {
-                nextCaption = "hub.json 里的 token 绑定的是 \(stored)，和当前 Hub URL 不一致，需要新配对码。"
-            } else {
-                nextCaption = "一次性配对码。成功后写在 ~/.capri-host/hub.json，之后不用再填。"
+    /// 把网页设置页写入的 start_at_login / keep_awake 落到系统登录项和
+    /// 电源断言上。只在配置文件变化时应用，避免和用户在系统设置里做的
+    /// 修改互相打架。
+    private func syncSystemPrefs() {
+        let f = ConfigFile.load()
+        if lastStartAtLoginPref != f.shouldStartAtLogin {
+            lastStartAtLoginPref = f.shouldStartAtLogin
+            appLog("配置变更: start_at_login=\(f.shouldStartAtLogin)")
+            do {
+                try Autostart.setEnabled(f.shouldStartAtLogin)
+            } catch {
+                appLog("登录项设置失败: \(error.localizedDescription)")
             }
         }
-        if hubTokenReady != nextReady { hubTokenReady = nextReady }
-        if hubTokenCaption != nextCaption { hubTokenCaption = nextCaption }
+        if lastKeepAwakePref != f.shouldKeepAwake {
+            lastKeepAwakePref = f.shouldKeepAwake
+            appLog("配置变更: keep_awake=\(f.shouldKeepAwake)")
+            if f.shouldKeepAwake {
+                if !sleepInhibitor.enable() {
+                    appLog("开启休眠阻止失败")
+                }
+            } else {
+                sleepInhibitor.disable()
+            }
+        }
+
+        let login = Autostart.isEnabled
+        if startAtLogin != login { startAtLogin = login }
+        let awake = sleepInhibitor.isEnabled
+        if keepAwake != awake { keepAwake = awake }
     }
 
     func refreshStatus() {
         let f = ConfigFile.load()
+        let login = Autostart.isEnabled
+        if startAtLogin != login { startAtLogin = login }
+        let awake = sleepInhibitor.isEnabled
+        if keepAwake != awake { keepAwake = awake }
         if lanBound != f.isLAN { lanBound = f.isLAN }
         let ours = host.isRunning
         let portNum = (ours ? host.endpoint()?.port : nil) ?? f.listenPort
@@ -185,19 +183,19 @@ final class AppModel: ObservableObject {
         if statusText != text { statusText = text }
         if toggleTitle != title { toggleTitle = title }
         if toggleDisabled != disabled { toggleDisabled = disabled }
+        let canRestart = ours
+        if restartDisabled != !canRestart { restartDisabled = !canRestart }
     }
 
     func toggleHost() {
         if host.isRunning {
             stopHost()
-            refreshStatus()
-            return
+        } else {
+            startHost()
         }
-        startHost()
     }
 
     func startHost() {
-        hint = ""
         statusText = "正在启动…"
         toggleTitle = "停止 Host"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -206,18 +204,15 @@ final class AppModel: ObservableObject {
                 try self.host.start()
                 let ok = self.host.waitUntilListening(timeout: 12)
                 DispatchQueue.main.async {
-                    if ok {
-                        let port = self.host.endpoint()?.port ?? ConfigFile.load().listenPort
-                        self.hint = "Host 已在 :\(port) 运行"
-                    } else {
+                    if !ok {
                         let err = self.host.lastError.isEmpty ? "等待端口监听超时" : self.host.lastError
-                        self.hint = err
+                        appLog("启动 Host 失败: \(err)")
                     }
                     self.refreshStatus()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.hint = error.localizedDescription
+                    appLog("启动 Host 失败: \(error.localizedDescription)")
                     self.refreshStatus()
                 }
             }
@@ -225,51 +220,105 @@ final class AppModel: ObservableObject {
     }
 
     func stopHost() {
+        guard host.isRunning else {
+            refreshStatus()
+            return
+        }
+        statusText = "正在停止…"
+        toggleDisabled = true
+        restartDisabled = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            self.host.stop()
+            DispatchQueue.main.async {
+                self.refreshStatus()
+            }
+        }
+    }
+
+    func stopHostOnTerminate() {
         host.stop()
-        refreshStatus()
+    }
+
+    func restartHost() {
+        guard host.isRunning else {
+            startHost()
+            return
+        }
+        statusText = "正在重启…"
+        toggleDisabled = true
+        restartDisabled = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            self.host.stop()
+            DispatchQueue.main.async {
+                self.startHost()
+            }
+        }
     }
 
     func openWeb() {
+        openWebPage(path: "/")
+    }
+
+    func openSettings() {
+        // 设置页必须钉在这台 Host 上：hub 模式下没有 ?host= 时，hub 会
+        // 转给「最近心跳的在线 Host」，多台在线时状态与保存都会飘到别的
+        // 机器。把本机 hostId 显式带进 URL，页面启动时据此固定目标。
+        var path = "/settings"
+        if let id = ConfigFile.load().hostID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !id.isEmpty,
+           let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            path += "?host=\(encoded)"
+        }
+        openWebPage(path: path)
+    }
+
+    private func openWebPage(path: String) {
         let filePort = ConfigFile.load().listenPort
         let portNum = (host.isRunning ? host.endpoint()?.port : nil) ?? filePort
-        if HostProcess.isListening(port: portNum), let url = URL(string: "http://127.0.0.1:\(portNum)/") {
+        if HostProcess.isListening(port: portNum), let url = URL(string: "http://127.0.0.1:\(portNum)\(path)") {
             Paths.open(url)
             return
         }
         startHost()
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
             _ = self.host.waitUntilListening(timeout: 12)
             DispatchQueue.main.async {
                 let port = self.host.endpoint()?.port ?? filePort
-                if HostProcess.isListening(port: port), let url = URL(string: "http://127.0.0.1:\(port)/") {
+                if HostProcess.isListening(port: port), let url = URL(string: "http://127.0.0.1:\(port)\(path)") {
                     Paths.open(url)
                 } else {
-                    SettingsWindow.show()
+                    self.showStartFailure()
                 }
                 self.refreshStatus()
             }
         }
     }
 
+    private func showStartFailure() {
+        appLog("无法打开设置页：Host 未就绪")
+        let alert = NSAlert()
+        alert.messageText = "Host 未能启动"
+        alert.informativeText = "设置页由本机 Host 提供。请从托盘菜单打开日志，检查端口占用后重试。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
     func copyLANAddress() {
         let filePort = ConfigFile.load().listenPort
         let port = (host.isRunning ? host.endpoint()?.port : nil) ?? filePort
         guard let ip = LANAddress.preferredIPv4() else {
-            hint = "找不到可用的局域网地址"
+            appLog("复制局域网地址失败：找不到可用的局域网地址")
             return
         }
         let text = "http://\(ip):\(port)/"
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        hint = "已复制 \(text)"
-    }
-
-    private func liveAPI() -> (port: Int, token: String) {
-        if host.isRunning, let ep = host.endpoint() {
-            return ep
-        }
-        let f = ConfigFile.load()
-        return (f.listenPort, f.feToken ?? "")
+        appLog("已复制局域网地址 \(text)")
     }
 
     private func pollHub(port: Int, token: String) {
@@ -282,7 +331,7 @@ final class AppModel: ObservableObject {
             await MainActor.run {
                 self.hubFetchBusy = false
                 guard gen == self.hubFetchGen else { return }
-                // uptimeSec 每秒 +1，菜单和设置都不显示。整份写回 @Published
+                // uptimeSec 每秒 +1，菜单不显示。整份写回 @Published
                 // 会让 MenuBarExtra 每拍再登记一份观察且不释放。
                 if let result {
                     if self.hubSnapshot?.ignoringUptime() != result.ignoringUptime() {
@@ -291,7 +340,6 @@ final class AppModel: ObservableObject {
                 } else if self.hubSnapshot != nil {
                     self.hubSnapshot = nil
                 }
-                self.refreshHubTokenState()
             }
         }
     }
@@ -306,178 +354,35 @@ final class AppModel: ObservableObject {
         Paths.open(Paths.logDir())
     }
 
-    func detectGrok() {
-        if let found = Paths.discoverGrok() {
-            grokBin = found
-            hint = "找到 \(found)"
-        } else {
-            hint = "没有找到 grok，请先安装 Grok Build 或填绝对路径"
-        }
-    }
-
     func setStartAtLogin(_ on: Bool) {
         do {
             try Autostart.setEnabled(on)
-            startAtLogin = on
-            try ConfigFile.update { $0.startAtLogin = on }
-        } catch {
-            hint = "登录项: \(error.localizedDescription)"
             startAtLogin = Autostart.isEnabled
-            SettingsWindow.show()
+            try ConfigFile.update { $0.startAtLogin = on }
+            lastStartAtLoginPref = on
+        } catch {
+            appLog("登录项设置失败: \(error.localizedDescription)")
+            startAtLogin = Autostart.isEnabled
+            lastStartAtLoginPref = ConfigFile.load().shouldStartAtLogin
         }
     }
 
     func setKeepAwake(_ on: Bool) {
         if on {
-            _ = sleepInhibitor.enable()
+            if !sleepInhibitor.enable() {
+                appLog("开启休眠阻止失败")
+            }
         } else {
             sleepInhibitor.disable()
         }
         keepAwake = sleepInhibitor.isEnabled
-        try? ConfigFile.update { $0.keepAwake = on }
-        hint = keepAwake ? "已开启休眠阻止（屏幕可正常息屏）" : "已恢复系统休眠设置"
-    }
-
-    func onlinePair() {
-        let ep = liveAPI()
-        let portNum = ep.port
-        let token = ep.token
-        let code = pairCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        let url = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !code.isEmpty else {
-            hint = "请填写 6 位配对码"
-            return
-        }
-        hint = "正在配对 Hub…"
-        Task {
-            do {
-                let hub = try await HostApiClient.pair(port: portNum, token: token, hubURL: url, code: code)
-                await MainActor.run {
-                    self.hubSnapshot = hub
-                    self.pairCode = ""
-                    self.rePairExpanded = false
-                    self.hint = "配对成功，已连上 Hub：\(hub.hubUrl ?? url)"
-                    self.refreshStatus()
-                }
-            } catch {
-                await MainActor.run {
-                    self.hint = "配对失败: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    func onlineReuse() {
-        let ep = liveAPI()
-        let portNum = ep.port
-        let token = ep.token
-        let url = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        hint = "正在使用已有凭证连接 Hub…"
-        Task {
-            do {
-                let hub = try await HostApiClient.reuse(port: portNum, token: token, hubURL: url)
-                await MainActor.run {
-                    self.hubSnapshot = hub
-                    self.hint = "已用存留凭证连上 Hub：\(hub.hubUrl ?? url)"
-                    self.refreshStatus()
-                }
-            } catch {
-                await MainActor.run {
-                    self.hint = "复用凭证失败: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    func onlineDisconnect() {
-        let ep = liveAPI()
-        let portNum = ep.port
-        let token = ep.token
-        hint = "正在断开 Hub…"
-        Task {
-            do {
-                let hub = try await HostApiClient.disconnect(port: portNum, token: token)
-                await MainActor.run {
-                    self.hubSnapshot = hub
-                    self.hubURL = ""
-                    self.pairCode = ""
-                    self.hint = "已断开 Hub，切回仅本机模式"
-                    self.refreshStatus()
-                }
-            } catch {
-                await MainActor.run {
-                    self.hint = "断开失败: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    func save(andStart: Bool) {
-        guard let portNum = Int(port.trimmingCharacters(in: .whitespaces)), portNum > 0 else {
-            hint = "端口必须是正整数"
-            return
-        }
-        let trimmedName = hostName.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? Paths.defaultHostName()
-        let runningName = hubSnapshot?.hostName?.nilIfEmpty
-            ?? ConfigFile.load().hostName?.nilIfEmpty
-            ?? Paths.defaultHostName()
-        var draft = ConfigFile.load()
-        draft.bind = bindLAN ? "0.0.0.0" : "127.0.0.1"
-        draft.port = portNum
-        draft.feToken = feToken
-        if let err = draft.bindPolicyError() {
-            hint = err
-            return
-        }
-        let newPair = pairCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        let replacePair = !newPair.isEmpty && (rePairExpanded || !hubTokenReady)
-        if replacePair {
-            HubState.clear()
-        }
+        let target = keepAwake
         do {
-            try ConfigFile.update { f in
-                f.bind = bindLAN ? "0.0.0.0" : "127.0.0.1"
-                f.port = portNum
-                f.hostName = trimmedName
-                f.hubURL = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                f.hubPairCode = replacePair ? newPair : nil
-                f.feToken = feToken
-                f.grokBin = grokBin.trimmingCharacters(in: .whitespacesAndNewlines)
-                f.proxy = proxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-                f.noProxy = noProxy.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-                f.agentProxy = agentProxy
-                f.hubProxy = hubProxy
-                // 后端专用项，设置界面不暴露。update 在锁内重新从磁盘读取，
-                // 未在此处赋值的键会原样保留；唯独 ConfigFile 里没声明的键会在
-                // 解码阶段就被丢掉，所以 hub_quic_host 必须声明（见 ConfigFile.swift）。
-                f.startHostOnLaunch = startHostOnLaunch
-                f.startAtLogin = startAtLogin
-                f.keepAwake = keepAwake
-            }
-            try Autostart.setEnabled(startAtLogin)
-            hint = "已保存 \(ConfigFile.path().path)"
-            hostName = trimmedName
-            refreshHubTokenState()
-            if hubTokenReady {
-                rePairExpanded = false
-                pairCode = ""
-            }
+            try ConfigFile.update { $0.keepAwake = target }
+            lastKeepAwakePref = target
+            appLog(target ? "已开启休眠阻止（屏幕可正常息屏）" : "已恢复系统休眠设置")
         } catch {
-            hint = "保存失败: \(error.localizedDescription)"
-            return
-        }
-
-        if host.isRunning && trimmedName != runningName {
-            let ep = liveAPI()
-            Task {
-                _ = try? await HostApiClient.rename(port: ep.port, token: ep.token, name: trimmedName)
-            }
-        }
-
-        refreshStatus()
-        if andStart {
-            if host.isRunning { stopHost() }
-            startHost()
+            appLog("保存休眠设置失败: \(error.localizedDescription)")
         }
     }
 }

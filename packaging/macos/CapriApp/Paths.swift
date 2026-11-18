@@ -10,31 +10,6 @@ enum Paths {
     static func hostLog() -> URL { logDir().appendingPathComponent("Capri-host.log") }
     static func appLog() -> URL { logDir().appendingPathComponent("Capri-app.log") }
 
-    static func defaultHostName() -> String {
-        Host.current().localizedName ?? Host.current().name ?? "Local Host"
-    }
-
-    static func defaultHostID() -> String {
-        sanitizeHostID(defaultHostName())
-    }
-
-    static func sanitizeHostID(_ raw: String) -> String {
-        let lower = raw.lowercased()
-        var out = ""
-        var dash = false
-        for ch in lower {
-            if ch.isLetter || ch.isNumber {
-                out.append(ch)
-                dash = false
-            } else if !out.isEmpty && !dash {
-                out.append("-")
-                dash = true
-            }
-        }
-        let trimmed = out.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return trimmed.isEmpty ? "local" : trimmed
-    }
-
     static func findHostBinary() throws -> URL {
         if let env = ProcessInfo.processInfo.environment["CAPRI_HOST_BIN"], !env.isEmpty {
             let url = URL(fileURLWithPath: env)
@@ -55,22 +30,6 @@ enum Paths {
             if FileManager.default.isExecutableFile(atPath: url.path) { return url }
         }
         throw AppError("找不到 Capri-host（应在 Capri.app/Contents/MacOS/ 里）")
-    }
-
-    static func discoverGrok() -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let names = [
-            home.appendingPathComponent(".local/bin/grok"),
-            home.appendingPathComponent(".grok/bin/grok"),
-            URL(fileURLWithPath: "/opt/homebrew/bin/grok"),
-            URL(fileURLWithPath: "/usr/local/bin/grok"),
-        ]
-        for url in names {
-            if FileManager.default.isExecutableFile(atPath: url.path) {
-                return url.path
-            }
-        }
-        return nil
     }
 
     static func childEnvironment() -> [String: String] {

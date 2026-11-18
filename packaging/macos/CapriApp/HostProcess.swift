@@ -7,6 +7,10 @@ final class HostProcess {
     private(set) var lastError: String = ""
     private var boundPort: Int = 0
     private var boundToken: String = ""
+    /// Keeps the app out of App Nap while the host runs. It allows the system
+    /// to idle-sleep (unlike the optional IOKit "keep awake" assertion), but
+    /// stops macOS from coalescing the host's timers when the display is off.
+    private var activity: NSObjectProtocol?
 
     var isRunning: Bool {
         lock.lock()
@@ -59,6 +63,7 @@ final class HostProcess {
                 self.process = nil
                 try? self.logHandle?.close()
                 self.logHandle = nil
+                self.endActivityLocked()
                 if finished.terminationStatus != 0 {
                     self.lastError = "capri-host 退出码 \(finished.terminationStatus)"
                 }
@@ -66,7 +71,17 @@ final class HostProcess {
             self.lock.unlock()
             appLog("capri-host exited status=\(finished.terminationStatus)")
         }
-        try proc.run()
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Capri-host is running"
+        )
+        do {
+            try proc.run()
+        } catch {
+            ProcessInfo.processInfo.endActivity(activity)
+            throw error
+        }
+        self.activity = activity
         process = proc
         logHandle = handle
         boundPort = port
@@ -81,7 +96,10 @@ final class HostProcess {
         let port = boundPort
         let token = boundToken
         lock.unlock()
-        guard let proc, proc.isRunning else { return }
+        guard let proc, proc.isRunning else {
+            endActivity()
+            return
+        }
         appLog("stopping capri-host pid=\(proc.processIdentifier)")
 
         // Quit the listener this child bound, not the port now written in the file.
@@ -100,6 +118,26 @@ final class HostProcess {
             proc.interrupt()
             proc.terminate()
         }
+        // The termination handler may not run if the child ignores both
+        // signals; release the activity here as well. endActivity is
+        // idempotent.
+        endActivity()
+    }
+
+    private func endActivity() {
+        lock.lock()
+        defer { lock.unlock() }
+        endActivityLocked()
+    }
+
+    private func endActivityLocked() {
+        guard let activity else { return }
+        ProcessInfo.processInfo.endActivity(activity)
+        self.activity = nil
+    }
+
+    deinit {
+        endActivity()
     }
 
     func waitUntilListening(timeout: TimeInterval) -> Bool {

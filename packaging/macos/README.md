@@ -1,6 +1,6 @@
 # macOS 打包
 
-`make-app.sh` 组装 `Capri.app`（SwiftUI 菜单栏 + 内嵌 capri-host），`make-dmg.sh` 把它打成 dmg。
+`make-app.sh` 组装 `Capri.app`（SwiftUI 菜单栏 + 内嵌 capri-host；设置统一走内嵌前端的 `/settings` 页面），`make-dmg.sh` 把它打成 dmg。
 
 ```bash
 cd ../..                                    # 仓库根

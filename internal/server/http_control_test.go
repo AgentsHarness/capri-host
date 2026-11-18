@@ -390,3 +390,32 @@ func TestHostConfigGetAndPost(t *testing.T) {
 		t.Errorf("expected 400 for bind 0.0.0.0 without token, got %d", badRec.Code)
 	}
 }
+
+func TestDetectGrokEndpoint(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	grok := filepath.Join(tmpHome, ".local", "bin", "grok")
+	if err := os.MkdirAll(filepath.Dir(grok), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(grok, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newControlServer(t)
+	rec := postControlJSON(t, s, "/api/host/detect-grok", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		OK    bool   `json:"ok"`
+		Path  string `json:"path"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !out.OK || out.Path != grok {
+		t.Errorf("response = %+v, want ok path %s", out, grok)
+	}
+}

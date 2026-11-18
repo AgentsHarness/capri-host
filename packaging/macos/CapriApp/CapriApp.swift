@@ -11,18 +11,20 @@ struct CapriApp: App {
             Button(model.statusText) {}
                 .disabled(true)
             Divider()
-            Button("打开界面") { model.openWeb() }
+            Button("打开 Capri FE") { model.openWeb() }
             if model.lanBound {
                 Button("复制局域网地址") { model.copyLANAddress() }
             }
             if let hubURL = model.hubSnapshot?.hubUrl?.nilIfEmpty, model.hubSnapshot?.connected == true {
-                Button("打开 Hub 控制台") {
+                Button("打开 Hub 地址") {
                     if let u = URL(string: hubURL) { Paths.open(u) }
                 }
             }
             Button(model.toggleTitle) { model.toggleHost() }
                 .disabled(model.toggleDisabled)
-            Button("设置…") { SettingsWindow.show() }
+            Button("重启 Host") { model.restartHost() }
+                .disabled(model.restartDisabled)
+            Button("设置…") { model.openSettings() }
                 .keyboardShortcut(",", modifiers: .command)
             Toggle("阻止电脑休眠", isOn: Binding(
                 get: { model.keepAwake },
@@ -50,45 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        AppModel.shared.stopHost()
+        AppModel.shared.stopHostOnTerminate()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
-    }
-}
-
-final class SettingsWindow: NSObject, NSWindowDelegate {
-    static let shared = SettingsWindow()
-    private var window: NSWindow?
-
-    static func show() { shared.present() }
-
-    private func present() {
-        if window == nil {
-            let hosting = NSHostingController(rootView: SettingsView(model: AppModel.shared))
-            let w = NSWindow(contentViewController: hosting)
-            w.title = "Capri 设置"
-            w.styleMask = [.titled, .closable, .miniaturizable]
-            // ARC 下不能把 isReleasedWhenClosed 设为 true。关掉时丢掉引用，
-            // 设置页才会释放。
-            w.isReleasedWhenClosed = false
-            w.delegate = self
-            w.setContentSize(NSSize(width: 480, height: 700))
-            w.center()
-            window = w
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        let closing = window
-        window = nil
-        // 等这次关闭走完再释放，避免 AppKit 还在用这扇窗口。
-        DispatchQueue.main.async {
-            withExtendedLifetime(closing) {}
-        }
     }
 }
 

@@ -65,29 +65,6 @@ enum HostApiClient {
         return hub
     }
 
-    static func pair(port: Int, token: String, hubURL: String, code: String) async throws -> HubSnapshot {
-        try await postJSON(port: port, token: token, path: "/api/hub/pair", body: [
-            "hubUrl": hubURL,
-            "code": code
-        ])
-    }
-
-    static func reuse(port: Int, token: String, hubURL: String) async throws -> HubSnapshot {
-        try await postJSON(port: port, token: token, path: "/api/hub/reuse", body: [
-            "hubUrl": hubURL
-        ])
-    }
-
-    static func disconnect(port: Int, token: String) async throws -> HubSnapshot {
-        try await postJSON(port: port, token: token, path: "/api/hub/disconnect", body: [String: String]())
-    }
-
-    static func rename(port: Int, token: String, name: String) async throws -> HubSnapshot {
-        try await postJSON(port: port, token: token, path: "/api/host/rename", body: [
-            "name": name
-        ])
-    }
-
     static func quit(port: Int, token: String) async {
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/host/quit") else { return }
         var req = URLRequest(url: url, timeoutInterval: 2.0)
@@ -98,27 +75,5 @@ enum HostApiClient {
         }
         req.httpBody = "{}".data(using: .utf8)
         _ = try? await URLSession.shared.data(for: req)
-    }
-
-    private static func postJSON(port: Int, token: String, path: String, body: [String: String]) async throws -> HubSnapshot {
-        guard let url = URL(string: "http://127.0.0.1:\(port)\(path)") else {
-            throw URLError(.badURL)
-        }
-        var req = URLRequest(url: url, timeoutInterval: 25.0)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !token.isEmpty {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, res) = try await URLSession.shared.data(for: req)
-        let parsed = try JSONDecoder().decode(ApiResponse<HubSnapshot>.self, from: data)
-        guard let http = res as? HTTPURLResponse, http.statusCode == 200, parsed.ok else {
-            throw AppError(parsed.error ?? "请求失败")
-        }
-        guard let hub = parsed.hub else {
-            throw AppError("返回数据缺少 hub 状态")
-        }
-        return hub
     }
 }

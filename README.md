@@ -22,7 +22,7 @@
 
 **Capri**（Capricorn）是 [Grok Build](https://x.ai/cli) 的具体适配项目，我们基于 ACP 协议，搭配 capri-fe、capri-hub 实现远程 Agent 控制。
 
-一个进程、一个端口，同时提供 **Web 界面** 和接口。macOS 上还提供一个菜单栏应用，把启停和配置收进图形界面。
+一个进程、一个端口，同时提供 **Web 界面** 和接口。macOS 上还提供一个菜单栏应用，负责 Host 启停、日志和设置入口，配置本身在网页设置页完成。
 
 ```
 浏览器  ──本机──▶  Capri-host :8765  ──▶  grok
@@ -44,9 +44,9 @@
 下载 `Capri-macos.zip`（或 `Capri-macos.dmg`），把 `Capri.app` 拖进「应用程序」后打开。应用只提供 Apple Silicon（arm64）版本；Intel Mac 请从 Releases 取命令行二进制。
 
 1、菜单栏会出现摩羯图标。
-2、首次使用点击摩羯图标，前往设置，配置好后点击保存并启动。
-3、按钮左侧会提示 Host 已在 :8765 启动。
-4、点击菜单按钮，点击打开界面即可跳转本地 Web UI。
+2、首次使用点击摩羯图标，选择「设置…」，浏览器会打开本机的 `/settings` 页面。
+3、在网页里完成本机、Hub、代理和启动偏好配置，点击保存。
+4、回到托盘菜单启动或重启 Host，再点「打开 Capri FE」即可进入本地 Web UI。
 
 首次打开若被系统拦下，右键点「打开」，或：
 
@@ -110,8 +110,7 @@ macOS 应用同理：`./packaging/macos/make-app.sh`（arm64，macOS 13+）。
 
 在一台能被访问的服务器上先起 [capri-hub](https://github.com/AgentsHarness/capri-hub)，并部署 capri-fe，通过前端左上角添加 Host 获得配对码。
 
-macOS 应用在设置窗里填 Hub URL 和配对码即可，配对成功后地址会留在 `config.json`。
-Windows 托盘在设置界面配置，同样落在 `config.json`。
+macOS 应用和 Windows 托盘都在网页设置页里填 Hub URL 和配对码，配对成功后地址会留在 `config.json`。
 
 命令行启动则需要提供环境变量：
 

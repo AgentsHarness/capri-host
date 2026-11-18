@@ -125,6 +125,7 @@ func (s *Server) registerCoreRoutes(mux *http.ServeMux) {
 	// Host configuration read and update.
 	mux.HandleFunc("GET /api/host/config", s.handleGetHostConfig)
 	mux.HandleFunc("POST /api/host/config", s.handlePostHostConfig)
+	mux.HandleFunc("POST /api/host/detect-grok", s.handleDetectGrok)
 	// Graceful stop, for the supervisor process that spawned this host.
 	mux.HandleFunc("POST /api/host/quit", s.handleHostQuit)
 	mux.HandleFunc("GET /api/probe", s.handleProbe)
