@@ -75,17 +75,22 @@ func (a *relayAnswer) payload(seq uint64) ([]byte, bool) {
 }
 
 // advance records n as the hub's highest contiguous chunk and drops everything
-// it covers. The writing cursor only moves forward.
-func (a *relayAnswer) advance(n uint64) {
+// it covers, returning the dropped payload bytes so the outbox can release them
+// from its budget. The writing cursor only moves forward.
+func (a *relayAnswer) advance(n uint64) int {
 	if n > a.final {
 		n = a.final
 	}
 	if n <= a.acked {
-		return
+		return 0
 	}
 	drop := int(n - a.acked)
 	if drop > len(a.chunks) {
 		drop = len(a.chunks)
+	}
+	freed := 0
+	for _, c := range a.chunks[:drop] {
+		freed += len(c.payload)
 	}
 	a.chunks = a.chunks[drop:]
 	a.acked = n
@@ -95,6 +100,7 @@ func (a *relayAnswer) advance(n uint64) {
 	if a.inflight != 0 && a.inflight <= n {
 		a.inflight = 0
 	}
+	return freed
 }
 
 // relaySend is one chunk the writer should put on the wire.
@@ -413,7 +419,7 @@ func (o *relayOutbox) reconcile(acks []wire.RelayAck, handshake bool) []relayDro
 			drops = append(drops, relayDrop{reqID: id})
 			continue
 		default:
-			a.advance(ack.Chunk)
+			o.bytes -= a.advance(ack.Chunk)
 		}
 		if a.acked >= a.final {
 			o.releaseLocked(id)
