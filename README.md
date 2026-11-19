@@ -106,6 +106,18 @@ macOS 应用同理：`./packaging/macos/make-app.sh`（arm64，macOS 13+）。
 源码或版本一变，系统里已授权的屏幕录制等权限就失配，表现为反复弹权限提示。用证书签名则身份恒定，
 授权一次即可。首次使用先跑一次 `./packaging/macos/make-cert.sh` 创建本地自签证书。
 
+### 本地出发布包（不依赖 Actions）
+
+在 tag 对应提交上、macOS 本机执行：
+
+```bash
+scripts/release-local.sh v0.5.1 --build-only
+scripts/release-local.sh v0.5.1 --notes-file /tmp/notes.md
+```
+
+脚本会先构建 `../acp-fe` 并嵌入，再出 4 个平台二进制、Windows zip、macOS app/dmg，
+产物在 `dist/release/<tag>/`。`--allow-dirty` 可带未提交改动出包。
+
 ## 连接到 capri-hub
 
 在一台能被访问的服务器上先起 [capri-hub](https://github.com/AgentsHarness/capri-hub)，并部署 capri-fe，通过前端左上角添加 Host 获得配对码。

@@ -55,6 +55,7 @@ jobs:
         with:
           name: capri-fe-dist
           path: capri-fe/dist
+          retention-days: 1
 
   build:
     name: build (${{ matrix.goos }}-${{ matrix.goarch }})
@@ -116,6 +117,7 @@ jobs:
         with:
           name: Capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/Capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
+          retention-days: 1
           if-no-files-found: error
 
   # Windows ships one folder holding two processes, the same shape as
@@ -186,6 +188,7 @@ jobs:
         with:
           name: Capri-windows-${{ matrix.goarch }}
           path: dist/Capri-windows-${{ matrix.goarch }}.zip
+          retention-days: 1
           if-no-files-found: error
 
   macos-app:
@@ -246,6 +249,7 @@ jobs:
           path: |
             dist/Capri-macos.zip
             dist/Capri-macos.dmg
+          retention-days: 1
           if-no-files-found: error
 
   release:
