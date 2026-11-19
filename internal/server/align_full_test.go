@@ -53,7 +53,7 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 		t.Errorf("_meta mcpApps = %v, want true", meta["mcpApps"])
 	}
 
-	// clientCapabilities._meta：既有 5 键 + env-opt-in 键。
+	// clientCapabilities._meta：既有 6 键 + env-opt-in 键。
 	caps, _ := params["clientCapabilities"].(map[string]any)
 	cmeta, ok := caps["_meta"].(map[string]any)
 	if !ok {
@@ -62,7 +62,7 @@ func TestInitializeCarriesMetaAndCaps(t *testing.T) {
 	for _, k := range []string{
 		"x.ai/incrementalBashOutput", "x.ai/bashOutputNoColor",
 		"x.ai/gitHeadChanged", "x.ai/hunkTracker", "x.ai/userMessageEcho",
-		"x.ai/codeNavigation", "x.ai/fs_notify",
+		"x.ai/statusLine", "x.ai/codeNavigation", "x.ai/fs_notify",
 	} {
 		if _, has := cmeta[k]; !has {
 			t.Errorf("clientCapabilities._meta missing %s: %v", k, cmeta)

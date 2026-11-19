@@ -73,6 +73,9 @@ func TestInitCapabilitiesMeta(t *testing.T) {
 		// 用户 prompt 实时回显（正文 + 附图各一块）：不带它 agent 只落盘不活推，
 		// 发出的图实时看不见（TUI 恒带，见 session/user_echo.rs）。
 		"x.ai/userMessageEcho": true,
+		// 前端有状态条（StatusChips 消费 session_status），必须像 TUI 一样
+		// 声明，否则 agent 直接不构建这份载荷。
+		"x.ai/statusLine": true,
 	}
 	if !reflect.DeepEqual(meta, want) {
 		t.Errorf("initCapabilitiesMeta = %v, want %v (opt-in keys absent by default)", meta, want)

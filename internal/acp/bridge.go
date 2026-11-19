@@ -663,6 +663,11 @@ func (b *Bridge) observeUpdateKind(sid, kind string, update map[string]any) {
 	switch kind {
 	case "turn_completed":
 		b.noteTurnEnd(sid)
+	case "session_ended":
+		// grok 1.0.89 adds SessionUpdate::SessionEnded. The session is gone,
+		// so any turn it was running can never emit its own terminal update;
+		// clear the observed leg here instead of waiting for turnStaleAfter.
+		b.noteTurnEnd(sid)
 	case "retry_state":
 		if retryStateIsEvidence(update) {
 			b.noteTurnActivity(sid)
@@ -1228,6 +1233,11 @@ func initCapabilitiesMeta() map[string]any {
 		"x.ai/gitHeadChanged":        true,
 		"x.ai/hunkTracker":           map[string]any{"mode": "agent_only"},
 		"x.ai/userMessageEcho":       true,
+		// The web client draws a status row (context %, cost, branch), so it
+		// advertises the same capability the TUI does. Without it the agent
+		// skips the payload entirely (grok 1.0.89 statusLine gating) and the
+		// FE's session_status chips stay empty.
+		"x.ai/statusLine": true,
 	}
 	if boolEnv("ACP_CAP_CODE_NAVIGATION") {
 		// Agent reads meta["x.ai/codeNavigation"]["enabled"] (code_nav.rs:9).
