@@ -33,7 +33,7 @@ func (s *Server) handleGoalSet(w http.ResponseWriter, r *http.Request) {
 
 // handleGoalStatus — POST /api/goal/status {sessionId?} → current goal
 // state of the given session (no agent round-trip; instant). goal is null
-// when no goal is set; 404 when a goal exists on another session.
+// when that session has no goal; goals on other sessions are independent.
 func (s *Server) handleGoalStatus(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID string `json:"sessionId,omitempty"`

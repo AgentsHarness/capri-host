@@ -166,7 +166,7 @@ type Bridge struct {
 	// accept, and the FE fell back to "not delivered" — does not start a
 	// second turn. Bounded FIFO; b.mu protects it. The FE reuses the same
 	// id when it retries, which is what makes the retry idempotent.
-	promptedIDs map[string]struct{}
+	promptedIDs  map[string]struct{}
 	promptedFIFO []string
 
 	// Last focused session survives process death / host restart so we can
@@ -6105,15 +6105,15 @@ func (b *Bridge) Shutdown() {
 		log.Printf("[Capri-host] 退出前用量台账落盘失败: %v", err)
 	}
 
-	// Stop the goal loop: a continuation turn can be blocked on a
-	// 30-minute prompt or waiting for the session to go idle, and must
-	// not outlive shutdown. Same mechanism as GoalClear — close the stop
-	// channel so the loop exits at its next checkpoint. stopLoopLocked
-	// guards against double-close (loopOn / stop nil checks);
-	// the process kill above fails the in-flight RPC, so the turn unwinds
-	// promptly instead of holding the loop open.
+	// Stop every session's goal loop: a continuation turn can be blocked
+	// on a 30-minute prompt or waiting for the session to go idle, and
+	// must not outlive shutdown. Same mechanism as GoalClear — close the
+	// stop channels so the loops exit at their next checkpoints.
+	// stopAllLoopsLocked guards against double-close (loopOn / stop nil
+	// checks); the process kill above fails the in-flight RPC, so the
+	// turn unwinds promptly instead of holding a loop open.
 	b.goal.mu.Lock()
-	b.goal.stopLoopLocked()
+	b.goal.stopAllLoopsLocked()
 	b.goal.mu.Unlock()
 }
 

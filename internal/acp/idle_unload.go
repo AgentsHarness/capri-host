@@ -73,9 +73,9 @@ func (b *Bridge) SweepIdleUnload(ctx context.Context) int {
 		return 0
 	}
 
-	goalSID := b.pinnedGoalSessionID()
+	goalSIDs := b.pinnedGoalSessionIDs()
 	b.mu.Lock()
-	nResident, unpinned := b.idleUnloadPoolLocked(goalSID)
+	nResident, unpinned := b.idleUnloadPoolLocked(goalSIDs)
 	b.mu.Unlock()
 	if nResident <= capN {
 		return 0
@@ -119,29 +119,39 @@ func (b *Bridge) SweepIdleUnload(ctx context.Context) int {
 	return n
 }
 
-func (b *Bridge) pinnedGoalSessionID() string {
+// pinnedGoalSessionIDs returns the sessions whose goal loop is live and
+// not terminal. Every such session is pinned against idle unload; goals
+// are per session, so this is a set rather than one session id.
+func (b *Bridge) pinnedGoalSessionIDs() map[string]bool {
 	b.goal.mu.Lock()
 	defer b.goal.mu.Unlock()
-	if !b.goal.loopOn || b.goal.g == nil {
-		return ""
+	if len(b.goal.runs) == 0 {
+		return nil
 	}
-	switch b.goal.g.Status {
-	case goalComplete, goalCleared, goalBudgetLimited:
-		return ""
+	pinned := make(map[string]bool, len(b.goal.runs))
+	for sid, run := range b.goal.runs {
+		if run == nil || !run.loopOn || run.g == nil {
+			continue
+		}
+		switch run.g.Status {
+		case goalComplete, goalCleared, goalBudgetLimited:
+			continue
+		}
+		pinned[sid] = true
 	}
-	return b.goal.g.sessionID
+	return pinned
 }
 
 // idleUnloadPoolLocked returns the current grok-resident count and the
 // sessions that are eligible to close (not busy / awaiting / focused /
 // last-session / goal / a queue that still holds work). Caller holds b.mu.
-func (b *Bridge) idleUnloadPoolLocked(goalSID string) (resident int, unpinned []unloadCandidate) {
+func (b *Bridge) idleUnloadPoolLocked(goalSIDs map[string]bool) (resident int, unpinned []unloadCandidate) {
 	for id, s := range b.sessions {
 		if s == nil || s.unloaded {
 			continue
 		}
 		resident++
-		if b.sessionPinnedLocked(id, s, goalSID) {
+		if b.sessionPinnedLocked(id, s, goalSIDs) {
 			continue
 		}
 		last := s.LastActiveAt
@@ -158,7 +168,7 @@ func (b *Bridge) idleUnloadPoolLocked(goalSID string) (resident int, unpinned []
 	return resident, unpinned
 }
 
-func (b *Bridge) sessionPinnedLocked(id string, s *SessionState, goalSID string) bool {
+func (b *Bridge) sessionPinnedLocked(id string, s *SessionState, goalSIDs map[string]bool) bool {
 	if s.Busy || s.AwaitingInput {
 		return true
 	}
@@ -168,7 +178,7 @@ func (b *Bridge) sessionPinnedLocked(id string, s *SessionState, goalSID string)
 	if id == b.activeSessionID || id == b.lastSessionID {
 		return true
 	}
-	if goalSID != "" && id == goalSID {
+	if goalSIDs[id] {
 		return true
 	}
 	if queueHoldsWork(b.queueSnapshots[id]) {
@@ -211,10 +221,10 @@ func (b *Bridge) sessionHasLiveBg(cwd, sessionID string) bool {
 // the host row (keep listed, HasSession stays true). It refuses if the
 // session became pinned between pick and close.
 func (b *Bridge) unloadResident(ctx context.Context, sessionID string) error {
-	goalSID := b.pinnedGoalSessionID()
+	goalSIDs := b.pinnedGoalSessionIDs()
 	b.mu.Lock()
 	s := b.sessions[sessionID]
-	if s == nil || s.unloaded || b.sessionPinnedLocked(sessionID, s, goalSID) {
+	if s == nil || s.unloaded || b.sessionPinnedLocked(sessionID, s, goalSIDs) {
 		b.mu.Unlock()
 		return nil
 	}

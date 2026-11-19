@@ -6,6 +6,28 @@ import (
 	"time"
 )
 
+// seedGoal installs a session's goal run directly; these unit tests drive
+// goalAnalyze without starting GoalSet's continuation loop.
+func seedGoal(b *Bridge, sid string, g *GoalState) *GoalState {
+	b.goal.mu.Lock()
+	defer b.goal.mu.Unlock()
+	if b.goal.runs == nil {
+		b.goal.runs = make(map[string]*goalRun)
+	}
+	b.goal.runs[sid] = &goalRun{g: g}
+	return g
+}
+
+// seededGoal returns the session's current goal state for assertions.
+func seededGoal(b *Bridge, sid string) *GoalState {
+	b.goal.mu.Lock()
+	defer b.goal.mu.Unlock()
+	if run := b.goal.runs[sid]; run != nil {
+		return run.g
+	}
+	return nil
+}
+
 // TestGoalDrainConcurrentKeepsLongTurns — the 64-slot Subscribe buffer
 // must not drop events on long turns: the continuous drainer collects
 // every broadcast event (>64, the old post-turn drain would have lost the
@@ -39,31 +61,25 @@ func TestGoalDrainConcurrentKeepsLongTurns(t *testing.T) {
 // concrete artifacts before the goal completes.
 func TestGoalAnalyzeCompletesAfterEvidenceRound(t *testing.T) {
 	b := NewBridge(GrokConfig{})
-	b.goal.mu.Lock()
-	b.goal.g = &GoalState{
+	g := seedGoal(b, "s1", &GoalState{
 		Objective: "修复登录模块",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	g := b.goal.g
-	b.goal.mu.Unlock()
+	})
 
 	// Round 1: bare claim without evidence → latch, keep looping.
-	done := b.goal.goalAnalyze(g, []Event{{"type": "chunk", "text": "目标已完成。"}})
+	done := b.goal.goalAnalyze("s1", g, []Event{{"type": "chunk", "text": "目标已完成。"}})
 	if done {
 		t.Fatal("bare claim must not terminate the goal")
 	}
-	b.goal.mu.Lock()
-	if !b.goal.g.verifyingRound || !b.goal.g.Verifying {
-		b.goal.mu.Unlock()
+	if !g.verifyingRound || !g.Verifying {
 		t.Fatal("expected verifying round to be latched after claim")
 	}
-	b.goal.mu.Unlock()
 
 	// Round 2: evidence round backs the claim → complete.
-	done = b.goal.goalAnalyze(g, []Event{{
+	done = b.goal.goalAnalyze("s1", g, []Event{{
 		"type": "chunk",
 		"text": "目标已完成。证据：修改了 internal/acp/goal.go 和 internal/server/http_goal.go，运行 go test ./... 全部通过，npm run build 成功。",
 	}})
@@ -80,18 +96,15 @@ func TestGoalAnalyzeCompletesAfterEvidenceRound(t *testing.T) {
 // status blocked.
 func TestGoalAnalyzeBlocked(t *testing.T) {
 	b := NewBridge(GrokConfig{})
-	b.goal.mu.Lock()
-	b.goal.g = &GoalState{
+	g := seedGoal(b, "s1", &GoalState{
 		Objective: "x",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	g := b.goal.g
-	b.goal.mu.Unlock()
+	})
 
-	done := b.goal.goalAnalyze(g, []Event{{"type": "chunk", "text": "我卡住了：第三方 SDK 不兼容，无法继续。"}})
+	done := b.goal.goalAnalyze("s1", g, []Event{{"type": "chunk", "text": "我卡住了：第三方 SDK 不兼容，无法继续。"}})
 	if !done {
 		t.Fatal("blocked claim must terminate the goal")
 	}
@@ -105,19 +118,16 @@ func TestGoalAnalyzeBlocked(t *testing.T) {
 // with budget_limited.
 func TestGoalAnalyzeBudget(t *testing.T) {
 	b := NewBridge(GrokConfig{})
-	b.goal.mu.Lock()
-	b.goal.g = &GoalState{
+	g := seedGoal(b, "s1", &GoalState{
 		Objective:   "x",
 		Status:      goalActive,
 		Phase:       "executing",
 		TokenBudget: 100,
 		StartedAt:   time.Now().UnixMilli(),
 		sessionID:   "s1",
-	}
-	g := b.goal.g
-	b.goal.mu.Unlock()
+	})
 
-	done := b.goal.goalAnalyze(g, []Event{{"type": "usage", "used": float64(150)}})
+	done := b.goal.goalAnalyze("s1", g, []Event{{"type": "usage", "used": float64(150)}})
 	if !done {
 		t.Fatal("budget overrun must terminate the goal")
 	}
@@ -130,18 +140,15 @@ func TestGoalAnalyzeBudget(t *testing.T) {
 	}
 	// Under budget stays active.
 	b2 := NewBridge(GrokConfig{})
-	b2.goal.mu.Lock()
-	b2.goal.g = &GoalState{
+	g2 := seedGoal(b2, "s1", &GoalState{
 		Objective:   "x",
 		Status:      goalActive,
 		Phase:       "executing",
 		TokenBudget: 100,
 		StartedAt:   time.Now().UnixMilli(),
 		sessionID:   "s1",
-	}
-	g2 := b2.goal.g
-	b2.goal.mu.Unlock()
-	if done := b2.goal.goalAnalyze(g2, []Event{{"type": "usage", "used": float64(40)}}); done {
+	})
+	if done := b2.goal.goalAnalyze("s1", g2, []Event{{"type": "usage", "used": float64(40)}}); done {
 		t.Fatal("under-budget usage must not terminate")
 	}
 }
@@ -150,18 +157,15 @@ func TestGoalAnalyzeBudget(t *testing.T) {
 // a terminal status (agent goal mode on) is mirrored and ends the loop.
 func TestGoalAnalyzeAgentNotification(t *testing.T) {
 	b := NewBridge(GrokConfig{})
-	b.goal.mu.Lock()
-	b.goal.g = &GoalState{
+	g := seedGoal(b, "s1", &GoalState{
 		Objective: "x",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	g := b.goal.g
-	b.goal.mu.Unlock()
+	})
 
-	done := b.goal.goalAnalyze(g, []Event{{
+	done := b.goal.goalAnalyze("s1", g, []Event{{
 		"type":   "goal_updated",
 		"update": map[string]any{"status": "complete", "objective": "x"},
 	}})
@@ -178,18 +182,15 @@ func TestGoalAnalyzeAgentNotification(t *testing.T) {
 // completed:true latches the evidence round; blocked_reason pauses.
 func TestGoalAnalyzeUpdateGoalTool(t *testing.T) {
 	b := NewBridge(GrokConfig{})
-	b.goal.mu.Lock()
-	b.goal.g = &GoalState{
+	g := seedGoal(b, "s1", &GoalState{
 		Objective: "x",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	g := b.goal.g
-	b.goal.mu.Unlock()
+	})
 
-	done := b.goal.goalAnalyze(g, []Event{{
+	done := b.goal.goalAnalyze("s1", g, []Event{{
 		"type": "tool_call",
 		"toolCall": map[string]any{
 			"title":    "update_goal",
@@ -199,26 +200,20 @@ func TestGoalAnalyzeUpdateGoalTool(t *testing.T) {
 	if done {
 		t.Fatal("completed:true must latch verification, not terminate")
 	}
-	b.goal.mu.Lock()
-	verifying := b.goal.g.Verifying
-	b.goal.mu.Unlock()
-	if !verifying {
+	if !g.Verifying {
 		t.Fatal("expected verifying flag after update_goal completed")
 	}
 
 	// Blocked reason terminates.
 	b2 := NewBridge(GrokConfig{})
-	b2.goal.mu.Lock()
-	b2.goal.g = &GoalState{
+	g2 := seedGoal(b2, "s1", &GoalState{
 		Objective: "x",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	g2 := b2.goal.g
-	b2.goal.mu.Unlock()
-	done = b2.goal.goalAnalyze(g2, []Event{{
+	})
+	done = b2.goal.goalAnalyze("s1", g2, []Event{{
 		"type": "tool_call",
 		"toolCall": map[string]any{
 			"title":    "update_goal",
@@ -236,101 +231,137 @@ func TestGoalAnalyzeUpdateGoalTool(t *testing.T) {
 
 // TestGoalAnalyzeStaleLoopDoesNotPolluteReplacement — the race behind
 // /goal set: while the old goal's loop is blocked in a long
-// PromptWithOpts, the user replaces the goal (GoalSet swaps b.goal.g and
-// starts a new loop). When the old loop finally analyzes its stale
-// turn's events, none of them may land on the replacement goal — the
-// analysis must be dropped and the old loop must terminate.
+// PromptWithOpts, the user replaces the same session's goal. When the old
+// loop finally analyzes its stale turn's events, none of them may land on
+// the replacement goal — the analysis must be dropped and the old loop
+// must terminate.
 func TestGoalAnalyzeStaleLoopDoesNotPolluteReplacement(t *testing.T) {
 	// Scenario 1: the stale turn carries a usage reading and a
 	// completion claim. Without the ownership guard these would mark B
 	// budget_limited / complete and overwrite B's tokens.
 	b1 := NewBridge(GrokConfig{})
-	b1.goal.mu.Lock()
-	b1.goal.g = &GoalState{
+	goalA := seedGoal(b1, "s1", &GoalState{
 		Objective: "目标A",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	goalA := b1.goal.g // what the old loop captured at entry
-	// GoalSet replaces b.goal.g with a brand-new state (new loop owns B).
-	b1.goal.g = &GoalState{
+	})
+	// A replacement /goal set on the same session swaps the run.
+	goalB := seedGoal(b1, "s1", &GoalState{
 		Objective:   "目标B",
 		Status:      goalActive,
 		Phase:       "executing",
 		TokenBudget: 100,
 		StartedAt:   time.Now().UnixMilli(),
 		sessionID:   "s1",
-	}
-	b1.goal.mu.Unlock()
+	})
 
-	done := b1.goal.goalAnalyze(goalA, []Event{
+	done := b1.goal.goalAnalyze("s1", goalA, []Event{
 		{"type": "usage", "used": float64(150)},
 		{"type": "chunk", "text": "目标A已完成。证据：修改了 a.go，运行 go test 通过。"},
 	})
 	if !done {
 		t.Fatal("stale loop analysis must terminate the old loop")
 	}
-	b1.goal.mu.Lock()
-	if b1.goal.g.Objective != "目标B" {
-		b1.goal.mu.Unlock()
-		t.Fatalf("objective = %q, want 目标B", b1.goal.g.Objective)
+	if goalB.Objective != "目标B" {
+		t.Fatalf("objective = %q, want 目标B", goalB.Objective)
 	}
-	if b1.goal.g.Status != goalActive {
-		b1.goal.mu.Unlock()
-		t.Fatalf("status = %v, want active (B must not be marked terminal by A's events)", b1.goal.g.Status)
+	if goalB.Status != goalActive {
+		t.Fatalf("status = %v, want active (B must not be marked terminal by A's events)", goalB.Status)
 	}
-	if b1.goal.g.TokensUsed != 0 {
-		b1.goal.mu.Unlock()
-		t.Fatalf("tokens_used = %v, want 0 (B must not inherit A's usage)", b1.goal.g.TokensUsed)
+	if goalB.TokensUsed != 0 {
+		t.Fatalf("tokens_used = %v, want 0 (B must not inherit A's usage)", goalB.TokensUsed)
 	}
-	if b1.goal.g.verifyingRound || b1.goal.g.Verifying || b1.goal.g.claimedCompletion {
-		b1.goal.mu.Unlock()
+	if goalB.verifyingRound || goalB.Verifying || goalB.claimedCompletion {
 		t.Fatal("B must not inherit A's verification latch")
 	}
-	if b1.goal.g.Message != "" {
-		b1.goal.mu.Unlock()
-		t.Fatalf("message = %q, want empty", b1.goal.g.Message)
+	if goalB.Message != "" {
+		t.Fatalf("message = %q, want empty", goalB.Message)
 	}
-	b1.goal.mu.Unlock()
 
 	// Scenario 2: the stale turn carries an agent-side goal_updated with
 	// a terminal status for A — it must not mark B complete either.
 	b2 := NewBridge(GrokConfig{})
-	b2.goal.mu.Lock()
-	b2.goal.g = &GoalState{
+	goalA2 := seedGoal(b2, "s1", &GoalState{
 		Objective: "目标A",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	goalA2 := b2.goal.g
-	b2.goal.g = &GoalState{
+	})
+	goalB2 := seedGoal(b2, "s1", &GoalState{
 		Objective: "目标B",
 		Status:    goalActive,
 		Phase:     "executing",
 		StartedAt: time.Now().UnixMilli(),
 		sessionID: "s1",
-	}
-	b2.goal.mu.Unlock()
+	})
 
-	done = b2.goal.goalAnalyze(goalA2, []Event{{
+	done = b2.goal.goalAnalyze("s1", goalA2, []Event{{
 		"type":   "goal_updated",
 		"update": map[string]any{"status": "complete", "objective": "目标A"},
 	}})
 	if !done {
 		t.Fatal("stale loop analysis must terminate the old loop")
 	}
-	b2.goal.mu.Lock()
-	if b2.goal.g.Objective != "目标B" {
-		b2.goal.mu.Unlock()
-		t.Fatalf("objective = %q, want 目标B", b2.goal.g.Objective)
+	if goalB2.Objective != "目标B" {
+		t.Fatalf("objective = %q, want 目标B", goalB2.Objective)
 	}
-	if b2.goal.g.Status != goalActive {
-		b2.goal.mu.Unlock()
-		t.Fatalf("status = %v, want active (B must not be marked complete by A's notification)", b2.goal.g.Status)
+	if goalB2.Status != goalActive {
+		t.Fatalf("status = %v, want active (B must not be marked complete by A's notification)", goalB2.Status)
 	}
-	b2.goal.mu.Unlock()
+}
+
+// TestGoalSessionsAreIndependent — goals are per session: a new goal on
+// s2 does not replace s1's, and pause/clear on one leaves the other alone.
+func TestGoalSessionsAreIndependent(t *testing.T) {
+	b := NewBridge(GrokConfig{})
+	seedGoal(b, "s1", &GoalState{
+		Objective: "目标1",
+		Status:    goalActive,
+		Phase:     "executing",
+		StartedAt: time.Now().UnixMilli(),
+		sessionID: "s1",
+	})
+	seedGoal(b, "s2", &GoalState{
+		Objective: "目标2",
+		Status:    goalActive,
+		Phase:     "executing",
+		StartedAt: time.Now().UnixMilli(),
+		sessionID: "s2",
+	})
+
+	if st, _ := b.GoalStatus("s1"); st["objective"] != "目标1" {
+		t.Fatalf("s1 objective = %v, want 目标1", st["objective"])
+	}
+	if st, _ := b.GoalStatus("s2"); st["objective"] != "目标2" {
+		t.Fatalf("s2 objective = %v, want 目标2", st["objective"])
+	}
+
+	if _, err := b.GoalPause("s1"); err != nil {
+		t.Fatalf("pause s1: %v", err)
+	}
+	if st, _ := b.GoalStatus("s1"); st["status"] != goalUserPaused {
+		t.Fatalf("s1 status = %v, want user_paused", st["status"])
+	}
+	if st, _ := b.GoalStatus("s2"); st["status"] != goalActive {
+		t.Fatalf("s2 status = %v, want active after pausing s1", st["status"])
+	}
+
+	if _, err := b.GoalClear("s1"); err != nil {
+		t.Fatalf("clear s1: %v", err)
+	}
+	if st, _ := b.GoalStatus("s1"); st["status"] != goalCleared {
+		t.Fatalf("s1 status = %v, want cleared", st["status"])
+	}
+	if st, _ := b.GoalStatus("s2"); st["status"] != goalActive {
+		t.Fatalf("s2 status = %v, want active after clearing s1", st["status"])
+	}
+
+	// No goal on a third session: status is null, not another session's
+	// goal and not an error.
+	if st, err := b.GoalStatus("s3"); err != nil || st != nil {
+		t.Fatalf("s3 status = %v, %v; want nil, nil", st, err)
+	}
 }

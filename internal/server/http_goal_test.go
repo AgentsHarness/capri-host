@@ -161,16 +161,15 @@ func goalFrom(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	return g
 }
 
-// TestGoalSessionBinding — the goal is a host-local single goal BOUND to
-// the session it was set on (the sessionId it resolved to). status/pause/
-// resume/clear for another session are 404; /goal set on another session
-// replaces the goal and re-binds it to that session.
+// TestGoalSessionBinding — goals are per session: two sessions can each
+// own a goal; status/pause/resume/clear only touch the named session and
+// leave every other session's goal alone.
 func TestGoalSessionBinding(t *testing.T) {
 	s, _ := newFakeAgentServer(t)
 	sid := createActiveSession(t, s) // fake agent answers session/new with "sess-new"
 	sidJSON := `"sessionId":"` + sid + `"`
 
-	// set with the explicit sessionId → the goal binds to that session.
+	// set with the explicit sessionId → that session owns the goal.
 	rec := postJSON(t, s, "/api/goal/set", `{"objective":"修复登录模块",`+sidJSON+`}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("set status = %d, body=%s", rec.Code, rec.Body.String())
@@ -185,25 +184,30 @@ func TestGoalSessionBinding(t *testing.T) {
 		t.Fatalf("status(bound sid) goal = %v, want active", g)
 	}
 
-	// …another sessionId does not → 404 当前会话没有目标.
+	// …another session has no goal: status returns null (not an error).
 	rec = postJSON(t, s, "/api/goal/status", `{"sessionId":"other-sess"}`)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status(other sid) code = %d, want 404, body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status(other sid) code = %d, want 200, body=%s", rec.Code, rec.Body.String())
 	}
-	if m := decodeBody(t, rec); !strings.Contains(m["error"].(string), "当前会话没有目标") {
-		t.Fatalf("resp = %s, want 当前会话没有目标", rec.Body.String())
+	if m := decodeBody(t, rec); m["goal"] != nil {
+		t.Fatalf("status(other sid) goal = %v, want null", m["goal"])
 	}
 
-	// pause/resume/clear on the wrong session are 404 and leave the goal
-	// untouched on the bound one.
-	for _, path := range []string{"/api/goal/pause", "/api/goal/resume", "/api/goal/clear"} {
+	// pause/resume/clear on a session with no goal keep their no-goal
+	// semantics (pause 409; resume/clear 404) and leave the first
+	// session's goal untouched.
+	for path, want := range map[string]int{
+		"/api/goal/pause":  http.StatusConflict,
+		"/api/goal/resume": http.StatusNotFound,
+		"/api/goal/clear":  http.StatusNotFound,
+	} {
 		rec = postJSON(t, s, path, `{"sessionId":"other-sess"}`)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("%s(other sid) code = %d, want 404, body=%s", path, rec.Code, rec.Body.String())
+		if rec.Code != want {
+			t.Fatalf("%s(other sid) code = %d, want %d, body=%s", path, rec.Code, want, rec.Body.String())
 		}
 	}
 	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{`+sidJSON+`}`)); g["status"] != "active" {
-		t.Fatalf("goal must survive wrong-session ops, status = %v", g["status"])
+		t.Fatalf("goal must survive other-session ops, status = %v", g["status"])
 	}
 
 	// pause on the bound session works.
@@ -211,38 +215,75 @@ func TestGoalSessionBinding(t *testing.T) {
 		t.Fatalf("pause(bound sid) goal = %v, want user_paused", g)
 	}
 
-	// /goal set on another session replaces the goal and re-binds it.
+	// /goal set on another session adds a second independent goal.
 	rec = postJSON(t, s, "/api/goal/set", `{"objective":"新目标","sessionId":"other-sess"}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("re-set status = %d, body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("second-set status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 	if g := goalFrom(t, rec); g["objective"] != "新目标" {
-		t.Fatalf("re-set goal = %v, want 新目标", g)
+		t.Fatalf("second goal = %v, want 新目标", g)
 	}
-	rec = postJSON(t, s, "/api/goal/status", `{`+sidJSON+`}`)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status(old sid) after re-bind = %d, want 404, body=%s", rec.Code, rec.Body.String())
+	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{`+sidJSON+`}`)); g["status"] != "user_paused" {
+		t.Fatalf("first status after second set = %v, want user_paused", g["status"])
 	}
 	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{"sessionId":"other-sess"}`)); g["status"] != "active" {
-		t.Fatalf("status(new sid) = %v, want active", g["status"])
+		t.Fatalf("second status = %v, want active", g["status"])
 	}
 
-	// clear on the new bound session.
+	// clear on the second session leaves the first alone.
 	if g := goalFrom(t, postJSON(t, s, "/api/goal/clear", `{"sessionId":"other-sess"}`)); g["status"] != "cleared" {
-		t.Fatalf("clear(new sid) = %v, want cleared", g["status"])
+		t.Fatalf("clear(second sid) = %v, want cleared", g["status"])
+	}
+	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{"sessionId":"other-sess"}`)); g["status"] != "cleared" {
+		t.Fatalf("status(second sid) after clear = %v, want cleared", g["status"])
+	}
+	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{`+sidJSON+`}`)); g["status"] != "user_paused" {
+		t.Fatalf("first status after second clear = %v, want user_paused", g["status"])
 	}
 
-	// The cleared goal is still bound to other-sess (status keeps showing
-	// the cleared state on that session, mirroring the no-sessionId flow) —
-	// the active session's view stays a 404.
-	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{"sessionId":"other-sess"}`)); g["status"] != "cleared" {
-		t.Fatalf("status(new sid) after clear = %v, want cleared", g["status"])
+	// No sessionId resolves to the active session (sid) — its paused goal.
+	if g := goalFrom(t, postJSON(t, s, "/api/goal/status", `{}`)); g["status"] != "user_paused" {
+		t.Fatalf("empty-sid status = %v, want active session's user_paused", g["status"])
 	}
-	rec = postJSON(t, s, "/api/goal/status", `{}`)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("empty-sid status after clear = %d, want 404, body=%s", rec.Code, rec.Body.String())
+}
+
+// TestSessionUpdatesIncludesGoal — history replay carries the session's
+// goal snapshot (null when there is none), so the FE needs no separate
+// /api/goal/status call and no local goal-session marker.
+func TestSessionUpdatesIncludesGoal(t *testing.T) {
+	s, _ := newFakeAgentServer(t)
+	sid := createActiveSession(t, s)
+
+	// No goal → the key is present with null.
+	rec := postJSON(t, s, "/api/session-updates", `{"sessionId":"`+sid+`","cwd":"/ws"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session-updates status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	if m := decodeBody(t, rec); !strings.Contains(m["error"].(string), "当前会话没有目标") {
-		t.Fatalf("resp = %s, want 当前会话没有目标", rec.Body.String())
+	m := decodeBody(t, rec)
+	if _, ok := m["goal"]; !ok {
+		t.Fatalf("session-updates resp missing goal key: %s", rec.Body.String())
+	}
+	if m["goal"] != nil {
+		t.Fatalf("session-updates goal = %v, want null", m["goal"])
+	}
+
+	if rec := postJSON(t, s, "/api/goal/set", `{"objective":"修复登录模块","sessionId":"`+sid+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("goal set status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = postJSON(t, s, "/api/session-updates", `{"sessionId":"`+sid+`","cwd":"/ws"}`)
+	m = decodeBody(t, rec)
+	g, _ := m["goal"].(map[string]any)
+	if g == nil || g["status"] != "active" || g["objective"] != "修复登录模块" {
+		t.Fatalf("session-updates goal = %v, want active 修复登录模块", m["goal"])
+	}
+
+	// Another session's replay must not see this goal.
+	rec = postJSON(t, s, "/api/session-updates", `{"sessionId":"other-sess","cwd":"/ws"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("other session-updates status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if m := decodeBody(t, rec); m["goal"] != nil {
+		t.Fatalf("other session goal = %v, want null", m["goal"])
 	}
 }

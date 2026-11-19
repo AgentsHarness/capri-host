@@ -1184,6 +1184,14 @@ func (s *Server) handleSessionUpdates(w http.ResponseWriter, r *http.Request) {
 		"totalCount": page.TotalCount,
 		"hasMore":    page.HasMore,
 	}
+	// goal：该会话的 goal 快照（host 引擎内存态；null = 没有）。回放时
+	// FE 直接用它恢复 GoalChip，不再为每个会话单独打 /api/goal/status。
+	// 键恒存在（值可为 null），旧 FE 忽略未知键，新 FE 用它判别新 host。
+	goal, goalErr := s.bridge.GoalStatus(body.SessionID)
+	if goalErr != nil {
+		goal = nil
+	}
+	out["goal"] = goal
 	// 能力回显（契约 [B]）：projected/omittedBytes 只在投影真正生效时带，
 	// 旧 host 不带该键 → FE 判定不支持 lite。meta 档省略 updates 键本身
 	// （而不是回空数组）——FE 要能区分「没回信封」与「会话没有历史」。

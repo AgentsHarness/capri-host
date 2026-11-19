@@ -26,6 +26,9 @@ import (
 //   - budget: token budget enforced from `usage` events (best effort)
 //   - verification: a claimed completion triggers a dedicated evidence
 //     round; the goal only completes when the evidence round backs it
+//   - per-session: one goal run per session (runs map), mirroring the TUI's
+//     per-SessionActor GoalTracker — a new /goal on one session never
+//     replaces another session's goal
 //
 // State values follow the TUI wire so the frontend's goal chip renders
 // them directly: active / user_paused / blocked / complete / cleared /
@@ -146,13 +149,29 @@ type goalHost interface {
 	Broadcast(ev Event)
 }
 
-type goalEngine struct {
-	host goalHost
-
-	mu     sync.Mutex
+// goalRun is one session's goal: its state plus the stop channel of the
+// continuation loop driving it. The engine keeps one run per session, so
+// different sessions can pursue goals at the same time and every control
+// verb (status/pause/resume/clear) only touches its own session.
+type goalRun struct {
 	g      *GoalState
 	stop   chan struct{} // closed to end the goal loop
 	loopOn bool
+}
+
+type goalEngine struct {
+	host goalHost
+
+	mu   sync.Mutex
+	runs map[string]*goalRun // sessionID → goal run
+}
+
+// runLocked returns the session's run, or nil. Callers hold ge.mu.
+func (ge *goalEngine) runLocked(sessionID string) *goalRun {
+	if ge.runs == nil {
+		return nil
+	}
+	return ge.runs[sessionID]
 }
 
 // goalLoopTurnDelay is the grace period after a user turn ends before the
@@ -164,8 +183,9 @@ const goalLoopTurnDelay = 3 * time.Second
 // GoalSet starts (or restarts) an autonomous goal on the given session
 // (empty sessionId resolves to the active one). Returns the new state.
 // The goal binds to the resolved session — the loop prompts that session
-// and broadcasts are tagged with it. The first turn is fired by the loop
-// goroutine, which injects the goal instruction.
+// and broadcasts are tagged with it. Other sessions' goals are untouched.
+// The first turn is fired by the loop goroutine, which injects the goal
+// instruction.
 func (ge *goalEngine) GoalSet(ctx context.Context, sessionID, objective string, tokenBudget int64) (map[string]any, error) {
 	objective = strings.TrimSpace(objective)
 	if objective == "" {
@@ -176,149 +196,144 @@ func (ge *goalEngine) GoalSet(ctx context.Context, sessionID, objective string, 
 	}
 	now := time.Now().UnixMilli()
 	ge.mu.Lock()
-	// Stop any previous loop before replacing the state.
-	ge.stopLoopLocked()
-	ge.g = &GoalState{
-		Objective:   objective,
-		Status:      goalActive,
-		Phase:       "executing",
-		TokenBudget: tokenBudget,
-		StartedAt:   now,
-		ElapsedMs:   0,
-		sessionID:   sessionID,
+	if ge.runs == nil {
+		ge.runs = make(map[string]*goalRun)
 	}
-	ge.loopOn = true
-	ge.stop = make(chan struct{})
-	stop := ge.stop
+	// Stop this session's previous loop before replacing its state.
+	ge.stopLoopLocked(sessionID)
+	stop := make(chan struct{})
+	ge.runs[sessionID] = &goalRun{
+		g: &GoalState{
+			Objective:   objective,
+			Status:      goalActive,
+			Phase:       "executing",
+			TokenBudget: tokenBudget,
+			StartedAt:   now,
+			ElapsedMs:   0,
+			sessionID:   sessionID,
+		},
+		stop:   stop,
+		loopOn: true,
+	}
 	ge.mu.Unlock()
 
-	ge.broadcastGoal()
-	go ge.goalLoop(stop)
-	return ge.goalSnapshot(), nil
+	ge.broadcastGoal(sessionID)
+	go ge.goalLoop(sessionID, stop)
+	return ge.goalSnapshot(sessionID), nil
 }
 
 // GoalStatus returns the current goal state of the given session (empty
-// sessionId resolves to the active one). nil state, no error when no goal
-// is set at all; 404 when a goal exists but is bound to another session.
+// sessionId resolves to the active one). nil state, no error when that
+// session has no goal — goals on other sessions are independent.
 func (ge *goalEngine) GoalStatus(sessionID string) (map[string]any, error) {
 	sessionID = ge.host.resolveSessionID(sessionID)
 	ge.mu.Lock()
 	defer ge.mu.Unlock()
-	if ge.g == nil {
-		return nil, nil
-	}
-	if ge.g.sessionID != sessionID {
-		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
-	}
-	return ge.goalSnapshotLocked(), nil
+	return ge.goalSnapshotLocked(sessionID), nil
 }
 
 // GoalPause pauses an active goal (user_paused) on the given session. The
-// current in-flight continuation turn finishes; the loop stops scheduling
-// further turns. Empty sessionId resolves to the active one; a goal bound
-// to another session is a 404.
+// current in-flight continuation turn finishes; that session's loop stops
+// scheduling further turns. Other sessions keep running.
 func (ge *goalEngine) GoalPause(sessionID string) (map[string]any, error) {
 	sessionID = ge.host.resolveSessionID(sessionID)
 	ge.mu.Lock()
-	if ge.g == nil {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
 		ge.mu.Unlock()
-		return ge.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
+		return nil, &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
 	}
-	if ge.g.sessionID != sessionID {
+	if run.g.Status != goalActive {
+		st := ge.goalSnapshotLocked(sessionID)
 		ge.mu.Unlock()
-		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
+		return st, &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
 	}
-	if ge.g.Status != goalActive {
-		ge.mu.Unlock()
-		return ge.goalSnapshot(), &HTTPError{Code: 409, Msg: "当前没有进行中的目标"}
-	}
-	ge.g.Status = goalUserPaused
-	ge.g.Message = ""
-	ge.stopLoopLocked()
+	run.g.Status = goalUserPaused
+	run.g.Message = ""
+	ge.stopLoopLocked(sessionID)
 	ge.mu.Unlock()
-	ge.broadcastGoal()
-	return ge.goalSnapshot(), nil
+	ge.broadcastGoal(sessionID)
+	return ge.goalSnapshot(sessionID), nil
 }
 
 // GoalResume resumes a paused goal on the given session (empty sessionId
-// resolves to the active one; a goal bound to another session is a 404).
+// resolves to the active one). Other sessions' goals are independent.
 func (ge *goalEngine) GoalResume(sessionID string) (map[string]any, error) {
 	sessionID = ge.host.resolveSessionID(sessionID)
 	ge.mu.Lock()
-	if ge.g == nil {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
 		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前没有目标"}
 	}
-	if ge.g.sessionID != sessionID {
+	if run.g.Status != goalUserPaused && run.g.Status != goalBlocked {
+		st := ge.goalSnapshotLocked(sessionID)
 		ge.mu.Unlock()
-		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
+		return st, &HTTPError{Code: 409, Msg: "目标未处于暂停状态"}
 	}
-	if ge.g.Status != goalUserPaused && ge.g.Status != goalBlocked {
-		ge.mu.Unlock()
-		return ge.goalSnapshot(), &HTTPError{Code: 409, Msg: "目标未处于暂停状态"}
-	}
-	ge.g.Status = goalActive
-	ge.g.Verifying = false
-	ge.g.verifyingRound = false
-	ge.g.claimedCompletion = false
-	ge.g.Message = ""
-	ge.loopOn = true
-	ge.stop = make(chan struct{})
-	stop := ge.stop
+	run.g.Status = goalActive
+	run.g.Verifying = false
+	run.g.verifyingRound = false
+	run.g.claimedCompletion = false
+	run.g.Message = ""
+	stop := make(chan struct{})
+	run.stop = stop
+	run.loopOn = true
 	ge.mu.Unlock()
-	ge.broadcastGoal()
-	go ge.goalLoop(stop)
-	return ge.goalSnapshot(), nil
+	ge.broadcastGoal(sessionID)
+	go ge.goalLoop(sessionID, stop)
+	return ge.goalSnapshot(sessionID), nil
 }
 
 // GoalClear clears the goal on the given session (cleared; empty sessionId
-// resolves to the active one; a goal bound to another session is a 404).
-// Stops the loop.
+// resolves to the active one). Stops that session's loop.
 func (ge *goalEngine) GoalClear(sessionID string) (map[string]any, error) {
 	sessionID = ge.host.resolveSessionID(sessionID)
 	ge.mu.Lock()
-	if ge.g == nil {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
 		ge.mu.Unlock()
 		return nil, &HTTPError{Code: 404, Msg: "当前没有目标"}
 	}
-	if ge.g.sessionID != sessionID {
-		ge.mu.Unlock()
-		return nil, &HTTPError{Code: 404, Msg: "当前会话没有目标"}
-	}
-	ge.g.Status = goalCleared
-	ge.g.Message = ""
-	ge.stopLoopLocked()
+	run.g.Status = goalCleared
+	run.g.Message = ""
+	ge.stopLoopLocked(sessionID)
 	ge.mu.Unlock()
-	ge.broadcastGoal()
-	return ge.goalSnapshot(), nil
+	ge.broadcastGoal(sessionID)
+	return ge.goalSnapshot(sessionID), nil
 }
 
 // ── loop ─────────────────────────────────────────────────────────────
 
-// goalLoop drives continuation turns while the goal is Active. It owns a
-// single goroutine per goal (stop channel closes to end it).
+// goalLoop drives continuation turns for one session while its goal is
+// Active. Each session's goal owns one goroutine (stop channel closes to
+// end it); goals on other sessions are unrelated and keep running.
 //
-// The loop captures the goal pointer it owns at entry. /goal set may
-// replace ge.g while this loop is blocked (e.g. in a long
-// PromptWithOpts, up to promptTimeout); every state write below is
-// guarded by goalLoopOwns so a stale loop never pollutes the
+// The loop captures the goal pointer it owns at entry. A later /goal set
+// on the same session replaces that run while this loop may be blocked
+// (e.g. in a long PromptWithOpts, up to promptTimeout); every state write
+// below is guarded by currentLocked so a stale loop never pollutes the
 // replacement goal and exits as soon as it notices the swap.
-func (ge *goalEngine) goalLoop(stop chan struct{}) {
+func (ge *goalEngine) goalLoop(sessionID string, stop chan struct{}) {
 	ge.mu.Lock()
-	g := ge.g
+	run := ge.runLocked(sessionID)
 	ge.mu.Unlock()
-	if g == nil {
+	if run == nil || run.g == nil {
 		return
 	}
+	g := run.g
 	for {
 		// 1. State check: only Active goals continue.
-		st := ge.goalStruct()
+		st := ge.goalStruct(sessionID)
 		if st == nil || st.Status != goalActive {
 			return
 		}
 		// 1b. Ownership: the goal was replaced by /goal set while this
 		//     loop was in flight — exit without touching the new goal.
-		if !ge.goalLoopOwns(g) {
+		ge.mu.Lock()
+		owned := ge.currentLocked(sessionID, g) != nil
+		ge.mu.Unlock()
+		if !owned {
 			return
 		}
 
@@ -327,32 +342,32 @@ func (ge *goalEngine) goalLoop(stop chan struct{}) {
 		//    decided by the previous iteration's analysis.
 		var instruction string
 		ge.mu.Lock()
-		if !ge.goalLoopOwns(g) {
+		cur := ge.currentLocked(sessionID, g)
+		if cur == nil {
 			ge.mu.Unlock()
 			return
 		}
-		first := ge.g.TokensUsed == 0 && !ge.g.claimedCompletion && !ge.g.verifyingRound
-		if ge.g.verifyingRound {
+		first := cur.TokensUsed == 0 && !cur.claimedCompletion && !cur.verifyingRound
+		if cur.verifyingRound {
 			instruction = goalVerifyInstruction(st.Objective)
 		} else if first {
 			instruction = goalInstruction(st.Objective)
 		} else {
 			instruction = goalContinueInstruction(st.Objective)
 		}
-		sid := st.sessionID
 		ge.mu.Unlock()
 
 		// 3. Wait until the session is idle (user turns win; the loop
 		//    yields while a user message is in flight).
-		if !ge.goalWaitIdle(stop, sid) {
+		if !ge.goalWaitIdle(stop, sessionID) {
 			return
 		}
 
 		// 4. Re-check state and ownership (pause/clear/set may have
 		//    landed while waiting).
 		ge.mu.Lock()
-		owned := ge.goalLoopOwns(g)
-		active := owned && ge.g.Status == goalActive
+		cur = ge.currentLocked(sessionID, g)
+		active := cur != nil && cur.Status == goalActive
 		ge.mu.Unlock()
 		if !active {
 			return
@@ -366,7 +381,7 @@ func (ge *goalEngine) goalLoop(stop chan struct{}) {
 		drain := ge.goalDrainConcurrent(evCh)
 		blocks := []ContentBlock{{kType: "text", "text": instruction}}
 		ctx, cancel := context.WithTimeout(context.Background(), promptTimeout)
-		stopReason, _, err := ge.host.PromptWithOpts(ctx, sid, blocks, PromptOpts{})
+		stopReason, _, err := ge.host.PromptWithOpts(ctx, sessionID, blocks, PromptOpts{})
 		cancel()
 		// Stop the drainer and collect the turn's events (in order).
 		collected := drain()
@@ -379,13 +394,13 @@ func (ge *goalEngine) goalLoop(stop chan struct{}) {
 			// (goal replaced while the prompt was in flight) must not
 			// write its failure into the new goal.
 			ge.mu.Lock()
-			owned := ge.goalLoopOwns(g)
-			if owned && ge.g.Status == goalActive {
-				ge.g.Message = "回合失败: " + err.Error()
+			cur = ge.currentLocked(sessionID, g)
+			if cur != nil && cur.Status == goalActive {
+				cur.Message = "回合失败: " + err.Error()
 			}
 			ge.mu.Unlock()
-			if owned {
-				ge.broadcastGoal()
+			if cur != nil {
+				ge.broadcastGoal(sessionID)
 			}
 			return
 		}
@@ -396,13 +411,13 @@ func (ge *goalEngine) goalLoop(stop chan struct{}) {
 		// restarts it.
 		if stopReason == "cancelled" {
 			ge.mu.Lock()
-			owned := ge.goalLoopOwns(g)
-			if owned && ge.g.Status == goalActive {
-				ge.g.Message = "回合已取消（goal 保持活动，可用 /goal resume 继续）"
+			cur = ge.currentLocked(sessionID, g)
+			if cur != nil && cur.Status == goalActive {
+				cur.Message = "回合已取消（goal 保持活动，可用 /goal resume 继续）"
 			}
 			ge.mu.Unlock()
-			if owned {
-				ge.broadcastGoal()
+			if cur != nil {
+				ge.broadcastGoal(sessionID)
 			}
 			return
 		}
@@ -412,7 +427,7 @@ func (ge *goalEngine) goalLoop(stop chan struct{}) {
 		//    before every state write and returns true when this loop is
 		//    stale (goal replaced) — the loop then exits without touching
 		//    the new goal.
-		if done := ge.goalAnalyze(g, collected); done {
+		if done := ge.goalAnalyze(sessionID, g, collected); done {
 			return
 		}
 	}
@@ -489,7 +504,7 @@ func (ge *goalEngine) goalDrainConcurrent(evCh chan Event) func() []Event {
 // replaced by /goal set returns true immediately without touching the
 // new goal. Returns true when the loop must exit (complete / blocked /
 // budget limited / cleared / paused mid-loop / loop stale).
-func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
+func (ge *goalEngine) goalAnalyze(sessionID string, g *GoalState, events []Event) bool {
 	var text strings.Builder
 	tokensUsed := int64(0)
 	sawAgentGoalUpdate := false
@@ -532,24 +547,25 @@ func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 				// The agent session has goal mode on and reports its own
 				// state — mirror it (agent is authoritative for status).
 				ge.mu.Lock()
-				if !ge.goalLoopOwns(g) {
+				cur := ge.currentLocked(sessionID, g)
+				if cur == nil {
 					ge.mu.Unlock()
 					return true // loop stale: goal replaced
 				}
 				if s, _ := u["status"].(string); s != "" {
-					ge.g.Status = s
+					cur.Status = s
 				}
 				if v, _ := u["verifying_completion"].(bool); v {
-					ge.g.Verifying = true
+					cur.Verifying = true
 				}
 				if m, _ := u["message"].(string); m != "" {
-					ge.g.Message = m
+					cur.Message = m
 				}
 				if n, ok := u["total_deliverables"].(float64); ok {
-					ge.g.TotalDeliverables = int(n)
+					cur.TotalDeliverables = int(n)
 				}
 				if n, ok := u["completed_deliverables"].(float64); ok {
-					ge.g.CompletedDeliverables = int(n)
+					cur.CompletedDeliverables = int(n)
 				}
 				ge.mu.Unlock()
 			}
@@ -558,20 +574,20 @@ func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 
 	// Budget enforcement (best effort — only when a budget was set).
 	ge.mu.Lock()
-	if !ge.goalLoopOwns(g) {
+	cur := ge.currentLocked(sessionID, g)
+	if cur == nil {
 		ge.mu.Unlock()
 		return true // loop stale: goal replaced
 	}
-	if ge.g != nil && ge.g.TokenBudget > 0 && tokensUsed > 0 {
-		ge.g.TokensUsed = tokensUsed
-		if tokensUsed > ge.g.TokenBudget {
-			ge.g.Status = goalBudgetLimited
-			ge.g.Message = fmt.Sprintf("token 预算 %d 已耗尽", ge.g.TokenBudget)
-			ge.stopLoopLocked()
-			done := true
+	if cur.TokenBudget > 0 && tokensUsed > 0 {
+		cur.TokensUsed = tokensUsed
+		if tokensUsed > cur.TokenBudget {
+			cur.Status = goalBudgetLimited
+			cur.Message = fmt.Sprintf("token 预算 %d 已耗尽", cur.TokenBudget)
+			ge.stopLoopLocked(sessionID)
 			ge.mu.Unlock()
-			ge.broadcastGoal()
-			return done
+			ge.broadcastGoal(sessionID)
+			return true
 		}
 	}
 	ge.mu.Unlock()
@@ -580,16 +596,17 @@ func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 	// states and stop the loop.
 	if sawAgentGoalUpdate {
 		ge.mu.Lock()
-		if !ge.goalLoopOwns(g) {
+		cur = ge.currentLocked(sessionID, g)
+		if cur == nil {
 			ge.mu.Unlock()
 			return true // loop stale: goal replaced
 		}
-		terminal := ge.g != nil && (ge.g.Status == goalComplete || ge.g.Status == goalCleared ||
-			ge.g.Status == goalBudgetLimited || ge.g.Status == goalUserPaused ||
-			ge.g.Status == goalBlocked)
+		terminal := cur.Status == goalComplete || cur.Status == goalCleared ||
+			cur.Status == goalBudgetLimited || cur.Status == goalUserPaused ||
+			cur.Status == goalBlocked
 		ge.mu.Unlock()
 		if terminal {
-			ge.broadcastGoal()
+			ge.broadcastGoal(sessionID)
 			return true
 		}
 	}
@@ -597,24 +614,23 @@ func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 	// Tool-driven state (update_goal call with completed/blocked_reason).
 	if sawUpdateGoalCall {
 		ge.mu.Lock()
-		if !ge.goalLoopOwns(g) {
+		cur = ge.currentLocked(sessionID, g)
+		if cur == nil {
 			ge.mu.Unlock()
 			return true // loop stale: goal replaced
 		}
-		if ge.g != nil {
-			if toolCompleted {
-				ge.g.claimedCompletion = true
-				ge.g.Verifying = true
-				ge.g.verifyingRound = true
-			} else if toolBlocked {
-				ge.g.Status = goalBlocked
-				ge.g.Message = toolMessage
-			} else if toolMessage != "" {
-				ge.g.Message = toolMessage
-			}
+		if toolCompleted {
+			cur.claimedCompletion = true
+			cur.Verifying = true
+			cur.verifyingRound = true
+		} else if toolBlocked {
+			cur.Status = goalBlocked
+			cur.Message = toolMessage
+		} else if toolMessage != "" {
+			cur.Message = toolMessage
 		}
 		ge.mu.Unlock()
-		ge.broadcastGoal()
+		ge.broadcastGoal(sessionID)
 		if toolBlocked {
 			return true
 		}
@@ -627,64 +643,61 @@ func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 	// Text-driven analysis.
 	claim, blocked, evidence := analyzeGoalText(text.String())
 	ge.mu.Lock()
-	if !ge.goalLoopOwns(g) {
+	cur = ge.currentLocked(sessionID, g)
+	if cur == nil {
 		ge.mu.Unlock()
 		return true // loop stale: goal replaced
 	}
-	if ge.g == nil {
-		ge.mu.Unlock()
-		return true
-	}
-	if ge.g.verifyingRound {
+	if cur.verifyingRound {
 		// Evidence round resolution.
-		ge.g.verifyingRound = false
-		ge.g.Verifying = false
+		cur.verifyingRound = false
+		cur.Verifying = false
 		switch {
 		case claim && evidence:
-			ge.g.Status = goalComplete
-			ge.g.Message = ""
-			ge.g.CompletedDeliverables = ge.g.TotalDeliverables
-			if ge.g.TotalDeliverables == 0 {
-				ge.g.TotalDeliverables = 1
-				ge.g.CompletedDeliverables = 1
+			cur.Status = goalComplete
+			cur.Message = ""
+			cur.CompletedDeliverables = cur.TotalDeliverables
+			if cur.TotalDeliverables == 0 {
+				cur.TotalDeliverables = 1
+				cur.CompletedDeliverables = 1
 			}
 			ge.mu.Unlock()
-			ge.broadcastGoal()
+			ge.broadcastGoal(sessionID)
 			return true
 		case claim && !evidence:
-			ge.g.Status = goalBlocked
-			ge.g.Message = "完成声明缺少可验证证据（无变更文件/命令/输出）"
+			cur.Status = goalBlocked
+			cur.Message = "完成声明缺少可验证证据（无变更文件/命令/输出）"
 			ge.mu.Unlock()
-			ge.broadcastGoal()
+			ge.broadcastGoal(sessionID)
 			return true
 		case blocked:
-			ge.g.Status = goalBlocked
-			ge.g.Message = "模型报告受阻"
+			cur.Status = goalBlocked
+			cur.Message = "模型报告受阻"
 			ge.mu.Unlock()
-			ge.broadcastGoal()
+			ge.broadcastGoal(sessionID)
 			return true
 		default:
 			// Model kept working instead of defending the claim.
-			ge.g.claimedCompletion = false
+			cur.claimedCompletion = false
 			ge.mu.Unlock()
 			return false
 		}
 	}
 	// Normal round: latch a completion claim for the evidence round.
-	if claim && !ge.g.claimedCompletion {
-		ge.g.claimedCompletion = true
-		ge.g.Verifying = true
-		ge.g.verifyingRound = true
-		ge.g.Message = "完成声明待验证…"
+	if claim && !cur.claimedCompletion {
+		cur.claimedCompletion = true
+		cur.Verifying = true
+		cur.verifyingRound = true
+		cur.Message = "完成声明待验证…"
 		ge.mu.Unlock()
-		ge.broadcastGoal()
+		ge.broadcastGoal(sessionID)
 		return false
 	}
 	if blocked {
-		ge.g.Status = goalBlocked
-		ge.g.Message = "模型报告受阻"
+		cur.Status = goalBlocked
+		cur.Message = "模型报告受阻"
 		ge.mu.Unlock()
-		ge.broadcastGoal()
+		ge.broadcastGoal(sessionID)
 		return true
 	}
 	ge.mu.Unlock()
@@ -693,54 +706,76 @@ func (ge *goalEngine) goalAnalyze(g *GoalState, events []Event) bool {
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-// stopLoopLocked closes the stop channel so an in-flight goalLoop
-// exits at its next checkpoint. Callers must hold ge.mu.
-func (ge *goalEngine) stopLoopLocked() {
-	if !ge.loopOn {
+// stopLoopLocked closes the session's stop channel so its in-flight
+// goalLoop exits at the next checkpoint. Other sessions' loops are
+// untouched. Callers must hold ge.mu.
+func (ge *goalEngine) stopLoopLocked(sessionID string) {
+	run := ge.runLocked(sessionID)
+	if run == nil {
 		return
 	}
-	if ge.stop != nil {
-		close(ge.stop)
+	if run.loopOn && run.stop != nil {
+		close(run.stop)
 	}
-	ge.loopOn = false
-	ge.stop = nil
+	run.loopOn = false
+	run.stop = nil
 }
 
-// goalLoopOwns reports whether g — the goal pointer a loop captured at
-// entry — is still the current goal. A /goal set that replaced ge.g
-// invalidates every older loop: a stale loop must stop writing state so
-// its old turn's events never pollute the new goal. Callers must hold
-// ge.mu.
-func (ge *goalEngine) goalLoopOwns(g *GoalState) bool {
-	return g != nil && ge.g == g
+// stopAllLoopsLocked closes every session's stop channel (shutdown).
+// Callers must hold ge.mu.
+func (ge *goalEngine) stopAllLoopsLocked() {
+	for _, run := range ge.runs {
+		if run == nil {
+			continue
+		}
+		if run.loopOn && run.stop != nil {
+			close(run.stop)
+		}
+		run.loopOn = false
+		run.stop = nil
+	}
 }
 
-// goalStruct returns a copy of the goal state as a struct (nil when no
-// goal is set). Loop logic that needs struct fields uses this instead of
-// the wire-shaped snapshot map.
-func (ge *goalEngine) goalStruct() *GoalState {
-	ge.mu.Lock()
-	defer ge.mu.Unlock()
-	if ge.g == nil {
+// currentLocked returns the live goal a loop still owns: the session's
+// run must still point at the same g. A /goal set that replaced the run
+// invalidates every older loop, so a stale loop must stop writing state
+// and exit. Callers must hold ge.mu.
+func (ge *goalEngine) currentLocked(sessionID string, g *GoalState) *GoalState {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g != g {
 		return nil
 	}
-	g := *ge.g
+	return run.g
+}
+
+// goalStruct returns a copy of the session's goal state as a struct (nil
+// when that session has no goal). Loop logic that needs struct fields
+// uses this instead of the wire-shaped snapshot map.
+func (ge *goalEngine) goalStruct(sessionID string) *GoalState {
+	ge.mu.Lock()
+	defer ge.mu.Unlock()
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
+		return nil
+	}
+	g := *run.g
 	return &g
 }
 
-// goalSnapshot returns a serializable copy of the current state (nil when
-// no goal is set). Elapsed is recomputed at snapshot time.
-func (ge *goalEngine) goalSnapshot() map[string]any {
+// goalSnapshot returns a serializable copy of the session's current state
+// (nil when it has no goal). Elapsed is recomputed at snapshot time.
+func (ge *goalEngine) goalSnapshot(sessionID string) map[string]any {
 	ge.mu.Lock()
 	defer ge.mu.Unlock()
-	return ge.goalSnapshotLocked()
+	return ge.goalSnapshotLocked(sessionID)
 }
 
-func (ge *goalEngine) goalSnapshotLocked() map[string]any {
-	if ge.g == nil {
+func (ge *goalEngine) goalSnapshotLocked(sessionID string) map[string]any {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
 		return nil
 	}
-	g := *ge.g
+	g := *run.g
 	g.ElapsedMs = time.Now().UnixMilli() - g.StartedAt
 	if g.ElapsedMs < 0 {
 		g.ElapsedMs = 0
@@ -771,23 +806,19 @@ func (ge *goalEngine) goalSnapshotLocked() map[string]any {
 	return m
 }
 
-// broadcastGoal pushes a goal_updated notification carrying the current
-// state — same event shape the agent's own goal_updated uses
+// broadcastGoal pushes a goal_updated notification carrying the session's
+// current state — same event shape the agent's own goal_updated uses
 // ({type, update, sessionId}).
-func (ge *goalEngine) broadcastGoal() {
+func (ge *goalEngine) broadcastGoal(sessionID string) {
 	ge.mu.Lock()
-	st := ge.goalSnapshotLocked()
-	var sid string
-	if ge.g != nil {
-		sid = ge.g.sessionID
-	}
+	st := ge.goalSnapshotLocked(sessionID)
 	ge.mu.Unlock()
 	if st == nil {
 		return
 	}
 	ev := Event{kType: "goal_updated", kUpdate: st}
-	if sid != "" {
-		ev[kSessionID] = sid
+	if sessionID != "" {
+		ev[kSessionID] = sessionID
 	}
 	ge.host.Broadcast(ev)
 }
