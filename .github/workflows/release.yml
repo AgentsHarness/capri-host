@@ -110,13 +110,13 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/Capri-host-${GOOS}-${GOARCH}" ./cmd/capri-host
+          go build -trimpath -ldflags "-s -w -X github.com/AgentsHarness/capri-host/internal/acp.Version=${GITHUB_REF_NAME}" -o "dist/Capri-host-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}" ./cmd/capri-host
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: Capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/Capri-host-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/Capri-host-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
           retention-days: 1
           if-no-files-found: error
 
@@ -179,7 +179,7 @@ jobs:
           # the user one directory to open rather than loose files wherever
           # they happened to extract.
           cd dist/win/${{ matrix.goarch }}
-          zip -r "../../Capri-windows-${{ matrix.goarch }}.zip" Capri
+          zip -r "../../Capri-${{ github.ref_name }}-windows-${{ matrix.goarch }}.zip" Capri
           cd ../..
           rm -rf win
 
@@ -187,7 +187,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: Capri-windows-${{ matrix.goarch }}
-          path: dist/Capri-windows-${{ matrix.goarch }}.zip
+          path: dist/Capri-${{ github.ref_name }}-windows-${{ matrix.goarch }}.zip
           retention-days: 1
           if-no-files-found: error
 
@@ -239,16 +239,21 @@ jobs:
           CAPRI_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         run: bash packaging/macos/make-app.sh
 
+      # make-app.sh 固定产出 dist/Capri-macos.zip；发布资产按 name-version-platform
+      # 命名，带版本号，下载到同一目录时不会互相覆盖。
+      - name: Name app zip with version
+        run: mv dist/Capri-macos.zip "dist/Capri-${{ github.ref_name }}-macos.zip"
+
       - name: Build dmg
-        run: bash packaging/macos/make-dmg.sh
+        run: bash packaging/macos/make-dmg.sh dist/Capri.app "dist/Capri-${{ github.ref_name }}-macos.dmg"
 
       - name: Upload app zip
         uses: actions/upload-artifact@v6
         with:
           name: Capri-macos-app
           path: |
-            dist/Capri-macos.zip
-            dist/Capri-macos.dmg
+            dist/Capri-${{ github.ref_name }}-macos.zip
+            dist/Capri-${{ github.ref_name }}-macos.dmg
           retention-days: 1
           if-no-files-found: error
 

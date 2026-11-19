@@ -115,7 +115,7 @@ cp -R "$FE_DIR/dist/." "$ROOT/internal/server/web/dist/"
 for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
   GOOS="${target%/*}"
   GOARCH="${target#*/}"
-  name="Capri-host-${GOOS}-${GOARCH}"
+  name="Capri-host-${TAG}-${GOOS}-${GOARCH}"
   echo "build  $name"
   CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
     go build -trimpath \
@@ -123,19 +123,19 @@ for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
     -o "$OUT/$name" ./cmd/capri-host
 done
 
-echo "build  Capri-windows-{amd64,arm64}.zip"
+echo "build  Capri-${TAG}-windows-{amd64,arm64}.zip"
 OUT="$STAGE/windows" VERSION="$TAG" bash packaging/windows/make-exes.sh amd64 arm64
 for arch in amd64 arm64; do
   (
     cd "$STAGE/windows/$arch"
-    zip -qr "$OUT/Capri-windows-$arch.zip" Capri
+    zip -qr "$OUT/Capri-${TAG}-windows-$arch.zip" Capri
   )
 done
 
-echo "build  Capri.app + Capri-macos.zip + Capri-macos.dmg"
+echo "build  Capri.app + Capri-${TAG}-macos.zip + Capri-${TAG}-macos.dmg"
 VERSION="$TAG" OUT="$STAGE/Capri.app" bash packaging/macos/make-app.sh
-cp "$ROOT/dist/Capri-macos.zip" "$OUT/Capri-macos.zip"
-bash packaging/macos/make-dmg.sh "$STAGE/Capri.app" "$OUT/Capri-macos.dmg"
+cp "$ROOT/dist/Capri-macos.zip" "$OUT/Capri-${TAG}-macos.zip"
+bash packaging/macos/make-dmg.sh "$STAGE/Capri.app" "$OUT/Capri-${TAG}-macos.dmg"
 
 echo "built  $OUT"
 

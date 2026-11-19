@@ -41,7 +41,7 @@
 
 ### macOS 应用（推荐，13+）
 
-下载 `Capri-macos.zip`（或 `Capri-macos.dmg`），把 `Capri.app` 拖进「应用程序」后打开。应用只提供 Apple Silicon（arm64）版本；Intel Mac 请从 Releases 取命令行二进制。
+下载 `Capri-vX.Y.Z-macos.zip`（或 `Capri-vX.Y.Z-macos.dmg`，`X.Y.Z` 为所下载 Release 的版本号），把 `Capri.app` 拖进「应用程序」后打开。应用只提供 Apple Silicon（arm64）版本；Intel Mac 请从 Releases 取命令行二进制。
 
 1、菜单栏会出现摩羯图标。
 2、首次使用点击摩羯图标，选择「设置…」，浏览器会打开本机的 `/settings` 页面。
@@ -56,7 +56,7 @@ xattr -dr com.apple.quarantine /Applications/Capri.app
 
 ### Windows 应用（推荐）
 
-下载 `Capri-windows-amd64.zip`（或 `Capri-windows-arm64.zip`，根据系统架构选择），解压后进入 `Capri`
+下载 `Capri-vX.Y.Z-windows-amd64.zip`（或 `Capri-vX.Y.Z-windows-arm64.zip`，按系统架构选择；`X.Y.Z` 为 Release 版本号），解压后进入 `Capri`
 目录，双击 **`Capri.exe`**。
 
 目录结构：
