@@ -15,7 +15,7 @@ import (
 )
 
 // This file is the Stage-4 fault matrix at the host end of the session: the
-// failure modes v2 must answer, driven through the real
+// failure modes v3 must answer, driven through the real
 // session loop over the in-process fake transport (deterministic) plus Run
 // over a real WebSocket where the reconnect policy matters.
 
@@ -244,14 +244,14 @@ func TestAudienceResumeFromAckNotBeginning(t *testing.T) {
 		Status: mustJSON(wire.HeartbeatStatus{})})
 	waitUntil(t, "the hub ack", func() bool { return c.out.acked() == 2 })
 
-	h.tr.push(t, audienceFrame(1, 2, pausedAudience(2)))
+	h.tr.push(t, audienceFrame(pausedAudience(2)))
 	waitUntil(t, "the paused audience", func() bool { return c.out.isPaused() })
 
 	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "c"})
 	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "d"})
 	waitUntil(t, "the paused backlog", func() bool { return c.out.next() == 4 })
 
-	h.tr.push(t, audienceFrame(2, 2, watchingAudience(3, "s1")))
+	h.tr.push(t, audienceFrame(watchingAudience(3, "s1")))
 	fr := h.tr.nextOfType(t, wire.TypeEvents, 3*time.Second)
 	if fr.Seq != 3 {
 		t.Fatalf("resume sent seq %d, want 3 (acked+1), not the beginning", fr.Seq)
@@ -453,7 +453,7 @@ func TestOutboxElisionKeepsSeqAndWatermark(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: testCaps(),
@@ -475,7 +475,7 @@ func TestOutboxElisionKeepsSeqAndWatermark(t *testing.T) {
 		}
 	}
 
-	h.tr.push(t, audienceFrame(1, 0, watchingAudience(2, "s1")))
+	h.tr.push(t, audienceFrame(watchingAudience(2, "s1")))
 	var seqs []uint64
 	deadline := time.Now().Add(3 * time.Second)
 	for len(seqs) < 6 && time.Now().Before(deadline) {
@@ -502,7 +502,7 @@ func TestOutboxElisionKeepsSeqAndWatermark(t *testing.T) {
 func TestOutboxCriticalOverflowReplaysAfterReconnect(t *testing.T) {
 	hub := newWSHub(t, watchingAudience(1, "s1"))
 	hub.noAutoAck = true
-	hub.limits = &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	hub.limits = &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	c := NewClient(Config{URL: hub.url(), HostID: "h1", HostName: "H1", Token: "tok123", DisableQUIC: true})
 	bridge := newTestBridge()
 	runClient(t, c, bridge)
@@ -558,7 +558,7 @@ func TestOverflowWhileDisconnectedKeepsCriticalEvents(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: testCaps(),

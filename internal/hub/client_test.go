@@ -106,7 +106,7 @@ func TestRunAudiencePausesAndResumes(t *testing.T) {
 		t.Fatalf("hub received %d events while nobody watched", n)
 	}
 
-	hub.push(t, audienceFrame(1, 0, watchingAudience(2, "s1")))
+	hub.push(t, audienceFrame(watchingAudience(2, "s1")))
 	hub.waitEvent(t, "queued-while-paused", 5*time.Second)
 }
 

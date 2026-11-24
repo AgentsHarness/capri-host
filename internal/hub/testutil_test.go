@@ -355,8 +355,8 @@ func pausedAudience(gen uint64) wire.Audience {
 	return wire.Audience{Gen: gen, Watchers: 0}
 }
 
-func audienceFrame(seq, ack uint64, a wire.Audience) wire.Frame {
-	return wire.NewAudience(seq, ack, a)
+func audienceFrame(a wire.Audience) wire.Frame {
+	return wire.NewAudience(a)
 }
 
 func requestFrame(seq, ack uint64, reqID, method, path string, body string) wire.Frame {

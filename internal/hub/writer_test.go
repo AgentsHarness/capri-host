@@ -216,7 +216,7 @@ func TestRetransmitReplaysOnlyTheOldestBatch(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: small, Caps: testCaps(),

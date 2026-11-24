@@ -1,25 +1,26 @@
 # PROTOCOL — host 侧传输说明
 
-协议权威定义在 `wire/PROTOCOL-V2.md`，帧模型、Sender/Receiver、关闭原因
-与默认限额都由 `github.com/AgentsHarness/capri-hub/wire` 提供。本文只记录
-**capri-host 这一侧**收发帧时需要注意的传输细节。
+协议权威定义在 `wire/PROTOCOL-V2.md`（文件名为历史保留，内容为 wire v3），
+帧模型、Sender/Receiver、关闭原因与默认限额都由
+`github.com/AgentsHarness/capri-hub/wire` 提供。本文只记录 **capri-host
+这一侧**收发帧时需要注意的传输细节。
 
-可靠性模型与故障矩阵：`acp-hub/docs/SESSION-V2-RELIABILITY.md`。
+可靠性模型与故障矩阵：见 `wire/PROTOCOL-V2.md` 的可靠投递与存活章节。
 
 ## 1. 帧封装
 
-每帧是一个 JSON 对象 `{"v":2,"type":...,"seq":N,"ack":M}`。
+每帧是一个 JSON 对象 `{"v":3,"type":...,"seq":N,"ack":M}`。
 
 - 新生连接的第一帧永远是 `hello`（epoch、token、resume、caps）；hub 回
   `hello_ack` 后，下行 seq、上行水位、重传与空闲计时都交给会话循环。
-- 可靠帧带 seq：`events`、`audience`、`request`；不可靠帧必须不带：
-  `hello`、`hello_ack`、`hb`、`respond`。
+- 可靠帧带 seq：`events`、`request`；不可靠帧必须不带：
+  `hello`、`hello_ack`、`audience`、`hb`、`respond`。
 - `ack` 是本端对反方向的水位，随可携带它的帧一起发出。下行 ack 前进后，
   如果 `wire.AckDelay`（20ms）内没有其他出站帧，必须立即补一帧 heartbeat；
   不能等周期心跳，否则确认延迟会等于 keepalive。
-- `audience` 是绝对状态：hub 可能在未确认期间原地更新同一 seq 的 payload。
-  收到 seq 不高于已应用水位的 `audience` 时，只要 `gen` 更新，仍必须应用，
-  不能按普通重传丢弃。
+- `audience` 是绝对状态，不可靠、按 `gen` 排序、最新值生效：不带 seq 也不
+  需要 ack。相同 `gen` 重复应用是无操作；旧 `gen` 忽略。hub 每个周期心跳重发
+  最新快照，因此丢帧最多滞后一个心跳周期即可自愈。
 - `hello_ack.hubBoot` 标识 hub 进程；中继备忘按 `(hubBoot, reqId)` 键控。
 
 ## 2. 握手顺序
@@ -80,6 +81,31 @@ writer 退出后才允许下一条会话接管应答日志。
 - 超过日志字节上限（默认按两个最大答案的 base64 体积，约 75MiB）时，只把
   **当前**请求以小块 502 结束（`chunkSeq=1`），不影响会话与其他应答。
 - `hubBoot` 变化（hub 重启）会清空应答日志与 memo：reqId 空间已重置。
+
+### 4.1 写请求幂等（`idemKey` / `idemScope`）
+
+`request` 帧可携带 `idemKey`（1..128 可打印 ASCII）和 `idemScope`
+（0..64，由 hub 按浏览器身份生成：`root` / `user:<id>` / `guest:<id>`）。
+`serveRelay` 把两者原样注入本地 HTTP 请求的 `Idempotency-Key` /
+`Idempotency-Scope` 头；host 的 `withIdempotency` 中间件（`withAuth`
+内侧）据此做 at-most-once：
+
+- 同一个 `(hostId, scope, key)` 最多执行一次。重复请求（新 `reqId`、相同
+  key）直接回放第一次的 status/body（直连模式下还会带
+  `Idempotent-Replayed: true`）；
+- 同 key 不同请求指纹（`sha256(method + "\n" + requestURI + "\n" + body)`）
+  返回 409 `idempotency_key_conflict`，不执行；
+- host 重启后只有 `started` 记录时返回 409
+  `idempotency_outcome_unknown`，绝不自动再次执行；
+- 结果持久化在 `~/.capri-host/relay-idempotency.jsonl`
+  （`RELAY_IDEMPOTENCY_FILE` 覆盖），默认 TTL 24h；响应超过 8MiB 时
+  标记为不可回放，重复请求返回 409 `idempotency_result_unavailable`。
+
+两者的分工：`relayMemo` 按 `(hubBoot, reqId)` 处理**同一次传输**的重放
+（新 reqId 不受它约束）；幂等 store 按**浏览器逻辑操作的 key** 跨 reqId、
+跨重连、跨 host 重启合并执行。`promptId` 仍是 prompt 的应用层键，三者
+互不冲突。
+
 
 ## 5. 关闭映射
 

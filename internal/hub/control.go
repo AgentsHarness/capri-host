@@ -107,6 +107,9 @@ func (c *Client) State() State {
 	if s := c.currentSession(); s != nil {
 		st.LastSentSeq = s.w.sentThrough()
 	}
+	if rs := c.relayStats.snapshot(); rs.Requests > 0 {
+		st.Relay = &rs
+	}
 
 	return st
 }

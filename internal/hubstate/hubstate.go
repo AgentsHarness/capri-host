@@ -83,6 +83,21 @@ func ReadToken(path string) *StoredToken {
 	return &t
 }
 
+// RelayStat is the host-side relay latency summary exposed through
+// GET /api/hub/state. It answers "how long did the local handlers take?"
+// without requiring a metrics backend.
+type RelayStat struct {
+	Requests  uint64 `json:"requests"`
+	Completed uint64 `json:"completed"`
+	Errors    uint64 `json:"errors"`
+	Inflight  int64  `json:"inflight"`
+	AvgMs     uint64 `json:"avgMs"`
+	MaxMs     uint64 `json:"maxMs"`
+	P50Ms     uint64 `json:"p50Ms"`
+	P95Ms     uint64 `json:"p95Ms"`
+	P99Ms     uint64 `json:"p99Ms"`
+}
+
 // State is a point-in-time snapshot of the hub link. Safe from any goroutine
 // at any time, including before Run has started.
 type State struct {
@@ -123,6 +138,9 @@ type State struct {
 	LastSentSeq  uint64 `json:"lastSentSeq,omitempty"`
 	HubAckSeq    uint64 `json:"hubAckSeq,omitempty"`
 	RelayQueued  int    `json:"relayQueued,omitempty"`
+	// Relay is the local relay execution summary (from request frame applied
+	// to local handler completion). Nil until the first relay request ends.
+	Relay *RelayStat `json:"relay,omitempty"`
 }
 
 // NormalizeURL cleans an address a person typed. An empty input stays empty.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"testing"
 )
 
@@ -35,6 +36,18 @@ func TestLoadBindAddr(t *testing.T) {
 	}
 	if !cfg.BindIsLoopback() {
 		t.Error("::1 must count as loopback")
+	}
+}
+
+func TestIdemFilePath(t *testing.T) {
+	dir := isolateConfig(t)
+	t.Setenv("RELAY_IDEMPOTENCY_FILE", "")
+	if got, want := Load().IdemFile, filepath.Join(dir, "relay-idempotency.jsonl"); got != want {
+		t.Fatalf("default IdemFile = %q, want %q", got, want)
+	}
+	t.Setenv("RELAY_IDEMPOTENCY_FILE", "/tmp/custom-idem.jsonl")
+	if got := Load().IdemFile; got != "/tmp/custom-idem.jsonl" {
+		t.Fatalf("RELAY_IDEMPOTENCY_FILE → IdemFile = %q", got)
 	}
 }
 

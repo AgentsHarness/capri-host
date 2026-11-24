@@ -14,7 +14,7 @@ import (
 	"github.com/AgentsHarness/capri-hub/wire"
 )
 
-// wsHub is a minimal v2 hub over WebSocket: it completes the handshake,
+// wsHub is a minimal v3 hub over WebSocket: it completes the handshake,
 // records what the host sends, auto-acks events, and lets a test push downlink
 // frames (audience, request, hb).
 type wsHub struct {

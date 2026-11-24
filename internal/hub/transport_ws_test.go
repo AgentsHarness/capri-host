@@ -111,7 +111,7 @@ func TestWSRecvReassemblesInterleavedUnits(t *testing.T) {
 	}
 
 	// A text message is one complete JSON frame, cut straight through.
-	text, err := wire.Encode(audienceFrame(9, 0, watchingAudience(2, "s1")))
+	text, err := wire.Encode(audienceFrame(watchingAudience(2, "s1")))
 	if err != nil {
 		t.Fatal(err)
 	}

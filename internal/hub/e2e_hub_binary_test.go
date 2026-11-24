@@ -9,7 +9,7 @@
 //
 // Run: CAPRI_E2E_HUB=/path/to/acp-hub go test -tags e2e ./internal/hub -run TestE2EHubBinary -v
 //
-// The v2 session layer is exercised end to end here: hello/hello_ack over
+// The v3 session layer is exercised end to end here: hello/hello_ack over
 // QUIC with an SPKI pin, per-event acking (the host's uplink log drains only
 // once the hub acks), a compressed uplink, and a large relay answer on its own
 // request stream while the control plane keeps carrying events.
@@ -379,7 +379,7 @@ func TestE2EHubBinaryHostClientQUIC(t *testing.T) {
 
 // TestE2EHubBinaryHostClientWS is the WebSocket half of the cross-repo happy
 // path: the REAL hub binary, a browser /ws/fe subscriber, and the REAL host
-// client forced onto WebSocket. It asserts the v2 handshake surfaces the host
+// client forced onto WebSocket. It asserts the v3 handshake surfaces the host
 // as online, the audience gate lets uplink events through, and a relayed
 // request is answered — the same contract the QUIC test pins.
 func TestE2EHubBinaryHostClientWS(t *testing.T) {

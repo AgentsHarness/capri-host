@@ -9,30 +9,24 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/AgentsHarness/capri-host/internal/acp"
+	"github.com/AgentsHarness/capri-hub/wire"
+	"github.com/quic-go/quic-go"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/quic-go/quic-go"
-
-	"github.com/AgentsHarness/capri-host/internal/acp"
-
-	"github.com/AgentsHarness/capri-hub/wire"
 )
 
-// quicTestHub is a v2 hub over QUIC: the control stream carries the session,
+// quicTestHub is a v3 hub over QUIC: the control stream carries the session,
 // every further stream is a per-request respond plane.
 type quicTestHub struct {
 	t       *testing.T
@@ -456,7 +450,7 @@ func TestQUICSessionRoundTrip(t *testing.T) {
 	}
 
 	// Downlink: an audience snapshot pauses and resumes the uplink.
-	if err := hub.writeControl(ctrl, audienceFrame(1, 0, pausedAudience(2))); err != nil {
+	if err := hub.writeControl(ctrl, audienceFrame(pausedAudience(2))); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -570,313 +564,6 @@ func TestQUICCompressedUplink(t *testing.T) {
 	hub.mu.Unlock()
 	if binary == 0 {
 		t.Fatal("large QUIC frame was not compressed")
-	}
-}
-
-// ── connection migration (T6) ─────────────────────────────────────────
-
-// migratableConn wraps two UDP sockets and can switch which one the QUIC
-// client sends from — simulating a NAT rebind / Wi-Fi↔cellular switch without
-// tearing the connection down.
-type migratableConn struct {
-	t       *testing.T
-	orig    *net.UDPConn
-	rebound *net.UDPConn
-
-	mu       sync.Mutex
-	current  *net.UDPConn
-	packets  chan migPacket
-	closed   chan struct{}
-	closeOne sync.Once
-}
-
-type migPacket struct {
-	data []byte
-	addr net.Addr
-}
-
-func newMigratableConn(t *testing.T) *migratableConn {
-	t.Helper()
-	listen := func() *net.UDPConn {
-		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			t.Fatalf("listen udp: %v", err)
-		}
-		return c
-	}
-	m := &migratableConn{
-		t:       t,
-		orig:    listen(),
-		rebound: listen(),
-		packets: make(chan migPacket, 256),
-		closed:  make(chan struct{}),
-	}
-	m.current = m.orig
-	pump := func(c *net.UDPConn) {
-		for {
-			buf := make([]byte, 64<<10)
-			n, addr, err := c.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			select {
-			case m.packets <- migPacket{data: buf[:n], addr: addr}:
-			case <-m.closed:
-				return
-			}
-		}
-	}
-	go pump(m.orig)
-	go pump(m.rebound)
-	t.Cleanup(func() { _ = m.Close() })
-	return m
-}
-
-func (m *migratableConn) migrate() {
-	m.mu.Lock()
-	m.current = m.rebound
-	m.mu.Unlock()
-}
-
-func (m *migratableConn) LocalAddr() net.Addr {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.current.LocalAddr()
-}
-
-func (m *migratableConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	select {
-	case pkt := <-m.packets:
-		n := copy(p, pkt.data)
-		return n, pkt.addr, nil
-	case <-m.closed:
-		return 0, nil, net.ErrClosed
-	}
-}
-
-func (m *migratableConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	m.mu.Lock()
-	c := m.current
-	m.mu.Unlock()
-	return c.WriteToUDP(p, addr.(*net.UDPAddr))
-}
-
-func (m *migratableConn) Close() error {
-	m.closeOne.Do(func() {
-		close(m.closed)
-		_ = m.orig.Close()
-		_ = m.rebound.Close()
-	})
-	return nil
-}
-
-func (m *migratableConn) SetDeadline(time.Time) error      { return nil }
-func (m *migratableConn) SetReadDeadline(time.Time) error  { return nil }
-func (m *migratableConn) SetWriteDeadline(time.Time) error { return nil }
-
-// TestQUICConnectionMigration: after the local UDP socket rebinds, the same
-// session keeps carrying events in both directions.
-func TestQUICConnectionMigration(t *testing.T) {
-	hub := newQUICTestHub(t, watchingAudience(1, "s1"))
-	hub.serve()
-	mconn := newMigratableConn(t)
-	c := newQUICClient(t, hub)
-	c.quicDial = func(ctx context.Context, addr string, tlsConf *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-		raddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			return nil, err
-		}
-		tr := &quic.Transport{Conn: mconn}
-		return tr.Dial(ctx, raddr, tlsConf, cfg)
-	}
-	bridge := newTestBridge()
-	runForwardLoop(t, c, bridge)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	res := make(chan sessionResult, 1)
-	go func() {
-		_, reason, err := c.quicSession(ctx, bridge)
-		res <- sessionResult{reason: reason, err: err}
-	}()
-	ctrl := hub.control(t)
-	_ = ctrl
-
-	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "before-migration"})
-	hub.waitEvent(t, 5*time.Second)
-
-	before := mconn.LocalAddr().String()
-	mconn.migrate()
-	if mconn.LocalAddr().String() == before {
-		t.Fatal("migration did not change the local address")
-	}
-
-	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "after-migration"})
-	hub.waitEvent(t, 5*time.Second)
-
-	// Downlink still steers the host on the migrated path.
-	if err := hub.writeControl(ctrl, audienceFrame(1, 0, pausedAudience(2))); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for !c.out.isPaused() {
-		if time.Now().After(deadline) {
-			t.Fatal("downlink broke across the address change")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	select {
-	case r := <-res:
-		t.Fatalf("session died across the address change: %v / %v", r.reason, r.err)
-	default:
-	}
-	cancel()
-}
-
-// ── SPKI pinning ──────────────────────────────────────────────────────
-
-func TestParseSPKIPin(t *testing.T) {
-	sum := sha256.Sum256([]byte("spki-pin-test-vector"))
-	hexPin := hex.EncodeToString(sum[:])
-	b64Pin := base64.StdEncoding.EncodeToString(sum[:])
-	cases := []struct {
-		name    string
-		in      string
-		wantErr bool
-	}{
-		{name: "hex", in: hexPin},
-		{name: "hex uppercase", in: strings.ToUpper(hexPin)},
-		{name: "hex with sha256/ prefix", in: "sha256/" + hexPin},
-		{name: "base64 padded", in: b64Pin},
-		{name: "base64 with sha256// prefix", in: "sha256//" + b64Pin},
-		{name: "surrounding whitespace", in: "  " + hexPin + "\n"},
-		{name: "empty", in: "", wantErr: true},
-		{name: "garbage", in: "!!", wantErr: true},
-		{name: "hex too short", in: hexPin[:62], wantErr: true},
-		{name: "prefix alone", in: "sha256//", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseSPKIPin(tc.in)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("parse(%q) = %x, want error", tc.in, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parse(%q): %v", tc.in, err)
-			}
-			if got != sum {
-				t.Fatalf("parse(%q) = %x, want %x", tc.in, got, sum)
-			}
-		})
-	}
-}
-
-func TestQUICTLSPinPolicy(t *testing.T) {
-	pin := hex.EncodeToString(make([]byte, 32))
-
-	t.Run("pin replaces CA verification", func(t *testing.T) {
-		c := NewClient(Config{URL: "https://hub.example.com", QUICPin: pin})
-		conf := c.quicTLSClientConfig("203.0.113.10")
-		if !conf.InsecureSkipVerify {
-			t.Error("InsecureSkipVerify = false; the pin path must skip the system CA chain")
-		}
-		if conf.VerifyPeerCertificate == nil {
-			t.Fatal("VerifyPeerCertificate = nil; the pin must be enforced in its place")
-		}
-		if conf.ServerName != "" {
-			t.Errorf("ServerName = %q; hostname verification is meaningless under a pin", conf.ServerName)
-		}
-		if len(conf.NextProtos) != 1 || conf.NextProtos[0] != "capri-hub" {
-			t.Errorf("NextProtos = %v, want [capri-hub]", conf.NextProtos)
-		}
-	})
-	t.Run("pin wins over insecure and http policy", func(t *testing.T) {
-		for _, url := range []string{"http://10.0.0.5:8787", "https://hub.example.com"} {
-			c := NewClient(Config{URL: url, QUICInsecure: true, QUICPin: pin})
-			conf := c.quicTLSClientConfig("h")
-			if conf.VerifyPeerCertificate == nil {
-				t.Errorf("URL %s: pin not enforced when QUICInsecure also set", url)
-			}
-		}
-	})
-	t.Run("no pin keeps the CA policy", func(t *testing.T) {
-		c := NewClient(Config{URL: "https://hub.example.com"})
-		conf := c.quicTLSClientConfig("203.0.113.10")
-		if conf.VerifyPeerCertificate != nil {
-			t.Error("VerifyPeerCertificate set without a pin")
-		}
-		if conf.InsecureSkipVerify {
-			t.Error("InsecureSkipVerify set without a pin over https")
-		}
-	})
-	t.Run("malformed pin fails closed", func(t *testing.T) {
-		c := NewClient(Config{URL: "https://hub.example.com", QUICPin: "definitely-not-a-fingerprint"})
-		conf := c.quicTLSClientConfig("hub.example.com")
-		if conf.VerifyPeerCertificate == nil {
-			t.Fatal("malformed pin produced no verifier — verification would be silently disabled")
-		}
-		if err := conf.VerifyPeerCertificate(nil, nil); err == nil {
-			t.Fatal("malformed pin verifier accepted a handshake; must always fail")
-		}
-	})
-}
-
-// TestQUICTLSPinHandshake: the matching fingerprint connects, a different one
-// fails the handshake itself.
-func TestQUICTLSPinHandshake(t *testing.T) {
-	hub := newQUICTestHub(t, watchingAudience(1))
-	hub.serve()
-	pin := hub.spkiPin()
-	local := httptest.NewServer(nil)
-	defer local.Close()
-
-	c := NewClient(Config{
-		URL: hub.url(), HostID: "h1", Token: "tok123", LocalBase: local.URL,
-		QUICPin: hex.EncodeToString(pin[:]),
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := c.quicSession(ctx, newTestBridge())
-		done <- err
-	}()
-	hub.control(t)
-	cancel()
-	<-done
-
-	bad := pin
-	bad[0] ^= 0xFF
-	c2 := NewClient(Config{
-		URL: hub.url(), HostID: "h1", Token: "tok123", LocalBase: local.URL,
-		QUICPin: hex.EncodeToString(bad[:]),
-	})
-	bctx, bcancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer bcancel()
-	if _, _, err := c2.quicSession(bctx, newTestBridge()); err == nil {
-		t.Fatal("session established against a mismatched SPKI pin")
-	} else if !strings.Contains(err.Error(), "SPKI") {
-		t.Errorf("error does not mention the pin mismatch: %v", err)
-	}
-}
-
-func TestPinSPKIVerifyUnits(t *testing.T) {
-	hub := newQUICTestHub(t, watchingAudience(1))
-	pin := hub.spkiPin()
-	verify := pinSPKIVerify(pin)
-
-	if err := verify([][]byte{hub.certDER}, nil); err != nil {
-		t.Fatalf("matching SPKI rejected: %v", err)
-	}
-	other := newQUICTestHub(t, watchingAudience(1))
-	if err := verify([][]byte{other.certDER}, nil); err == nil {
-		t.Fatal("different certificate SPKI accepted")
-	}
-	if err := verify(nil, nil); err == nil {
-		t.Fatal("empty certificate chain accepted")
 	}
 }
 

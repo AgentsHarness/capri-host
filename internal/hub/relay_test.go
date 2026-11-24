@@ -136,7 +136,7 @@ func TestRelayInProcess(t *testing.T) {
 		HostID: "h1", Token: "tok123", AccessToken: "tok", Local: mux,
 	})
 	h := newSessionHarness(t, c, newTestBridge())
-	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: 1 << 20, ResumeWindow: wire.ResumeWindow}
+	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: 1 << 20}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: testCaps(),

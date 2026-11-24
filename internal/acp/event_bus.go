@@ -4,6 +4,8 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+
+	"github.com/AgentsHarness/capri-hub/wire/events"
 )
 
 // ─────────────────────────────────────────────────────────────────────
@@ -264,30 +266,21 @@ func trimPlaceholder(ev Event) Event {
 	return out
 }
 
-// droppableEventType reports whether an event type is lossy-tolerable stream
-// noise: dropping one (or several) of these under backpressure costs at most
-// transient UI jitter that FE gap-pull can repair or ignore. Everything else
-// (terminal states like done/turn_completed, errors, client_request, roster
-// and permission changes) is critical and is never dropped voluntarily.
+// droppableEventType is the any-typed view of events.Droppable for the bus
+// hot path, where the type arrives as an `any` map value. Non-string values
+// are never droppable (and therefore critical).
 func droppableEventType(t any) bool {
 	s, ok := t.(string)
 	if !ok {
 		return false
 	}
-	switch s {
-	case "chunk", "user_chunk", "thought", "gen_rate", "log",
-		"session_updates_chunk", "search_fuzzy_status", "search_content_status":
-		return true
-	}
-	return false
+	return events.Droppable(s)
 }
 
 // IsDroppableEventType reports whether an event of this type may be dropped
-// under back-pressure: chunk-like payloads the transcript can rebuild. It is
-// the exported form of the drop tier above so the hub client's replay ring
-// does not keep a second, drifting copy of the list — it trims those events
-// while nobody is watching and must never trim the rest (a client_request
-// that is dropped has no history to come back from).
+// under back-pressure: chunk-like payloads the transcript can rebuild. The
+// classification lives in acp-hub/wire/events so the host does not keep a
+// second, drifting copy of the list.
 func IsDroppableEventType(typ string) bool {
 	return droppableEventType(typ)
 }

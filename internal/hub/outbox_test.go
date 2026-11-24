@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -47,6 +48,24 @@ func TestOutboxEnforceLockedElidesMixedLog(t *testing.T) {
 	}
 	if got := o.snd.Bytes(); got != want {
 		t.Fatalf("bytes = %d, want %d", got, want)
+	}
+}
+
+// TestOutboxGapFillCap: a bus jump beyond the fill cap is refused instead of
+// synthesizing an unbounded run of placeholders; a gap at the cap still fills.
+func TestOutboxGapFillCap(t *testing.T) {
+	o := newOutbox()
+	if err := o.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":257,"text":"x"}`)); !errors.Is(err, errOutboxGap) {
+		t.Fatalf("append past a %d-seq gap: %v, want errOutboxGap", maxGapFill, err)
+	}
+	if n := o.len(); n != 0 {
+		t.Fatalf("refused append logged %d entries", n)
+	}
+	if err := o.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":256,"text":"x"}`)); err != nil {
+		t.Fatalf("append at the cap: %v", err)
+	}
+	if n := o.len(); n != maxGapFill {
+		t.Fatalf("log = %d entries, want %d (placeholders plus the event)", n, maxGapFill)
 	}
 }
 

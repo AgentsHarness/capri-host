@@ -29,8 +29,18 @@ const relayTimeout = 40 * time.Minute
 // frame. A 28MB answer as a single frame would hold the transport's write lock
 // for tens of seconds, blocking every event and heartbeat behind it. At 256KB
 // per chunk the largest body is ~112 chunks (base64 ~341KB each), well inside
-// the hub's 1500-frame resume window.
+// the hub's down-log budget.
 const relayChunkSize = 256 << 10
+
+// 幂等信封头：request 帧的 idemKey/idemScope 注入本地 HTTP 请求，由
+// server 的 withIdempotency 中间件把同一个 key 合并成一次执行。
+const (
+	idemKeyHeader   = "Idempotency-Key"
+	idemScopeHeader = "Idempotency-Scope"
+	// requestIDHeader carries the hub's relay reqId into the local HTTP
+	// handler so its logs can be joined with the hub's [relay] lines.
+	requestIDHeader = "X-Capri-Request-ID"
+)
 
 // serveRelay answers one `request` frame. Duplicates on a same-epoch resume
 // must not re-execute — a prompt is not idempotent — so the memo admits one
@@ -38,21 +48,31 @@ const relayChunkSize = 256 << 10
 // the outbox and reaches the hub from there.
 func (c *Client) serveRelay(s *session, f wire.Frame) {
 	if c.memo.aborted(s.hubBoot, f.ReqID) {
-		log.Printf("[hub-client] hub 已放弃该请求，不再执行 reqId=%s", f.ReqID)
+		log.Printf("[relay] req=%s boot=%d host=%s skip=aborted", f.ReqID, s.hubBoot, c.cfg.HostID)
 		return
 	}
 	e, owner := c.memo.begin(s.hubBoot, f.ReqID)
 	if !owner {
+		log.Printf("[relay] req=%s boot=%d host=%s skip=duplicate", f.ReqID, s.hubBoot, c.cfg.HostID)
 		return
 	}
+	start := time.Now()
+	c.relayStats.begin()
+	log.Printf("[relay] req=%s boot=%d host=%s begin method=%s path=%s body=%dB", f.ReqID, s.hubBoot, c.cfg.HostID, f.Method, f.Path, len(f.Body))
 	go func() {
 		// An abort can race begin: the hub discarded the request between the
 		// frame arriving and the execution starting.
 		if !c.memo.executable(e) {
-			log.Printf("[hub-client] 请求在开始执行前已被放弃 reqId=%s", e.key.reqID)
+			duration := time.Since(start)
+			c.relayStats.end(duration, false)
+			log.Printf("[relay] req=%s boot=%d host=%s end status=0 bytes=0 duration_ms=%d err=aborted", f.ReqID, s.hubBoot, c.cfg.HostID, duration.Milliseconds())
 			return
 		}
-		status, body := c.executeRelay(s, f.Method, f.Path, f.Body)
+		status, body := c.executeRelay(s, f.ReqID, f.Method, f.Path, f.Body, f.IdemKey, f.IdemScope)
+		duration := time.Since(start)
+		ok := status < http.StatusInternalServerError
+		c.relayStats.end(duration, ok)
+		log.Printf("[relay] req=%s boot=%d host=%s end status=%d bytes=%d duration_ms=%d", f.ReqID, s.hubBoot, c.cfg.HostID, status, len(body), duration.Milliseconds())
 		c.answer(e, status, body)
 	}()
 }
@@ -202,7 +222,7 @@ func encodeRelayFailure(ack uint64, reqID, reason string) []byte {
 // Execution path: in-process via c.local (server.Handler()) when wired — 同一
 // 条 withAuth/withCORS 管线，无本机端口依赖；否则回退 LocalBase 的 TCP 回环
 // HTTP 直调（外部装配方与旧测试）。
-func (c *Client) executeRelay(s *session, method, path string, body json.RawMessage) (int, json.RawMessage) {
+func (c *Client) executeRelay(s *session, reqID, method, path string, body json.RawMessage, idemKey, idemScope string) (int, json.RawMessage) {
 	limit := s.maxRelay
 	if limit <= 0 {
 		limit = wire.DefaultLimits.MaxRelayBody
@@ -211,7 +231,7 @@ func (c *Client) executeRelay(s *session, method, path string, body json.RawMess
 	defer cancel()
 
 	if c.local != nil {
-		return c.relayInProcess(ctx, method, path, body, limit)
+		return c.relayInProcess(ctx, reqID, method, path, body, limit, idemKey, idemScope)
 	}
 
 	var rd io.Reader
@@ -223,6 +243,8 @@ func (c *Client) executeRelay(s *session, method, path string, body json.RawMess
 		return 500, mustJSON(map[string]any{"ok": false, "error": "invalid relay request"})
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(requestIDHeader, reqID)
+	setIdemHeaders(req, idemKey, idemScope)
 	// LocalBase 的 /api/* 已配置入站 token（FE_TOKEN）时，中继请求必须
 	// 带上它，否则 hub 模式下所有 API 会 401。
 	if c.cfg.AccessToken != "" {
@@ -247,6 +269,17 @@ func (c *Client) executeRelay(s *session, method, path string, body json.RawMess
 		return 502, mustJSON(map[string]any{"ok": false, "error": fmt.Sprintf("本地响应过大（>%dMB），无法中继", limit>>20)})
 	}
 	return res.StatusCode, json.RawMessage(rb)
+}
+
+// setIdemHeaders 只在字段非空时注入；老 hub 不发这两个字段时本地请求
+// 与改造前完全一致。
+func setIdemHeaders(req *http.Request, key, scope string) {
+	if key != "" {
+		req.Header.Set(idemKeyHeader, key)
+	}
+	if scope != "" {
+		req.Header.Set(idemScopeHeader, scope)
+	}
 }
 
 // relayResponseWriter 是进程内中继的响应记录器：缓存状态码与响应体
@@ -281,7 +314,7 @@ func (w *relayResponseWriter) Flush() {}
 // relayInProcess 直接调用本 host 的 API 处理链并回帧。net/http 的服务器
 // 通常会 recover handler panic；进程内直调没有这层防护，这里补齐——
 // panic 必须变成 500 响应，而不是击穿 hub client 的会话 goroutine。
-func (c *Client) relayInProcess(ctx context.Context, method, path string, body json.RawMessage, limit int) (int, json.RawMessage) {
+func (c *Client) relayInProcess(ctx context.Context, reqID, method, path string, body json.RawMessage, limit int, idemKey, idemScope string) (int, json.RawMessage) {
 	var rd io.Reader
 	if len(body) > 0 {
 		rd = bytes.NewReader(body)
@@ -294,6 +327,8 @@ func (c *Client) relayInProcess(ctx context.Context, method, path string, body j
 		return 500, mustJSON(map[string]any{"ok": false, "error": "invalid relay request"})
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(requestIDHeader, reqID)
+	setIdemHeaders(req, idemKey, idemScope)
 	if c.cfg.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.AccessToken)
 	}
@@ -314,6 +349,14 @@ func (c *Client) relayInProcess(ctx context.Context, method, path string, body j
 		return 502, mustJSON(map[string]any{"ok": false, "error": fmt.Sprintf("本地响应过大（>%dMB），无法中继", limit>>20)})
 	}
 	if rec.code == 0 {
+		// The middleware intentionally leaves an idempotency waiter's
+		// response empty when its request context is canceled. In-process
+		// relay has no real client disconnect, so an empty response here
+		// means the relay deadline fired while waiting on the same-key
+		// execution; report it as a timeout instead of a fake 200.
+		if ctx.Err() != nil {
+			return http.StatusGatewayTimeout, mustJSON(map[string]any{"ok": false, "error": "中继等待超时"})
+		}
 		rec.code = http.StatusOK
 	}
 	return rec.code, json.RawMessage(rec.buf.Bytes())
@@ -321,14 +364,16 @@ func (c *Client) relayInProcess(ctx context.Context, method, path string, body j
 
 // ── request dedupe ────────────────────────────────────────────────────
 
-// Bounds on the seen-request table. A duplicate only matters across a
-// same-epoch reconnect, which happens within seconds; the TTL bounds how long a
-// finished reqId stays a tombstone. hubBoot scopes the key, so a restarted
+// Bounds on the seen-request table. A duplicate matters across a same-epoch
+// reconnect, and the hub may replay an unacked request for up to its relay
+// timeout (45m), so a tombstone must outlive that window plus one minute of
+// margin. A five-minute TTL would let a late replay execute a request the
+// browser was already told failed. hubBoot scopes the key, so a restarted
 // hub's reused reqId can never inherit (or suppress) the previous process's
 // request.
 const (
-	memoIDs = 256
-	memoTTL = 5 * time.Minute
+	memoIDs = 1024
+	memoTTL = 46 * time.Minute
 )
 
 // relayKey names one request: a reqId is only unique inside one hub process.

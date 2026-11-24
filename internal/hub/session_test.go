@@ -232,7 +232,7 @@ func TestAudiencePauseStopsUpload(t *testing.T) {
 		t.Fatal("event frame sent while the audience was empty")
 	}
 
-	h.tr.push(t, audienceFrame(1, 0, watchingAudience(2, "s1")))
+	h.tr.push(t, audienceFrame(watchingAudience(2, "s1")))
 	fr := h.tr.nextOfType(t, wire.TypeEvents, 3*time.Second)
 	if fr.Seq != 1 || len(fr.Events) != 1 {
 		t.Fatalf("resume flush = seq %d with %d events, want the backlogged event", fr.Seq, len(fr.Events))
@@ -240,7 +240,7 @@ func TestAudiencePauseStopsUpload(t *testing.T) {
 }
 
 // TestAudienceGenOrdering: a snapshot older than the one in force is ignored;
-// an equal gen is a duplicate that still yields an ack.
+// gen, not arrival order, decides which state is current.
 func TestAudienceGenOrdering(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
@@ -248,15 +248,11 @@ func TestAudienceGenOrdering(t *testing.T) {
 	h.handshake(helloAckFrame(c.epoch, 0, 0, pausedAudience(5)))
 
 	// Older generation with watchers: must not resume the uplink.
-	h.tr.push(t, audienceFrame(1, 0, watchingAudience(4, "s1")))
+	h.tr.push(t, audienceFrame(watchingAudience(4, "s1")))
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		fr, ok := h.tr.tryFrame(time.Until(deadline))
-		if !ok {
+		if _, ok := h.tr.tryFrame(time.Until(deadline)); !ok {
 			break
-		}
-		if fr.Type == wire.TypeHeartbeat && fr.Ack != 1 {
-			t.Fatalf("heartbeat ack = %d, want the audience frame acked", fr.Ack)
 		}
 	}
 	if !c.out.isPaused() {
@@ -264,22 +260,67 @@ func TestAudienceGenOrdering(t *testing.T) {
 	}
 }
 
-// TestAudienceDuplicateSeqAppliesNewerGen: the hub may fold a newer absolute
-// snapshot into an audience frame whose seq the host already applied. A
-// duplicate seq must still apply the newer generation instead of being
-// mistaken for a retransmission.
-func TestAudienceDuplicateSeqAppliesNewerGen(t *testing.T) {
+// TestAudienceEqualGenIdempotent: the hub repeats the newest snapshot on every
+// heartbeat, so an equal gen must leave the installed state unchanged.
+func TestAudienceEqualGenIdempotent(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	h.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
+	h.handshake(helloAckFrame(c.epoch, 0, 0, pausedAudience(1)))
 
-	h.tr.push(t, audienceFrame(1, 0, wire.Audience{Gen: 2, Watchers: 2, Sessions: []string{"s1"}}))
-	waitUntil(t, "audience gen 2", func() bool { return c.watchers() == 2 })
+	snap := watchingAudience(2, "s1")
+	h.tr.push(t, audienceFrame(snap))
+	waitUntil(t, "audience gen 2", func() bool { return c.watchers() == 1 })
 
-	// Same seq, newer gen: a retransmitted payload after an in-place update.
-	h.tr.push(t, audienceFrame(1, 0, wire.Audience{Gen: 3, Watchers: 3, Sessions: []string{"s1"}}))
-	waitUntil(t, "audience gen 3", func() bool { return c.watchers() == 3 })
+	// A probe behind the repeated snapshot proves the loop processed it in
+	// order before answering; the state must stay exactly what gen 2 installed.
+	h.tr.push(t, audienceFrame(snap))
+	probe, err := wire.NewHeartbeatProbe(0, 41, wire.HeartbeatStatus{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.tr.push(t, probe)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fr, ok := h.tr.tryFrame(time.Until(deadline))
+		if !ok {
+			t.Fatal("no probeAck after the repeated audience")
+		}
+		if fr.ProbeAck == 41 {
+			break
+		}
+	}
+	if c.out.isPaused() {
+		t.Fatal("an equal-gen refresh paused the uplink")
+	}
+	if got := c.watchers(); got != 1 {
+		t.Fatalf("watchers = %d after the refresh, want 1", got)
+	}
+}
+
+// TestAudienceConsumesNoDownSeq: an audience frame never advances the down
+// watermark, so it needs no ack and leaves no retransmit entry.
+func TestAudienceConsumesNoDownSeq(t *testing.T) {
+	c := newSessionClient(t)
+	bridge := newTestBridge()
+	h := newSessionHarness(t, c, bridge)
+	h.handshake(helloAckFrame(c.epoch, 0, 0, pausedAudience(1)))
+
+	h.tr.push(t, audienceFrame(watchingAudience(2, "s1")))
+	waitUntil(t, "audience gen 2", func() bool { return c.watchers() == 1 })
+
+	if got := c.downApplied(); got != 0 {
+		t.Fatalf("down applied = %d after an audience, want 0", got)
+	}
+	// The only frame that follows is the periodic heartbeat, and it carries
+	// ack 0: nothing about the audience is being acknowledged.
+	fr, ok := h.tr.tryFrame(1500 * time.Millisecond)
+	if !ok {
+		return
+	}
+	if fr.Type != wire.TypeHeartbeat || fr.Ack != 0 {
+		t.Fatalf("unexpected frame after the audience: type %s ack %d", fr.Type, fr.Ack)
+	}
 }
 
 // TestAudienceTrimsUnwatchedSessions: bulk transcript for a session nobody
@@ -335,7 +376,7 @@ func TestOversizedEventBecomesPlaceholder(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	small := &wire.Limits{MaxFrame: 2048, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	small := &wire.Limits{MaxFrame: 2048, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: testCaps(),
@@ -364,7 +405,7 @@ func TestOutboxElidesDroppableWhilePaused(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(pausedAudience(1)),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: testCaps(),
@@ -447,8 +488,9 @@ func TestHeartbeatCarriesDownAckAndStatus(t *testing.T) {
 	h := newSessionHarness(t, c, bridge)
 	h.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
 
-	// A down frame advances the watermark; the host must confirm immediately.
-	h.tr.push(t, audienceFrame(1, 0, watchingAudience(2, "s1")))
+	// A reliable down frame advances the watermark; the host must confirm
+	// immediately.
+	h.tr.push(t, requestFrame(1, 0, "7", "GET", "/api/status", ""))
 	for {
 		fr := h.tr.nextOfType(t, wire.TypeHeartbeat, 3*time.Second)
 		if fr.Ack != 1 {
@@ -621,7 +663,7 @@ func TestBatchingRespectsMaxFrame(t *testing.T) {
 	c := newSessionClient(t)
 	bridge := newTestBridge()
 	h := newSessionHarness(t, c, bridge)
-	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: wire.ResumeWindow}
+	small := &wire.Limits{MaxFrame: 1024, MaxRelayBody: wire.DefaultLimits.MaxRelayBody}
 	h.adopt(wire.NewHelloAck(wire.HelloAck{
 		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
 		Liveness: &wire.Liveness{Keepalive: 1, Idle: 2}, Limits: small, Caps: testCaps(),
@@ -650,28 +692,41 @@ func TestBatchingRespectsMaxFrame(t *testing.T) {
 
 func audiencePtr(a wire.Audience) *wire.Audience { return &a }
 
-// TestDownReceiverUsesAdvertisedWindow: the down receiver parks at most
-// hello_ack.limits.resumeWindow frames, not the local package default. A host
-// that kept the default would happily buffer far past what the hub promised
-// and never notice the gap is unrecoverable.
-func TestDownReceiverUsesAdvertisedWindow(t *testing.T) {
+// TestDownGapClosesProtocol: the down log is gapless, so a frame that skips a
+// seq ends the session with protocol instead of being parked.
+func TestDownGapClosesProtocol(t *testing.T) {
 	c := newSessionClient(t)
 	h := newSessionHarness(t, c, newTestBridge())
-	limits := &wire.Limits{MaxFrame: wire.DefaultLimits.MaxFrame, MaxRelayBody: wire.DefaultLimits.MaxRelayBody, ResumeWindow: 2}
-	h.adopt(wire.NewHelloAck(wire.HelloAck{
-		Epoch: c.epoch, HubBoot: testHubBoot, Audience: audiencePtr(watchingAudience(1, "s1")),
-		Liveness: &wire.Liveness{Keepalive: 1, Idle: 30}, Limits: limits, Caps: testCaps(),
-	}))
-	if got := c.currentSession().down.Window(); got != 2 {
-		t.Fatalf("down receiver window = %d, want the advertised 2", got)
-	}
+	h.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
 
-	// Seq 1 is missing; 2..4 park one frame past the advertised window.
+	// Seq 1 never arrives; seq 2 is a hole the receiver must not paper over.
 	h.tr.push(t, requestFrame(2, 0, "a", "GET", "/api/x", ""))
-	h.tr.push(t, requestFrame(3, 0, "b", "GET", "/api/x", ""))
-	h.tr.push(t, requestFrame(4, 0, "c", "GET", "/api/x", ""))
-	if res := h.wait(t, 3*time.Second); res.reason != wire.CloseOverflow {
-		t.Fatalf("close = %s, want overflow at the advertised bound", res.reason)
+	if res := h.wait(t, 3*time.Second); res.reason != wire.CloseProtocol {
+		t.Fatalf("close = %s, want protocol", res.reason)
+	}
+	if got := c.downApplied(); got != 0 {
+		t.Fatalf("down watermark = %d, want 0", got)
+	}
+}
+
+// TestDownDuplicateSeqIgnored: a retransmitted down frame applies nothing, and
+// the next seq still continues the watermark.
+func TestDownDuplicateSeqIgnored(t *testing.T) {
+	c := newSessionClient(t)
+	h := newSessionHarness(t, c, newTestBridge())
+	h.handshake(helloAckFrame(c.epoch, 0, 0, watchingAudience(1)))
+
+	h.tr.push(t, requestFrame(1, 0, "a", "GET", "/api/x", ""))
+	h.tr.push(t, requestFrame(1, 0, "b", "GET", "/api/x", ""))
+	h.tr.push(t, requestFrame(2, 0, "c", "GET", "/api/x", ""))
+	for {
+		fr := h.tr.nextOfType(t, wire.TypeHeartbeat, 3*time.Second)
+		if fr.Ack == 2 {
+			break
+		}
+	}
+	if got := c.downApplied(); got != 2 {
+		t.Fatalf("down watermark = %d, want 2", got)
 	}
 }
 

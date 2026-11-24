@@ -1,0 +1,603 @@
+package acp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// ── loop ─────────────────────────────────────────────────────────────
+
+// goalLoop drives continuation turns for one session while its goal is
+// Active. Each session's goal owns one goroutine (stop channel closes to
+// end it); goals on other sessions are unrelated and keep running.
+//
+// The loop captures the goal pointer it owns at entry. A later /goal set
+// on the same session replaces that run while this loop may be blocked
+// (e.g. in a long PromptWithOpts, up to promptTimeout); every state write
+// below is guarded by currentLocked so a stale loop never pollutes the
+// replacement goal and exits as soon as it notices the swap.
+func (ge *goalEngine) goalLoop(sessionID string, stop chan struct{}) {
+	ge.mu.Lock()
+	run := ge.runLocked(sessionID)
+	ge.mu.Unlock()
+	if run == nil || run.g == nil {
+		return
+	}
+	g := run.g
+	for {
+		// 1. State check: only Active goals continue.
+		st := ge.goalStruct(sessionID)
+		if st == nil || st.Status != goalActive {
+			return
+		}
+		// 1b. Ownership: the goal was replaced by /goal set while this
+		//     loop was in flight — exit without touching the new goal.
+		ge.mu.Lock()
+		owned := ge.currentLocked(sessionID, g) != nil
+		ge.mu.Unlock()
+		if !owned {
+			return
+		}
+
+		// 2. First turn injects the full instruction; continuation and
+		//    evidence turns inject their own. The evidence round is
+		//    decided by the previous iteration's analysis.
+		var instruction string
+		ge.mu.Lock()
+		cur := ge.currentLocked(sessionID, g)
+		if cur == nil {
+			ge.mu.Unlock()
+			return
+		}
+		first := cur.TokensUsed == 0 && !cur.claimedCompletion && !cur.verifyingRound
+		if cur.verifyingRound {
+			instruction = goalVerifyInstruction(st.Objective)
+		} else if first {
+			instruction = goalInstruction(st.Objective)
+		} else {
+			instruction = goalContinueInstruction(st.Objective)
+		}
+		ge.mu.Unlock()
+
+		// 3. Wait until the session is idle (user turns win; the loop
+		//    yields while a user message is in flight).
+		if !ge.goalWaitIdle(stop, sessionID) {
+			return
+		}
+
+		// 4. Re-check state and ownership (pause/clear/set may have
+		//    landed while waiting).
+		ge.mu.Lock()
+		cur = ge.currentLocked(sessionID, g)
+		active := cur != nil && cur.Status == goalActive
+		ge.mu.Unlock()
+		if !active {
+			return
+		}
+
+		// 5. Run the turn, collecting events for analysis. The drainer
+		//    goroutine consumes the subscription during the whole turn, so
+		//    long turns never overflow the 512-slot Subscribe buffer and
+		//    lose update_goal / usage / summary events to Broadcast drops.
+		evCh, unsub := ge.host.Subscribe()
+		drain := ge.goalDrainConcurrent(evCh)
+		blocks := []ContentBlock{{kType: "text", "text": instruction}}
+		ctx, cancel := context.WithTimeout(context.Background(), promptTimeout)
+		stopReason, _, err := ge.host.PromptWithOpts(ctx, sessionID, blocks, PromptOpts{})
+		cancel()
+		// Stop the drainer and collect the turn's events (in order).
+		collected := drain()
+		unsub()
+
+		if err != nil {
+			// Transport failure (agent rebooted mid-goal) — stop the loop;
+			// the goal stays active and only /goal resume restarts it (a
+			// user message does not restart the loop). A stale loop
+			// (goal replaced while the prompt was in flight) must not
+			// write its failure into the new goal.
+			ge.mu.Lock()
+			cur = ge.currentLocked(sessionID, g)
+			if cur != nil && cur.Status == goalActive {
+				cur.Message = "回合失败: " + err.Error()
+			}
+			ge.mu.Unlock()
+			if cur != nil {
+				ge.broadcastGoal(sessionID)
+			}
+			return
+		}
+
+		// The user cancelled the continuation turn (or the agent hit its
+		// own stop gate) — stop the loop rather than immediately firing
+		// another turn; the goal stays active and only /goal resume
+		// restarts it.
+		if stopReason == "cancelled" {
+			ge.mu.Lock()
+			cur = ge.currentLocked(sessionID, g)
+			if cur != nil && cur.Status == goalActive {
+				cur.Message = "回合已取消（goal 保持活动，可用 /goal resume 继续）"
+			}
+			ge.mu.Unlock()
+			if cur != nil {
+				ge.broadcastGoal(sessionID)
+			}
+			return
+		}
+
+		// 6. Analyze the turn (agent goal_updated / update_goal tool call
+		//    / reply text / usage). goalAnalyze checks goal ownership
+		//    before every state write and returns true when this loop is
+		//    stale (goal replaced) — the loop then exits without touching
+		//    the new goal.
+		if done := ge.goalAnalyze(sessionID, g, collected); done {
+			return
+		}
+	}
+}
+
+// goalWaitIdle polls the session busy flag until idle, or until the stop
+// channel closes (returns false when stopped).
+func (ge *goalEngine) goalWaitIdle(stop chan struct{}, sessionID string) bool {
+	// Grace period so the user's previous turn renders before the loop
+	// fires its continuation.
+	select {
+	case <-time.After(goalLoopTurnDelay):
+	case <-stop:
+		return false
+	}
+	for {
+		if !ge.host.sessionBusy(sessionID) {
+			return true
+		}
+		select {
+		case <-time.After(goalLoopIdlePoll):
+		case <-stop:
+			return false
+		}
+	}
+}
+
+// goalDrainConcurrent starts a background drainer that consumes a
+// subscription channel continuously, so long turns (dozens to hundreds of
+// chunk/thought/usage events) never overflow the Subscribe buffer —
+// Broadcast drops events for slow consumers, and the goal analysis must
+// see the FULL turn (update_goal / usage / summary events near the end
+// would otherwise be lost to the old post-turn drain / smaller buffer).
+// The returned stop function terminates the drainer (with a short grace
+// sweep for events still in flight, mirroring the old post-turn drain)
+// and returns the collected events in turn order. The drainer only
+// collects events; it never touches goal state, so the goalLoopOwns
+// identity guard in goalAnalyze is unaffected.
+func (ge *goalEngine) goalDrainConcurrent(evCh chan Event) func() []Event {
+	var events []Event
+	stop := make(chan struct{})
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			select {
+			case ev := <-evCh:
+				events = append(events, ev)
+			case <-stop:
+				// Final sweep: catch events still in flight, then exit.
+				deadline := time.After(300 * time.Millisecond)
+				for {
+					select {
+					case ev := <-evCh:
+						events = append(events, ev)
+					case <-deadline:
+						return
+					}
+				}
+			}
+		}
+	}()
+	return func() []Event {
+		close(stop)
+		<-drained
+		return events
+	}
+}
+
+// goalAnalyze applies the collected turn events to the tracker and
+// decides whether the loop should stop. g is the goal pointer the
+// calling loop captured at entry: before every write to ge.g the
+// function checks goalLoopOwns(g), so a stale loop whose goal was
+// replaced by /goal set returns true immediately without touching the
+// new goal. Returns true when the loop must exit (complete / blocked /
+// budget limited / cleared / paused mid-loop / loop stale).
+func (ge *goalEngine) goalAnalyze(sessionID string, g *GoalState, events []Event) bool {
+	var text strings.Builder
+	tokensUsed := int64(0)
+	sawAgentGoalUpdate := false
+	sawUpdateGoalCall := false
+	var toolCompleted, toolBlocked bool
+	var toolMessage string
+
+	for _, ev := range events {
+		switch ev[kType] {
+		case "chunk":
+			if t, ok := ev["text"].(string); ok {
+				text.WriteString(t)
+			}
+		case "usage":
+			if u := toInt64(ev["used"]); u > 0 {
+				tokensUsed = u
+			}
+		case "tool_call":
+			if tc, ok := ev["toolCall"].(map[string]any); ok {
+				if isUpdateGoalToolCall(tc) {
+					sawUpdateGoalCall = true
+					ri := toolRawInput(tc)
+					if m, ok := ri.(map[string]any); ok {
+						if b, _ := m["completed"].(bool); b {
+							toolCompleted = true
+						}
+						if r, _ := m["blocked_reason"].(string); r != "" {
+							toolBlocked = true
+							toolMessage = r
+						}
+						if s, _ := m["message"].(string); s != "" && toolMessage == "" {
+							toolMessage = s
+						}
+					}
+				}
+			}
+		case "goal_updated":
+			if u, ok := ev[kUpdate].(map[string]any); ok {
+				sawAgentGoalUpdate = true
+				// The agent session has goal mode on and reports its own
+				// state — mirror it (agent is authoritative for status).
+				ge.mu.Lock()
+				cur := ge.currentLocked(sessionID, g)
+				if cur == nil {
+					ge.mu.Unlock()
+					return true // loop stale: goal replaced
+				}
+				if s, _ := u["status"].(string); s != "" {
+					cur.Status = s
+				}
+				if v, _ := u["verifying_completion"].(bool); v {
+					cur.Verifying = true
+				}
+				if m, _ := u["message"].(string); m != "" {
+					cur.Message = m
+				}
+				if n, ok := u["total_deliverables"].(float64); ok {
+					cur.TotalDeliverables = int(n)
+				}
+				if n, ok := u["completed_deliverables"].(float64); ok {
+					cur.CompletedDeliverables = int(n)
+				}
+				ge.mu.Unlock()
+			}
+		}
+	}
+
+	// Budget enforcement (best effort — only when a budget was set).
+	ge.mu.Lock()
+	cur := ge.currentLocked(sessionID, g)
+	if cur == nil {
+		ge.mu.Unlock()
+		return true // loop stale: goal replaced
+	}
+	if cur.TokenBudget > 0 && tokensUsed > 0 {
+		cur.TokensUsed = tokensUsed
+		if tokensUsed > cur.TokenBudget {
+			cur.Status = goalBudgetLimited
+			cur.Message = fmt.Sprintf("token 预算 %d 已耗尽", cur.TokenBudget)
+			ge.stopLoopLocked(sessionID)
+			ge.mu.Unlock()
+			ge.broadcastGoal(sessionID)
+			return true
+		}
+	}
+	ge.mu.Unlock()
+
+	// Agent-driven state (goal mode on the agent side): mirror terminal
+	// states and stop the loop.
+	if sawAgentGoalUpdate {
+		ge.mu.Lock()
+		cur = ge.currentLocked(sessionID, g)
+		if cur == nil {
+			ge.mu.Unlock()
+			return true // loop stale: goal replaced
+		}
+		terminal := cur.Status == goalComplete || cur.Status == goalCleared ||
+			cur.Status == goalBudgetLimited || cur.Status == goalUserPaused ||
+			cur.Status == goalBlocked
+		ge.mu.Unlock()
+		if terminal {
+			ge.broadcastGoal(sessionID)
+			return true
+		}
+	}
+
+	// Tool-driven state (update_goal call with completed/blocked_reason).
+	if sawUpdateGoalCall {
+		ge.mu.Lock()
+		cur = ge.currentLocked(sessionID, g)
+		if cur == nil {
+			ge.mu.Unlock()
+			return true // loop stale: goal replaced
+		}
+		if toolCompleted {
+			cur.claimedCompletion = true
+			cur.Verifying = true
+			cur.verifyingRound = true
+		} else if toolBlocked {
+			cur.Status = goalBlocked
+			cur.Message = toolMessage
+		} else if toolMessage != "" {
+			cur.Message = toolMessage
+		}
+		ge.mu.Unlock()
+		ge.broadcastGoal(sessionID)
+		if toolBlocked {
+			return true
+		}
+		if toolCompleted {
+			// Next loop iteration is the evidence round.
+			return false
+		}
+	}
+
+	// Text-driven analysis.
+	claim, blocked, evidence := analyzeGoalText(text.String())
+	ge.mu.Lock()
+	cur = ge.currentLocked(sessionID, g)
+	if cur == nil {
+		ge.mu.Unlock()
+		return true // loop stale: goal replaced
+	}
+	if cur.verifyingRound {
+		// Evidence round resolution.
+		cur.verifyingRound = false
+		cur.Verifying = false
+		switch {
+		case claim && evidence:
+			cur.Status = goalComplete
+			cur.Message = ""
+			cur.CompletedDeliverables = cur.TotalDeliverables
+			if cur.TotalDeliverables == 0 {
+				cur.TotalDeliverables = 1
+				cur.CompletedDeliverables = 1
+			}
+			ge.mu.Unlock()
+			ge.broadcastGoal(sessionID)
+			return true
+		case claim && !evidence:
+			cur.Status = goalBlocked
+			cur.Message = "完成声明缺少可验证证据（无变更文件/命令/输出）"
+			ge.mu.Unlock()
+			ge.broadcastGoal(sessionID)
+			return true
+		case blocked:
+			cur.Status = goalBlocked
+			cur.Message = "模型报告受阻"
+			ge.mu.Unlock()
+			ge.broadcastGoal(sessionID)
+			return true
+		default:
+			// Model kept working instead of defending the claim.
+			cur.claimedCompletion = false
+			ge.mu.Unlock()
+			return false
+		}
+	}
+	// Normal round: latch a completion claim for the evidence round.
+	if claim && !cur.claimedCompletion {
+		cur.claimedCompletion = true
+		cur.Verifying = true
+		cur.verifyingRound = true
+		cur.Message = "完成声明待验证…"
+		ge.mu.Unlock()
+		ge.broadcastGoal(sessionID)
+		return false
+	}
+	if blocked {
+		cur.Status = goalBlocked
+		cur.Message = "模型报告受阻"
+		ge.mu.Unlock()
+		ge.broadcastGoal(sessionID)
+		return true
+	}
+	ge.mu.Unlock()
+	return false
+}
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+// stopLoopLocked closes the session's stop channel so its in-flight
+// goalLoop exits at the next checkpoint. Other sessions' loops are
+// untouched. Callers must hold ge.mu.
+func (ge *goalEngine) stopLoopLocked(sessionID string) {
+	run := ge.runLocked(sessionID)
+	if run == nil {
+		return
+	}
+	if run.loopOn && run.stop != nil {
+		close(run.stop)
+	}
+	run.loopOn = false
+	run.stop = nil
+}
+
+// stopAllLoopsLocked closes every session's stop channel (shutdown).
+// Callers must hold ge.mu.
+func (ge *goalEngine) stopAllLoopsLocked() {
+	for _, run := range ge.runs {
+		if run == nil {
+			continue
+		}
+		if run.loopOn && run.stop != nil {
+			close(run.stop)
+		}
+		run.loopOn = false
+		run.stop = nil
+	}
+}
+
+// currentLocked returns the live goal a loop still owns: the session's
+// run must still point at the same g. A /goal set that replaced the run
+// invalidates every older loop, so a stale loop must stop writing state
+// and exit. Callers must hold ge.mu.
+func (ge *goalEngine) currentLocked(sessionID string, g *GoalState) *GoalState {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g != g {
+		return nil
+	}
+	return run.g
+}
+
+// goalStruct returns a copy of the session's goal state as a struct (nil
+// when that session has no goal). Loop logic that needs struct fields
+// uses this instead of the wire-shaped snapshot map.
+func (ge *goalEngine) goalStruct(sessionID string) *GoalState {
+	ge.mu.Lock()
+	defer ge.mu.Unlock()
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
+		return nil
+	}
+	g := *run.g
+	return &g
+}
+
+// goalSnapshot returns a serializable copy of the session's current state
+// (nil when it has no goal). Elapsed is recomputed at snapshot time.
+func (ge *goalEngine) goalSnapshot(sessionID string) map[string]any {
+	ge.mu.Lock()
+	defer ge.mu.Unlock()
+	return ge.goalSnapshotLocked(sessionID)
+}
+
+func (ge *goalEngine) goalSnapshotLocked(sessionID string) map[string]any {
+	run := ge.runLocked(sessionID)
+	if run == nil || run.g == nil {
+		return nil
+	}
+	g := *run.g
+	g.ElapsedMs = time.Now().UnixMilli() - g.StartedAt
+	if g.ElapsedMs < 0 {
+		g.ElapsedMs = 0
+	}
+	m := map[string]any{
+		"objective":              g.Objective,
+		"status":                 g.Status,
+		"phase":                  g.Phase,
+		"tokens_used":            g.TokensUsed,
+		"token_baseline":         g.TokenBaseline,
+		"started_at":             g.StartedAt,
+		"elapsed_ms":             g.ElapsedMs,
+		"total_deliverables":     g.TotalDeliverables,
+		"completed_deliverables": g.CompletedDeliverables,
+	}
+	if g.Planning {
+		m["planning"] = true
+	}
+	if g.Verifying {
+		m["verifying_completion"] = true
+	}
+	if g.TokenBudget > 0 {
+		m["token_budget"] = g.TokenBudget
+	}
+	if g.Message != "" {
+		m["message"] = g.Message
+	}
+	return m
+}
+
+// broadcastGoal pushes a goal_updated notification carrying the session's
+// current state — same event shape the agent's own goal_updated uses
+// ({type, update, sessionId}).
+func (ge *goalEngine) broadcastGoal(sessionID string) {
+	ge.mu.Lock()
+	st := ge.goalSnapshotLocked(sessionID)
+	ge.mu.Unlock()
+	if st == nil {
+		return
+	}
+	ev := Event{kType: "goal_updated", kUpdate: st}
+	if sessionID != "" {
+		ev[kSessionID] = sessionID
+	}
+	ge.host.Broadcast(ev)
+}
+
+// isUpdateGoalToolCall detects the update_goal tool call on the wire
+// (title "update_goal", kind "UpdateGoal", or a "Goal:" prefixed title).
+func isUpdateGoalToolCall(tc map[string]any) bool {
+	title, _ := tc["title"].(string)
+	kind, _ := tc["kind"].(string)
+	if title == "update_goal" || strings.HasPrefix(title, "Goal:") {
+		return true
+	}
+	return kind == "UpdateGoal" || kind == "WorkflowSignal"
+}
+
+// toolRawInput returns the rawInput of a tool call, handling both a JSON
+// string and an already-parsed object.
+func toolRawInput(tc map[string]any) any {
+	ri, ok := tc["rawInput"]
+	if !ok {
+		return nil
+	}
+	if s, ok := ri.(string); ok {
+		var m map[string]any
+		if json.Unmarshal([]byte(s), &m) == nil {
+			return m
+		}
+		return s
+	}
+	return ri
+}
+
+// analyzeGoalText heuristically classifies a turn's reply text into a
+// completion claim, a blocked claim, and presence of concrete evidence.
+func analyzeGoalText(text string) (claimComplete, claimBlocked, hasEvidence bool) {
+	lower := strings.ToLower(text)
+	// Blocked claims win over completion claims ("I'm stuck, can't
+	// complete").
+	for _, kw := range []string{"受阻", "卡住", "无法继续", "无法完成", "不能继续", "blocked", "stuck", "cannot continue"} {
+		if strings.Contains(lower, kw) {
+			claimBlocked = true
+			break
+		}
+	}
+	// Completion claims: explicit phrasing, excluding "not complete" /
+	// "未完成".
+	for _, kw := range []string{"目标已完成", "目标完成", "已完成", "全部完成", "都完成了", "任务完成", "goal completed", "goal achieved", "all done", "fully complete", "completed the goal"} {
+		if strings.Contains(lower, kw) {
+			claimComplete = true
+			break
+		}
+	}
+	if !claimComplete {
+		for _, kw := range []string{"完成", "done", "completed", "finished"} {
+			if strings.Contains(lower, kw) &&
+				!strings.Contains(lower, "未完成") &&
+				!strings.Contains(lower, "not complete") &&
+				!strings.Contains(lower, "not done") &&
+				!strings.Contains(lower, "not finished") &&
+				!strings.Contains(lower, "尚未完成") {
+				claimComplete = true
+				break
+			}
+		}
+	}
+	// Evidence: concrete artifacts — file paths, commands, test output.
+	if len(strings.TrimSpace(text)) >= 200 {
+		hasEvidence = true
+	}
+	for _, kw := range []string{"/", "npm ", "pnpm ", "yarn ", "cargo ", "go test", "go build", "npm run", "tsc ", "python", "pytest", "jest", "vitest", "测试通过", "构建成功", "运行成功", "passed", "success", "✅"} {
+		if strings.Contains(lower, kw) {
+			hasEvidence = true
+			break
+		}
+	}
+	return claimComplete, claimBlocked, hasEvidence
+}

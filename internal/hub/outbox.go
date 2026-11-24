@@ -16,6 +16,12 @@ import (
 // nobody can deliver.
 var errOutboxOverflow = errors.New("hub: uplink log over the hard cap")
 
+// errOutboxGap means one event's seq jumped past the fill cap. The bus seq is
+// dense, so a jump this large is a broken producer rather than a hole to paper
+// over; the session ends with overflow instead of synthesizing placeholders for
+// an unbounded run.
+var errOutboxGap = errors.New("hub: event seq gap over the fill cap")
+
 // outbox is the host's uplink log: one wire.Sender entry per event, keyed by
 // the seq the bridge event bus assigned. It is the only repair path — a
 // reconnect retransmits from the hub's ack — so nothing is ever dropped
@@ -79,6 +85,10 @@ func (o *outbox) appendEvent(raw []byte) error {
 	next := o.snd.Next()
 	if head.Seq <= next {
 		return nil
+	}
+	if head.Seq-next > maxGapFill {
+		log.Printf("[hub-client] 事件 seq 从 %d 跳到 %d，超过 %d 的空缺填充上限", next, head.Seq, maxGapFill)
+		return errOutboxGap
 	}
 	if len(raw)+frameEnvelopeOverhead > o.maxFrame {
 		// One event that cannot fit a frame becomes a placeholder at its own
@@ -196,10 +206,15 @@ func (o *outbox) setLimitsLocked(maxFrame int) {
 // (type, seq, ack, brackets) when checking it against maxFrame.
 const frameEnvelopeOverhead = 64
 
+// maxGapFill bounds the trimmed placeholders one append may synthesize for a
+// bus gap. Placeholders cost a log entry each, so the loop below must not walk
+// an unbounded jump.
+const maxGapFill = 256
+
 // inflightSoftFrames / inflightHardFrames scale hello_ack limits.maxFrame into
 // the outbox budget. A tunnel that cannot move two frames' worth of log is
-// not delivering; a critical-only log eight frames deep cannot fit the peer's
-// resume window in any useful time.
+// not delivering; a critical-only log eight frames deep cannot drain in any
+// useful time.
 const (
 	inflightSoftFrames = 2
 	inflightHardFrames = 8

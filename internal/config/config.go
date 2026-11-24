@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -57,6 +58,9 @@ type Config struct {
 	// before the agent's session cleanup can delete the session directory,
 	// so /usage history outlives that cleanup.
 	UsageLedger string
+	// IdemFile 是 relay 幂等日志（JSONL）的路径，RELAY_IDEMPOTENCY_FILE
+	// 可覆盖。空值表示只用内存（测试与嵌入方）：重启后丢失幂等结果。
+	IdemFile string
 	// Proxy is the HTTP(S) proxy address. Empty before WithSystemProxy means
 	// "use the OS network proxy if enabled".
 	Proxy string
@@ -130,6 +134,7 @@ func merge(file File) Config {
 		AccessToken:    firstNonEmpty(os.Getenv("FE_TOKEN"), os.Getenv("ACCESS_TOKEN"), strings.TrimSpace(file.FEToken)),
 		ResidentCap:    envResidentCap(),
 		UsageLedger:    strings.TrimSpace(os.Getenv("USAGE_LEDGER")),
+		IdemFile:       envOr("RELAY_IDEMPOTENCY_FILE", filepath.Join(Dir(), "relay-idempotency.jsonl")),
 		Proxy:          proxyURL(os.Getenv("PROXY"), file.Proxy),
 		NoProxy:        envOr("NO_PROXY", strings.TrimSpace(file.NoProxy)),
 		AgentProxy:     boolPtr(envFlag("AGENT_PROXY", file.ShouldAgentProxy())),

@@ -105,9 +105,8 @@ type session struct {
 	// restart resets its request ids.
 	hubBoot uint64
 
-	up     *outbox
-	down   *wire.Receiver
-	parked map[uint64]wire.Frame
+	up   *outbox
+	down *wire.Receiver
 
 	lastGen uint64
 
@@ -188,7 +187,6 @@ func (c *Client) runSession(ctx context.Context, bridge bridgeSource, tr Transpo
 		tr:        tr,
 		epoch:     c.epoch,
 		up:        c.out,
-		parked:    make(map[uint64]wire.Frame),
 		keepalive: time.Duration(wire.DefaultLiveness.Keepalive) * time.Second,
 		idle:      time.Duration(wire.DefaultLiveness.Idle) * time.Second,
 		maxRelay:  wire.DefaultLimits.MaxRelayBody,
@@ -449,14 +447,9 @@ func (s *session) adoptHelloAck(data []byte) (wire.CloseReason, error) {
 
 	// ackUp is authoritative: it drops everything the hub already applied and
 	// leaves the rest queued for replay. ackDown seeds the down receiver over
-	// the hub's own sequence space, which a hub restart resets; the parked-run
-	// bound is the window the hub advertised, not a local constant.
+	// the hub's own sequence space, which a hub restart resets.
 	s.up.ack(ack.AckUp)
-	window := wire.DefaultLimits.ResumeWindow
-	if lim := ack.Limits; lim != nil {
-		window = lim.ResumeWindow
-	}
-	s.down = wire.NewReceiverWindow(ack.AckDown, window)
+	s.down = wire.NewReceiver(ack.AckDown)
 	s.c.setDownApplied(ack.AckDown)
 	s.downAck.Store(ack.AckDown)
 	s.w.setSent(s.up.acked())
@@ -529,18 +522,11 @@ func (s *session) handleFrame(data []byte) (wire.CloseReason, error) {
 	}
 	switch f.Type {
 	case wire.TypeAudience:
-		if f.Seq <= s.down.Acked() {
-			// The hub may replace an unacked audience frame's payload in place
-			// with a newer absolute snapshot. The seq is then a duplicate for
-			// the receiver, but the generation is not: apply it so a state
-			// change can never be mistaken for a retransmission.
-			s.applyAudience(f.AudienceState())
-			return 0, nil
-		}
-		return s.acceptDown(f, data, func(pf wire.Frame) (wire.CloseReason, error) {
-			s.applyAudience(pf.AudienceState())
-			return 0, nil
-		})
+		// Absolute state on the unreliable path: no seq, no ack. The hub
+		// repeats the newest snapshot on every heartbeat, so a lost frame
+		// corrects itself and there is nothing to accept into the log.
+		s.applyAudience(f.AudienceState())
+		return 0, nil
 	case wire.TypeRequest:
 		return s.acceptDown(f, data, func(pf wire.Frame) (wire.CloseReason, error) {
 			s.onRequest(pf)
@@ -566,36 +552,21 @@ func (s *session) handleFrame(data []byte) (wire.CloseReason, error) {
 	}
 }
 
-// acceptDown feeds one reliable downframe through the receiver and applies
-// whatever became contiguous. A frame that arrives ahead of a gap is parked
-// with its decoded form; the receiver hands back payloads in seq order, so the
-// contiguous seqs are prev+1, prev+2, …
+// acceptDown feeds one reliable down frame through the receiver and applies it
+// when it continues the watermark. The down log is gapless (the hub assigns
+// every seq), so a frame ahead of a gap is a protocol violation, and a
+// duplicate is a retransmission that applies nothing.
 func (s *session) acceptDown(f wire.Frame, raw []byte, apply func(wire.Frame) (wire.CloseReason, error)) (wire.CloseReason, error) {
 	prev := s.down.Acked()
-	s.parked[f.Seq] = f
-	ready, ack, err := s.down.Accept(f.Seq, raw)
-	switch {
-	case errors.Is(err, wire.ErrOverflow):
-		log.Printf("[hub-client] 下行乱序窗口溢出（seq %d）", f.Seq)
-		return wire.CloseOverflow, err
-	case err != nil:
-		return wire.CloseUnreadable, err
+	_, ack, err := s.down.Accept(f.Seq, raw)
+	if err != nil {
+		log.Printf("[hub-client] 下行帧 seq %d 不连续（已应用 %d）: %v", f.Seq, prev, err)
+		return closeReasonFor(err), err
 	}
-	for i := range ready {
-		seq := prev + 1 + uint64(i)
-		pf, ok := s.parked[seq]
-		delete(s.parked, seq)
-		if !ok {
-			// The contiguous frame is the one that just arrived; it can only
-			// be missing here if the receiver advanced differently.
-			continue
-		}
-		if reason, err := apply(pf); err != nil {
+	if ack > prev {
+		if reason, err := apply(f); err != nil {
 			return reason, err
 		}
-	}
-	if f.Seq <= ack {
-		delete(s.parked, f.Seq)
 	}
 	s.c.setDownApplied(ack)
 	s.downAck.Store(ack)
@@ -610,6 +581,8 @@ func (s *session) acceptDown(f wire.Frame, raw []byte, apply func(wire.Frame) (w
 	return 0, nil
 }
 
+// applyAudience installs an absolute snapshot. gen orders snapshots, and an
+// equal gen is the same state applied again, so the last one always wins.
 func (s *session) applyAudience(a wire.Audience) {
 	if a.Gen < s.lastGen {
 		return // a snapshot older than the one already in force
