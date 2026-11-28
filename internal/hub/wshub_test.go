@@ -36,6 +36,9 @@ type wsHub struct {
 
 	// refuse makes the upgrade answer 401 instead of 101.
 	refuse bool
+	// protocolClose makes the hub close the handshake with CloseProtocol
+	// instead of sending hello_ack.
+	protocolClose bool
 	// audience is what hello_ack (and every audience a test pushes) starts
 	// with.
 	audience wire.Audience
@@ -143,7 +146,13 @@ func (h *wsHub) handle(w http.ResponseWriter, r *http.Request) {
 	h.helloOf = &hello
 	aud := h.audience
 	limits := h.limits
+	protocolClose := h.protocolClose
 	h.mu.Unlock()
+	if protocolClose {
+		code, reason := wire.CloseProtocol.WS()
+		_ = cc.conn.Close(websocket.StatusCode(code), reason)
+		return
+	}
 	if limits == nil {
 		limits = testLimits()
 	}

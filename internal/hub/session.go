@@ -405,11 +405,19 @@ func resetTimer(t *time.Timer, d time.Duration) {
 }
 
 func (s *session) sendHello() error {
+	up, reanchored := s.up.prepareEpoch(s.bridge.LastSeq)
+	if reanchored {
+		// The bus lost a run too long to fill with placeholders. A new
+		// epoch makes the hub seed its receiver from this baseline rather
+		// than expect the retired sequence space.
+		s.epoch = newClientEpoch()
+		s.c.epoch = s.epoch
+	}
 	hello := wire.NewHello(wire.Hello{
 		Epoch: s.epoch,
 		Token: s.c.tokenLocked(),
 		Resume: &wire.Resume{
-			Up:   s.up.prepareEpoch(s.bridge.LastSeq),
+			Up:   up,
 			Down: s.c.downApplied(),
 		},
 		Caps: &wire.Caps{Deflate: true, TransportUnits: true, RelayAck: true},

@@ -53,6 +53,8 @@ func TestOutboxEnforceLockedElidesMixedLog(t *testing.T) {
 
 // TestOutboxGapFillCap: a bus jump beyond the fill cap is refused instead of
 // synthesizing an unbounded run of placeholders; a gap at the cap still fills.
+// The refusal must also request an epoch re-anchor so the log cannot stay
+// stuck forever.
 func TestOutboxGapFillCap(t *testing.T) {
 	o := newOutbox()
 	if err := o.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":257,"text":"x"}`)); !errors.Is(err, errOutboxGap) {
@@ -61,11 +63,40 @@ func TestOutboxGapFillCap(t *testing.T) {
 	if n := o.len(); n != 0 {
 		t.Fatalf("refused append logged %d entries", n)
 	}
-	if err := o.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":256,"text":"x"}`)); err != nil {
+	if !o.gapResetPending() {
+		t.Fatal("oversize gap did not request an epoch re-anchor")
+	}
+
+	fill := newOutbox()
+	if err := fill.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":256,"text":"x"}`)); err != nil {
 		t.Fatalf("append at the cap: %v", err)
 	}
-	if n := o.len(); n != maxGapFill {
+	if n := fill.len(); n != maxGapFill {
 		t.Fatalf("log = %d entries, want %d (placeholders plus the event)", n, maxGapFill)
+	}
+}
+
+// TestOutboxGapReanchors: after an oversize gap, prepareEpoch must start a
+// fresh sender at the bus high-water mark and accept the next live event.
+func TestOutboxGapReanchors(t *testing.T) {
+	o := newOutbox()
+	if got, reanchored := o.prepareEpoch(func() uint64 { return 10 }); got != 10 || reanchored {
+		t.Fatalf("initial baseline = %d, reanchored=%v; want 10, false", got, reanchored)
+	}
+	if err := o.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":300,"text":"x"}`)); !errors.Is(err, errOutboxGap) {
+		t.Fatalf("oversize gap: %v, want errOutboxGap", err)
+	}
+	if got, reanchored := o.prepareEpoch(func() uint64 { return 500 }); got != 500 || !reanchored {
+		t.Fatalf("re-anchor baseline = %d, reanchored=%v; want 500, true", got, reanchored)
+	}
+	if o.gapResetPending() {
+		t.Fatal("re-anchor left the gap pending")
+	}
+	if err := o.appendEvent([]byte(`{"type":"chunk","sessionId":"s1","seq":501,"text":"ok"}`)); err != nil {
+		t.Fatalf("append after re-anchor: %v", err)
+	}
+	if got := o.next(); got != 501 {
+		t.Fatalf("next seq = %d, want 501", got)
 	}
 }
 

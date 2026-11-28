@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/AgentsHarness/capri-host/internal/acp"
 	"github.com/AgentsHarness/capri-hub/wire"
@@ -16,10 +17,10 @@ import (
 // nobody can deliver.
 var errOutboxOverflow = errors.New("hub: uplink log over the hard cap")
 
-// errOutboxGap means one event's seq jumped past the fill cap. The bus seq is
-// dense, so a jump this large is a broken producer rather than a hole to paper
-// over; the session ends with overflow instead of synthesizing placeholders for
-// an unbounded run.
+// errOutboxGap means one event's seq jumped past the fill cap. The outbox
+// requests a fresh epoch at the bus high-water mark; the session closes with
+// overflow so the hub retires the old sequence space instead of replaying a
+// permanently stuck log.
 var errOutboxGap = errors.New("hub: event seq gap over the fill cap")
 
 // outbox is the host's uplink log: one wire.Sender entry per event, keyed by
@@ -39,6 +40,19 @@ type outbox struct {
 	maxFrame int
 	soft     int
 	hard     int
+
+	// gapPending is set when the event bus dropped a run too large to fill
+	// with placeholders. The next handshake starts a new epoch from the bus
+	// high-water mark, re-anchoring this log instead of leaving it stuck.
+	gapPending bool
+	// gapLogAt/gapLogCount throttle the per-event gap diagnostics; a permanent
+	// gap would otherwise write one log line for every event the bus emits.
+	gapLogAt    time.Time
+	gapLogCount int
+	// compactAt is the byte size due for the next full compaction walk. A log
+	// over the soft cap that consists mostly of critical entries must not be
+	// walked on every append: that turns the producer path quadratic.
+	compactAt int
 }
 
 func newOutbox() *outbox {
@@ -53,19 +67,27 @@ func newOutbox() *outbox {
 // everything below is history the FE rebuilds from the host.
 //
 // A same-epoch reconnect keeps the log and returns its ack watermark instead;
-// the hub's ackUp is authoritative there.
-func (o *outbox) prepareEpoch(lastSeq func() uint64) uint64 {
+// the hub's ackUp is authoritative there. reanchored is true when the caller
+// must mint a new epoch for the returned baseline: either the first handshake
+// or a bus gap too large to fill.
+func (o *outbox) prepareEpoch(lastSeq func() uint64) (base uint64, reanchored bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.anchored {
-		return o.snd.Acked()
+	if o.anchored && !o.gapPending {
+		return o.snd.Acked(), false
 	}
-	base := lastSeq()
+	base = lastSeq()
 	// Nothing already appended can be above base: every entry's seq was
 	// assigned by the same bus the high-water mark is read from.
+	reanchored = o.gapPending
+	if reanchored {
+		log.Printf("[hub-client] 按新 epoch 重置上行序号基线为 %d", base)
+	}
 	o.snd = wire.NewSender(base)
 	o.anchored = true
-	return base
+	o.gapPending = false
+	o.compactAt = o.soft
+	return base, reanchored
 }
 
 // appendEvent logs one event under its own seq. A seq at or below the log's
@@ -82,12 +104,16 @@ func (o *outbox) appendEvent(raw []byte) error {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.gapPending {
+		return errOutboxGap
+	}
 	next := o.snd.Next()
 	if head.Seq <= next {
 		return nil
 	}
 	if head.Seq-next > maxGapFill {
-		log.Printf("[hub-client] 事件 seq 从 %d 跳到 %d，超过 %d 的空缺填充上限", next, head.Seq, maxGapFill)
+		o.gapPending = true
+		o.noteGapLocked(next, head.Seq)
 		return errOutboxGap
 	}
 	if len(raw)+frameEnvelopeOverhead > o.maxFrame {
@@ -111,6 +137,32 @@ func (o *outbox) appendEvent(raw []byte) error {
 	return o.enforceLocked()
 }
 
+// noteGapLocked records one oversize gap. The first gap is logged at once;
+// repeats inside the window are summarized, so a permanently stuck log cannot
+// emit hundreds of thousands of identical lines.
+func (o *outbox) noteGapLocked(next, head uint64) {
+	o.gapLogCount++
+	now := time.Now()
+	if !o.gapLogAt.IsZero() && now.Sub(o.gapLogAt) < gapLogWindow {
+		return
+	}
+	if o.gapLogAt.IsZero() {
+		log.Printf("[hub-client] 事件 seq 从 %d 跳到 %d，超过 %d 的空缺填充上限；将以新 epoch 重连", next, head, maxGapFill)
+	} else {
+		log.Printf("[hub-client] 事件 seq 仍停在 %d（最新 %d），过去 %.0fs 有 %d 条事件超过空缺填充上限", next, head, now.Sub(o.gapLogAt).Seconds(), o.gapLogCount)
+	}
+	o.gapLogAt = now
+	o.gapLogCount = 0
+}
+
+// gapResetPending reports whether the log needs a fresh epoch baseline before
+// the next handshake.
+func (o *outbox) gapResetPending() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.gapPending
+}
+
 // enforceLocked keeps the log inside its byte budget: droppable transcript
 // payloads become placeholders in place (the seq is kept), critical entries
 // are retained, and a log that critical entries alone push past the hard cap
@@ -122,12 +174,22 @@ func (o *outbox) appendEvent(raw []byte) error {
 // never fill, and critical events (prompts, turn terminals) are rare enough
 // that the cap is a link-health signal, not a memory ceiling.
 func (o *outbox) enforceLocked() error {
-	if o.snd.Bytes() <= o.soft {
+	bytes := o.snd.Bytes()
+	if bytes > o.hard {
+		return errOutboxOverflow
+	}
+	if bytes <= o.soft {
+		o.compactAt = o.soft
+		return nil
+	}
+	// The log has not grown enough since the last full walk; a repeat scan
+	// cannot shrink it. Skip until the size threshold advances.
+	if bytes < o.compactAt {
 		return nil
 	}
 	// Walk the log once. ElideFrom resumes after the previous replacement, so
 	// compacting n entries costs one scan instead of one head scan per entry.
-	for i, n := 0, o.snd.Len(); i < n && o.snd.Bytes() > o.soft; i++ {
+	for i, n := 0, o.snd.Len(); i < n; i++ {
 		e, ok := o.snd.EntryAt(i)
 		if !ok {
 			break
@@ -145,6 +207,11 @@ func (o *outbox) enforceLocked() error {
 		if _, err := o.snd.ElideFrom(i, e.Seq, wire.TrimmedEvent(head.SessionID, e.Seq)); err != nil {
 			continue
 		}
+	}
+	if bytes := o.snd.Bytes(); bytes > o.soft {
+		o.compactAt = bytes + o.maxFrame
+	} else {
+		o.compactAt = o.soft
 	}
 	if o.snd.Bytes() > o.hard {
 		return errOutboxOverflow
@@ -200,6 +267,7 @@ func (o *outbox) setLimitsLocked(maxFrame int) {
 	o.maxFrame = maxFrame
 	o.soft = inflightSoftFrames * maxFrame
 	o.hard = inflightHardFrames * maxFrame
+	o.compactAt = o.soft
 }
 
 // frameEnvelopeOverhead is the slack one event needs for the frame envelope
@@ -207,9 +275,12 @@ func (o *outbox) setLimitsLocked(maxFrame int) {
 const frameEnvelopeOverhead = 64
 
 // maxGapFill bounds the trimmed placeholders one append may synthesize for a
-// bus gap. Placeholders cost a log entry each, so the loop below must not walk
-// an unbounded jump.
+// bus gap. A larger jump means the event bus lost a whole run: the outbox
+// requests a fresh epoch instead of walking an unbounded jump.
 const maxGapFill = 256
+
+// gapLogWindow bounds how often the gap diagnostic may reach the log.
+const gapLogWindow = 30 * time.Second
 
 // inflightSoftFrames / inflightHardFrames scale hello_ack limits.maxFrame into
 // the outbox budget. A tunnel that cannot move two frames' worth of log is

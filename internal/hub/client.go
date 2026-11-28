@@ -222,14 +222,6 @@ func NewClient(cfg Config) *Client {
 	if cfg.QUICPort == 0 {
 		cfg.QUICPort = 8788
 	}
-	epoch, err := wire.NewEpoch()
-	if err != nil {
-		// crypto/rand failing is not a state this process can serve the
-		// protocol in, but a non-zero timestamp keeps the invariant "epoch is
-		// non-zero and per-process" instead of panicking at startup.
-		epoch = uint64(time.Now().UnixNano()) | 1
-		log.Printf("[hub-client] 无法生成随机 epoch（%v），使用时间戳 %d", err, epoch)
-	}
 	c := &Client{
 		cfg:   cfg,
 		local: cfg.Local,
@@ -247,7 +239,7 @@ func NewClient(cfg Config) *Client {
 		// and the HTTP API before Run's first iteration, and a nil channel
 		// would make requestRepair's non-blocking send silently vanish.
 		repairCh: make(chan struct{}, 1),
-		epoch:    epoch,
+		epoch:    newClientEpoch(),
 		out:      newOutbox(),
 		memo:     newRelayMemo(),
 
@@ -257,6 +249,19 @@ func NewClient(cfg Config) *Client {
 	}
 	c.name.Store(cfg.HostName)
 	return c
+}
+
+// newClientEpoch mints a non-zero sequence-space id.
+func newClientEpoch() uint64 {
+	epoch, err := wire.NewEpoch()
+	if err != nil {
+		// crypto/rand failing is not a state this process can serve the
+		// protocol in, but a non-zero timestamp keeps the invariant "epoch is
+		// non-zero and per-process" instead of panicking at startup.
+		epoch = uint64(time.Now().UnixNano()) | 1
+		log.Printf("[hub-client] 无法生成随机 epoch（%v），使用时间戳 %d", err, epoch)
+	}
+	return epoch
 }
 
 // proxyFunc turns the configured proxy URL into the transport's Proxy
@@ -404,8 +409,21 @@ func (c *Client) Run(ctx context.Context, bridge bridgeSource) {
 		}
 
 		c.setLastErr(err)
-		wait := backoffJitter(backoff)
 		policy := reconnectPolicy(reason, err)
+		if policy == wire.CloseProtocol {
+			// A protocol mismatch is not a transient network failure. Retrying
+			// only spams both logs and the hub until one side is upgraded;
+			// stop the hub link and let the operator restart the host after
+			// the upgrade.
+			msg := "协议版本不匹配，已停止自动重连；请把 Host 与 Hub 升到同一版本后重启 Host"
+			if err != nil {
+				msg += ": " + err.Error()
+			}
+			c.setLastErr(errors.New(msg))
+			log.Printf("[hub-client] %s", msg)
+			return
+		}
+		wait := backoffJitter(backoff)
 		if policy == wire.CloseSuperseded {
 			// Another connection already holds this hostId. The credential
 			// is FINE: re-pairing here would delete a working token and

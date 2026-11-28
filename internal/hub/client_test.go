@@ -208,6 +208,81 @@ func TestRunResumesAfterHubRestart(t *testing.T) {
 	t.Fatal("host never replayed the unacked event after reconnecting")
 }
 
+// TestRunReanchorsAfterEventSeqGap: when the bridge reports a seq jump past
+// the placeholder cap, Run must switch to a new epoch, reset the uplink log at
+// the bus high-water mark, and keep delivering events instead of reconnect
+// looping forever with the old watermark.
+func TestRunReanchorsAfterEventSeqGap(t *testing.T) {
+	hub := newWSHub(t, watchingAudience(1, "s1"))
+	bridge := newTestBridge()
+	c := NewClient(Config{URL: hub.url(), HostID: "h1", Token: "tok123", DisableQUIC: true})
+	runClient(t, c, bridge)
+	waitConnected(t, c)
+
+	hub.mu.Lock()
+	firstEpoch := hub.helloOf.Epoch
+	hub.mu.Unlock()
+
+	bridge.setSeq(1000)
+	if seq := bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "before-gap"}); seq != 1001 {
+		t.Fatalf("pushed seq = %d, want 1001", seq)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	reanchored := false
+	for time.Now().Before(deadline) {
+		hub.mu.Lock()
+		conns := hub.conns
+		var epoch uint64
+		if hub.helloOf != nil {
+			epoch = hub.helloOf.Epoch
+		}
+		hub.mu.Unlock()
+		if conns >= 2 && epoch != firstEpoch && epoch != 0 {
+			reanchored = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !reanchored {
+		t.Fatalf("host never re-handshook with a new epoch (state: %+v)", c.State())
+	}
+
+	bridge.push(acp.Event{"type": "chunk", "sessionId": "s1", "text": "after-gap"})
+	fr := hub.waitEvent(t, "after-gap", 5*time.Second)
+	if fr.Seq != 1002 {
+		t.Fatalf("event frame seq = %d, want 1002", fr.Seq)
+	}
+}
+
+// TestRunStopsOnProtocolMismatch: a hub that speaks a different protocol is
+// not a transient failure. The client logs the mismatch and stops dialing
+// instead of retrying forever until one side is upgraded.
+func TestRunStopsOnProtocolMismatch(t *testing.T) {
+	hub := newWSHub(t, watchingAudience(1))
+	hub.protocolClose = true
+	c := NewClient(Config{URL: hub.url(), HostID: "h1", Token: "tok123", DisableQUIC: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		c.Run(ctx, newTestBridge())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run kept retrying after a protocol mismatch")
+	}
+	if st := c.State(); !strings.Contains(st.LastError, "协议版本不匹配") {
+		t.Fatalf("last error = %q, want protocol mismatch", st.LastError)
+	}
+	if got := hub.connCount(); got != 1 {
+		t.Fatalf("hub connections = %d, want 1 (no retry loop)", got)
+	}
+}
+
 // TestRunRepairsOnAuthRejection: a rejected credential triggers exactly one
 // re-pair, then the session comes up on the new token.
 func TestRunRepairsOnAuthRejection(t *testing.T) {
